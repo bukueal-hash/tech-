@@ -1,0 +1,266 @@
+#pragma once
+#include <cstddef>
+#include <cstdint>
+
+namespace Offsets {
+    // ── Globals (CL-1315578) ─────────────────────────────────────────────────
+    constexpr std::ptrdiff_t UWorld = 0xE91A288;
+    constexpr uint64_t GameStateGlobalRva = 0xDCA7C88ULL;
+    constexpr uint64_t GNamePoolRva = 0xE4F2A00ULL;
+    constexpr uint64_t FNameKeyTableRva = 0xE4318DCULL;
+    constexpr uint64_t FNameBlockMaskRva = 0xB523C50ULL;
+    constexpr uint64_t GUObjectArrayChunksRva = 0xE3B61C0ULL;
+    constexpr uint64_t GObjPshufbMaskRva = 0xAD97CC0ULL;
+
+    // ── UWorld ───────────────────────────────────────────────────────────────
+    constexpr std::ptrdiff_t PersistentLevel = 0x158;
+    constexpr std::ptrdiff_t StreamingLevels = 0x178;
+    constexpr std::ptrdiff_t Levels = 0x4A0;
+    constexpr std::ptrdiff_t UWorld_InstanceTime = 0x1E0;
+    constexpr std::ptrdiff_t OwningGameInstance = 0x4D8;
+    constexpr std::ptrdiff_t LevelCollections = 0x370;
+    constexpr std::ptrdiff_t AuthorityGameMode = 0x3F0;
+    constexpr std::ptrdiff_t PhysicsField = 0x560;
+    constexpr std::ptrdiff_t UWorldSeconds = 0x778;
+
+    // LevelCollection (size 0x78)
+    constexpr std::ptrdiff_t LevelCollection_GameState = 0x08;
+    constexpr std::ptrdiff_t LevelCollection_NetDriver = 0x10;
+    constexpr std::ptrdiff_t LevelCollection_DemoNetDriver = 0x18;
+    constexpr std::ptrdiff_t LevelCollection_PersistentLevel = 0x20;
+    constexpr std::ptrdiff_t LevelCollection_Levels = 0x28;
+    constexpr std::ptrdiff_t LevelCollection_Stride = 0x78;
+
+    // UWorld has no direct GameState field on CL-1315578 — use LevelCollections.
+    // Offsets::GameState kept as LevelCollections base for ResolveGameStateFromWorld.
+    constexpr std::ptrdiff_t GameState = LevelCollections;
+
+    // ── GameInstance / LocalPlayer ───────────────────────────────────────────
+    constexpr std::ptrdiff_t LocalPlayers = 0x120;
+    constexpr std::ptrdiff_t LocalPlayer_PlayerController = 0x00A0;
+    constexpr std::ptrdiff_t LocalPlayer_ControllerId = 0x0270;
+    /** @deprecated CL-1315578 — do not use as primary; kept only for compile refs. */
+    constexpr std::ptrdiff_t LocalPlayersAlt = LocalPlayers;
+    constexpr std::ptrdiff_t LocalPlayersFlat = LocalPlayers;
+    /** @deprecated — was wrong object; use LocalPlayer_PlayerController. */
+    constexpr std::ptrdiff_t APlayerController = LocalPlayer_PlayerController;
+
+    // ── Level ────────────────────────────────────────────────────────────────
+    constexpr std::ptrdiff_t ActorsCount = 0x110;
+    constexpr std::ptrdiff_t AActors = 0x108;
+    constexpr std::ptrdiff_t OwningActor = 0x108;
+    constexpr std::ptrdiff_t ActorsMax = 0x114;
+    constexpr std::ptrdiff_t Level_OwningWorld = 0x130;
+    constexpr std::ptrdiff_t ActorCluster = 0x150;
+
+    // LevelActorContainer
+    constexpr std::ptrdiff_t LevelActorContainer_Actors = 0x98;
+    constexpr std::ptrdiff_t LevelActorContainer_ActorCount = 0xA8;
+
+    // ── GameState ────────────────────────────────────────────────────────────
+    constexpr std::ptrdiff_t GameState_PlayerArray = 0x0480;
+    constexpr std::ptrdiff_t GameState_GameModeClass = 0x03C0;
+    constexpr std::ptrdiff_t GameState_AuthorityGameMode = 0x03C8;
+    constexpr std::ptrdiff_t GameState_SpectatorClass = 0x03D0;
+    constexpr std::ptrdiff_t GameState_PlayerStates = 0x0940;
+    constexpr std::ptrdiff_t GameState_GamePhase = 0x0950;
+    constexpr std::ptrdiff_t GameState_EnemyCount = 0x0980;
+    constexpr std::ptrdiff_t GameState_PickupCount = 0x0984;
+
+    // ── GameViewportClient ───────────────────────────────────────────────────
+    constexpr std::ptrdiff_t GameViewportClient_World = 0x0178;
+
+    // ── PlayerController ─────────────────────────────────────────────────────
+    constexpr std::ptrdiff_t AcknowledgedPawn = 0x3E0;
+    constexpr std::ptrdiff_t ControlRotation = 0x418;
+    constexpr std::ptrdiff_t AController_PlayerState = 0x3A8;
+    constexpr std::ptrdiff_t LocalAckPlayerState = 0x3F0; // CHARACTER on PC (help)
+    constexpr std::ptrdiff_t APlayerCameraManager = 0x4E0;
+    constexpr std::ptrdiff_t APlayerState = 0x3A8; // Actor/PC PlayerState
+    constexpr std::ptrdiff_t PlayerNamePrivate = 0x440;
+    constexpr std::ptrdiff_t PlayerNameOnPawn = 0x438;
+    constexpr std::ptrdiff_t PlayerState_PawnPrivate = 0x418;
+    constexpr std::ptrdiff_t Pawn_Controller = 0x3D8;
+
+    // ── PlayerCameraManager ──────────────────────────────────────────────────
+    constexpr std::ptrdiff_t CameraCachePrivate = 0x4B0;
+    constexpr std::ptrdiff_t ViewTarget = 0x04B0;
+    constexpr std::ptrdiff_t ViewTargetTarget = ViewTarget;
+    constexpr std::ptrdiff_t ViewTargetPOV = 0x10;
+    constexpr std::ptrdiff_t CameraCachePOV = 0x10;
+    constexpr std::ptrdiff_t CameraCachePOVAlt = 0xC;
+
+    // POV relative (help: Location +0x00, Rotation +0x28, FOV +0x50)
+    constexpr std::ptrdiff_t CameraPOV_Location = 0x00;
+    constexpr std::ptrdiff_t CameraPOV_Rotation = 0x28;
+    constexpr std::ptrdiff_t CameraPOV_FOV = 0x50;
+    constexpr std::ptrdiff_t CameraLocation = CameraPOV_Location;
+    constexpr std::ptrdiff_t CameraRotation = CameraPOV_Rotation;
+    constexpr std::ptrdiff_t CameraFOV = CameraPOV_FOV;
+    constexpr std::ptrdiff_t POV_Location = CameraPOV_Location;
+    constexpr std::ptrdiff_t POV_Rotation = CameraPOV_Rotation;
+    constexpr std::ptrdiff_t POV_FOV = CameraPOV_FOV;
+    constexpr std::ptrdiff_t PCOwner = 0x0420;
+    constexpr std::ptrdiff_t DefaultFOV = 0x0430;
+    constexpr std::ptrdiff_t LockedFOV = 0x3C4;
+    constexpr std::ptrdiff_t DefaultOrthoWidth = 0x70;
+
+    // ── Actor ────────────────────────────────────────────────────────────────
+    constexpr std::ptrdiff_t RootComponent = 0x218;
+    constexpr std::ptrdiff_t ClassDefaultObject = 0x70;
+    constexpr std::ptrdiff_t ClassDefaultObjectAlt = 0x78;
+    constexpr std::ptrdiff_t ActorTypeId = 0xB0;
+    constexpr std::ptrdiff_t IsRenderedTime = 0x1F0;
+    constexpr std::ptrdiff_t ActorID = 0x18;
+    constexpr std::ptrdiff_t Super = ActorTypeId;
+    constexpr std::ptrdiff_t ActorOwner = 0x1c0;
+    constexpr std::ptrdiff_t ActorInstigator = 0x210;
+    constexpr std::ptrdiff_t Actor_bHiddenByte = 0xd9;
+    constexpr uint8_t Actor_bHiddenMask = 0x1;
+    constexpr std::ptrdiff_t Actor_FlagsDd = 0xdd;
+    constexpr uint8_t Actor_bActorEnableCollisionMask = 0x1;
+    constexpr uint8_t Actor_bActorIsBeingDestroyedMask = 0x2;
+    constexpr std::ptrdiff_t ReplicatedMovement = 0x148;
+    constexpr std::ptrdiff_t RepMov_LinearVelocity = 0x0;
+    constexpr std::ptrdiff_t Actor_InstanceComponents = 0x328;
+
+    // ── SceneComponent ───────────────────────────────────────────────────────
+    constexpr std::ptrdiff_t RelativeLocation = 0x218;
+    constexpr std::ptrdiff_t RelativeRotation = 0x230;
+    constexpr std::ptrdiff_t RelativeScale3D = 0x248;
+    constexpr std::ptrdiff_t ComponentVelocity = 0x260;
+    constexpr std::ptrdiff_t ComponentToWorld = 0x330;
+    constexpr std::ptrdiff_t WorldLocation = 0x350; // CTW + 0x20
+    constexpr std::ptrdiff_t Scene_bVisibleByte = 0x278;
+    constexpr uint8_t Scene_bVisibleMask = 0x20;
+    constexpr std::ptrdiff_t Scene_bHiddenInGameByte = 0x279;
+    constexpr uint8_t Scene_bHiddenInGameMask = 0x10;
+
+    constexpr std::ptrdiff_t BoundsScale = 0x438;
+    constexpr std::ptrdiff_t LastSubmitTime = 0x4C4;
+    constexpr std::ptrdiff_t LastRenderTime = LastSubmitTime + 0x4;
+    constexpr std::ptrdiff_t LastRenderTimeOnScreen = LastSubmitTime + 0x8;
+    constexpr std::ptrdiff_t LastSubmitTimeOnScreen = LastRenderTimeOnScreen;
+    constexpr std::ptrdiff_t VisibilityBasedAnimTickOption = 0x8F4;
+    constexpr std::ptrdiff_t bRecentlyRendered = 0x8F7;
+
+    // ── Bone decrypt (CL-1315578) ────────────────────────────────────────────
+    constexpr std::ptrdiff_t Encrypted = 0x7A0;
+    constexpr std::ptrdiff_t LodSelect = 0x830;
+    constexpr std::ptrdiff_t BoneArrayLodStride = 0xB8;
+    constexpr uint64_t BonePshufMaskRva = GObjPshufbMaskRva; // unused by help bone path
+
+    // ── Mesh / character ─────────────────────────────────────────────────────
+    constexpr std::ptrdiff_t USkeletalMeshComponent = 0x428;
+    constexpr std::ptrdiff_t SkeletalMeshAsset = 0xA20;
+    constexpr std::ptrdiff_t bNoSkeletonUpdate = 0xBB1;
+    constexpr std::ptrdiff_t bForceRefpose = 0xBB2;
+    constexpr std::ptrdiff_t CharacterMovement = 0x438;
+    constexpr std::ptrdiff_t Velocity = 0x1A8;
+    constexpr std::ptrdiff_t PioneerCharacterMovement = 0xb38;
+    constexpr std::ptrdiff_t HealthComponent = 0xDC8;
+    constexpr std::ptrdiff_t InventoryComponent = 0xCB0;
+
+    constexpr std::ptrdiff_t HealthInfo = 0x530;
+    constexpr std::ptrdiff_t PlayerState_Health = HealthInfo;
+    constexpr std::ptrdiff_t PlayerState_MaxHealth = 0x538;
+    constexpr std::ptrdiff_t PlayerState_Armor = 0x540;
+    constexpr std::ptrdiff_t PlayerState_MaxArmor = 0x548;
+    constexpr std::ptrdiff_t Health = 0x640;
+    constexpr std::ptrdiff_t MaxHealth = 0x2E0;
+    constexpr std::ptrdiff_t Shield = 0x140;
+    constexpr std::ptrdiff_t MaxDBNO = 0x2E8;
+    constexpr std::ptrdiff_t TeamID = 0x812;
+
+    constexpr std::ptrdiff_t LocalCurrentItemActors = 0x4D0;
+    constexpr std::ptrdiff_t EquippedPrimaryItem = 0x520;
+    constexpr std::ptrdiff_t WeaponQuality = 0x472;
+
+    constexpr std::ptrdiff_t LootInteractionComponent = 0xB68;
+    constexpr std::ptrdiff_t LootInteraction_Container = 0xBB8;
+    constexpr std::ptrdiff_t SalvageContainer_ChosenMesh = 0xCF0;
+    constexpr std::ptrdiff_t LootInteraction_Searched = 0x810;
+    constexpr std::ptrdiff_t SimpleLootActivity_LootInteraction = 0x4E0;
+    constexpr std::ptrdiff_t SimpleLootActivity_LootStateMachine = 0x508;
+    constexpr std::ptrdiff_t SimpleLootActivity_ItemContainer = 0x4F8;
+    constexpr std::ptrdiff_t SalvageContainer_MeshVariants = 0xCB8;
+    constexpr std::ptrdiff_t ItemDataAsset = 0x8F8;
+    constexpr std::ptrdiff_t BP_PickupBase_SpawnItems = 0x5b0;
+    constexpr std::ptrdiff_t ItemContainer_OpenTime = 0x530;
+    constexpr std::ptrdiff_t ConstructableItemContainer_OpenTime = 0x4c0;
+    constexpr std::ptrdiff_t ItemDataAsset_OverrideItemAssetId = 0x120;
+    constexpr std::ptrdiff_t ItemDataAsset_bOverrideItemAssetId = 0x118;
+    constexpr std::ptrdiff_t UIHoverData = 0x550;
+    constexpr std::ptrdiff_t UIHoverData_Pickup = 0x5F8;
+
+    // Pickup (help)
+    constexpr std::ptrdiff_t Pickup_RootCollider = 0x460;
+    constexpr std::ptrdiff_t Pickup_Interaction = 0x478;
+    constexpr std::ptrdiff_t Pickup_DefaultPickupDataAsset = 0x488;
+
+    constexpr std::ptrdiff_t bIsBreaked = 0x1220;
+    constexpr std::ptrdiff_t Constructable_EnemyTypeDataAsset = 0x11A0;
+    constexpr std::ptrdiff_t Constructable_AITemplateData = 0x1190;
+    constexpr std::ptrdiff_t Constructable_bIsDestroyed = 0x1210;
+    constexpr std::ptrdiff_t Constructable_HealthService = 0x1270;
+    constexpr std::ptrdiff_t Constructable_HealthGroupService = 0x1298;
+    constexpr std::ptrdiff_t HealthGroupService_BaseGroup = 0x1A8;
+    constexpr std::ptrdiff_t BotHealthCached = 0x668;
+    constexpr std::ptrdiff_t BotHealthMax = 0x308;
+    constexpr std::ptrdiff_t LastSubmitTimeAlt = 0x4CC;
+    constexpr std::ptrdiff_t ActorHealthComponent = 0x4D0;
+    constexpr std::ptrdiff_t CurrentHealth = 0x1D0;
+    constexpr std::ptrdiff_t UseDistance = 0x268;
+
+    constexpr std::ptrdiff_t AttachChildren = 0x168;
+    constexpr std::ptrdiff_t StaticMesh = 0x710;
+    constexpr std::ptrdiff_t StaticMeshLegacy = 0x6A0;
+    constexpr std::ptrdiff_t BodySetup = 0x1F0;
+    constexpr std::ptrdiff_t AggGeom = 0xb8;
+    constexpr std::ptrdiff_t ExtendedBounds = 0x300;
+    constexpr std::ptrdiff_t PositiveBoundsExt = 0x2D0;
+    constexpr std::ptrdiff_t NegativeBoundsExt = 0x2E8;
+    constexpr std::ptrdiff_t AggGeom_SphereElems = 0x00;
+    constexpr std::ptrdiff_t AggGeom_BoxElems = 0x10;
+    constexpr std::ptrdiff_t AggGeom_SphylElems = 0x20;
+    constexpr std::ptrdiff_t AggGeom_ConvexElems = 0x30;
+    constexpr std::ptrdiff_t ConvexElem_VertexData = 0x30;
+    constexpr std::ptrdiff_t ConvexElem_IndexData = 0x40;
+    constexpr std::ptrdiff_t ConvexElem_Stride = 0x110;
+    constexpr std::ptrdiff_t BoxElem_Center = 0x30;
+    constexpr std::ptrdiff_t BoxElem_Rotation = 0x48;
+    constexpr std::ptrdiff_t BoxElem_XExtent = 0x60;
+    constexpr std::ptrdiff_t BoxElem_YExtent = 0x64;
+    constexpr std::ptrdiff_t BoxElem_ZExtent = 0x68;
+    constexpr std::ptrdiff_t BoxElem_Stride = 0x70;
+    constexpr std::ptrdiff_t SphereElem_Center = 0x30;
+    constexpr std::ptrdiff_t SphereElem_Radius = 0x48;
+    constexpr std::ptrdiff_t SphereElem_Stride = 0x50;
+    constexpr std::ptrdiff_t SphylElem_Center = 0x30;
+    constexpr std::ptrdiff_t SphylElem_Rotation = 0x48;
+    constexpr std::ptrdiff_t SphylElem_Radius = 0x60;
+    constexpr std::ptrdiff_t SphylElem_Length = 0x64;
+    constexpr std::ptrdiff_t SphylElem_Stride = 0x68;
+
+    constexpr std::ptrdiff_t EmbarkMesh = 0x7d8;
+
+    // ── PhysX (help, header-only) ────────────────────────────────────────────
+    constexpr std::ptrdiff_t NpScene_ActorArrayData = 0x2618;
+    constexpr std::ptrdiff_t NpScene_ActorArrayCount = 0x2620;
+    constexpr std::ptrdiff_t NpRigidActor_ShapeManager = 0x30;
+    constexpr std::ptrdiff_t NpRigidActor_Pose = 0xA0;
+    constexpr std::ptrdiff_t NpShape_LocalPose = 0x90;
+    constexpr std::ptrdiff_t NpShape_GeomType = 0xB8;
+    constexpr std::ptrdiff_t NpShape_GeomData = 0xBC;
+
+    // ── Lighting (help, header-only) ─────────────────────────────────────────
+    constexpr std::ptrdiff_t LightComponentBase_Brightness = 0x3A0;
+    constexpr std::ptrdiff_t LightComponent_Temperature = 0x3C8;
+    constexpr std::ptrdiff_t DirectionalLight_ShadowCascadeBias = 0x4D0;
+    constexpr std::ptrdiff_t SkyLight_bRealTimeCapture = 0x3C8;
+    constexpr std::ptrdiff_t SkyAtmosphere_TransformMode = 0x390;
+    constexpr std::ptrdiff_t VolumetricCloud_LayerBottomAltitude = 0x390;
+    constexpr std::ptrdiff_t HeightFog_FogDensity = 0x390;
+    constexpr std::ptrdiff_t PostProcess_Settings = 0x3A0;
+    constexpr std::ptrdiff_t PostProcessVolume_Settings = 0x3E0;
+}

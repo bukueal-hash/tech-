@@ -1,0 +1,4 @@
+# Minimal ignore — user wants full repo including Build/ output and binaries.
+.vs/
+*.vcxproj.user
+*.suo

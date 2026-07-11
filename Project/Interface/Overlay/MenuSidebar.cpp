@@ -1,0 +1,1018 @@
+#define WIN32_LEAN_AND_MEAN
+#include "Menu.h"
+#include "MenuLayout.h"
+#include "MenuTheme.h"
+
+#include <cfloat>
+#include <string>
+#include <vector>
+#include <chrono>
+
+#include "../../ThirdParty/ImGui/imgui.h"
+#include "../../DMA/Memory.h"
+#include "../../Core/Memory.h"
+#include "../../Core/Engine.h"
+#include "../Render.h"
+#include "../OverlayHost.h"
+#include "../Utils/Variables/index.h"
+#include "../Utils/AutoConfig.h"
+#include "../../Hardware/KmBox.h"
+#include "../../Input/Controller.h"
+#include "../../Input/DmaGamepad.h"
+#include "../../Input/KeyBind.h"
+#include "ImGuiKeybind.h"
+#include "../../Core/WorldItemCategory.h"
+
+namespace {
+
+static void RequestArcSlowCache() {}
+
+static bool ArcIsSaneLocation(const Vector3& loc)
+{
+    const double mag =
+        static_cast<double>(loc.x) * loc.x +
+        static_cast<double>(loc.y) * loc.y +
+        static_cast<double>(loc.z) * loc.z;
+    return mag > 100.0 && mag < 1.0e18;
+}
+
+constexpr float kSidebarWidth = 300.0f;
+constexpr ImVec4 kTabRed(0.95f, 0.2f, 0.2f, 1.0f);
+constexpr ImVec4 kTabDarkRed(0.4f, 0.08f, 0.08f, 1.0f);
+constexpr ImU32 kTabDarkRedU32 = IM_COL32(102, 20, 20, 255);
+static int g_currentPage = 0;
+static int g_selectedTab = 0;
+static bool* g_requestExitPtr = nullptr;
+
+static bool DrawStatusChip(const char* label, bool active, bool clickable, const ImVec4& ok, const ImVec4& bad)
+{
+    ImGui::PushStyleColor(ImGuiCol_Text, active ? ok : bad);
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.35f, 0.35f, 0.35f, 0.45f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.5f, 0.5f, 0.5f, 0.55f));
+
+    bool clicked = false;
+    if (clickable)
+        clicked = ImGui::Selectable(label, false, ImGuiSelectableFlags_None,
+            ImVec2(ImGui::CalcTextSize(label).x + 4.0f, ImGui::GetTextLineHeight()));
+    else
+        ImGui::TextUnformatted(label);
+
+    ImGui::PopStyleColor(4);
+    return clicked;
+}
+
+static void PushMenuContentWrap()
+{
+    ImGui::PushTextWrapPos(ArcMenuLayout::ContentWrapX());
+}
+
+static void WrappedBulletText(const char* text)
+{
+    ImGui::Bullet();
+    ImGui::SameLine();
+    PushMenuContentWrap();
+    ImGui::TextWrapped("%s", text);
+    ImGui::PopTextWrapPos();
+}
+
+static void CheckboxWithColor(const char* label, bool* value, float color[4], const char* colorId, bool requestSlowCache = false)
+{
+    if (ArcMenuLayout::CheckboxWithColorRow(label, value, color, colorId) && requestSlowCache)
+        RequestArcSlowCache();
+}
+
+using ArcMenuLayout::kColorColumnX;
+using ArcMenuLayout::kContainerSpColumnX;
+
+static void DrawContainerTypeHeaderRow()
+{
+    ImGui::TextUnformatted("Type");
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetCursorStartPos().x + kColorColumnX);
+    ImGui::TextUnformatted("Color");
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetCursorStartPos().x + kContainerSpColumnX);
+    ImGui::TextUnformatted("SP");
+}
+
+static void ContainerTypeRow(
+    const char* label,
+    bool* enabled,
+    float color[4],
+    const char* colorId,
+    WorldItemCategory cat)
+{
+    const float startX = ImGui::GetCursorStartPos().x;
+    ImGui::PushID(colorId);
+    bool changed = false;
+
+    if (ImGui::Checkbox("##cb", enabled))
+        changed = true;
+    ImGui::SameLine(0.f, ImGui::GetStyle().ItemInnerSpacing.x);
+    ImGui::SetCursorPosX(startX + ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x);
+    ImGui::PushTextWrapPos(startX + kColorColumnX - 2.f);
+    ImGui::TextUnformatted(label);
+    ImGui::PopTextWrapPos();
+
+    if (ArcMenuLayout::ColorEditAtColumn(colorId, color))
+        changed = true;
+
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(startX + kContainerSpColumnX);
+    const char* suffix = WorldItemCategoryConfigSuffix(cat);
+    const std::string spId = suffix ? std::string("##csp_") + suffix : "##csp_unknown";
+    bool useSp = WorldCategoryUsesSpContainerRange(cat);
+    if (ImGui::Checkbox(spId.c_str(), &useSp)) {
+        SetContainerRangeSp(cat, useSp);
+        changed = true;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Checked = SP distance for this container type. Unchecked = loot distance.");
+
+    ImGui::PopID();
+    if (changed)
+        RequestArcSlowCache();
+}
+
+static bool LootFilterSliderWithSp(
+    const char* label,
+    const char* sliderId,
+    float* value,
+    float vMin,
+    float vMax,
+    const char* fmt,
+    bool* spFlag,
+    const char* spTooltip)
+{
+    const float startX = ImGui::GetCursorStartPos().x;
+    ImGui::PushID(sliderId);
+    bool changed = false;
+
+    ArcMenuLayout::Label(label);
+    ImGui::SetNextItemWidth(kContainerSpColumnX - startX - 4.f);
+    if (ImGui::SliderFloat(sliderId, value, vMin, vMax, fmt)) {
+        changed = true;
+        AutoConfig_MarkDirty();
+    }
+
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(startX + kContainerSpColumnX);
+    if (ImGui::Checkbox("##sp", spFlag)) {
+        changed = true;
+        AutoConfig_MarkDirty();
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", spTooltip);
+
+    ImGui::PopID();
+    return changed;
+}
+
+static bool LootFilterComboWithSp(
+    const char* label,
+    const char* comboId,
+    int* current,
+    const char* const* items,
+    int count,
+    bool* spFlag,
+    const char* spTooltip)
+{
+    const float startX = ImGui::GetCursorStartPos().x;
+    ImGui::PushID(comboId);
+    bool changed = false;
+
+    ArcMenuLayout::Label(label);
+    ImGui::SetNextItemWidth(kContainerSpColumnX - startX - 4.f);
+    if (ImGui::Combo(comboId, current, items, count)) {
+        changed = true;
+        AutoConfig_MarkDirty();
+    }
+
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(startX + kContainerSpColumnX);
+    if (ImGui::Checkbox("##sp", spFlag)) {
+        changed = true;
+        AutoConfig_MarkDirty();
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", spTooltip);
+
+    ImGui::PopID();
+    return changed;
+}
+
+} // namespace
+
+namespace arc_ui {
+
+void DrawMainMenu()
+{
+    const char* tabs[] = { "Visuals", "Loot", "Radar", "Aimbot", "Settings", "Debug", "Help", "Close" };
+    const char* tabTips[] = {
+        "Visual controls: player ESP and world ESP toggles.",
+        "Loot container ESP: distance, value/rarity filters, per-type SP checkboxes.",
+        "Mini-map: enable, size, and world range.",
+        "Aimbot controls: FOV, distance, smoothness, and hotkey.",
+        "Runtime settings: controller, KmBox, and overlay monitor.",
+        "Live camera, ESP, and bone diagnostics.",
+        "Project disclaimer and high-level feature list.",
+        "Exit ARC completely (same as END key)."
+    };
+    const int tabCount = IM_ARRAYSIZE(tabs);
+
+    const float buttonHeight = 40.0f;
+    const float totalButtonHeight = tabCount * buttonHeight;
+    const float availableForButtons = ImGui::GetContentRegionAvail().y - 100.0f;
+    float spacingBetweenButtons = (availableForButtons - totalButtonHeight) / (tabCount + 1);
+    spacingBetweenButtons = (spacingBetweenButtons > 8.0f) ? spacingBetweenButtons : 8.0f;
+
+    ArcMenuUi& ui = ArcMenuTheme();
+    ImGui::Dummy(ImVec2(0, spacingBetweenButtons * 0.6f));
+
+    if (ui.headerFont)
+        ImGui::PushFont(ui.headerFont);
+
+    const ImVec4 tabBase(ui.headerColor.x, ui.headerColor.y, ui.headerColor.z, 0.92f);
+    const ImVec4 tabHover(
+        ui.menuAccentColor.x * 0.75f,
+        ui.menuAccentColor.y * 0.75f,
+        ui.menuAccentColor.z * 0.75f,
+        1.0f);
+    const ImVec4 tabActive = kTabRed;
+
+    for (int i = 0; i < tabCount; ++i) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Button, tabBase);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, tabHover);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, tabActive);
+
+        if (ImGui::Button(tabs[i], ImVec2(270, buttonHeight))) {
+            if (i == tabCount - 1) {
+                if (g_requestExitPtr)
+                    *g_requestExitPtr = true;
+            } else {
+                g_selectedTab = i;
+                g_currentPage = 1;
+            }
+        }
+        ArcMenuHoverTooltip(tabTips[i]);
+
+        ImGui::PopStyleColor(4);
+        ImGui::Dummy(ImVec2(0, spacingBetweenButtons * 0.7f));
+    }
+
+    if (ui.headerFont)
+        ImGui::PopFont();
+}
+
+} // namespace
+
+void ArcMenuRestartApplication()
+{
+    WCHAR exePath[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH))
+        return;
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(exePath, nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+}
+
+void ArcMenuResetController()
+{
+    if (!g_mem.IsInitialized())
+        return;
+    g_controller.InitController();
+}
+
+void ArcMenuResetKmBox()
+{
+    g_kmbox.Initialize();
+}
+
+int ArcGetMonitorCount()
+{
+    return OverlayDisplay_GetMonitorCount();
+}
+
+namespace arc_ui {
+
+void DrawArcEspTab()
+{
+    ArcMenuLayout::CheckboxWithDualColorRow(
+        "Enable ESP",
+        &var::enableesp,
+        var::esp_color_visible,
+        "##esp_vis",
+        var::esp_color_invisible,
+        "##esp_invis");
+    ArcMenuHoverTooltip("Master switch for player ESP. Colors: visible (left), invisible (right).");
+    ArcMenuLayout::SliderFloat("ESP distance", "##esp_distance", &var::esp_distance, 50.f, var::kMaxDistanceSliderM, "%.0f m");
+    ArcMenuHoverTooltip("Maximum distance for player ESP rendering.");
+    if (ArcMenuLayout::Checkbox("Visible check", &var::visiblecheck)) {
+        (void)0;
+    }
+    ArcMenuHoverTooltip(
+        "ON: mesh render-time visibility (CL-1233465). OFF: treat all players as visible.");
+    ArcMenuLayout::Checkbox("Obstruction LOS", &var::obstruction_check);
+    ArcMenuHoverTooltip(
+        "UC-style static-mesh KD-tree line-of-sight. Requires Visible check. Rebuilds on move.");
+    ImGui::BeginDisabled(!var::obstruction_check);
+    ArcMenuLayout::Checkbox("Auto thin (doors)", &var::vischeck_auto_thin);
+    ImGui::EndDisabled();
+    ArcMenuHoverTooltip(
+        "Thin vertical extended bounds for door frames and thin collision primitives.");
+    ImGui::BeginDisabled(!var::enableesp);
+    ArcMenuLayout::Checkbox("Box", &var::box);
+    ArcMenuHoverTooltip("Draw box around tracked players.");
+    ArcMenuLayout::Checkbox("Health", &var::health);
+    ArcMenuHoverTooltip("HP and shield bar above the player's head.");
+    ArcMenuLayout::Checkbox("Names", &var::names);
+    ArcMenuHoverTooltip("Display player name labels.");
+    ArcMenuLayout::Checkbox("Weapon", &var::show_weapon);
+    ArcMenuHoverTooltip("Weapon name colored by tier (gray/green/blue/purple/gold).");
+    ArcMenuLayout::Checkbox("Snaplines", &var::snaplines);
+    ArcMenuHoverTooltip("Draw lines from screen bottom to players.");
+    ArcMenuLayout::Checkbox("Skeleton", &var::skeleton);
+    ArcMenuHoverTooltip("Draw bone skeleton lines on players.");
+    ArcMenuLayout::Checkbox("Silhouette", &var::silhouette);
+    ArcMenuHoverTooltip(
+        "Filled body within max distance. Beyond that, skeleton only (when both are on).");
+    ArcMenuLayout::SliderFloat(
+        "Silhouette max (m, 0=25)",
+        "##silhouette_max_distance_m",
+        &var::silhouette_max_distance_m,
+        0.f,
+        var::kMaxDistanceSliderM,
+        "%.0f");
+    ArcMenuHoverTooltip(
+        "Close: silhouette. Past this range: skeleton lines only. 0 defaults to 25 m.");
+    ArcMenuLayout::Checkbox("Distance", &var::show_distance);
+    ArcMenuHoverTooltip("Show distance in meters below each player.");
+    if (ArcMenuLayout::Checkbox("Hide allies", &var::hide_allies))
+        RequestArcSlowCache();
+    ArcMenuHoverTooltip("No ESP or radar on teammates (box, skeleton, silhouette, names, etc.).");
+    ImGui::EndDisabled();
+
+    ImGui::Separator();
+    ImGui::Text("Bot ESP");
+    ArcMenuHoverTooltip("ARC robot ESP — separate from player ESP toggles above.");
+    if (ArcMenuLayout::CheckboxWithDualColorRow(
+            "Show robots",
+            &var::showRobots,
+            var::bot_color_visible,
+            "##bot_vis",
+            var::bot_color_invisible,
+            "##bot_invis"))
+        RequestArcSlowCache();
+    ArcMenuHoverTooltip("Draw ARC robots. Colors: visible (left), invisible (right).");
+    ArcMenuLayout::SliderFloat(
+        "Bot ESP distance", "##bot_esp_distance", &var::bot_esp_distance, 50.f, var::kMaxDistanceSliderM, "%.0f m");
+    ArcMenuHoverTooltip("Maximum distance for robot ESP rendering.");
+    ImGui::BeginDisabled(!var::showRobots);
+    ArcMenuLayout::Checkbox("Box##bot", &var::bot_box);
+    ArcMenuHoverTooltip("Draw box around tracked robots.");
+    ArcMenuLayout::Checkbox("Names##bot", &var::bot_names);
+    ArcMenuHoverTooltip("Display robot name labels.");
+    ArcMenuLayout::Checkbox("Snaplines##bot", &var::bot_snaplines);
+    ArcMenuHoverTooltip("Draw lines from screen bottom to robots.");
+    ArcMenuLayout::Checkbox("Distance##bot", &var::bot_show_distance);
+    ArcMenuHoverTooltip("Show distance in meters below each robot.");
+    ArcMenuLayout::Checkbox("Heart", &var::bot_heart);
+    ArcMenuHoverTooltip("Pulsating heart at box center; robot aim targets the same point.");
+    if (ArcMenuLayout::CheckboxWithColorRow(
+            "Dead bot bodies",
+            &var::show_dead_bots,
+            var::color_dead_bots,
+            "##col_dead_bots"))
+        RequestArcSlowCache();
+    ArcMenuHoverTooltip("Show destroyed/broken robot wrecks; color applies to dead bot ESP and radar.");
+    ImGui::EndDisabled();
+}
+
+void DrawArcLootTab()
+{
+    ImGui::Separator();
+    ImGui::Text("Loot");
+    ArcMenuHoverTooltip("Loot container ESP settings.");
+    if (ArcMenuLayout::Checkbox("Show loot", &var::showLoot))
+        RequestArcSlowCache();
+    ArcMenuHoverTooltip("Display loot container positions on screen.");
+    ImGui::BeginDisabled(!var::showLoot);
+    ArcMenuLayout::Checkbox("Color loot by rarity", &var::loot_rarity_color);
+    ArcMenuHoverTooltip("Color dropped pickup labels by item rarity tier.");
+    ArcMenuLayout::Label("Loot label color");
+    ArcMenuLayout::ColorEditAtColumn("##color_loot", var::color_loot);
+    ArcMenuHoverTooltip("Pickup/loot label color when rarity coloring is off.");
+    ArcMenuLayout::Checkbox("Show loot value on label", &var::show_loot_value);
+    ArcMenuHoverTooltip("Append coin value to resolved pickup names.");
+    ImGui::SetCursorPosX(ImGui::GetCursorStartPos().x + kContainerSpColumnX);
+    ImGui::TextUnformatted("SP");
+    ArcMenuHoverTooltip("Per-filter SP: checked = SP distance, unchecked = loot distance.");
+    static const char* kMinRarityLabels[] = {
+        "Any", "Uncommon+", "Rare+", "Epic+", "Legendary only"
+    };
+    if (LootFilterSliderWithSp(
+            "Min loot value",
+            "##loot_min_value",
+            &var::loot_min_value,
+            0.f,
+            5000.f,
+            "%.0f c",
+            &var::loot_min_val_sp,
+            "Min value filter range: SP distance when checked, loot distance when unchecked."))
+        RequestArcSlowCache();
+    ArcMenuHoverTooltip("Pickups at/above min value use SP distance when checked, loot distance when unchecked. 0 = off.");
+    if (LootFilterComboWithSp(
+            "Min rarity",
+            "##loot_min_rarity",
+            &var::loot_min_rarity,
+            kMinRarityLabels,
+            IM_ARRAYSIZE(kMinRarityLabels),
+            &var::loot_min_rar_sp,
+            "Min rarity filter range: SP distance when checked, loot distance when unchecked."))
+        RequestArcSlowCache();
+    ArcMenuHoverTooltip("Pickups at/above min rarity use SP distance when checked, loot distance when unchecked. Any = off.");
+    ArcMenuLayout::SliderFloat(
+        "Loot distance", "##loot_distance", &var::loot_distance, 20.f, var::kMaxDistanceSliderM, "%.0f m");
+    ArcMenuHoverTooltip("Default loot draw distance. Used whenever SP is unchecked on that row.");
+    ArcMenuLayout::SliderFloat(
+        "SP", "##container_distance_sp", &var::container_distance_sp, 20.f, var::kMaxDistanceSliderM, "%.0f m");
+    ArcMenuHoverTooltip("Extended draw distance. Used only when SP is checked on that row.");
+    ImGui::EndDisabled();
+
+    ImGui::Separator();
+    ImGui::Text("Container types");
+    ArcMenuHoverTooltip(
+        "Each row: SP unchecked = Loot distance. SP checked = SP distance. No other rules.");
+    DrawContainerTypeHeaderRow();
+    ContainerTypeRow("Dropped items", &var::droppedItems, var::color_dropped_items, "##col_dropped",
+        WorldItemCategory::DroppedPickup);
+    ArcMenuHoverTooltip("Show dropped loot items.");
+    ContainerTypeRow("Raider stock", &var::raiderStock, var::color_raider_stock, "##col_raider",
+        WorldItemCategory::RaiderCache);
+    ArcMenuHoverTooltip("Show raider stock/world pickups list.");
+    ContainerTypeRow("ARC entities", &var::showArc, var::color_arc_entities, "##col_arc",
+        WorldItemCategory::ArcCargoship);
+    ArcMenuHoverTooltip("Show ARC-specific world entities.");
+    ContainerTypeRow("Corpses", &var::showDeadPlayers, var::color_world_corpses, "##col_corpse",
+        WorldItemCategory::Corpse);
+    ArcMenuHoverTooltip("World ESP corpse markers (not the same as downed players in player ESP).");
+    ContainerTypeRow("Items", &var::show_world_items, var::color_world_items, "##col_w_items", WorldItemCategory::Items);
+    ContainerTypeRow("Ammo", &var::show_world_ammo, var::color_world_ammo, "##col_w_ammo", WorldItemCategory::Ammo);
+    ContainerTypeRow("Arc loot", &var::show_world_arc_loot, var::color_world_arc_loot, "##col_w_arc_loot", WorldItemCategory::ArcLoot);
+    ContainerTypeRow("Backpack", &var::show_world_backpack, var::color_world_backpack, "##col_w_backpack", WorldItemCategory::Backpack);
+    ContainerTypeRow("Crate", &var::show_world_crate, var::color_world_crate, "##col_w_crate", WorldItemCategory::Crate);
+    ContainerTypeRow("Furniture", &var::show_world_furniture, var::color_world_furniture, "##col_w_furniture", WorldItemCategory::Furniture);
+    ContainerTypeRow("Grenade", &var::show_world_grenade, var::color_world_grenade, "##col_w_grenade", WorldItemCategory::Grenade);
+    ContainerTypeRow("Harvestable", &var::show_world_harvestable, var::color_world_harvestable, "##col_w_harvestable", WorldItemCategory::Harvestable);
+    ContainerTypeRow("Industrial", &var::show_world_industrial, var::color_world_industrial, "##col_w_industrial", WorldItemCategory::Industrial);
+    ContainerTypeRow("Medical", &var::show_world_medical, var::color_world_medical, "##col_w_medical", WorldItemCategory::Medical);
+    ContainerTypeRow("Other", &var::show_world_other, var::color_world_other, "##col_w_other", WorldItemCategory::Other);
+    ContainerTypeRow("Probe", &var::show_world_probe, var::color_world_probe, "##col_w_probe", WorldItemCategory::Probe);
+    ContainerTypeRow("Vehicles", &var::show_world_vehicles, var::color_world_vehicles, "##col_w_vehicles", WorldItemCategory::Vehicles);
+    ContainerTypeRow("Weapon case", &var::show_world_weapon_case, var::color_world_weapon_case, "##col_w_weapon_case", WorldItemCategory::WeaponCase);
+    ContainerTypeRow("Field crate", &var::show_world_field_crate, var::color_world_field_crate, "##col_w_field_crate", WorldItemCategory::FieldCrate);
+    ContainerTypeRow("Supply station", &var::show_world_supply_station, var::color_world_supply_station, "##col_w_supply", WorldItemCategory::SupplyCallStation);
+    ContainerTypeRow("Keys", &var::show_world_keys, var::color_world_keys, "##col_w_keys", WorldItemCategory::Keys);
+    ContainerTypeRow("Locker", &var::show_world_locker, var::color_world_locker, "##col_w_locker", WorldItemCategory::Locker);
+    ContainerTypeRow("Open container", &var::show_world_open_container, var::color_world_open_container, "##col_w_open", WorldItemCategory::OpenedContainer);
+    ArcMenuHoverTooltip("Already searched/opened containers. Uses its own color so you can tell at a glance.");
+    ContainerTypeRow("Safe", &var::show_world_safe, var::color_world_safe, "##col_w_safe", WorldItemCategory::Safe);
+    ContainerTypeRow("Buried", &var::show_world_buried, var::color_world_buried, "##col_w_buried", WorldItemCategory::Buried);
+    ContainerTypeRow("Dead drop", &var::show_world_deaddrop, var::color_world_deaddrop, "##col_w_deaddrop", WorldItemCategory::DeadDrop);
+}
+
+void DrawArcRadarTab()
+{
+    ArcMenuLayout::Checkbox("Enable radar", &var::show_radar);
+    ArcMenuHoverTooltip("Top-down blips for players and bots. Works without Enemy ESP enabled.");
+    ImGui::BeginDisabled(!var::show_radar);
+    ArcMenuLayout::SliderFloat("Map size", "##radar_scale", &var::radar_scale, 30.f, 120.f, "%.0f px");
+    static const char* kRadarShapeLabels[] = { "Circle", "Square" };
+    int radarShape = var::radar_shape_circle ? 0 : 1;
+    if (ArcMenuLayout::Combo("Shape", "##radar_shape", &radarShape, kRadarShapeLabels, IM_ARRAYSIZE(kRadarShapeLabels)))
+        var::radar_shape_circle = (radarShape == 0);
+    ArcMenuHoverTooltip("Circle clips blips to range; square uses a box outline.");
+    ArcMenuLayout::SliderFloat("World range", "##radar_range", &var::radar_range, 20.f, var::kMaxDistanceSliderM, "%.0f m");
+    ArcMenuHoverTooltip("Radar radius for players, bots, and rare loot blips.");
+    static const char* kRadarMinRarityLabels[] = { "Rare+", "Epic+", "Legendary only" };
+    ArcMenuLayout::Combo(
+        "Min rarity",
+        "##radar_loot_min_rarity",
+        &var::radar_loot_min_rarity,
+        kRadarMinRarityLabels,
+        IM_ARRAYSIZE(kRadarMinRarityLabels));
+    ArcMenuHoverTooltip("Show dropped loot of this rarity or higher on the radar (within world range).");
+    ArcMenuLayout::Checkbox("Special", &var::show_radar_special);
+    ArcMenuHoverTooltip(
+        "Show container types with SP checked under Visuals on the radar (within world range).");
+    ImGui::Separator();
+    ImGui::TextWrapped("Close the menu (INSERT), then click and drag the radar to move it.");
+    ImGui::TextWrapped("Players/bots use Visuals ESP colors; rare loot uses rarity colors; SP containers use their type colors.");
+    ImGui::EndDisabled();
+}
+
+void DrawArcAimbotTab()
+{
+    ArcMenuLayout::Checkbox("Enable Aimbot", &var::enable_aimbot);
+    ArcMenuHoverTooltip("KmBox hardware aim — requires MAKCU or Net device connected.");
+    if (ArcMenuLayout::Checkbox("Robot aim", &var::robotAimEnabled))
+        RequestArcSlowCache();
+    ArcMenuHoverTooltip("Aim at robots (works without Show robots on Visuals).");
+
+    ImGui::Separator();
+    ArcMenuLayout::SliderFloat("FOV", "##aimbot_fov", &var::aimbot_fov, 1.f, 360.f, "%.1f");
+    ArcMenuHoverTooltip("Target cone for aim pick.");
+    ArcMenuLayout::Checkbox("Show FOV", &var::show_fov);
+    ArcMenuLayout::SliderFloat(
+        "Max distance (m)", "##aimbot_distance", &var::aimbot_distance, 5.f, var::kMaxDistanceSliderM, "%.0f");
+    ArcMenuHoverTooltip("Do not consider targets beyond this distance.");
+
+    ImGui::Separator();
+    ArcMenuLayout::SliderFloat(
+        "Aim speed", "##aim_hardware_speed", &var::aim_hardware_speed, 1.f, 20.f, "%.1f");
+    ArcMenuHoverTooltip("10 = full snap per tick. 15–20 = very aggressive. Uses chunked moves (no delay).");
+    ArcMenuLayout::SliderFloat(
+        "Smoothness", "##aim_smoothness", &var::smoothness, 1.f, 20.f, "%.2f");
+    ArcMenuHoverTooltip("Slows aim when above 1. Keep at 1 for maximum speed.");
+    ArcMenuLayout::SliderFloat(
+        "Sensitivity", "##aim_sensitivity", &var::aim_sensitivity, 0.25f, 4.f, "%.2fx");
+    ArcMenuHoverTooltip("Extra slowdown divisor. Lower = faster (try 0.5–1.0).");
+    ArcMenuLayout::SliderFloat(
+        "Deadzone", "##aim_deadzone", &var::aim_deadzone_px, 0.f, 50.f, "%.0f px");
+    ArcMenuHoverTooltip("Stop moving when target is within this many pixels of crosshair.");
+    ArcMenuLayout::Checkbox("Humanizer", &var::humanizer);
+    ArcMenuHoverTooltip("Adds subtle motion variation on the rotation path.");
+    ArcMenuLayout::Checkbox("Visibility check", &var::visiblecheck);
+    ArcMenuHoverTooltip(
+        "Mesh render-time visibility; optional Obstruction LOS (ESP tab) adds static-mesh wall checks.");
+    ArcMenuLayout::Checkbox("Bullet prediction", &var::predict);
+    ArcMenuHoverTooltip("Lead moving targets by travel time (uses cached velocity).");
+    ArcMenuLayout::SliderFloat(
+        "Bullet speed (cm/s)",
+        "##aim_bullet_speed_cm_s",
+        &var::aim_bullet_speed_cm_s,
+        20000.f,
+        150000.f,
+        "%.0f");
+    ArcMenuHoverTooltip("Travel speed used for lead prediction. Default 80000 (~800 m/s).");
+    ArcMenuLayout::Checkbox("Random bone", &var::randombone);
+    ArcMenuHoverTooltip("Cycle through torso bones over time instead of locking head only.");
+
+    static const char* kAimAlgoLabels[] = { "Linear", "Accelerated" };
+    int aimAlgo = static_cast<int>(var::aim_algorithm);
+    if (ArcMenuLayout::Combo(
+            "Aim curve",
+            "##aim_algorithm",
+            &aimAlgo,
+            kAimAlgoLabels,
+            IM_ARRAYSIZE(kAimAlgoLabels)))
+        var::aim_algorithm = static_cast<AimAlgorithm>(aimAlgo);
+    ArcMenuHoverTooltip("Linear = constant pull speed. Accelerated = faster when farther from crosshair.");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Hardware aim (KMBox / MAKCU)");
+    if (!g_kmbox.kmboxConfig.initialized)
+        ImGui::TextColored(ImVec4(1.f, 0.4f, 0.2f, 1.f),
+            "KMBox not connected — aim will not run (Settings -> Re-init KmBox)");
+    else
+        ImGui::TextDisabled("KMBox connected — hardware aim active (read-only DMA, no memory writes).");
+
+    ImGui::Separator();
+    ImGui::Keybind("Aim hotkey", &var::aim_hold_key, nullptr, false);
+    ArcMenuHoverTooltip("Hold to run aim assist.");
+}
+
+void DrawArcSettingsTab()
+{
+    const bool ctrlOk = g_controller.IsReady();
+    if (ctrlOk)
+        ImGui::TextColored(ImVec4(0.f, 1.f, 0.f, 1.f), "Controller: connected");
+    else
+        ImGui::TextColored(ImVec4(1.f, 0.f, 0.f, 1.f), "Controller: not connected");
+    ArcMenuHoverTooltip("xusb22 kernel read. Pad must be plugged into the TARGET (game) PC.");
+    ImGui::Separator();
+
+    if (ImGui::Button("Connect controller"))
+        ArcMenuResetController();
+    ArcMenuHoverTooltip("Retry xusb22 connect (~10s). Wiggle sticks on target PC.");
+    if (ImGui::Button("Re-init KmBox"))
+        ArcMenuResetKmBox();
+    ArcMenuHoverTooltip("Reconnect hardware mouse device (KmBox/MAKCU).");
+    ImGui::Separator();
+
+    const int monitorCount = OverlayDisplay_GetMonitorCount();
+    int selected = OverlayDisplay_GetSelectedMonitor();
+    if (selected < 0)
+        selected = 0;
+    if (selected >= monitorCount)
+        selected = monitorCount > 0 ? monitorCount - 1 : 0;
+
+    const char* selectedLabel = (monitorCount <= 0)
+        ? "No monitors"
+        : OverlayDisplay_GetMonitorLabel(selected).c_str();
+    ImGui::TextWrapped("Overlay monitor");
+    if (ImGui::BeginCombo("##overlay_monitor", selectedLabel)) {
+        for (int i = 0; i < monitorCount; ++i) {
+            const bool isSelected = (i == selected);
+            if (ImGui::Selectable(OverlayDisplay_GetMonitorLabel(i).c_str(), isSelected)) {
+                OverlayDisplay_SetSelectedMonitor(i);
+                g_kmbox.kmboxConfig.monitorIndex = i;
+                OverlayDisplay_ApplySelectedMonitor();
+                AutoConfig_MarkDirty();
+            }
+            if (isSelected)
+                ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    ArcMenuHoverTooltip("Choose which monitor displays the overlay.");
+
+    ImGui::TextWrapped("Monitors detected: %d", ArcGetMonitorCount());
+    ArcMenuHoverTooltip("Number of displays currently detected.");
+    ImGui::Separator();
+    if (ArcMenuLayout::SliderFloat(
+            "Text Size",
+            "##esp_text_scale",
+            &var::esp_text_scale,
+            0.5f,
+            3.0f,
+            "%.2fx")) {
+        var::esp_text_scale = (std::max)(0.5f, (std::min)(var::esp_text_scale, 3.0f));
+        AutoConfig_MarkDirty();
+    }
+    ArcMenuHoverTooltip("Global multiplier for all in-game ESP text (player/bot names, weapons, distance, container & item labels). Applies on top of distance scaling. Menu text is unchanged.");
+    g_kmbox.renderKmboxSettings();
+}
+
+void DrawArcDebugTab()
+{
+    ImGui::Text("KmBox type: %s", g_kmbox.kmboxConfig.type.c_str());
+    if (g_kmbox.kmboxConfig.type == "MAKCU")
+        ImGui::Text("COM port: %s", g_kmbox.kmboxConfig.comPort.c_str());
+    else if (g_kmbox.kmboxConfig.type == "Net")
+        ImGui::Text("Net: %s:%s", g_kmbox.kmboxConfig.ip.c_str(), g_kmbox.kmboxConfig.port.c_str());
+    ImGui::Text("KmBox initialized: %s", g_kmbox.kmboxConfig.initialized ? "yes" : "no");
+    ImGui::Text("Auto-config: auto_config.ini");
+    ImGui::Spacing();
+    ImGui::Text("Controller ready: %s", g_controller.IsReady() ? "yes" : "no");
+    ImGui::TextWrapped("Gamepad: %s", DmaGamepad::GetLastStatusMessage());
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Text("Engine caches");
+    ImGui::Text("playerCache: %zu", engine.PlayerCacheCount());
+    ImGui::Text("worldCache: %zu", engine.WorldCacheCount());
+    ImGui::Text("robotCache: %zu", engine.RobotCacheCount());
+    ImGui::Text("esp drawable players: %zu", engine.CountEspDrawablePlayers());
+    ImGui::Separator();
+    ImGui::Text("Aimbot runtime");
+    const int aimKey = var::aim_hold_key ? var::aim_hold_key : VK_SHIFT;
+    if (engine.IsInRaid()) {
+        ImGui::TextColored(ImVec4(0.45f, 1.0f, 0.55f, 1.0f),
+            "Raid: active (ESP scanning)");
+    } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
+            "Raid: lobby / menu (ESP paused)");
+    }
+    ImGui::Text("In raid raw: %s", engine.IsInRaidRaw() ? "yes" : "no");
+    ImGui::Text("Aimbot enabled: %s", var::enable_aimbot ? "yes" : "no");
+    ImGui::Text("Robot aim enabled: %s", var::robotAimEnabled ? "yes" : "no");
+    ImGui::Text("Aim hotkey code: %d", aimKey);
+    ImGui::Text("Aim hotkey held: %s", KeyBindIsHeld(aimKey) ? "yes" : "no");
+    ImGui::Text("KmBox ready: %s", g_kmbox.kmboxConfig.initialized ? "yes" : "no");
+    ImGui::Separator();
+    ImGui::TextWrapped(
+        "Visible check: mesh render-time (LastSubmitTime/LastRenderTime @ mesh+0x4C4). "
+        "Obstruction LOS: UC static-mesh KD-tree rebuild (see [debugVisCheck] collisionLos/tris).");
+    if (var::visiblecheck)
+        ImGui::TextColored(ImVec4(0.45f, 1.0f, 0.55f, 1.0f), "Visible check: ON");
+    else
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "Visible check: OFF");
+
+    Engine::CameraCache cam{};
+    {
+        std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
+        cam = engine.g_Camera;
+    }
+    const bool fovOk = cam.FOV > 1.0f && cam.FOV <= 179.0f && ArcIsSaneLocation(cam.Location);
+    ImGui::Separator();
+    ImGui::TextWrapped("Camera (engine cache)");
+    if (!fovOk) {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "Status: bad or missing");
+    } else {
+        ImGui::TextColored(ImVec4(0.45f, 1.0f, 0.55f, 1.0f), "Status: OK");
+        ImGui::Text("Location: %.1f, %.1f, %.1f", cam.Location.x, cam.Location.y, cam.Location.z);
+        ImGui::Text("Rotation: %.2f, %.2f, %.2f", cam.Rotation.x, cam.Rotation.y, cam.Rotation.z);
+        ImGui::Text("FOV: %.2f", cam.FOV);
+    }
+
+    if (const char* attached = Memory::GetAttachedGameExe())
+        ImGui::Text("Attached: %s", attached);
+  ImGui::Text("GWorld: 0x%llX", static_cast<unsigned long long>(engine.GWorld));
+
+    ImGui::Separator();
+    ImGui::Text("Debug overlay");
+    ArcMenuLayout::Checkbox("Show offset validation", &var::show_debug_overlay);
+    ArcMenuHoverTooltip("Draws pointer chain validation on screen. Close menu to see it.");
+}
+
+void DrawArcHelpTab()
+{
+    ImGui::TextWrapped("Disclaimer:");
+    WrappedBulletText("Educational use only. Not for sale. Owner use only.");
+    ImGui::Spacing();
+
+    ImGui::TextWrapped("Visuals — Player ESP:");
+    WrappedBulletText("Enable ESP + visible/invisible colors, distance slider.");
+    WrappedBulletText(
+        "Visible check: mesh render-time test (LastSubmitTime/LastRenderTime @ mesh+0x4C4, CL-1233465).");
+    WrappedBulletText("Box, health/shield bar, names, weapon tier color, snaplines.");
+    WrappedBulletText("Silhouette fill within max m; skeleton beyond that when both enabled.");
+
+    ImGui::Spacing();
+    ImGui::TextWrapped("Visuals — Bot ESP:");
+    WrappedBulletText("Show robots + bot visible/invisible colors, bot distance.");
+    WrappedBulletText("Box, health bar, names, snaplines, distance, dead bot wrecks + color.");
+    WrappedBulletText("Heart toggle: pulsating marker at box center; robot Center aim uses the same point.");
+
+    ImGui::Spacing();
+    ImGui::TextWrapped("Visuals — World / loot:");
+    WrappedBulletText("World ESP: corpses, dropped items, raider stock, ARC entities + per-type colors.");
+    WrappedBulletText("Loot: containers, hide opened, rarity color, value filter, min rarity, distances.");
+    WrappedBulletText("Container types: per-category toggles, colors, SP = SP distance else loot distance.");
+
+    ImGui::Spacing();
+    ImGui::TextWrapped("Loot tab:");
+    WrappedBulletText("Show loot, hide opened, rarity color, loot label color, show value on label.");
+    WrappedBulletText("Min value slider + SP, min rarity combo + SP, loot distance & SP distance sliders.");
+    WrappedBulletText("Container types: per-category toggles, colors, SP checkboxes.");
+
+    ImGui::Spacing();
+    ImGui::TextWrapped("Radar tab:");
+    WrappedBulletText("Enable radar; hidden while menu is open. Drag to move when menu closed.");
+    WrappedBulletText("Circle or square shape, size, world range.");
+    WrappedBulletText("Blips use Visuals ESP colors (players/bots); rare loot + SP containers on radar.");
+    WrappedBulletText("Works without Enemy ESP enabled.");
+
+    ImGui::Spacing();
+    ImGui::TextWrapped("Aimbot tab:");
+    WrappedBulletText("Enable aimbot (KmBox/MAKCU/Net) + Robot aim (bots without Show robots).");
+    WrappedBulletText("Robot aim: dead center of bot + small in-box shake (on target, not miss spread).");
+    WrappedBulletText("Dbg KmBox: FOV, max distance, smoothness, aim hotkey.");
+    WrappedBulletText(
+        "Advanced sections (hard lock, humanization, hitboxes, delay) each have their own enable checkbox.");
+
+    ImGui::Spacing();
+    ImGui::TextWrapped("Settings tab:");
+    WrappedBulletText("DMA controller status, re-init controller / KmBox.");
+    WrappedBulletText("Overlay monitor picker; KmBox/MAKCU type, COM or Net, device settings.");
+
+    ImGui::Spacing();
+    ImGui::TextWrapped("Debug tab:");
+    WrappedBulletText("KmBox/config status, gamepad status, debug log/world toggles.");
+    WrappedBulletText("Worker camera, cache counts, visible-check status + overlay toggles.");
+    WrappedBulletText("Live GWorld / camera readout for offset debugging.");
+
+    ImGui::Spacing();
+    ImGui::TextWrapped("Other:");
+    WrappedBulletText("DMA attach to PioneerGame-d before overlay; auto_config.ini save/load.");
+    WrappedBulletText("Close tab exits the application.");
+
+    ImGui::Spacing();
+    ImGui::TextWrapped("Keys:");
+    WrappedBulletText("INSERT — toggle menu. END — exit overlay.");
+}
+
+} // namespace arc_ui
+
+void ArcMenuAddVerticalSpacing(float spacing)
+{
+    ImGui::Dummy(ImVec2(0.0f, spacing));
+    ImGui::Spacing();
+}
+
+void ArcMenuHoverTooltip(const char* txt)
+{
+    if (ImGui::IsItemHovered()) {
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32.0f);
+        ImGui::SetTooltip("%s", txt);
+        ImGui::PopTextWrapPos();
+    }
+}
+
+void DrawArcSidebar(bool& menuOpen, bool& requestExit)
+{
+    g_requestExitPtr = &requestExit;
+    if (!menuOpen) {
+        g_currentPage = 0;
+        return;
+    }
+
+    ArcMenuUi& ui = ArcMenuTheme();
+    ui.menuAccentColor = kTabRed;
+    ui.headerColor = kTabDarkRed;
+    ImGuiStyle& style = ImGui::GetStyle();
+    const ImVec4 darkBg(0.16f, 0.16f, 0.16f, 0.95f);
+    const ImVec4 logoBg(0.12f, 0.12f, 0.12f, 1.0f);
+    const ImVec4 tabRed = kTabRed;
+    const ImVec4 tabBorder = kTabDarkRed;
+
+    const ImVec2 vp = ImGui::GetMainViewport()->Size;
+    const float screenW = vp.x > 0 ? vp.x : static_cast<float>(GetSystemMetrics(SM_CXSCREEN));
+    const float screenH = vp.y > 0 ? vp.y : static_cast<float>(GetSystemMetrics(SM_CYSCREEN));
+
+    ImGui::SetNextWindowPos(ImVec2(screenW - kSidebarWidth, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(kSidebarWidth, screenH), ImGuiCond_Always);
+
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, darkBg);
+    ImGui::PushStyleColor(ImGuiCol_Border, tabBorder);
+    ImGui::PushStyleColor(ImGuiCol_Separator, tabBorder);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18, 18));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 7.0f);
+
+    ImGui::Begin("##Sidebar", nullptr,
+        ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoScrollbar);
+
+    if (ui.logoTexture != 0) {
+        float texW = static_cast<float>(ui.logoWidth);
+        float texH = static_cast<float>(ui.logoHeight);
+        if (texW <= 0 || texH <= 0) {
+            texW = 1080.0f;
+            texH = 608.0f;
+        }
+
+        const float contentWidth = ImGui::GetContentRegionAvail().x;
+        const float scale = contentWidth / texW;
+        const float drawW = contentWidth;
+        const float drawH = texH * scale;
+
+        // Dark grey background behind image
+        ImVec2 imgMin = ImGui::GetCursorScreenPos();
+        ImVec2 imgMax(imgMin.x + drawW, imgMin.y + drawH);
+        ImGui::GetWindowDrawList()->AddRectFilled(imgMin, imgMax, IM_COL32(30, 30, 30, 255));
+
+        ImGui::Image(ui.logoTexture, ImVec2(drawW, drawH));
+        ImGui::Spacing();
+    }
+
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::Spacing();
+    if (ui.headerFont) {
+        ImGui::PushFont(ui.headerFont);
+        const char* sub = "Buku's Arc Manager";
+        const float subW = ImGui::CalcTextSize(sub).x;
+        ImGui::SetCursorPosX((kSidebarWidth - subW) * 0.5f);
+        ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.9f, 1.0f), "%s", sub);
+        ImGui::PopFont();
+    }
+
+    ImGui::Spacing();
+
+    const float metricsHeight = 100.0f;
+    const float availableHeight = ImGui::GetContentRegionAvail().y;
+    const float mainContentHeight = availableHeight - metricsHeight - 60.0f;
+
+    ImGui::BeginChild("Content", ImVec2(0, mainContentHeight), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    PushMenuContentWrap();
+
+    if (ui.regularFont)
+        ImGui::PushFont(ui.regularFont);
+
+    if (g_currentPage == 0) {
+        arc_ui::DrawMainMenu();
+    } else {
+        switch (g_selectedTab) {
+        case 0: arc_ui::DrawArcEspTab(); break;
+        case 1: arc_ui::DrawArcLootTab(); break;
+        case 2: arc_ui::DrawArcRadarTab(); break;
+        case 3: arc_ui::DrawArcAimbotTab(); break;
+        case 4: arc_ui::DrawArcSettingsTab(); break;
+        case 5: arc_ui::DrawArcDebugTab(); break;
+        case 6: arc_ui::DrawArcHelpTab(); break;
+        default: break;
+        }
+    }
+
+    if (ui.regularFont)
+        ImGui::PopFont();
+    ImGui::PopTextWrapPos();
+    ImGui::EndChild();
+
+    if (g_currentPage > 0) {
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::PushStyleColor(ImGuiCol_Button, ui.headerColor);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(
+            ui.headerColor.x * 1.2f, ui.headerColor.y * 1.2f, ui.headerColor.z * 1.2f, ui.headerColor.w));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(
+            ui.headerColor.x * 0.8f, ui.headerColor.y * 0.8f, ui.headerColor.z * 0.8f, ui.headerColor.w));
+
+        if (ui.headerFont)
+            ImGui::PushFont(ui.headerFont);
+
+        constexpr float buttonWidth = 270.0f;
+        constexpr float buttonHeight = 40.0f;
+        ImGui::SetCursorPosX((kSidebarWidth - buttonWidth) * 0.5f);
+        if (ImGui::Button("Back", ImVec2(buttonWidth, buttonHeight)))
+            g_currentPage = 0;
+        ArcMenuHoverTooltip("Return to main tab selection page.");
+
+        ImGui::SetCursorPosX((kSidebarWidth - buttonWidth) * 0.5f);
+        if (ImGui::Button("Close", ImVec2(buttonWidth, buttonHeight)))
+            requestExit = true;
+        ArcMenuHoverTooltip("Exit ARC completely (same as END key).");
+
+        if (ui.headerFont)
+            ImGui::PopFont();
+        ImGui::PopStyleColor(3);
+    }
+
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    constexpr ImVec2 metricsSize(264.0f, 52.0f);
+    ImGui::SetCursorPosX((kSidebarWidth - metricsSize.x) * 0.5f);
+    const ImVec2 metricsStart = ImGui::GetCursorScreenPos();
+
+    ImGui::GetWindowDrawList()->AddRectFilled(
+        metricsStart,
+        ImVec2(metricsStart.x + metricsSize.x, metricsStart.y + metricsSize.y),
+        ImColor(ui.headerColor),
+        4.0f);
+    ImGui::GetWindowDrawList()->AddRect(
+        metricsStart,
+        ImVec2(metricsStart.x + metricsSize.x, metricsStart.y + metricsSize.y),
+        ImColor(tabBorder),
+        4.0f, 0, 2.0f);
+
+    const float chipRowH = ImGui::GetTextLineHeight();
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (metricsSize.y - chipRowH) * 0.5f);
+
+    if (ui.regularFont)
+        ImGui::PushFont(ui.regularFont);
+
+    const ImVec4 ok(0.35f, 1.0f, 0.35f, 1.0f);
+    const ImVec4 bad(1.0f, 0.35f, 0.35f, 1.0f);
+
+    const bool dmaOk = g_mem.IsInitialized();
+    const bool ctrlOk = g_controller.IsReady();
+    const bool kmOk = g_kmbox.kmboxConfig.initialized;
+    const char* kmLabel = (g_kmbox.kmboxConfig.type == "MAKCU") ? "MAKCU" : "KMBOX";
+
+    constexpr float chipGap = 18.0f;
+    const float rowW =
+        ImGui::CalcTextSize("DMA").x + chipGap +
+        ImGui::CalcTextSize("CTRL").x + chipGap +
+        ImGui::CalcTextSize(kmLabel).x;
+
+    ImGui::SetCursorPosX((kSidebarWidth - rowW) * 0.5f);
+
+    if (DrawStatusChip("DMA", dmaOk, dmaOk, ok, bad)) {
+        ArcMenuRestartApplication();
+        requestExit = true;
+    }
+    ArcMenuHoverTooltip("Click to restart ARC (DMA connected).");
+
+    ImGui::SameLine(0, chipGap);
+    if (DrawStatusChip("CTRL", ctrlOk, true, ok, bad))
+        ArcMenuResetController();
+    ArcMenuHoverTooltip("Click to re-initialize DMA gamepad (CTRL).");
+
+    ImGui::SameLine(0, chipGap);
+    if (DrawStatusChip(kmLabel, kmOk, true, ok, bad))
+        ArcMenuResetKmBox();
+    ArcMenuHoverTooltip("Click to re-initialize KmBox / MAKCU device.");
+
+    ImGui::Dummy(ImVec2(0.0f, metricsSize.y - chipRowH));
+
+    if (ui.regularFont)
+        ImGui::PopFont();
+
+    {
+        const ImVec2 wPos = ImGui::GetWindowPos();
+        const ImVec2 wSize(ImGui::GetWindowWidth(), ImGui::GetWindowHeight());
+        const ImVec2 wMax(wPos.x + wSize.x, wPos.y + wSize.y);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRect(wPos, wMax, kTabDarkRedU32, 0.0f, 0, 7.0f);
+        dl->AddRectFilled(wPos, ImVec2(wPos.x + 7.0f, wMax.y), kTabDarkRedU32);
+    }
+
+    ImGui::End();
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(3);
+
+    (void)style;
+}

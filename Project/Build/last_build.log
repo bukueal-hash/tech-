@@ -1,0 +1,82 @@
+
+  DmaKeyboard.cpp
+  Memory.cpp
+  EngineThreads.cpp
+  EntityList.cpp
+  ContainerList.cpp
+  ItemList.cpp
+  PositionRefreshPass.cpp
+  RenderQueue.cpp
+  WorldScanCommon.cpp
+  RobotList.cpp
+  World.cpp
+  BoneList.cpp
+  Esp.cpp
+F:\Test\ARCs\Project\Functions\Esp.cpp(1340,30): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data [F:\Test\ARCs\Project\Project.vcxproj]
+F:\Test\ARCs\Project\Functions\Esp.cpp(1340,30): warning C4244: 'initializing': conversion from 'double' to 'const float', possible loss of data [F:\Test\ARCs\Project\Project.vcxproj]
+  VisCheck.cpp
+  Aimbot.cpp
+  AssetNames.cpp
+  WorldItemCategory.cpp
+  Update.cpp
+  Utils.cpp
+  KmBox.cpp
+  Compiling...
+  KmBoxNet.cpp
+  MyMakcu.cpp
+  makcu.cpp
+  serialport.cpp
+  Controller.cpp
+  DmaGamepad.cpp
+  InputBind.cpp
+  KeyBind.cpp
+  MenuAssets.cpp
+  ImGuiKeybind.cpp
+  MenuLayout.cpp
+  MenuSidebar.cpp
+  OverlayHost.cpp
+  Render.cpp
+  AutoConfig.cpp
+  index.cpp
+  HealthBarDraw.cpp
+  visuals.cpp
+  imgui.cpp
+  imgui_draw.cpp
+  Compiling...
+  imgui_impl_dx11.cpp
+  imgui_impl_win32.cpp
+  imgui_tables.cpp
+  imgui_widgets.cpp
+  Project.cpp
+  Generating code
+  Previous IPDB not found, fall back to full compilation.
+  All 9987 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Finished generating code
+  Project.vcxproj -> F:\Test\ARCs\Build\ArcRaiders.exe
+  Copy DMA runtime from Project\x64 to Build\
+          1 file(s) copied.
+          1 file(s) copied.
+  F:\Test\ARCs\Project\x64\leechcore.dll
+  F:\Test\ARCs\Project\x64\vmm.dll
+  2 File(s) copied
+  0 File(s) copied
+  F:\Test\ARCs\Project\Data\asset_index.csv
+  F:\Test\ARCs\Project\Data\asset_localizations.csv
+  F:\Test\ARCs\Project\Data\items_meta.json
+  F:\Test\ARCs\Project\Data\Bots_Items_Maps\en.json
+  F:\Test\ARCs\Project\Data\loc\ST_Enemy.json
+  F:\Test\ARCs\Project\Data\loc\ST_ItemNames.json
+  F:\Test\ARCs\Project\Data\loc\ST_ItemNames_Armors.json
+  F:\Test\ARCs\Project\Data\loc\ST_ItemNames_Augments.json
+  F:\Test\ARCs\Project\Data\loc\ST_ItemNames_Augments_Effects.json
+  F:\Test\ARCs\Project\Data\loc\ST_ItemNames_Consumables.json
+  F:\Test\ARCs\Project\Data\loc\ST_ItemNames_Deployables.json
+  F:\Test\ARCs\Project\Data\loc\ST_ItemNames_FirearmMods.json
+  F:\Test\ARCs\Project\Data\loc\ST_ItemNames_Firearms.json
+  F:\Test\ARCs\Project\Data\loc\ST_ItemNames_Gadgets.json
+  F:\Test\ARCs\Project\Data\loc\ST_ItemNames_QuestItems.json
+  F:\Test\ARCs\Project\Data\loc\ST_ItemNames_Recipes.json
+  F:\Test\ARCs\Project\Data\loc\ST_ItemNames_Salvage.json
+  F:\Test\ARCs\Project\Data\loc\ST_ItemNames_Throwables.json
+  F:\Test\ARCs\Project\Data\loc\ST_WorldObjects.json
+  19 File(s) copied
