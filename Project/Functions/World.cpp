@@ -60,24 +60,32 @@ bool Engine::GatherWorldScanContext(WorldScanContext& ctx)
 void Engine::FinalizeWorldCacheMap(
     std::unordered_map<uintptr_t, WorldCacheEntry>& cache,
     const CameraCache& cam,
+    uintptr_t localPawn,
     int& outDrawing)
 {
     outDrawing = 0;
     for (auto it = cache.begin(); it != cache.end(); ) {
         auto& entry = it->second;
+        const uintptr_t actorKey = it->first;
 
-        const uintptr_t root = entry.rootComponent;
+        auto cat = static_cast<WorldItemCategory>(entry.worldCategory);
+        const bool pickupLike = cat == WorldItemCategory::DroppedPickup
+            || cat == WorldItemCategory::Items
+            || cat == WorldItemCategory::Harvestable;
+
+        uintptr_t root = entry.rootComponent;
+        if (pickupLike && actorKey) {
+            if (const uintptr_t lootRoot = ResolveLootActorRoot(actorKey, true))
+                root = lootRoot;
+        }
         if (root && IsValidPointer(root)) {
             const Vector3 freshPos = ReadSceneWorldPos(root);
             if (!WorldScan::IsOldStyleInvalidXY(freshPos))
                 entry.WorldPos = freshPos;
+            entry.rootComponent = root;
         }
 
-        Vector3 delta = entry.WorldPos - cam.Location;
-        entry.Distance = static_cast<float>(std::sqrt(
-            delta.x * delta.x + delta.y * delta.y + delta.z * delta.z) / 100.0);
-
-        auto cat = static_cast<WorldItemCategory>(entry.worldCategory);
+        entry.Distance = EspDistanceMeters(entry.WorldPos, cam, 0);
 
         if (WorldCategoryIsContainerProp(cat)
             && cat != WorldItemCategory::DroppedPickup

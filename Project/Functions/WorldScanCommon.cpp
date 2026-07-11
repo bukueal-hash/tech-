@@ -583,10 +583,19 @@ bool ScatterReadActorRootPositions(std::vector<CacheRootScatterRow>& rows)
         return false;
 
     for (CacheRootScatterRow& row : rows) {
-        if (!row.root || !engine.IsValidPointer(row.root))
+        uintptr_t root = row.root;
+        if (!root || !engine.IsValidPointer(root))
+            root = Engine::ResolveLootActorRoot(row.actorKey);
+        else {
+            const Vector3 probe = Engine::ReadSceneWorldPos(root);
+            if (!IsPlausibleWorldPos(probe))
+                root = Engine::ResolveLootActorRoot(row.actorKey);
+        }
+        if (!root || !engine.IsValidPointer(root))
             continue;
+        row.root = root;
         row.rootValid = true;
-        const Vector3 worldPos = Engine::ReadSceneWorldPos(row.root);
+        const Vector3 worldPos = Engine::ReadSceneWorldPos(root);
         if (WorldScan::IsOldStyleInvalidXY(worldPos))
             continue;
         row.worldPos = worldPos;

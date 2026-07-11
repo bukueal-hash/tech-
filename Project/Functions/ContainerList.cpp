@@ -446,7 +446,7 @@ void Engine::ContainerList()
             ++dbgAdmitLooks;
         }
 
-        const uintptr_t root = Memory::read<uintptr_t>(key + Offsets::RootComponent);
+        const uintptr_t root = Engine::ResolveActorRoot(key);
         if (!root || !IsValidPointer(root)) {
             ++dbgRootSkip;
             continue;
@@ -537,7 +537,8 @@ void Engine::ContainerList()
         if (displayName.empty())
             continue;
 
-        const float distM = DistanceMeters(worldPos, ctx.camera.Location);
+        const float distM = Engine::EspDistanceMeters(
+            worldPos, ctx.camera, 0);
         WorldLootFilterView distView{
             static_cast<uint8_t>(cat),
             fname,
@@ -670,7 +671,7 @@ void Engine::ContainerList()
         }
     }
 
-    FinalizeWorldCacheMap(localCache, ctx.camera, dbgDrawing);
+    FinalizeWorldCacheMap(localCache, ctx.camera, ctx.acknowledgedPawn, dbgDrawing);
 
     {
         std::unique_lock<std::shared_mutex> lock(m_containerCacheMutex);

@@ -1044,10 +1044,20 @@ bool WorldLootEntryLooksLikeContainer(const WorldLootFilterView& loot)
         && wcat != WorldItemCategory::Harvestable;
 }
 
+namespace {
+
+/** Menu Loot tab: SP checked → SP slider; unchecked → loot slider (per filter row). */
+float LootMenuRowDrawMeters(bool spChecked)
+{
+    return spChecked ? var::container_distance_sp : var::loot_distance;
+}
+
+} // namespace
+
 float WorldLootPickupMaxDrawMeters(WorldItemCategory cat, const WorldLootFilterView* loot)
 {
     const float maxM = WorldCategoryMaxDrawMeters(cat);
-    // Row SP checkbox is authoritative — never downgrade to loot_distance via pickup path.
+    // Container-type row SP checkbox (Loot tab table) — not the filter-row SP boxes.
     if (CategoryRowUsesSp(cat))
         return maxM;
     if (!loot)
@@ -1062,37 +1072,28 @@ float WorldLootPickupMaxDrawMeters(WorldItemCategory cat, const WorldLootFilterV
     const float minValue = var::loot_min_value;
     const int minTier = LootMinRarityMenuToMinTier(var::loot_min_rarity);
 
-    const bool meetsValue = minValue > 0.f
+    const bool valueFilterOn = minValue > 0.f;
+    const bool rarityFilterOn = minTier > 0;
+
+    const bool meetsValue = valueFilterOn
         && loot->lootValue > 0
         && static_cast<float>(loot->lootValue) >= minValue;
-    const bool meetsRarity = minTier > 0
+    const bool meetsRarity = rarityFilterOn
         && loot->lootRarityTier > 0
         && loot->lootRarityTier >= minTier;
 
+    // Pickups below every active filter use the default loot slider (maxM).
     if (!meetsValue && !meetsRarity)
         return maxM;
 
-    // Qualifying pickup: filter SP checkbox → SP or loot slider (menu tooltip).
-    bool useSp = false;
-    bool useLoot = false;
-    if (meetsValue) {
-        if (var::loot_min_val_sp)
-            useSp = true;
-        else
-            useLoot = true;
-    }
-    if (meetsRarity) {
-        if (var::loot_min_rar_sp)
-            useSp = true;
-        else
-            useLoot = true;
-    }
-    if (useSp)
-        return var::container_distance_sp;
-    if (useLoot)
-        return var::loot_distance;
-
-    return maxM;
+    // Each active filter row applies its own SP / loot distance; use the widest
+    // range when an item qualifies for more than one row (menu: per-row SP column).
+    float drawM = maxM;
+    if (meetsValue)
+        drawM = (std::max)(drawM, LootMenuRowDrawMeters(var::loot_min_val_sp));
+    if (meetsRarity)
+        drawM = (std::max)(drawM, LootMenuRowDrawMeters(var::loot_min_rar_sp));
+    return drawM;
 }
 
 float WorldLootScanRadiusMeters()

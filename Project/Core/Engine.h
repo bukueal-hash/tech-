@@ -127,6 +127,7 @@ public:
     void FinalizeWorldCacheMap(
         std::unordered_map<uintptr_t, WorldCacheEntry>& cache,
         const CameraCache& cam,
+        uintptr_t localPawn,
         int& outDrawing);
 
     void StartWorkerThreads();
@@ -647,7 +648,7 @@ public:
         return ctw;
     }
 
-    /** Distance filter anchor: trust camera when plausible; never override with bad pawn root. */
+    /** Distance anchor: frame camera first (matches projection); pawn only if camera bad. */
     static Vector3 ResolveDistanceReference(const CameraCache& cam, uintptr_t localPawn)
     {
         if (IsPlausibleWorldPos(cam.Location))
@@ -661,6 +662,18 @@ public:
             }
         }
         return cam.Location;
+    }
+
+    static float EspDistanceMeters(
+        const Vector3& worldPos,
+        const CameraCache& cam,
+        uintptr_t localPawn)
+    {
+        const Vector3 ref = ResolveDistanceReference(cam, localPawn);
+        const double dx = static_cast<double>(worldPos.x - ref.x);
+        const double dy = static_cast<double>(worldPos.y - ref.y);
+        const double dz = static_cast<double>(worldPos.z - ref.z);
+        return static_cast<float>(std::sqrt(dx * dx + dy * dy + dz * dz) / 100.0);
     }
 
     static bool IsUsableObjectPtr(uintptr_t p)
@@ -702,6 +715,34 @@ public:
                 return mesh;
         }
         return 0;
+    }
+
+    /** Ground loot: Pickup_RootCollider @0x460 is often the real world anchor (help CL-1315578). */
+    static uintptr_t ResolveLootActorRoot(uintptr_t actor, bool preferPickupCollider = false)
+    {
+        if (!IsUsableObjectPtr(actor))
+            return 0;
+
+        auto tryPickupCollider = [&]() -> uintptr_t {
+            const uintptr_t collider =
+                Memory::read_nocache<uintptr_t>(actor + Offsets::Pickup_RootCollider);
+            if (!IsUsableObjectPtr(collider))
+                return 0;
+            const Vector3 pos = ReadSceneWorldPos(collider);
+            const float magSq = static_cast<float>(
+                pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
+            return magSq > 100.f ? collider : 0;
+        };
+
+        if (preferPickupCollider) {
+            if (const uintptr_t collider = tryPickupCollider())
+                return collider;
+            return ResolveActorRoot(actor);
+        }
+
+        if (const uintptr_t root = ResolveActorRoot(actor))
+            return root;
+        return tryPickupCollider();
     }
 
     static uintptr_t ResolveAcknowledgedPawn(uintptr_t pc)

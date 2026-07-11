@@ -395,7 +395,8 @@ void Engine::ItemList()
                 hasContainerLoot, hasItemDataAsset))
             continue;
 
-        const uintptr_t root = Memory::read<uintptr_t>(key + Offsets::RootComponent);
+        const uintptr_t root =
+            Engine::ResolveLootActorRoot(key, pickupLike);
         if (!root || !IsValidPointer(root))
             continue;
 
@@ -566,7 +567,7 @@ void Engine::ItemList()
         }
     }
 
-    FinalizeWorldCacheMap(localCache, ctx.camera, dbgDrawing);
+    FinalizeWorldCacheMap(localCache, ctx.camera, ctx.acknowledgedPawn, dbgDrawing);
 
     {
         std::unique_lock<std::shared_mutex> lock(m_itemCacheMutex);

@@ -327,6 +327,7 @@ static bool ResolveLiveRenderCamera(
     const Engine::EspRenderFrame& frame,
     Engine::CameraCache& outCam)
 {
+    // g_Camera is refreshed every Update() tick — required for live distance while moving.
     {
         std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
         if (CameraOkForEsp(engine.g_Camera)) {
@@ -338,6 +339,74 @@ static bool ResolveLiveRenderCamera(
         outCam = frame.camera;
         return true;
     }
+    return false;
+}
+
+static Vector3 ResolveWorldEspDrawPos(
+    uintptr_t actorKey,
+    const Engine::WorldCacheEntry& entry)
+{
+    auto tryComp = [](uintptr_t comp) -> Vector3 {
+        if (!comp || !engine.IsValidPointer(comp))
+            return {};
+        const Vector3 pos = Engine::ReadSceneWorldPos(comp);
+        return IsPlausibleWorldPos(pos) ? pos : Vector3{};
+    };
+
+    // Same-frame scatter position is synchronized with frame camera — prefer it.
+    if (IsPlausibleWorldPos(entry.WorldPos))
+        return entry.WorldPos;
+
+    const auto cat = static_cast<WorldItemCategory>(entry.worldCategory);
+    const bool preferPickupCollider = IsGroundLootEspCategory(cat)
+        || cat == WorldItemCategory::Items
+        || cat == WorldItemCategory::Harvestable;
+
+    if (actorKey && preferPickupCollider) {
+        if (const uintptr_t lootRoot =
+                Engine::ResolveLootActorRoot(actorKey, true)) {
+            if (const Vector3 fromLoot = tryComp(lootRoot); IsPlausibleWorldPos(fromLoot))
+                return fromLoot;
+        }
+    }
+
+    if (const Vector3 fromRoot = tryComp(entry.rootComponent); IsPlausibleWorldPos(fromRoot))
+        return fromRoot;
+
+    if (actorKey) {
+        const uintptr_t resolved = Engine::ResolveLootActorRoot(
+            actorKey, preferPickupCollider);
+        if (const Vector3 fromResolved = tryComp(resolved); IsPlausibleWorldPos(fromResolved))
+            return fromResolved;
+
+        const uintptr_t skMesh = engine.GetActorSkeletalMesh(actorKey);
+        if (const Vector3 fromSk = tryComp(skMesh); IsPlausibleWorldPos(fromSk))
+            return fromSk;
+
+        const uintptr_t embark =
+            Memory::read<uintptr_t>(actorKey + Offsets::EmbarkMesh);
+        if (const Vector3 fromEmbark = tryComp(embark); IsPlausibleWorldPos(fromEmbark))
+            return fromEmbark;
+    }
+
+    return entry.WorldPos;
+}
+
+static bool ProjectWorldEspPoint(
+    const Vector3& worldPos,
+    const Engine::CameraCache& frameCam,
+    Vector3& outScreen)
+{
+    if (engine.ProjectWorldLocationToScreen(worldPos, outScreen, frameCam))
+        return true;
+
+    Engine::CameraCache liveCam{};
+    {
+        std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
+        liveCam = engine.g_Camera;
+    }
+    if (IsUsableCameraFov(liveCam.FOV) && IsPlausibleWorldPos(liveCam.Location))
+        return engine.ProjectWorldLocationToScreen(worldPos, outScreen, liveCam);
     return false;
 }
 
@@ -670,12 +739,22 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             EspPosReadTarget{ kind, index, rootComponent, distance, {}, {} });
     };
 
-    for (size_t i = 0; i < out.world.size(); ++i)
+    for (size_t i = 0; i < out.world.size(); ++i) {
+        uintptr_t scatterRoot = out.world[i].entry.rootComponent;
+        const auto cat = static_cast<WorldItemCategory>(out.world[i].entry.worldCategory);
+        if (IsGroundLootEspCategory(cat)
+            || cat == WorldItemCategory::Items
+            || cat == WorldItemCategory::Harvestable) {
+            if (const uintptr_t lootRoot =
+                    Engine::ResolveLootActorRoot(out.world[i].actorKey, true))
+                scatterRoot = lootRoot;
+        }
         queuePosTarget(
             EspPosTargetKind::World,
             i,
-            out.world[i].entry.rootComponent,
+            scatterRoot,
             out.world[i].entry.Distance);
+    }
     for (size_t i = 0; i < out.robots.size(); ++i)
         queuePosTarget(
             EspPosTargetKind::Robot,
@@ -757,7 +836,26 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         return false;
 
     for (const EspPosReadTarget& target : posTargets) {
-        const Vector3 worldPos = ResolveScatterWorldPos(target.c2w, target.relative);
+        Vector3 worldPos = ResolveScatterWorldPos(target.c2w, target.relative);
+        if (!IsPlausibleWorldPos(worldPos)
+            && target.rootComponent && IsValidPointer(target.rootComponent))
+            worldPos = Engine::ReadSceneWorldPos(target.rootComponent);
+        if (!IsPlausibleWorldPos(worldPos) && target.kind == EspPosTargetKind::World) {
+            const size_t wi = target.index;
+            if (wi < out.world.size()) {
+                const uintptr_t actorKey = out.world[wi].actorKey;
+                const auto cat = static_cast<WorldItemCategory>(
+                    out.world[wi].entry.worldCategory);
+                const bool preferPickupCollider =
+                    IsGroundLootEspCategory(cat)
+                    || cat == WorldItemCategory::Items
+                    || cat == WorldItemCategory::Harvestable;
+                const uintptr_t resolved = Engine::ResolveLootActorRoot(
+                    actorKey, preferPickupCollider);
+                if (resolved && IsValidPointer(resolved))
+                    worldPos = Engine::ReadSceneWorldPos(resolved);
+            }
+        }
         if (!IsPlausibleWorldPos(worldPos))
             continue;
 
@@ -1158,7 +1256,6 @@ static void RenderWorldEspFromFrame(
         return;
 
     const Engine::EngineStateSnapshot stateSnap = engine.GetStateSnapshot();
-    const Vector3 distRef = engine.ResolveDistanceReference(frameCam, stateSnap.acknowledgedPawn);
 
     for (const Engine::EspFrameWorld& item : world) {
         const uintptr_t key = item.actorKey;
@@ -1172,12 +1269,12 @@ static void RenderWorldEspFromFrame(
             continue;
         }
 
-        const Vector3 worldPos = entry.WorldPos;
-        const double dx = static_cast<double>(worldPos.x) - distRef.x;
-        const double dy = static_cast<double>(worldPos.y) - distRef.y;
-        const double dz = static_cast<double>(worldPos.z) - distRef.z;
-        const float distM = static_cast<float>(
-            std::sqrt(dx * dx + dy * dy + dz * dz) / 100.0);
+        const Vector3 worldPos = ResolveWorldEspDrawPos(key, entry);
+        if (!IsPlausibleWorldPos(worldPos)) {
+            ++dbg.skipPos;
+            continue;
+        }
+        const float distM = engine.EspDistanceMeters(worldPos, frameCam, 0);
 
         std::string fname = engine.GetActorFNameStringCached(key);
         if (fname.empty())
@@ -1197,18 +1294,6 @@ static void RenderWorldEspFromFrame(
             continue;
         }
 
-        WorldLootFilterView distFilterView{
-            entry.worldCategory,
-            entry.ActorName,
-            entry.ItemDisplayName,
-            entry.lootValue,
-            entry.lootRarityTier};
-        const float maxDrawM = WorldLootPickupMaxDrawMeters(cat, &distFilterView);
-        if (distM > maxDrawM) {
-            ++dbg.skipDist;
-            continue;
-        }
-
         std::string classFname;
         if (isContainerEsp)
             classFname = engine.GetActorClassFName(key);
@@ -1217,14 +1302,14 @@ static void RenderWorldEspFromFrame(
 
         if (!isContainerEsp && !isGroundLoot) {
             Vector3 headScreen{};
-            if (!engine.ProjectWorldLocationToScreen(worldPos, headScreen, frameCam))
+            if (!ProjectWorldEspPoint(worldPos, frameCam, headScreen))
                 continue;
 
             constexpr float kWorldItemHeightCm = 50.f;
             Vector3 feetWorld = worldPos;
             feetWorld.z -= kWorldItemHeightCm;
             Vector3 feetScreen{};
-            if (!engine.ProjectWorldLocationToScreen(feetWorld, feetScreen, frameCam))
+            if (!ProjectWorldEspPoint(feetWorld, frameCam, feetScreen))
                 continue;
 
             const float boxH = static_cast<float>(std::abs(feetScreen.y - headScreen.y));
@@ -1327,7 +1412,7 @@ static void RenderWorldEspFromFrame(
                     }
                 }
             }
-        } else if (lootValue <= 0 || lootTier <= 0) {
+        } else {
             ResolveItemMetaForActor(
                 engine, key, fname, label.empty() ? entry.ItemDisplayName : label,
                 lootTier, lootValue);
@@ -1335,7 +1420,7 @@ static void RenderWorldEspFromFrame(
 
         WorldLootFilterView filterView{
             entry.worldCategory,
-            label,
+            entry.ActorName.empty() ? fname : entry.ActorName,
             label,
             lootValue,
             lootTier};
@@ -1348,7 +1433,7 @@ static void RenderWorldEspFromFrame(
         const bool looksLikeContainer = WorldLootEntryLooksLikeContainer(filterView);
 
         Vector3 screen{};
-        if (!engine.ProjectWorldLocationToScreen(worldPos, screen, frameCam)) {
+        if (!ProjectWorldEspPoint(worldPos, frameCam, screen)) {
             ++dbg.skipProj;
             continue;
         }
