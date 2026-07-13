@@ -329,8 +329,8 @@ bool Engine::RefreshCameraFromViewTarget()
 	return true;
 }
 
-// Deprecated for worker threads — only Update() may refresh g_Camera (see Update.cpp).
-// Retained for manual/debug use; do not add new callers.
+// Worker threads should not call this (race with Update). RenderEsp uses
+// ResolveLiveRenderCamera (g_Camera from Update / frame.camera) — no per-paint DMA.
 void Engine::UpdateCamera()
 {
 	RefreshCameraFromViewTarget();
@@ -1109,13 +1109,19 @@ std::string Engine::GetWeaponName(const std::string& internal_name) {
         { "BasicMeleeWeapon",                  "Melee" },
         { "HealingHoT_Small",                  "Bandage" },
         { "HealingHoT_Improvised",             "Herbal Bandage" },
+        { "HealingHoT_Sterilized",             "Sterilized Bandage" },
         { "AdrenalineShot",                    "Adrenaline Shot" },
-        { "Consumable_ShieldOverTimePack",     "Shield Recharge" },
+        { "Consumable_ShieldOverTimePack",     "Shield Recharger" },
+        { "Armor_Patcher",                     "Surge Shield Recharger" },
+        { "ShieldOverTimePack",                "Shield Recharger" },
         { "Defibrillator",                     "Defibrillator" },
         { "JumpMine_Impulse",                  "Impulse Mine" },
         { "SmokeGrenade",                      "Smoke Grenade" },
         { "ScatterMissileGrenade",             "Wolfpack Grenade" },
-        { "StunGrenade",                       "Showstopper Grenade" }
+        { "StunGrenade",                       "Showstopper Grenade" },
+        { "FragGrenade",                       "Frag Grenade" },
+        { "GasGrenade",                        "Gas Grenade" },
+        { "LightGrenade",                      "Light Stick" },
     };
 
     if (auto it = processMap.find(internal_name); it != processMap.end()) {
@@ -1176,14 +1182,18 @@ namespace {
 
 bool FnameMatchesLootItemBucket(const std::string& actorNameLower)
 {
+    // Same order as FnameLooksLikeDroppedPickup: floor BP_ItemActor / DA shells
+    // win before inventory-service exclusions (Canister was wiped by "itemactor").
+    if (actorNameLower.find("bp_pickupbase") != std::string::npos
+        || actorNameLower.find("pickupbase") != std::string::npos
+        || actorNameLower.find("bp_pickup") != std::string::npos
+        || actorNameLower.find("bp_itemactor_") != std::string::npos
+        || actorNameLower.find("bp_item_") != std::string::npos
+        || actorNameLower.find("da_item_") != std::string::npos
+        || actorNameLower.find("wid_") != std::string::npos)
+        return true;
     if (IsInventoryWorldFnameExcluded(actorNameLower))
         return false;
-    if (actorNameLower.find("bp_pickupbase") != std::string::npos)
-        return true;
-    if (actorNameLower.find("pickupbase") != std::string::npos)
-        return true;
-    if (actorNameLower.find("bp_pickup") != std::string::npos)
-        return true;
     return false;
 }
 

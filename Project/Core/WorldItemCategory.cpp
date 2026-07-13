@@ -10,8 +10,10 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 extern Engine engine;
@@ -989,51 +991,53 @@ bool WorldLootEntryLooksLikeContainer(const WorldLootFilterView& loot)
 
 float WorldLootPickupMaxDrawMeters(WorldItemCategory cat, const WorldLootFilterView* loot)
 {
+    const float maxM = WorldCategoryMaxDrawMeters(cat);
+    // Row SP checkbox is authoritative — never downgrade to loot_distance via pickup path.
+    if (CategoryRowUsesSp(cat))
+        return maxM;
     if (!loot)
-        return WorldCategoryMaxDrawMeters(cat);
+        return maxM;
 
-    // Every loot-tab SP box: unchecked → loot_distance, checked → container_distance_sp.
-    // Ground items (syringe, etc.) use Items/Dropped/Keys/Harvestable row SP only —
-    // never Medical/Ammo/Grenade container-row SP. Value/rarity SP stretch matching
-    // pickups the same way (unchecked = stay on item-row distance).
-    const bool fnameIsContainer =
-        !loot->actorName.empty() && FnameLooksLikeWorldContainer(loot->actorName);
-    const bool pickupPath =
-        LootItemLooksLikePickup(*loot)
-        || cat == WorldItemCategory::DroppedPickup
-        || cat == WorldItemCategory::Items
-        || cat == WorldItemCategory::Keys
-        || cat == WorldItemCategory::Harvestable
-        || (loot->lootValue > 0 && !fnameIsContainer);
+    if (WorldLootEntryLooksLikeContainer(*loot))
+        return maxM;
 
-    if (pickupPath) {
-        WorldItemCategory itemRow = WorldItemCategory::DroppedPickup;
-        if (cat == WorldItemCategory::Items
-            || cat == WorldItemCategory::Keys
-            || cat == WorldItemCategory::DroppedPickup
-            || cat == WorldItemCategory::Harvestable)
-            itemRow = cat;
+    if (!LootItemLooksLikePickup(*loot))
+        return maxM;
 
-        float drawM = WorldCategoryMaxDrawMeters(itemRow);
+    const float minValue = var::loot_min_value;
+    const int minTier = LootMinRarityMenuToMinTier(var::loot_min_rarity);
 
-        const float minValue = var::loot_min_value;
-        const int minTier = LootMinRarityMenuToMinTier(var::loot_min_rarity);
-        const bool meetsValue = minValue > 0.f
-            && loot->lootValue > 0
-            && static_cast<float>(loot->lootValue) >= minValue;
-        const bool meetsRarity = minTier > 0
-            && loot->lootRarityTier > 0
-            && loot->lootRarityTier >= minTier;
+    const bool meetsValue = minValue > 0.f
+        && loot->lootValue > 0
+        && static_cast<float>(loot->lootValue) >= minValue;
+    const bool meetsRarity = minTier > 0
+        && loot->lootRarityTier > 0
+        && loot->lootRarityTier >= minTier;
 
-        if (meetsValue && var::loot_min_val_sp)
-            drawM = (std::max)(drawM, var::container_distance_sp);
-        if (meetsRarity && var::loot_min_rar_sp)
-            drawM = (std::max)(drawM, var::container_distance_sp);
-        return drawM;
+    if (!meetsValue && !meetsRarity)
+        return maxM;
+
+    // Qualifying pickup: filter SP checkbox → SP or loot slider (menu tooltip).
+    bool useSp = false;
+    bool useLoot = false;
+    if (meetsValue) {
+        if (var::loot_min_val_sp)
+            useSp = true;
+        else
+            useLoot = true;
     }
+    if (meetsRarity) {
+        if (var::loot_min_rar_sp)
+            useSp = true;
+        else
+            useLoot = true;
+    }
+    if (useSp)
+        return var::container_distance_sp;
+    if (useLoot)
+        return var::loot_distance;
 
-    // Real containers (medical bag, crate, locker, …): that row's SP only.
-    return WorldCategoryMaxDrawMeters(cat);
+    return maxM;
 }
 
 int LootMinRarityMenuToMinTier(int menuIndex)
@@ -1385,6 +1389,29 @@ bool FnameLooksLikeEngineSubobjectClass(const std::string& fname)
         "lootinteraction",
         "itemcontainer",
         "lootstatemachine",
+        "rootcollider",
+        "pickup_rootcollider",
+        "boxcomponent",
+        "capsulecomponent",
+        "spherecomponent",
+        "scenecomponent",
+        "staticmeshcomponent",
+        "skeletalmeshcomponent",
+        "interfaceproperty",
+        "boolproperty",
+        "structproperty",
+        "objectproperty",
+        "arrayproperty",
+        "mapproperty",
+        "setproperty",
+        "enumproperty",
+        "textproperty",
+        "strproperty",
+        "nameproperty",
+        "classproperty",
+        "softobjectproperty",
+        "fproperty",
+        "uproperty",
     };
     for (const char* token : kBlocked) {
         if (lower == token)
@@ -1799,6 +1826,36 @@ bool IsJunkWorldEspLabel(const std::string& label)
         "metadata",
         "weapon mod",
         "weaponmod",
+        "collider",
+        "root collider",
+        "rootcollider",
+        "scene component",
+        "scenecomponent",
+        "static mesh",
+        "skeletal mesh",
+        "interface property",
+        "interfaceproperty",
+        "bool property",
+        "struct property",
+        "object property",
+        "array property",
+        "map property",
+        "set property",
+        "enum property",
+        "text property",
+        "name property",
+        "class property",
+        "soft object property",
+        "fproperty",
+        "uproperty",
+        "ddgi",
+        "point of interest",
+        "poi volume",
+        "volume",
+        "global illumination",
+        "persistent level",
+        "online store",
+        "health service",
     };
     for (const char* token : kBlocked) {
         if (lower.find(token) != std::string::npos)
@@ -2087,34 +2144,27 @@ ContainerOpenSignal ProbeContainerOpenSignals(uintptr_t actor, const std::string
 
 bool ContainerLootLooksOpened(uintptr_t actor, const std::string& fnameHint)
 {
+    // Strong only: owned LootInteraction bHasBeenOpened. SalvageMesh / weak probes
+    // false-positive closed crates → admit skip, Finalize Drawing=false, deplete erase
+    // (labels missing for ~30s while standing on them).
+    return ProbeContainerOpenSignals(actor, fnameHint) == ContainerOpenSignal::LootSearched;
+}
+
+bool ContainerLootLooksOpenedAny(uintptr_t actor, const std::string& fnameHint)
+{
     return ProbeContainerOpenSignals(actor, fnameHint) != ContainerOpenSignal::None;
 }
 
 bool GroundLootPickupHasStrongSignal(GroundLootPickupSignal sig)
 {
     using S = GroundLootPickupSignal;
+    // Console proof (post deplete “weak-pair” removal): still admitted==depleted
+    // every tick. StillHasAssetId|NoCollision false-positives on LIVE floor shells
+    // when Actor_FlagsDd collision bit is unread/wrong. Only treat destroyed/hidden.
     if ((sig & S::HiddenOrDestroyed) != S::None)
         return true;
-    // LootSearched is a container bit — never strong for ground loot.
-
-    // After pickup the game often leaves the item DA / asset id on the shell
-    // and only clears collision or SpawnItems. Alone, those weaks never hit
-    // the old >=2 bar → ESP lingered ~30–40s until destroy. Treat lingering
-    // identity + one physical clear as picked up (#85/#87).
-    const bool stillId = (sig & S::StillHasAssetId) != S::None;
-    if (stillId
-        && ((sig & S::NoCollision) != S::None
-            || (sig & S::SpawnItemsEmpty) != S::None
-            || (sig & S::NoItemDa) != S::None))
-        return true;
-
-    int weakSignals = 0;
-    if ((sig & S::NoItemDa) != S::None) ++weakSignals;
-    if ((sig & S::NoCollision) != S::None) ++weakSignals;
-    if ((sig & S::SpawnItemsEmpty) != S::None) ++weakSignals;
-
-    // Two independent weaks without asset id (DA cleared + collision/spawn).
-    return weakSignals >= 2;
+    (void)sig;
+    return false;
 }
 
 GroundLootPickupSignal ProbeGroundLootPickupSignals(
@@ -2182,27 +2232,17 @@ bool GroundLootLooksPickedUp(uintptr_t actor, const std::string& fnameHint)
     if (!actor || !Memory::IsValidPtrFast2(actor))
         return true;
 
-    std::string fname = fnameHint;
-    if (fname.empty())
-        fname = engine.GetActorFNameStringCached(actor);
-    if (fname.empty())
-        fname = engine.GetActorFNameString(actor);
+    // Use strong-signal probe only. Returning true on missing ItemDataAsset or
+    // empty SpawnItems wiped all live floor loot (ItemDataAsset often unset;
+    // SpawnItems empty while asset id still present).
+    const GroundLootPickupSignal sig =
+        ProbeGroundLootPickupSignals(actor, fnameHint);
+    return GroundLootPickupHasStrongSignal(sig);
+}
 
-    const std::string classFname = engine.GetActorClassFName(actor);
-    const uint32_t masked =
-        ArcActorType::MaskActorTypeId(ArcActorType::ReadActorTypeId(actor));
-    const bool pickupLike = FnameLooksLikeDroppedPickup(fname)
-        || FnameLooksLikeDroppedPickup(classFname)
-        || ArcActorType::IsGroundLootClassId(masked);
-
-    if (!pickupLike) {
-        if (ContainerLootLooksOpened(actor, fname))
-            return true;
-        return false;
-    }
-
-    return GroundLootPickupHasStrongSignal(
-        ProbeGroundLootPickupSignals(actor, fname));
+void ClearGroundLootPickupStickyState()
+{
+    // Retained for raid-reset callers; sticky pickup state removed (tech- path).
 }
 
 bool WorldLootCacheEntryDepleted(
@@ -2215,14 +2255,13 @@ bool WorldLootCacheEntryDepleted(
 
     if (WorldCategoryIsContainerProp(cat) || cat == WorldItemCategory::OpenedContainer) {
         if (ContainerLootLooksOpened(actor, fnameHint))
-            return !var::show_world_open_container;
+            return true;
     }
 
     if (cat == WorldItemCategory::DroppedPickup
         || cat == WorldItemCategory::Harvestable
         || cat == WorldItemCategory::Items
         || FnameLooksLikeDroppedPickup(fnameHint)
-        || FnameLooksLikeDroppedPickup(engine.GetActorClassFName(actor))
         || FnameLooksLikeHarvestableActor(fnameHint)) {
         return GroundLootLooksPickedUp(actor, fnameHint);
     }
@@ -2539,7 +2578,10 @@ bool WorldCategoryEnabled(int category)
     case WorldItemCategory::Grenade:
         return var::show_world_grenade || var::showLoot;
     case WorldItemCategory::Harvestable:
-        return var::show_world_harvestable || var::showLoot;
+        // Items/Dropped toggles also cover world plants so Prickly Pear etc.
+        // aren't invisible when only loot/items ESP is on.
+        return var::show_world_harvestable || var::droppedItems
+            || var::show_world_items || var::showLoot;
     case WorldItemCategory::Industrial:
         return var::show_world_industrial || var::showLoot;
     case WorldItemCategory::Medical:

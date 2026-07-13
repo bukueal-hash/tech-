@@ -1,10 +1,11 @@
 #include <Windows.h>
 #include <vector>
 #include <cmath>
+#include <algorithm>
 
 #include "../Core/Engine.h"
+#include "../Core/Memory.h"
 #include "../Core/SteamDecrypt.hpp"
-#include <algorithm>
 
 extern Engine engine;
 
@@ -36,13 +37,7 @@ static int ScoreBoneArrayForMesh(
     bool hasPelvis = false;
 
     for (const auto& [gameIndex, uniBone] : eng.GameBoneMapArcRaiders) {
-        const FTransform bone =
-            Memory::read<FTransform>(boneArray + (gameIndex * 0x60));
-        const D3DMATRIX matrix = eng.MatrixMultiplication(
-            bone.ToMatrixWithScale(),
-            ctw.ToMatrixWithScale());
-        const Vector3 world(matrix._41, matrix._42, matrix._43);
-
+        const Vector3 world = eng.GetBone(gameIndex, boneArray, ctw);
         if (!IsPlausibleWorldPos(world) || IsNearZero(world))
             continue;
 
@@ -74,6 +69,7 @@ static BoneArrayCandidate FindBestBoneArray(uintptr_t actor, uintptr_t primaryMe
     const uintptr_t meshB = actor
         ? Memory::read<uintptr_t>(actor + Offsets::EmbarkMesh) : 0;
 
+    // Embark mesh usually owns the encrypted bone block on this build.
     const uintptr_t meshes[] = { meshB, primaryMesh, meshA };
 
     Engine& eng = engine;
@@ -130,38 +126,76 @@ void Engine::GetBones(PlayerCacheEntry& actor)
     actor.boneArray = 0;
     actor.boneMesh = 0;
 
-    if (!IsValidPointer(actor.actorMesh) && !IsValidPointer(actor.APawn))
+    uintptr_t meshForBones = GetActorBoneMesh(actor.APawn);
+    if (!meshForBones || !IsValidPointer(meshForBones))
+        meshForBones = actor.actorMesh;
+    if (!meshForBones || !IsValidPointer(meshForBones))
         return;
 
-    actor.boneArray = ResolveBoneArray(actor.APawn, actor.actorMesh, &actor.boneMesh);
+    uintptr_t resolvedMesh = 0;
+    actor.boneArray = ResolveBoneArray(actor.APawn, meshForBones, &resolvedMesh);
     if (!actor.boneArray || !IsValidPointer(actor.boneArray))
         return;
 
-    if (!actor.boneMesh || !IsValidPointer(actor.boneMesh))
-        actor.boneMesh = actor.actorMesh;
+    actor.boneMesh = resolvedMesh ? resolvedMesh : meshForBones;
+    actor.actorMesh = actor.boneMesh;
 
-    const FTransform componentToWorld = Engine::ReadComponentToWorld(actor.boneMesh);
+    const size_t boneCount = GameBoneMapArcRaiders.size();
 
-    for (const auto& [gameIndex, uniBone] : GameBoneMapArcRaiders)
+    FTransform componentToWorld{};
+    std::vector<FTransform> boneTransforms(boneCount);
+
+    bool batched = false;
     {
-        const Vector3 worldPos = GetBone(gameIndex, actor.boneArray, componentToWorld);
+        ScatterSession scatter;
+        if (scatter.isValid()) {
+            bool ok = scatter.prepare(
+                actor.boneMesh + Offsets::ComponentToWorld,
+                &componentToWorld, sizeof(FTransform));
+            for (size_t i = 0; i < boneCount && ok; ++i) {
+                const int gameIndex = GameBoneMapArcRaiders[i].first;
+                ok = scatter.prepare(
+                    actor.boneArray + (gameIndex * 0x60),
+                    &boneTransforms[i], sizeof(FTransform));
+            }
+            if (ok && scatter.execute())
+                batched = true;
+        }
+    }
 
-        if (worldPos.x == 0.0 && worldPos.y == 0.0 && worldPos.z == 0.0)
+    if (!batched) {
+        componentToWorld = Engine::ReadComponentToWorld(actor.boneMesh);
+        for (size_t i = 0; i < boneCount; ++i) {
+            const int gameIndex = GameBoneMapArcRaiders[i].first;
+            boneTransforms[i] = Memory::read<FTransform>(
+                actor.boneArray + (gameIndex * 0x60));
+        }
+    } else {
+        // Prefer a fresh CompToWorld — scatter CTW can race mesh motion.
+        componentToWorld = Engine::ReadComponentToWorld(actor.boneMesh);
+    }
+
+    const D3DMATRIX ctwMatrix = componentToWorld.ToMatrixWithScale();
+
+    for (size_t i = 0; i < boneCount; ++i) {
+        const UniBone uniBone = GameBoneMapArcRaiders[i].second;
+        const D3DMATRIX matrix = MatrixMultiplication(
+            boneTransforms[i].ToMatrixWithScale(), ctwMatrix);
+        const Vector3 worldPos(matrix._41, matrix._42, matrix._43);
+
+        if (IsNearZero(worldPos))
             continue;
-
-        Vector3 screenPos{};
-        if (!ProjectWorldLocationToScreen(worldPos, screenPos))
+        if (!IsPlausibleWorldPos(worldPos))
             continue;
 
         const size_t idx = static_cast<size_t>(uniBone);
-        actor.boneData.bonesDouble[idx] =
-            Vector3{ screenPos.x, screenPos.y, 0.0 };
         actor.boneData.bonesWorldDouble[idx] = worldPos;
         actor.boneData.valid.set(idx);
     }
 
     if (actor.boneData.valid.test(static_cast<size_t>(UniBone::Head)) &&
-        actor.boneData.valid.test(static_cast<size_t>(UniBone::Pelvis)))
+        (actor.boneData.valid.test(static_cast<size_t>(UniBone::Pelvis)) ||
+         actor.boneData.valid.test(static_cast<size_t>(UniBone::Chest))))
     {
         actor.boneData.isVisible = true;
     }

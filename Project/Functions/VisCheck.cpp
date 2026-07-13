@@ -3,7 +3,6 @@
 #include "../Core/Offsets.h"
 #include "../Interface/Utils/Variables/index.h"
 #include "../Core/IntervalTimer.h"
-#include "CollisionLos.h"
 #include <immintrin.h>
 #include <iostream>
 #include <cstring>
@@ -180,20 +179,9 @@ bool Engine::Visible(uintptr_t mesh) const
 	return MeshRenderTimeVisible(mesh);
 }
 
-bool Engine::HasLineOfSight(const Vector3& from, const Vector3& to) const
-{
-	if (!var::obstruction_check)
-		return true;
-	return CollisionLos::IsVisible(from, to);
-}
-
 Engine::VisCheckDebugStats Engine::CollectVisCheckDebugStats() const
 {
 	VisCheckDebugStats stats{};
-	stats.collisionLosEnabled = var::obstruction_check;
-	stats.collisionTriCount = static_cast<int>(CollisionLos::TriangleCount());
-	stats.collisionSmcCount = static_cast<int>(CollisionLos::LastSmcCount());
-	stats.collisionRebuilding = CollisionLos::IsRebuilding();
 
 	auto applySample = [&](const MeshVisProbe& probe) {
 		stats.sampleSubmit = probe.lastSubmit;
@@ -258,10 +246,6 @@ void Engine::PrintVisCheckDebugConsole()
 
 	const VisCheckDebugStats stats = CollectVisCheckDebugStats();
 	std::cout << "[debugVisCheck] meshMode=render_time"
-		<< " collisionLos=" << (stats.collisionLosEnabled ? "on" : "off")
-		<< " tris=" << stats.collisionTriCount
-		<< " smc=" << stats.collisionSmcCount
-		<< " rebuilding=" << (stats.collisionRebuilding ? 1 : 0)
 		<< " players=" << stats.playersMeshVisible << '/' << stats.playersTotal
 		<< " bots=" << stats.botsMeshVisible << '/' << stats.botsTotal;
 	if (stats.hasSample) {
@@ -327,6 +311,24 @@ static bool MeshHasEncryptedBoneBlock(uintptr_t mesh)
 	__m128i enc830{};
 	return Memory::ReadRaw(mesh + Offsets::LodSelect, &enc830, sizeof(enc830))
 		&& _mm_cvtsi128_si64(enc830) != 0;
+}
+
+uintptr_t Engine::GetActorBoneMesh(uintptr_t actor)
+{
+	if (!actor)
+		return 0;
+
+	const uintptr_t embark =
+		Memory::read<uintptr_t>(actor + Offsets::EmbarkMesh);
+	const uintptr_t skel =
+		Memory::read<uintptr_t>(actor + Offsets::USkeletalMeshComponent);
+
+	if (embark && IsValidPointer(embark) && MeshHasEncryptedBoneBlock(embark))
+		return embark;
+	if (skel && IsValidPointer(skel) && MeshHasEncryptedBoneBlock(skel))
+		return skel;
+
+	return GetActorSkeletalMesh(actor);
 }
 
 uintptr_t Engine::GetActorSkeletalMesh(uintptr_t actor) const

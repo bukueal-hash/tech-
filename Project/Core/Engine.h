@@ -56,7 +56,6 @@ private:
     std::unique_ptr<SyncedThread> m_worldThread;
     std::unique_ptr<SyncedThread> m_entityThread;
     std::unique_ptr<SyncedThread> m_worldEspThread;
-    std::unique_ptr<SyncedThread> m_containerEspThread;
     std::unique_ptr<SyncedThread> m_robotEspThread;
     std::unique_ptr<SyncedThread> m_aimThread;
     std::unique_ptr<SyncedThread> m_positionThread;
@@ -72,15 +71,27 @@ private:
 
     std::atomic<bool> m_raidRaw{ false };
     std::atomic<bool> m_espRaidActive{ false };
+    /** Scanners may run; ESP/aim only draw after caches prove healthy. */
+    std::atomic<bool> m_espDrawReady{ false };
     bool m_raidEnterPending{ false };
+    bool m_partyEnterPending{ false };
     std::chrono::steady_clock::time_point m_raidDebSince{};
+    std::chrono::steady_clock::time_point m_partyDebSince{};
+    std::chrono::steady_clock::time_point m_raidArmedSince{};
 
-    static constexpr std::chrono::milliseconds kRaidEnterDelayMs{ 1500 };
+    /** Party settle (self + 2 others) then raid settle before arming scanners. */
+    static constexpr std::chrono::milliseconds kPartyEnterDelayMs{ 5000 };
+    static constexpr std::chrono::milliseconds kRaidEnterDelayMs{ 5000 };
     static constexpr std::chrono::milliseconds kRaidRawFalseGraceMs{ 5000 };
+    /** Soft draw-ready if not all three caches fill (solo / empty pocket). */
+    static constexpr std::chrono::milliseconds kEspCacheReadySoftMs{ 12000 };
+    static constexpr int kPartyMinPlayers{ 3 };
 
     std::chrono::steady_clock::time_point m_raidFalseSince{};
 
     void TickRaidGate();
+    void TickEspCacheReadiness();
+    int CountGameStatePlayerArray() const;
     void ClearEspCaches();
     /** PC cache, camera, FName/decrypt — same class of reset as process restart for raid transitions. */
     void ResetRaidTransitionState();
@@ -127,7 +138,6 @@ public:
     void FinalizeWorldCacheMap(
         std::unordered_map<uintptr_t, WorldCacheEntry>& cache,
         const CameraCache& cam,
-        uintptr_t localPawn,
         int& outDrawing);
 
     void StartWorkerThreads();
@@ -225,18 +235,12 @@ public:
     bool VisibleActor(uintptr_t actor) const;
     /** Bot-only mesh vis: embark-first + SDK recently-rendered fallback. */
     bool VisibleBotActor(uintptr_t actor) const;
-    /** Collision KD-tree LOS when obstruction_check; else true. */
-    bool HasLineOfSight(const Vector3& from, const Vector3& to) const;
 
     struct VisCheckDebugStats {
         int playersTotal = 0;
         int playersMeshVisible = 0;
         int botsTotal = 0;
         int botsMeshVisible = 0;
-        bool collisionLosEnabled = false;
-        int collisionTriCount = 0;
-        int collisionSmcCount = 0;
-        bool collisionRebuilding = false;
         float sampleSubmit = 0.f;
         float sampleRender = 0.f;
         float sampleRenderScr = 0.f;
@@ -254,6 +258,8 @@ public:
     void PrintVisCheckDebugConsole();
 
     uintptr_t GetActorSkeletalMesh(uintptr_t actor) const;
+    /** Mesh that owns the encrypted bone block (Embark preferred). */
+    uintptr_t GetActorBoneMesh(uintptr_t actor);
 
     std::uintptr_t GetBoneArrayDecrypt(std::uintptr_t Meh);
 
@@ -409,6 +415,10 @@ public:
     bool IsInRaidRaw() const;
     bool IsEspRaidActive() const {
         return m_espRaidActive.load(std::memory_order_acquire);
+    }
+    /** True only after player + bot + world caches look healthy (or soft timeout). */
+    bool IsEspDrawReady() const {
+        return m_espDrawReady.load(std::memory_order_acquire);
     }
     bool IsInRaid() const { return IsEspRaidActive(); }
 
@@ -912,6 +922,7 @@ public:
         return std::isfinite(value) ? value : 0.0;
     }
 
+    /** PioneerPlayerState+0x530 is not HealthInfo — prefer HealthComponent always. */
     static double ReadPlayerStatWithHealthFallback(
         uintptr_t actor,
         std::ptrdiff_t psOff,
@@ -920,14 +931,13 @@ public:
         if (!actor)
             return 0.0;
 
-        const uintptr_t ps = Memory::read<uintptr_t>(actor + Offsets::APlayerState);
-        if (ps && IsPlausibleUsermodePtr(ps)) {
-            const double psValue = Memory::read<double>(ps + psOff);
-            if (std::isfinite(psValue) && psValue > 0.0)
-                return psValue;
-        }
+        const double hcValue = ReadHealthComponentStat(actor, compOff);
+        if (std::isfinite(hcValue))
+            return hcValue;
 
-        return ReadHealthComponentStat(actor, compOff);
+        // HC missing only — do not trust PS+0x530 as live HP on Pioneer.
+        (void)psOff;
+        return 0.0;
     }
 
     double get_health(uintptr_t actor)
@@ -952,15 +962,7 @@ public:
     {
         if (!actor)
             return 0.0;
-
-        const uintptr_t ps = Memory::read<uintptr_t>(actor + Offsets::APlayerState);
-        if (ps && IsPlausibleUsermodePtr(ps)) {
-            const double psValue =
-                Memory::read<double>(ps + Offsets::PlayerState_MaxArmor);
-            if (std::isfinite(psValue) && psValue > 0.0)
-                return psValue;
-        }
-
+        // PS+0x548 collides with PlayerStatus — use HealthComponent only.
         return ReadHealthComponentStat(actor, Offsets::Shield + 0x8);
     }
 

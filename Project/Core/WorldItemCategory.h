@@ -97,8 +97,11 @@ bool PointerIsLootInteractionComponent(uintptr_t obj);
 bool LootInteractionOwnedByActor(uintptr_t component, uintptr_t actor);
 /** Zipline anchors, corpses, pioneer characters — never container/open-container targets. */
 bool FnameExcludedFromContainerEsp(const std::string& fnameLower);
-/** True when container loot has already been searched/opened. */
+/** True when container was searched (strong open — used to hide/skip/deplete).
+ *  SalvageMesh alone is NOT enough — it false-hid closed crates for tens of seconds. */
 bool ContainerLootLooksOpened(uintptr_t actor, const std::string& fnameHint = {});
+/** Any open signal (including weak SalvageMesh) — labeling "(Open)" only. */
+bool ContainerLootLooksOpenedAny(uintptr_t actor, const std::string& fnameHint = {});
 
 enum class ContainerOpenSignal : uint8_t {
     None = 0,
@@ -141,6 +144,8 @@ GroundLootPickupSignal ProbeGroundLootPickupSignals(
     uintptr_t actor, const std::string& fnameHint = {});
 /** True when a ground pickup/harvestable was taken (searched flag or item asset gone). */
 bool GroundLootLooksPickedUp(uintptr_t actor, const std::string& fnameHint = {});
+/** Clear sticky pickup-collision state on raid/world reset. */
+void ClearGroundLootPickupStickyState();
 /** True when cached world/item entry should be evicted (opened container or taken pickup). */
 bool WorldLootCacheEntryDepleted(
     uintptr_t actor,

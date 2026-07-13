@@ -8,43 +8,40 @@ void Engine::StartWorkerThreads()
     if (m_workerThreadsStarted.exchange(true))
         return;
 
+    // DMA throttle: slower periods cut PCIe/FPGA "packet loss" under load.
+    // Frame velocity extrapolate still bridges gaps; aim 8 ms is plenty for kmbox.
     m_worldThread = std::make_unique<SyncedThread>([this] { Update(); }, 16);
-    // Hot player path: health/team/bones every 10 ms; admission gated inside EntityList.
     m_entityThread = std::make_unique<SyncedThread>([this] {
         if (!IsEspRaidActive())
             return;
         EntityList();
-    }, 10);
+    }, 16);
     m_robotEspThread = std::make_unique<SyncedThread>([this] {
         if (!IsEspRaidActive())
             return;
         RobotList();
-    }, 10);
-    m_containerEspThread = std::make_unique<SyncedThread>([this] {
-        if (!IsEspRaidActive())
-            return;
-        ContainerList();
-    }, 50);
+    }, 16);
     m_worldEspThread = std::make_unique<SyncedThread>([this] {
         if (!IsEspRaidActive())
             return;
+        ContainerList();
         ItemList();
     }, 50);
     m_positionThread = std::make_unique<SyncedThread>([this] {
         if (!IsEspRaidActive())
             return;
         PositionRefreshPass();
-    }, 10);
+    }, 20);
     m_frameBuilderThread = std::make_unique<SyncedThread>([this] {
         if (!IsEspRaidActive())
             return;
         BuildEspRenderFrameWorker();
-    }, 8);
+    }, 12);
     m_aimThread = std::make_unique<SyncedThread>([this] {
         if (!IsEspRaidActive() || showmenu)
             return;
         AimAssistence();
-    }, 1);
+    }, 8);
 }
 
 void Engine::StopWorkerThreads()
@@ -56,7 +53,6 @@ void Engine::StopWorkerThreads()
     m_frameBuilderThread.reset();
     m_positionThread.reset();
     m_robotEspThread.reset();
-    m_containerEspThread.reset();
     m_worldEspThread.reset();
     m_entityThread.reset();
     m_worldThread.reset();

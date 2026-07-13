@@ -8,7 +8,6 @@
 #include "../Interface/Utils/Variables/index.h"
 
 #include <cctype>
-#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <unordered_map>
@@ -50,6 +49,12 @@ bool FnameLooksLikeNonWorldEspActor(const std::string& fname)
     if (IsInventoryWorldFnameExcluded(lower))
         return true;
     if (FnameExcludedFromContainerEsp(lower))
+        return true;
+    if (lower.find("rootcollider") != std::string::npos
+        || lower.find("root_collider") != std::string::npos
+        || lower == "collider"
+        || lower.find("boxcomponent") != std::string::npos
+        || lower.find("capsulecomponent") != std::string::npos)
         return true;
     return false;
 }
@@ -129,7 +134,11 @@ WorldItemCategory ClassifyItem(
     bool fnameIsPickup,
     bool fnameIsContainer)
 {
-    if (FnameOrDisplayLooksLikeHarvestable(fnameLower, displayLower))
+    // Plant/world harvestables stay Harvestable. Floor BP_ItemActor / DA shells
+    // that also carry "consumable_*" (Prickly Pear fruit, etc.) must stay under
+    // DroppedPickup so Items/Dropped toggles show them — not harvestable-only.
+    if (FnameOrDisplayLooksLikeHarvestable(fnameLower, displayLower)
+        && !(classGroundLoot || fnameIsPickup))
         return WorldItemCategory::Harvestable;
 
     WorldItemCategory cat = InferLootWorldCategory(
@@ -191,10 +200,7 @@ WorldItemCategory ClassifyItem(
     return cat;
 }
 
-static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> s_depletedDeny;
-static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> s_pickupEvictAfter;
 static std::unordered_map<uintptr_t, uint8_t> s_itemPosMisses;
-static constexpr std::chrono::seconds kItemPickupDenyDuration{5};
 static constexpr uint8_t kItemPosMissEvict = 12;
 
 static bool ItemPosMissShouldEvict(uintptr_t key, bool posOk)
@@ -214,55 +220,8 @@ static void ClearItemPosMiss(uintptr_t key)
 
 static void ClearItemListStaticMaps()
 {
-    s_depletedDeny.clear();
-    s_pickupEvictAfter.clear();
     s_itemPosMisses.clear();
-}
-
-static bool IsItemAdmissionDenied(uintptr_t key)
-{
-    const auto now = std::chrono::steady_clock::now();
-    if (auto it = s_depletedDeny.find(key); it != s_depletedDeny.end()) {
-        if (now < it->second)
-            return true;
-        s_depletedDeny.erase(it);
-    }
-    return false;
-}
-
-static void MarkItemDepleted(uintptr_t key)
-{
-    const auto until =
-        std::chrono::steady_clock::now() + kItemPickupDenyDuration;
-    s_depletedDeny[key] = until;
-    s_pickupEvictAfter[key] = until;
-    ClearItemPosMiss(key);
-}
-
-static void SchedulePickupEvict(uintptr_t key)
-{
-    const auto until =
-        std::chrono::steady_clock::now() + kItemPickupDenyDuration;
-    const auto it = s_pickupEvictAfter.find(key);
-    if (it == s_pickupEvictAfter.end() || until > it->second)
-        s_pickupEvictAfter[key] = until;
-}
-
-static void PruneExpiredItemDenyEntries()
-{
-    const auto now = std::chrono::steady_clock::now();
-    for (auto it = s_depletedDeny.begin(); it != s_depletedDeny.end(); ) {
-        if (now >= it->second)
-            it = s_depletedDeny.erase(it);
-        else
-            ++it;
-    }
-    for (auto it = s_pickupEvictAfter.begin(); it != s_pickupEvictAfter.end(); ) {
-        if (now >= it->second)
-            it = s_pickupEvictAfter.erase(it);
-        else
-            ++it;
-    }
+    ClearGroundLootPickupStickyState();
 }
 
 } // namespace
@@ -318,11 +277,7 @@ void Engine::ItemList()
     int dbgAdmitted = 0;
     int dbgPosSkip = 0;
     int dbgDepleted = 0;
-    int dbgDenyReAdmit = 0;
-    int dbgTtlEvict = 0;
     int dbgDrawing = 0;
-
-    PruneExpiredItemDenyEntries();
 
     static IntervalTimer metadataTimer(250);
     const bool doMetadata = metadataTimer.fire();
@@ -333,6 +288,7 @@ void Engine::ItemList()
             continue;
         if (localPawn && key == localPawn)
             continue;
+
         if (occupiedCharacterKeys.contains(key))
             continue;
         if (WorldScan::ShouldExcludeFromWorldCaches(key, localPawn))
@@ -341,10 +297,6 @@ void Engine::ItemList()
             continue;
         if (localCache.contains(key))
             continue;
-        if (IsItemAdmissionDenied(key)) {
-            ++dbgDenyReAdmit;
-            continue;
-        }
 
         ++dbgScanned;
 
@@ -383,7 +335,7 @@ void Engine::ItemList()
         if (!scanPickupLike && FnameLooksLikeNonWorldEspActor(classFname))
             continue;
 
-        if (WorldScan::LooksLikeBotPawn(key, localPawn))
+        if (!scanPickupLike && WorldScan::LooksLikeBotPawn(key, localPawn))
             continue;
 
         std::string dataAssetFName;
@@ -432,8 +384,12 @@ void Engine::ItemList()
                 hasContainerLoot, hasItemDataAsset))
             continue;
 
-        const uintptr_t root =
-            Engine::ResolveLootActorRoot(key, pickupLike);
+        // tech- parity: floor pickups use AActor::RootComponent only. Preferring
+        // Pickup_RootCollider assigned the wrong transform → Distance 400–500m →
+        // Drawing=false while standing 14m away (see debug-5681af Ruined Parachute).
+        const uintptr_t root = pickupLike
+            ? Memory::read<uintptr_t>(key + Offsets::RootComponent)
+            : Engine::ResolveLootActorRoot(key, false);
         if (!root || !IsValidPointer(root))
             continue;
 
@@ -534,18 +490,8 @@ void Engine::ItemList()
     retainIters.reserve(localCache.size());
     retainRoots.reserve(localCache.size());
 
-    const auto retainNow = std::chrono::steady_clock::now();
-
     for (auto it = localCache.begin(); it != localCache.end(); ) {
         const uintptr_t key = it->first;
-
-        if (auto evictIt = s_pickupEvictAfter.find(key);
-            evictIt != s_pickupEvictAfter.end() && retainNow >= evictIt->second) {
-            ++dbgTtlEvict;
-            MarkItemDepleted(key);
-            it = localCache.erase(it);
-            continue;
-        }
 
         if (occupiedCharacterKeys.contains(key)) {
             it = localCache.erase(it);
@@ -573,8 +519,7 @@ void Engine::ItemList()
         const auto retainCat = static_cast<WorldItemCategory>(it->second.worldCategory);
         if (WorldLootCacheEntryDepleted(key, retainFname, retainCat)) {
             ++dbgDepleted;
-            MarkItemDepleted(key);
-            SchedulePickupEvict(key);
+            ClearItemPosMiss(key);
             it = localCache.erase(it);
             continue;
         }
@@ -642,7 +587,6 @@ void Engine::ItemList()
             && IsPlausibleWorldPos(retainIters[i]->second.WorldPos);
         if (!posOk) {
             ++dbgPosSkip;
-            // Grace like containers — never MarkItemDepleted on a one-frame DMA miss.
             if (ItemPosMissShouldEvict(key, false)) {
                 ClearItemPosMiss(key);
                 localCache.erase(key);
@@ -666,7 +610,7 @@ void Engine::ItemList()
         }
     }
 
-    FinalizeWorldCacheMap(localCache, ctx.camera, ctx.acknowledgedPawn, dbgDrawing);
+    FinalizeWorldCacheMap(localCache, ctx.camera, dbgDrawing);
 
     if (m_worldGeneration.load(std::memory_order_acquire) != genAtStart)
         return;
@@ -713,8 +657,6 @@ void Engine::ItemList()
         std::cout << "[debugItem] scanned=" << dbgScanned
             << " admitted=" << dbgAdmitted
             << " depleted=" << dbgDepleted
-            << " denyReAdmit=" << dbgDenyReAdmit
-            << " ttlEvict=" << dbgTtlEvict
             << " posSkip=" << dbgPosSkip
             << " drawing=" << dbgDrawing
             << " cache=" << itemCache.size()

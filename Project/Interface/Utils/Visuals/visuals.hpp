@@ -90,8 +90,13 @@ struct HumanSilhouetteInput {
     bool hasLegR = false;
 };
 
-/** Single filled human body outline from bone screen positions. */
-void DrawHumanSilhouetteFilled(ImDrawList* dl, const HumanSilhouetteInput& in, ImU32 fill);
+/** Single filled human body outline from bone screen positions.
+ *  softFill: translucent body (outline + afro still full opacity). */
+void DrawHumanSilhouetteFilled(
+    ImDrawList* dl,
+    const HumanSilhouetteInput& in,
+    ImU32 fill,
+    bool softFill = true);
 void Names(const std::string& name, float center_x, float top_y, const EspDrawScale& scale, ImColor color);
 void HealthBar(float min_x, float min_y, float max_y, float health, const EspDrawScale& scale, const ImColor* fillOverride = nullptr);
 ImColor HealthColorFromPct(float hpPct);

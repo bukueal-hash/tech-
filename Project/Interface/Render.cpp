@@ -185,14 +185,6 @@ static void DrawDebugOffsetValidation(Engine& eng)
         const Engine::VisCheckDebugStats visDbg = eng.CollectVisCheckDebugStats();
         drawRow(xPos, row++, "MeshVisMode", true, "%s",
             var::visiblecheck ? "render_time" : "off");
-        drawRow(xPos, row++, "CollisionLOS", visDbg.collisionLosEnabled,
-            "%s tris=%d smc=%d reb=%d",
-            visDbg.collisionLosEnabled ? "on" : "off",
-            visDbg.collisionTriCount,
-            visDbg.collisionSmcCount,
-            visDbg.collisionRebuilding ? 1 : 0);
-        drawRow(xPos, row++, "CollTris", visDbg.collisionTriCount > 0,
-            "%d", visDbg.collisionTriCount);
         drawRow(xPos, row++, "PlrMeshVis", visDbg.playersTotal > 0,
             "%d/%d", visDbg.playersMeshVisible, visDbg.playersTotal);
         drawRow(xPos, row++, "BotMeshVis", visDbg.botsTotal > 0,

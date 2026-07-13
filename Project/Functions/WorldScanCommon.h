@@ -60,6 +60,12 @@ bool IsHeldEquipmentActor(uintptr_t actor);
  */
 void CollectHeldItemActors(uintptr_t pawn, std::unordered_set<uintptr_t>& out);
 
+/**
+ * Current item in hand for ESP: Inventory CurrentItemActors[0], else best
+ * Instigator/Owner held actor (gun, bandage, nade, defib, etc.).
+ */
+uintptr_t ResolvePreferredHeldItemActor(uintptr_t pawn);
+
 struct CacheRootScatterRow {
     uintptr_t actorKey = 0;
     uintptr_t root = 0;

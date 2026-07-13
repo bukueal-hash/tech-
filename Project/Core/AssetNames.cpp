@@ -1456,11 +1456,14 @@ bool IsInventoryWorldFnameExcluded(const std::string& actorFNameLower)
     if (actorFNameLower.empty())
         return false;
 
+    // Do NOT use bare "itemactor" / "weaponactor" — those match every floor
+    // BP_ItemActor_* (Canister, salvage, DA shells) and strip them from world ESP.
+    // Held/UI-only names stay precise (inventoryservice, stowed, slots, stash…).
     static const char* kExcluded[] = {
         "inventory", "containerslot", "container_slot", "containeritem", "container_item",
         "augmentcontainer", "stashcontainer", "bonusstash", "expeditionstash", "secretstash",
         "safepocket", "backpackslot", "inventoryslot",
-        "colonyrun", "equipped", "localcurrent", "itemactor", "weaponactor",
+        "colonyrun", "equipped", "localcurrent",
         "stowedweapon", "inventoryservice", "inventoryserviceitem", "fakeinventory",
         "primaryitem", "secondaryitem", "loadout", "menu", "hud",
         "flashlight", "defibitem",
@@ -2446,20 +2449,24 @@ bool FnameLooksLikeDroppedPickup(const std::string& actorFName)
         return false;
 
     const std::string lower = ToLowerCopy(actorFName);
-    if (IsInventoryWorldFnameExcluded(lower))
-        return false;
 
-    if (FnameLooksLikePlacedWorldInteractable(lower))
-        return false;
-
+    // Pickup tokens win. Historically "itemactor" in inventory-exclude blocked
+    // every BP_ItemActor_* floor drop (Canister) while BP_PickupBase still matched.
+    // itemactor/weaponactor were removed from IsInventoryWorldFnameExcluded.
     static const char* kPickupTokens[] = {
-        "bp_pickupbase", "pickupbase", "bp_pickup", "bp_item_", "bp_itemactor_",
+        "bp_pickupbase", "pickupbase", "bp_pickup", "bp_itemactor_", "bp_item_",
         "da_item_", "wid_",
     };
     for (const char* token : kPickupTokens) {
         if (lower.find(token) != std::string::npos)
             return true;
     }
+
+    if (IsInventoryWorldFnameExcluded(lower))
+        return false;
+
+    if (FnameLooksLikePlacedWorldInteractable(lower))
+        return false;
 
     return false;
 }

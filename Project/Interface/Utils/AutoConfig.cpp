@@ -84,6 +84,7 @@ struct Snapshot {
     bool snaplines{};
     bool skeleton{};
     bool silhouette{};
+    bool silhouette_soft_fill{};
     float silhouette_max_distance_m{};
     bool show_distance{};
     bool hide_allies{};
@@ -118,8 +119,6 @@ struct Snapshot {
     int aim_hold_key{};
     int aim_bone_mode{};
     bool visiblecheck{};
-    bool obstruction_check{};
-    bool vischeck_auto_thin{};
     bool predict{};
     bool humanizer{};
     bool randombone{};
@@ -271,6 +270,7 @@ Snapshot CaptureSnapshot()
     s.snaplines = var::snaplines;
     s.skeleton = var::skeleton;
     s.silhouette = var::silhouette;
+    s.silhouette_soft_fill = var::silhouette_soft_fill;
     s.silhouette_max_distance_m = var::silhouette_max_distance_m;
     s.show_distance = var::show_distance;
     s.hide_allies = var::hide_allies;
@@ -304,8 +304,6 @@ Snapshot CaptureSnapshot()
     s.aim_hold_key = var::aim_hold_key;
     s.aim_bone_mode = static_cast<int>(var::aim_bone_mode);
     s.visiblecheck = var::visiblecheck;
-    s.obstruction_check = var::obstruction_check;
-    s.vischeck_auto_thin = var::vischeck_auto_thin;
     s.predict = var::predict;
     s.humanizer = var::humanizer;
     s.randombone = var::randombone;
@@ -416,6 +414,7 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.snaplines == b.snaplines &&
         a.skeleton == b.skeleton &&
         a.silhouette == b.silhouette &&
+        a.silhouette_soft_fill == b.silhouette_soft_fill &&
         a.silhouette_max_distance_m == b.silhouette_max_distance_m &&
         a.show_distance == b.show_distance &&
         a.hide_allies == b.hide_allies &&
@@ -448,8 +447,6 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.aim_hold_key == b.aim_hold_key &&
         a.aim_bone_mode == b.aim_bone_mode &&
         a.visiblecheck == b.visiblecheck &&
-        a.obstruction_check == b.obstruction_check &&
-        a.vischeck_auto_thin == b.vischeck_auto_thin &&
         a.predict == b.predict &&
         a.humanizer == b.humanizer &&
         a.randombone == b.randombone &&
@@ -736,6 +733,7 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     else if (key == "snaplines") var::snaplines = ParseBool(val, var::snaplines);
     else if (key == "skeleton") var::skeleton = ParseBool(val, var::skeleton);
     else if (key == "silhouette") var::silhouette = ParseBool(val, var::silhouette);
+    else if (key == "silhouette_soft_fill") var::silhouette_soft_fill = ParseBool(val, var::silhouette_soft_fill);
     else if (key == "silhouette_max_distance_m") {
         var::silhouette_max_distance_m = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.f, var::kMaxDistanceSliderM);
     }
@@ -780,8 +778,6 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
         var::aim_bone_mode = static_cast<AimBoneMode>(m);
     }
     else if (key == "visiblecheck") var::visiblecheck = ParseBool(val, var::visiblecheck);
-    else if (key == "obstruction_check") var::obstruction_check = ParseBool(val, var::obstruction_check);
-    else if (key == "vischeck_auto_thin") var::vischeck_auto_thin = ParseBool(val, var::vischeck_auto_thin);
     else if (key == "predict" || key == "Prediction") var::predict = ParseBool(val, var::predict);
     else if (key == "humanizer") var::humanizer = ParseBool(val, var::humanizer);
     else if (key == "randombone") var::randombone = ParseBool(val, var::randombone);
@@ -886,6 +882,7 @@ void WriteIni()
     file << "snaplines=" << (var::snaplines ? 1 : 0) << '\n';
     file << "skeleton=" << (var::skeleton ? 1 : 0) << '\n';
     file << "silhouette=" << (var::silhouette ? 1 : 0) << '\n';
+    file << "silhouette_soft_fill=" << (var::silhouette_soft_fill ? 1 : 0) << '\n';
     file << "silhouette_max_distance_m=" << var::silhouette_max_distance_m << '\n';
     file << "show_distance=" << (var::show_distance ? 1 : 0) << '\n';
     file << "hide_allies=" << (var::hide_allies ? 1 : 0) << '\n';
@@ -919,8 +916,6 @@ void WriteIni()
     file << "aim_hold_key=" << var::aim_hold_key << '\n';
     file << "aim_bone_mode=" << static_cast<int>(var::aim_bone_mode) << '\n';
     file << "visiblecheck=" << (var::visiblecheck ? 1 : 0) << '\n';
-    file << "obstruction_check=" << (var::obstruction_check ? 1 : 0) << '\n';
-    file << "vischeck_auto_thin=" << (var::vischeck_auto_thin ? 1 : 0) << '\n';
     file << "predict=" << (var::predict ? 1 : 0) << '\n';
     file << "humanizer=" << (var::humanizer ? 1 : 0) << '\n';
     file << "randombone=" << (var::randombone ? 1 : 0) << '\n';

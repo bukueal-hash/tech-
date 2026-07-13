@@ -320,14 +320,6 @@ void DrawArcEspTab()
     ArcMenuHoverTooltip(
         "ON: UC encrypted render-time decrypt (mesh+0x488, CL-1315578 / UC pg185 #3689); "
         "legacy plain fallback @ mesh+0x4C4. OFF: treat all as visible.");
-    ArcMenuLayout::Checkbox("Obstruction LOS", &var::obstruction_check);
-    ArcMenuHoverTooltip(
-        "UC-style static-mesh KD-tree line-of-sight. Requires Visible check. Rebuilds on move.");
-    ImGui::BeginDisabled(!var::obstruction_check);
-    ArcMenuLayout::Checkbox("Auto thin (doors)", &var::vischeck_auto_thin);
-    ImGui::EndDisabled();
-    ArcMenuHoverTooltip(
-        "Thin vertical extended bounds for door frames and thin collision primitives.");
     ImGui::BeginDisabled(!var::enableesp);
     ArcMenuLayout::Checkbox("Box", &var::box);
     ArcMenuHoverTooltip("Draw box around tracked players.");
@@ -336,7 +328,9 @@ void DrawArcEspTab()
     ArcMenuLayout::Checkbox("Names", &var::names);
     ArcMenuHoverTooltip("Display player name labels.");
     ArcMenuLayout::Checkbox("Weapon", &var::show_weapon);
-    ArcMenuHoverTooltip("Weapon name colored by tier (gray/green/blue/purple/gold).");
+    ArcMenuHoverTooltip(
+        "Held item in hand — gun, bandage, shield recharger, grenade, defibrillator, etc. "
+        "Guns tint by tier; other items use a neutral color.");
     ArcMenuLayout::Checkbox("Snaplines", &var::snaplines);
     ArcMenuHoverTooltip("Draw lines from screen bottom to players.");
     ArcMenuLayout::Checkbox("Skeleton", &var::skeleton);
@@ -344,6 +338,10 @@ void DrawArcEspTab()
     ArcMenuLayout::Checkbox("Silhouette", &var::silhouette);
     ArcMenuHoverTooltip(
         "Filled body within max distance. Beyond that, skeleton only (when both are on).");
+    ImGui::Indent(16.f);
+    ImGui::BeginDisabled(!var::silhouette);
+    ArcMenuLayout::Checkbox("Soft fill", &var::silhouette_soft_fill);
+    ArcMenuHoverTooltip("Translucent body fill instead of solid chalk.");
     ArcMenuLayout::SliderFloat(
         "Silhouette max (m, 0=25)",
         "##silhouette_max_distance_m",
@@ -353,6 +351,8 @@ void DrawArcEspTab()
         "%.0f");
     ArcMenuHoverTooltip(
         "Close: silhouette. Past this range: skeleton lines only. 0 defaults to 25 m.");
+    ImGui::EndDisabled();
+    ImGui::Unindent(16.f);
     ArcMenuLayout::Checkbox("Distance", &var::show_distance);
     ArcMenuHoverTooltip("Show distance in meters below each player.");
     if (ArcMenuLayout::Checkbox("Hide allies", &var::hide_allies))
@@ -761,8 +761,7 @@ void DrawArcDebugTab()
     ImGui::Separator();
     ImGui::TextWrapped(
         "Visible check: UC encrypted decrypt (mesh+0x488, CL-1315578 / UC pg185 #3689); "
-        "legacy plain fallback @ mesh+0x4C4. "
-        "Obstruction LOS: UC static-mesh KD-tree rebuild (see [debugVisCheck] collisionLos/tris).");
+        "legacy plain fallback @ mesh+0x4C4.");
     if (var::visiblecheck)
         ImGui::TextColored(ImVec4(0.45f, 1.0f, 0.55f, 1.0f), "Visible check: ON");
     else
@@ -812,8 +811,8 @@ void DrawArcHelpTab()
     ImGui::Spacing();
     ImGui::TextWrapped("Visuals — Bot ESP:");
     WrappedBulletText("Show robots + bot visible/invisible colors, bot distance.");
-    WrappedBulletText("Box, health bar when data is available, names, snaplines, distance, dead bot wrecks + color.");
-    WrappedBulletText("Heart toggle: pulsating marker when no health max; robot Center aim uses the same point.");
+    WrappedBulletText("Box, names, snaplines, distance, dead bot wrecks + color.");
+    WrappedBulletText("Heart toggle: pulsating marker at box center; robot Center aim uses the same point.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Visuals — World / loot:");

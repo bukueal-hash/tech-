@@ -35,6 +35,8 @@ namespace var {
     extern bool snaplines;
     extern bool skeleton;
     extern bool silhouette;
+    /** Soft translucent silhouette fill (child of silhouette). */
+    extern bool silhouette_soft_fill;
     /** Silhouette fill max range (m); 0 = use esp_distance. */
     extern float silhouette_max_distance_m;
     extern bool show_distance;
@@ -66,10 +68,6 @@ namespace var {
     extern int aim_hold_key;
     extern AimBoneMode aim_bone_mode;
     extern bool visiblecheck;
-    /** UC-style static-mesh KD-tree obstruction LOS (additive with mesh vischeck). */
-    extern bool obstruction_check;
-    /** Thin vertical extended bounds for door-frame LOS primitives. */
-    extern bool vischeck_auto_thin;
     extern bool predict;
     extern bool humanizer;
     extern bool randombone;

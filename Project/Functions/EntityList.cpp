@@ -1,7 +1,9 @@
 #include "../Core/Engine.h"
 #include "../Core/ActorType.h"
 #include "../Core/IntervalTimer.h"
+#include "../Core/AssetNames.h"
 #include "EspDraw.h"
+#include "WorldScanCommon.h"
 
 #include <iostream>
 #include <chrono>
@@ -476,8 +478,17 @@ void Engine::EntityList()
             continue;
         }
 
-        if (!gsPlayerStates.empty() && !gsPlayerStates.contains(playerState))
-            ++dbgGsEvict; // count only — still admit
+        if (PlayerStateIsBot(playerState)) {
+            ++dbgGsBot;
+            continue;
+        }
+
+        // When GameState PlayerArray is healthy, do not admit stray PS pawns —
+        // that inflated preAdmit/cache (~15) vs ~6 remotes (ghost boxes).
+        if (!gsPlayerStates.empty() && !gsPlayerStates.contains(playerState)) {
+            ++dbgGsEvict;
+            continue;
+        }
 
         const float health = ReadPawnHealthForAdmit(actor);
         if (health < 1.0f) {
@@ -591,6 +602,18 @@ void Engine::EntityList()
             continue;
         }
 
+        if (PlayerStateIsBot(playerState)) {
+            ++dbgGsBot;
+            it = localCache.erase(it);
+            continue;
+        }
+
+        if (!gsPlayerStates.empty() && !gsPlayerStates.contains(playerState)) {
+            ++dbgGsEvict;
+            it = localCache.erase(it);
+            continue;
+        }
+
         actor.actorState = playerState;
         actor.bIsDeathVerge = false;
 
@@ -629,12 +652,35 @@ void Engine::EntityList()
         actor.shield = static_cast<float>(get_armor(key));
         actor.maxshield = static_cast<float>(get_maxarmor(key));
 
-        const uintptr_t currentWeapon = GetCurrentWeaponActor(key);
-        const int quality = GetWeaponQuality(key);
-        const std::string weaponNames = GetActorFNameString(currentWeapon);
+        const uintptr_t currentHeld = WorldScan::ResolvePreferredHeldItemActor(key);
+        std::string heldFName;
+        if (currentHeld) {
+            heldFName = GetActorFNameStringCached(currentHeld);
+            if (heldFName.empty())
+                heldFName = GetActorFNameString(currentHeld);
+        }
 
-        actor.weaponName = currentWeapon ? GetWeaponName(weaponNames) : "Unarmed";
-        actor.weaponQuality = currentWeapon ? (quality + 1) : -1;
+        std::string heldLabel;
+        if (currentHeld && !heldFName.empty())
+            heldLabel = GetWeaponName(heldFName);
+        if (heldLabel.empty() && !heldFName.empty())
+            heldLabel = HumanizeActorFName(heldFName);
+        actor.weaponName = heldLabel.empty() ? (currentHeld ? "Item" : "Unarmed") : heldLabel;
+
+        // Firearm tier only — consumables/nades stay neutral-colored in ESP.
+        int quality = -1;
+        if (currentHeld) {
+            std::string lower = heldFName;
+            for (char& c : lower)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (lower.find("weaponactor") != std::string::npos
+                || lower.find("bp_weapon") != std::string::npos) {
+                quality = GetWeaponQualityFromActor(currentHeld);
+                if (quality < 0 || quality > 4)
+                    quality = GetWeaponQuality(key);
+            }
+        }
+        actor.weaponQuality = (quality >= 0 && quality <= 4) ? (quality + 1) : -1;
 
         GetBones(actor);
 

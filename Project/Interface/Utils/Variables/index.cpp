@@ -10,6 +10,7 @@ namespace var {
     bool snaplines = false;
     bool skeleton = true;
     bool silhouette = false;
+    bool silhouette_soft_fill = true;
     float silhouette_max_distance_m = 25.f;
     bool show_distance = false;
     bool hide_allies = true;
@@ -34,8 +35,6 @@ namespace var {
     int aim_hold_key = 0x10; // VK_SHIFT
     AimBoneMode aim_bone_mode = AimBoneMode::Chest;
     bool visiblecheck = true;
-    bool obstruction_check = false;
-    bool vischeck_auto_thin = true;
     bool predict = true;
     bool humanizer = false;
     bool randombone = true;

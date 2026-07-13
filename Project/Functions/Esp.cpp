@@ -24,9 +24,9 @@ extern Engine engine;
 
 namespace {
 
-constexpr size_t kMaxEspFramePosReads = 384;
-constexpr size_t kMaxEspFrameBoneReads = 32;
-constexpr size_t kReservedPlayerPosReads = 64;
+constexpr size_t kMaxEspFramePosReads = 768;
+constexpr size_t kMaxEspFrameBoneReads = 16;
+constexpr size_t kReservedPlayerPosReads = 48;
 
 namespace {
 
@@ -36,7 +36,6 @@ struct WorldEspDebugStats {
     int skipAllow = 0;
     int skipPos = 0;
     int skipDist = 0;
-    int skipPickedUp = 0;
     int skipProj = 0;
 };
 
@@ -91,7 +90,7 @@ static std::string ResolveContainerEspDrawLabel(
     const std::string fnameHint = entry.ActorName.empty() ? fname : entry.ActorName;
     const bool isOpened = var::show_world_open_container
         && (cat == WorldItemCategory::OpenedContainer
-            || ContainerLootLooksOpened(key, fnameHint));
+            || ContainerLootLooksOpenedAny(key, fnameHint));
 
     if (isOpened
         && entry.ItemDisplayName.find("(Open)") != std::string::npos
@@ -327,7 +326,9 @@ static bool ResolveLiveRenderCamera(
     const Engine::EspRenderFrame& frame,
     Engine::CameraCache& outCam)
 {
-    // g_Camera is refreshed every Update() tick — required for live distance while moving.
+    // Live POV (refreshed on the render path) first — left-stick move updates
+    // camera Location; right-stick look updates Rotation. Stale frame.camera made
+    // walk-tracking lag while look still "stuck" to the overlay.
     {
         std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
         if (CameraOkForEsp(engine.g_Camera)) {
@@ -455,7 +456,7 @@ static void DrawWeaponLabel(
 
     const ImU32 wColor = actor.weaponQuality > 0
         ? WeaponTierColor(actor.weaponQuality)
-        : IM_COL32(200, 200, 200, 255);
+        : IM_COL32(220, 220, 220, 255); // consumables / nades / unknown held
     EspDraw::DrawLabelEsp(
         drawList,
         ImVec2(anchorX, anchorY),
@@ -515,6 +516,10 @@ static float StackPlayerLabels(
 }
 
 } // namespace
+
+static void RenderPlayerEspFromFrame(
+    const std::vector<Engine::EspFramePlayer>& players,
+    const Engine::CameraCache& frameCam);
 
 static void RenderWorldEspFromFrame(
     const std::vector<Engine::EspFrameWorld>& world,
@@ -637,6 +642,31 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
     if (!g_scatter.valid())
         return false;
 
+    if (var::enableesp || var::show_radar || var::enable_aimbot) {
+        std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
+        out.players.reserve(playerCache.size());
+        for (const auto& [key, entry] : playerCache) {
+            bool include = false;
+            if (var::enableesp || var::show_radar) {
+                if (ShouldDrawPlayerEsp(entry))
+                    include = true;
+            }
+            if (!include && var::enable_aimbot) {
+                if (!entry.isAlly && !entry.bIsDead
+                    && entry.Distance <= var::aimbot_distance
+                    && IsPlausibleWorldPos(entry.WorldPos))
+                    include = true;
+            }
+            if (!include)
+                continue;
+
+            EspFramePlayer framePlayer{};
+            framePlayer.actorKey = key;
+            framePlayer.entry = entry;
+            out.players.push_back(std::move(framePlayer));
+        }
+    }
+
     if (AnyWorldEspEnabled() || var::show_radar) {
         size_t worldReserve = 0;
         {
@@ -709,7 +739,7 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
     }
 
     std::vector<EspPosReadTarget> posTargets;
-    posTargets.reserve(out.world.size() + out.robots.size());
+    posTargets.reserve(out.players.size() + out.world.size() + out.robots.size());
 
     auto queuePosTarget = [&](
         EspPosTargetKind kind,
@@ -722,6 +752,12 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             EspPosReadTarget{ kind, index, rootComponent, distance, {}, {} });
     };
 
+    for (size_t i = 0; i < out.players.size(); ++i)
+        queuePosTarget(
+            EspPosTargetKind::Player,
+            i,
+            out.players[i].entry.rootComponent,
+            out.players[i].entry.Distance);
     for (size_t i = 0; i < out.world.size(); ++i) {
         uintptr_t scatterRoot = out.world[i].entry.rootComponent;
         const auto cat = static_cast<WorldItemCategory>(out.world[i].entry.worldCategory);
@@ -749,9 +785,10 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         [](const EspPosReadTarget& a, const EspPosReadTarget& b) {
             const auto rank = [](EspPosTargetKind kind) -> int {
                 switch (kind) {
-                case EspPosTargetKind::Robot: return 0;
-                case EspPosTargetKind::World: return 1;
-                default: return 2;
+                case EspPosTargetKind::Player: return 0;
+                case EspPosTargetKind::Robot: return 1;
+                case EspPosTargetKind::World: return 2;
+                default: return 3;
                 }
             };
             const int ra = rank(a.kind);
@@ -761,8 +798,51 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             return a.distance < b.distance;
         });
 
-    if (posTargets.size() > kMaxEspFramePosReads)
-        posTargets.resize(kMaxEspFramePosReads);
+    if (posTargets.size() > kMaxEspFramePosReads) {
+        // Players reserved (nearest already sorted first within kind), then
+        // robots, then world — nearest-first so close bots/loot are not starved.
+        std::vector<EspPosReadTarget> kept;
+        kept.reserve(kMaxEspFramePosReads);
+
+        size_t playerKept = 0;
+        for (const EspPosReadTarget& t : posTargets) {
+            if (t.kind != EspPosTargetKind::Player)
+                continue;
+            if (playerKept >= kReservedPlayerPosReads)
+                break;
+            kept.push_back(t);
+            ++playerKept;
+        }
+        for (const EspPosReadTarget& t : posTargets) {
+            if (t.kind != EspPosTargetKind::Robot)
+                continue;
+            if (kept.size() >= kMaxEspFramePosReads)
+                break;
+            kept.push_back(t);
+        }
+        for (const EspPosReadTarget& t : posTargets) {
+            if (t.kind != EspPosTargetKind::World)
+                continue;
+            if (kept.size() >= kMaxEspFramePosReads)
+                break;
+            kept.push_back(t);
+        }
+        // If still room and more players beyond the reserve, fill remaining.
+        if (kept.size() < kMaxEspFramePosReads) {
+            size_t seenPlayers = 0;
+            for (const EspPosReadTarget& t : posTargets) {
+                if (t.kind != EspPosTargetKind::Player)
+                    continue;
+                ++seenPlayers;
+                if (seenPlayers <= playerKept)
+                    continue;
+                if (kept.size() >= kMaxEspFramePosReads)
+                    break;
+                kept.push_back(t);
+            }
+        }
+        posTargets = std::move(kept);
+    }
 
     float povFov = 0.f;
     float defFov = 0.f;
@@ -843,6 +923,9 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             continue;
 
         switch (target.kind) {
+        case EspPosTargetKind::Player:
+            out.players[target.index].entry.WorldPos = worldPos;
+            break;
         case EspPosTargetKind::World:
             out.world[target.index].entry.WorldPos = worldPos;
             break;
@@ -870,6 +953,13 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         pos.z += vel.z * dtSec;
     };
 
+    for (EspFramePlayer& framePlayer : out.players) {
+        Engine::PlayerCacheEntry& e = framePlayer.entry;
+        if (!IsPlausibleWorldPos(e.WorldPos))
+            continue;
+        extrapolateEntry(e.WorldPos, e.cachedVelocity, e.lastVelocityUpdate);
+    }
+
     for (EspFrameWorld& frameRobot : out.robots) {
         if (IsPlausibleWorldPos(frameRobot.entry.WorldPos))
             continue;
@@ -886,6 +976,17 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
 
     {
         const Vector3 distRef = ResolveDistanceReference(out.camera, pawn);
+        for (EspFramePlayer& framePlayer : out.players) {
+            Engine::PlayerCacheEntry& e = framePlayer.entry;
+            if (!IsPlausibleWorldPos(e.WorldPos))
+                continue;
+            const Vector3& wp = e.WorldPos;
+            const double dx = static_cast<double>(wp.x) - distRef.x;
+            const double dy = static_cast<double>(wp.y) - distRef.y;
+            const double dz = static_cast<double>(wp.z) - distRef.z;
+            e.Distance = static_cast<float>(
+                std::sqrt(dx * dx + dy * dy + dz * dz) / 100.0);
+        }
         for (EspFrameWorld& frameRobot : out.robots) {
             Engine::WorldCacheEntry& e = frameRobot.entry;
             if (!IsPlausibleWorldPos(e.WorldPos))
@@ -908,145 +1009,45 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             }),
         out.robots.end());
 
+    if (var::skeleton || var::silhouette || var::box || var::enable_aimbot) {
+        const float boneMaxM =
+            var::esp_distance > 0.f ? var::esp_distance : var::kMaxDistanceSliderM;
+        const float aimBoneMaxM = var::enable_aimbot && var::aimbot_distance > 0.f
+            ? var::aimbot_distance
+            : boneMaxM;
+        const float readMaxM = (std::max)(boneMaxM, aimBoneMaxM);
+        std::vector<size_t> boneIndices;
+        boneIndices.reserve(out.players.size());
+        for (size_t i = 0; i < out.players.size(); ++i) {
+            const Engine::PlayerCacheEntry& entry = out.players[i].entry;
+            if (entry.Distance > readMaxM)
+                continue;
+            if (!entry.APawn || !IsValidPointer(entry.APawn))
+                continue;
+            boneIndices.push_back(i);
+        }
+
+        std::sort(
+            boneIndices.begin(),
+            boneIndices.end(),
+            [&](size_t a, size_t b) {
+                return out.players[a].entry.Distance < out.players[b].entry.Distance;
+            });
+
+        if (boneIndices.size() > kMaxEspFrameBoneReads)
+            boneIndices.resize(kMaxEspFrameBoneReads);
+
+        for (size_t idx : boneIndices) {
+            Engine::PlayerCacheEntry& entry = out.players[idx].entry;
+            const uintptr_t liveMesh = GetActorBoneMesh(entry.APawn);
+            if (liveMesh)
+                entry.actorMesh = liveMesh;
+            GetBones(entry);
+        }
+    }
+
     out.valid = true;
     return true;
-}
-
-// help: root RelativeLocation 0x218 first; then scene; net fallback
-static constexpr std::ptrdiff_t kACharacterMesh = 0x428;
-static constexpr std::ptrdiff_t kACharacterMovement = 0x430;
-static constexpr std::ptrdiff_t kACharacterCapsule = 0x438;
-static constexpr std::ptrdiff_t kCmcLastUpdateLocation = 0x3e0;
-static constexpr std::ptrdiff_t kReplicatedMovement = 0x150;
-static constexpr std::ptrdiff_t kRepMovLocation = 0x30;
-static constexpr std::ptrdiff_t kStateInterpolator = 0x7c0;
-static constexpr std::ptrdiff_t kReplicatedRootTransform = 0x1f8;
-
-static Vector3 ResolvePlayerWorldPosLive(uintptr_t pawn, uintptr_t root, uintptr_t /*legacy*/)
-{
-    auto tryScene = [](uintptr_t comp) -> Vector3 {
-        if (!comp || !engine.IsValidPointer(comp))
-            return {};
-        const Vector3 p = Engine::ReadSceneWorldPos(comp);
-        return IsPlausibleWorldPos(p) ? p : Vector3{};
-    };
-    auto tryFVector3d = [](uintptr_t addr) -> Vector3 {
-        if (!addr || !engine.IsValidPointer(addr))
-            return {};
-        const Engine::FVector3d loc = Memory::read_nocache<Engine::FVector3d>(addr);
-        const Vector3 p = Engine::ToVector3(loc);
-        return IsPlausibleWorldPos(p) ? p : Vector3{};
-    };
-
-    if (pawn && engine.IsValidPointer(pawn)) {
-        // Prefer live CompToWorld — RelativeLocation freezes on remotes (posSame).
-        const uintptr_t comps[] = {
-            Memory::read_nocache<uintptr_t>(pawn + Offsets::EmbarkMesh),
-            Memory::read_nocache<uintptr_t>(pawn + kACharacterMesh),
-            Memory::read_nocache<uintptr_t>(pawn + kACharacterCapsule),
-        };
-        for (uintptr_t c : comps) {
-            if (const Vector3 p = tryScene(c); IsPlausibleWorldPos(p))
-                return p;
-        }
-        if (const Vector3 p = tryScene(root); IsPlausibleWorldPos(p))
-            return p;
-
-        if (root && engine.IsValidPointer(root)) {
-            const Vector3 rel = Memory::read_nocache<Vector3>(
-                root + Offsets::RelativeLocation);
-            if (IsPlausibleWorldPos(rel))
-                return rel;
-        }
-
-        {
-            const uintptr_t interp =
-                Memory::read_nocache<uintptr_t>(pawn + kStateInterpolator);
-            if (interp && engine.IsValidPointer(interp)) {
-                if (const Vector3 p = tryFVector3d(interp + kReplicatedRootTransform);
-                    IsPlausibleWorldPos(p))
-                    return p;
-            }
-        }
-
-        if (const Vector3 p = tryFVector3d(
-                pawn + kReplicatedMovement + kRepMovLocation);
-            IsPlausibleWorldPos(p))
-            return p;
-
-        uintptr_t cmc = Memory::read_nocache<uintptr_t>(
-            pawn + Offsets::PioneerCharacterMovement);
-        if (!cmc || !engine.IsValidPointer(cmc))
-            cmc = Memory::read_nocache<uintptr_t>(pawn + kACharacterMovement);
-        if (cmc && engine.IsValidPointer(cmc)) {
-            if (const Vector3 p = tryFVector3d(cmc + kCmcLastUpdateLocation); IsPlausibleWorldPos(p))
-                return p;
-        }
-    }
-
-    return tryScene(root);
-}
-
-static Vector3 ReadLivePlayerWorldPos(uintptr_t pawn, Engine::PlayerCacheEntry& live)
-{
-    Vector3 pos = live.WorldPos;
-    if (pawn && engine.IsValidPointer(pawn)) {
-        const uintptr_t root =
-            Memory::read_nocache<uintptr_t>(pawn + Offsets::RootComponent);
-        const Vector3 fresh = ResolvePlayerWorldPosLive(pawn, root, 0);
-        if (IsPlausibleWorldPos(fresh))
-            pos = fresh;
-    }
-
-    // Match bot extrapolateEntry — bridge network-tick gaps with cachedVelocity.
-    if (live.lastVelocityUpdate > 0.f) {
-        const uint64_t nowMs = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch())
-                .count());
-        const float dtSec =
-            (nowMs - static_cast<uint64_t>(live.lastVelocityUpdate)) * 0.001f;
-        if (dtSec > 0.f && dtSec < 0.12f) {
-            pos.x += live.cachedVelocity.x * dtSec;
-            pos.y += live.cachedVelocity.y * dtSec;
-            pos.z += live.cachedVelocity.z * dtSec;
-        }
-    }
-    return pos;
-}
-
-/** Re-decrypt bone array + ComponentToWorld at render time (UE double-buffer). */
-static void RefreshBoneWorldPositions(Engine& eng, Engine::PlayerCacheEntry& live)
-{
-    uintptr_t boneMesh = 0;
-    const uintptr_t resolved = eng.ResolveBoneArray(
-        live.APawn, live.actorMesh, &boneMesh);
-    if (resolved && eng.IsValidPointer(resolved) && boneMesh
-        && eng.IsValidPointer(boneMesh)) {
-        live.boneArray = resolved;
-        live.boneMesh = boneMesh;
-    } else if (!live.boneArray || !eng.IsValidPointer(live.boneArray)) {
-        return;
-    }
-
-    boneMesh = live.boneMesh ? live.boneMesh : live.actorMesh;
-    if (!boneMesh || !eng.IsValidPointer(boneMesh))
-        return;
-
-    const FTransform ctw = Engine::ReadComponentToWorld(boneMesh);
-    for (const auto& [gameIndex, uniBone] : eng.GameBoneMapArcRaiders) {
-        const size_t idx = static_cast<size_t>(uniBone);
-        if (!live.boneData.valid.test(idx))
-            continue;
-        const FTransform bone =
-            Memory::read_nocache<FTransform>(live.boneArray + (gameIndex * 0x60));
-        const D3DMATRIX mat = eng.MatrixMultiplication(
-            bone.ToMatrixWithScale(),
-            ctw.ToMatrixWithScale());
-        const Vector3 world(mat._41, mat._42, mat._43);
-        if (IsPlausibleWorldPos(world))
-            live.boneData.bonesWorldDouble[idx] = world;
-    }
 }
 
 static void DrawPlayerEspList(
@@ -1069,13 +1070,11 @@ static void DrawPlayerEspList(
             continue;
         if (actor->Distance < 2.f)
             continue;
-
-        Engine::PlayerCacheEntry live = *actor;
-        live.WorldPos = ReadLivePlayerWorldPos(actor->APawn, live);
-        if (!IsPlausibleWorldPos(live.WorldPos))
+        if (!IsPlausibleWorldPos(actor->WorldPos))
             continue;
-        live.Distance = engine.EspDistanceMeters(live.WorldPos, frameCam, 0);
-        RefreshBoneWorldPositions(engine, live);
+
+        // Frame-synced WorldPos (scatter + velocity) — no per-paint live DMA.
+        const Engine::PlayerCacheEntry& live = *actor;
 
         Vector3 headWorld{};
         Vector3 feetWorld{};
@@ -1097,12 +1096,11 @@ static void DrawPlayerEspList(
         const Visuals::EspDrawScale scale =
             Visuals::ComputeEspScaleFromBox(boxH, live.Distance);
 
-        const bool drawSilhouette =
+        const bool wantSilhouette =
             var::silhouette && live.Distance <= silhouetteMaxM;
-        const bool drawSkeleton =
-            var::skeleton && !drawSilhouette;
+        bool drewSilhouette = false;
 
-        if (drawSilhouette) {
+        if (wantSilhouette) {
             Visuals::HumanSilhouetteInput silIn{};
             if (EspDraw::BuildHumanSilhouetteInput(engine, live, frameCam, silIn)) {
                 const ImU32 fill = (color & 0x00FFFFFFu)
@@ -1110,9 +1108,14 @@ static void DrawPlayerEspList(
                            static_cast<int>((color >> IM_COL32_A_SHIFT) & 0xFF) / 2 + 64,
                            48,
                            180)) << IM_COL32_A_SHIFT);
-                Visuals::DrawHumanSilhouetteFilled(drawList, silIn, fill);
+                Visuals::DrawHumanSilhouetteFilled(
+                    drawList, silIn, fill, var::silhouette_soft_fill);
+                drewSilhouette = true;
             }
-        } else if (drawSkeleton) {
+        }
+        // Skeleton when silhouette off, OR when silhouette wanted but head/neck
+        // failed to build (otherwise Silhouette-on kills the stick figure head).
+        if (var::skeleton && !drewSilhouette) {
             DrawPlayerSkeletonFromCache(
                 drawList, engine, live, frameCam, color, live.Distance);
         }
@@ -1144,6 +1147,55 @@ static void DrawPlayerEspList(
         if (var::snaplines && EspDraw::IsEspPointOnScreen(feet))
             EspDraw::DrawSnaplineEsp(drawList, feet, color, live.Distance);
     }
+}
+
+static void RenderPlayerEspFromFrame(
+    const std::vector<Engine::EspFramePlayer>& players,
+    const Engine::CameraCache& frameCam)
+{
+    if (!var::enableesp)
+        return;
+
+    static thread_local std::vector<Engine::PlayerCacheEntry> drawEntries;
+    drawEntries.clear();
+    drawEntries.reserve(players.size());
+
+    std::unordered_set<uintptr_t> seenKeys;
+    std::unordered_set<uintptr_t> seenPlayerStates;
+    std::unordered_set<uintptr_t> seenPawns;
+
+    for (const Engine::EspFramePlayer& item : players) {
+        if (!IsPlausibleWorldPos(item.entry.WorldPos))
+            continue;
+        if (item.entry.Distance < 2.f)
+            continue;
+        if (!seenKeys.insert(item.actorKey).second)
+            continue;
+        if (item.entry.actorState) {
+            if (!seenPlayerStates.insert(item.entry.actorState).second)
+                continue;
+        } else if (item.entry.APawn && !seenPawns.insert(item.entry.APawn).second) {
+            continue;
+        }
+        drawEntries.push_back(item.entry);
+    }
+
+    std::sort(
+        drawEntries.begin(),
+        drawEntries.end(),
+        [](const Engine::PlayerCacheEntry& a, const Engine::PlayerCacheEntry& b) {
+            return a.Distance > b.Distance;
+        });
+
+    // Bones already refreshed in CollectEspRenderFrame (once per frame build).
+    // Per-paint GetBones doubled DMA load and drove FPGA packet loss red.
+
+    std::vector<const Engine::PlayerCacheEntry*> actors;
+    actors.reserve(drawEntries.size());
+    for (const Engine::PlayerCacheEntry& entry : drawEntries)
+        actors.push_back(&entry);
+
+    DrawPlayerEspList(actors, frameCam);
 }
 
 void Engine::RenderPlayerEspFromCache(const CameraCache& renderCam)
@@ -1250,6 +1302,8 @@ static void RenderRobotEspFromFrame(
 
         const std::string botLabel =
             ResolveBotDrawLabel(key, robot.ActorName, fname);
+        // No name → no draw (distance/heart-only rows are ghost spots).
+        // Never use ARC/Bot/Oil placeholders.
         if (botLabel.empty()) {
             RecordBotDrawLabelMiss();
             continue;
@@ -1257,19 +1311,11 @@ static void RenderRobotEspFromFrame(
         if (!EspDraw::IsEspBoxOnScreen(head, feet))
             continue;
 
-        // Health bar for constructable bots (maxhealth > 0 means HealthService read succeeded).
-        // Regular bots fall back to the pulsating heart — no live health field available for them.
+        // Heart only — no bot health bars (constructable HealthService often unread /
+        // unused; heart is the consistent marker and matches robot Center aim).
         float botLabelY = head.y;
-        if (var::showRobots && var::bot_heart) {
-            if (robot.maxhealth > 0.f) {
-                botLabelY = Visuals::HealthShieldBarsAboveHead(
-                    head.x, head.y, boxH * 0.65f,
-                    robot.health, robot.maxhealth,
-                    0.f, 0.f, scale, drawList);
-            } else {
-                DrawBotHeartIfEnabled(drawList, head, feet, boxH, scale, color);
-            }
-        }
+        if (var::showRobots && var::bot_heart)
+            DrawBotHeartIfEnabled(drawList, head, feet, boxH, scale, color);
 
         if (var::bot_box) {
             const Vector3 screenTop{ head.x, head.y, 0.0 };
@@ -1322,35 +1368,26 @@ void Engine::RenderEsp()
         ImGui::GetIO().DisplaySize.x,
         ImGui::GetIO().DisplaySize.y);
 
-    Engine::CameraCache renderCam{};
-    {
-        std::shared_lock<std::shared_mutex> lock(m_cameraMutex);
-        renderCam = g_Camera;
-    }
-    if (!IsUsableCameraFov(renderCam.FOV) || !IsPlausibleWorldPos(renderCam.Location))
-        return;
-
-    g_renderQueue.newFrame();
-
-    if (drawPlayers)
-        RenderPlayerEspFromCache(renderCam);
-
     EspRenderFrame frame{};
     {
         std::shared_lock<std::shared_mutex> lock(m_espFrameMutex);
         frame = m_lastEspFrame;
     }
+    if (!frame.valid)
+        return;
 
-    Engine::CameraCache frameCam = renderCam;
-    if (frame.valid)
-        ResolveLiveRenderCamera(frame, frameCam);
+    Engine::CameraCache renderCam{};
+    if (!ResolveLiveRenderCamera(frame, renderCam))
+        return;
 
-    if (frame.valid) {
-        if (var::showRobots)
-            RenderRobotEspFromFrame(frame.robots, frameCam);
-        if (drawWorld)
-            RenderWorldEspFromFrame(frame.world, frameCam);
-    }
+    g_renderQueue.newFrame();
+
+    if (drawPlayers)
+        RenderPlayerEspFromFrame(frame.players, renderCam);
+    if (var::showRobots)
+        RenderRobotEspFromFrame(frame.robots, renderCam);
+    if (drawWorld)
+        RenderWorldEspFromFrame(frame.world, renderCam);
 
     g_renderQueue.endFrame();
 
@@ -1370,7 +1407,6 @@ void Engine::RenderEsp()
                 << " skipAllow=" << g_worldEspDbg.skipAllow
                 << " skipPos=" << g_worldEspDbg.skipPos
                 << " skipDist=" << g_worldEspDbg.skipDist
-                << " skipPickedUp=" << g_worldEspDbg.skipPickedUp
                 << " skipProj=" << g_worldEspDbg.skipProj
                 << std::endl;
         }
@@ -1392,6 +1428,8 @@ static void RenderWorldEspFromFrame(
         return;
 
     const Engine::EngineStateSnapshot stateSnap = engine.GetStateSnapshot();
+    const Vector3 distRef = engine.ResolveDistanceReference(
+        frameCam, stateSnap.acknowledgedPawn);
 
     for (const Engine::EspFrameWorld& item : world) {
         const uintptr_t key = item.actorKey;
@@ -1410,7 +1448,11 @@ static void RenderWorldEspFromFrame(
             ++dbg.skipPos;
             continue;
         }
-        const float distM = engine.EspDistanceMeters(worldPos, frameCam, 0);
+        const double dx = static_cast<double>(worldPos.x) - distRef.x;
+        const double dy = static_cast<double>(worldPos.y) - distRef.y;
+        const double dz = static_cast<double>(worldPos.z) - distRef.z;
+        const float distM = static_cast<float>(
+            std::sqrt(dx * dx + dy * dy + dz * dz) / 100.0);
 
         std::string fname = engine.GetActorFNameStringCached(key);
         if (fname.empty())
@@ -1422,13 +1464,6 @@ static void RenderWorldEspFromFrame(
         const bool isGroundLoot = IsGroundLootEspCategory(cat);
         const bool isContainerEsp =
             WorldCategoryIsContainerProp(cat) && !isGroundLoot;
-
-        if (isGroundLoot
-            && GroundLootLooksPickedUp(
-                key, fname.empty() ? entry.ActorName : fname)) {
-            ++dbg.skipPickedUp;
-            continue;
-        }
 
         std::string classFname;
         if (isContainerEsp)
@@ -1501,14 +1536,29 @@ static void RenderWorldEspFromFrame(
                 !mem.empty() && !IsJunkWorldEspLabel(mem)
                 && !IsGarbledEspLabel(mem) && IsPlausibleEspLabel(mem))
                 label = mem;
-            if (label.empty() || IsJunkWorldEspLabel(label) || IsGarbledEspLabel(label)) {
-                if (!entry.ItemDisplayName.empty()
-                    && !IsJunkWorldEspLabel(entry.ItemDisplayName)
-                    && !IsGarbledEspLabel(entry.ItemDisplayName))
-                    label = entry.ItemDisplayName;
-                else
-                    label = "Pickup";
+            if (label.empty() || IsJunkWorldEspLabel(label) || IsGarbledEspLabel(label)
+                || !IsPlausibleEspLabel(label) || IsGenericWorldEspLabel(label)) {
+                if (const int64_t assetId = TryReadItemGameAssetIdFromActor(key);
+                    assetId != 0) {
+                    const std::string fromId = LookupDisplayByAssetId(assetId);
+                    if (!fromId.empty() && !IsJunkWorldEspLabel(fromId)
+                        && !IsGarbledEspLabel(fromId) && IsPlausibleEspLabel(fromId))
+                        label = fromId;
+                }
             }
+            if (label.empty() || IsJunkWorldEspLabel(label) || IsGarbledEspLabel(label)
+                || !IsPlausibleEspLabel(label) || IsGenericWorldEspLabel(label)) {
+                if (!fname.empty()) {
+                    const std::string fromAsset = LookupByAssetName(fname);
+                    if (!fromAsset.empty() && !IsJunkWorldEspLabel(fromAsset)
+                        && IsPlausibleEspLabel(fromAsset))
+                        label = fromAsset;
+                }
+            }
+            // Never draw engine junk (Interface Property, Root Collider, …) as loot.
+            if (label.empty() || IsJunkWorldEspLabel(label) || IsGarbledEspLabel(label)
+                || !IsPlausibleEspLabel(label) || IsGenericWorldEspLabel(label))
+                continue;
         }
         if (label.empty())
             continue;
@@ -1587,7 +1637,7 @@ static void RenderWorldEspFromFrame(
             [&]() -> WorldItemCategory {
                 if (!isContainerEsp || !var::show_world_open_container)
                     return cat;
-                if (ContainerLootLooksOpened(
+                if (ContainerLootLooksOpenedAny(
                         key,
                         entry.ActorName.empty() ? fname : entry.ActorName))
                     return WorldItemCategory::OpenedContainer;

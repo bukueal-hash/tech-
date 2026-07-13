@@ -1,8 +1,8 @@
 #include "../Core/Engine.h"
 #include "../Core/ActorType.h"
 #include "../Core/AssetNames.h"
+#include "../Core/BotTypes.h"
 #include "../Core/IntervalTimer.h"
-#include "CollisionLos.h"
 #include "RobotList.h"
 #include "WorldScanCommon.h"
 
@@ -306,11 +306,24 @@ bool QuickBotCandidate(uintptr_t actor)
     if (HasWorldItemStructure(actor))
         return false;
 
-    const std::string fnameCached = engine.GetActorFNameStringCached(actor);
-    if (!fnameCached.empty()) {
-        if (!ResolveRobotTypeFromFName(engine, fnameCached).empty())
+    auto fnameLooksLikeBot = [](const std::string& fname) -> bool {
+        if (fname.empty())
+            return false;
+        if (!ResolveRobotTypeFromFName(engine, fname).empty())
             return true;
-        if (!LookupEnemyBotByFName(fnameCached).empty())
+        if (!LookupEnemyBotByFName(fname).empty())
+            return true;
+        return false;
+    };
+
+    // Cached fname first (cheap). Fresh snitch spawns often miss the cache —
+    // decrypt once so QuickBot does not skip actors Verify would accept.
+    const std::string fnameCached = engine.GetActorFNameStringCached(actor);
+    if (fnameLooksLikeBot(fnameCached))
+        return true;
+    if (fnameCached.empty()) {
+        const std::string fname = engine.GetActorFNameString(actor);
+        if (fnameLooksLikeBot(fname))
             return true;
     }
 
@@ -419,6 +432,7 @@ bool ShouldSkipBotActor(
     uintptr_t localPawn,
     const Vector3& localPos)
 {
+    (void)localPos;
     if (!actor)
         return true;
     if (localPawn && actor == localPawn)
@@ -428,26 +442,6 @@ bool ShouldSkipBotActor(
 
     if (engine.IsCachedPlayer(actor))
         return true;
-
-    // Near-self skip: coincident ghost/duplicate pawn near local position.
-    // Never skip proven ARC bots (melee/on-top Wasps must still admit).
-    if (IsPlausibleWorldPos(localPos)) {
-        const uintptr_t root = ResolveBotSceneRoot(actor);
-        if (root) {
-            const Vector3 botPos = ResolveBotWorldPos(actor, root, 0);
-            if (IsPlausibleWorldPos(botPos)) {
-                const double dx = botPos.x - localPos.x;
-                const double dy = botPos.y - localPos.y;
-                const double dz = botPos.z - localPos.z;
-                const double distM = std::sqrt(dx * dx + dy * dy + dz * dz) / 100.0;
-                if (distM < 0.5
-                    && !ArcActorType::IsAnyBotActor(actor)
-                    && !HasStrongEnemyDataAsset(actor)
-                    && !WorldScan::HasArcEnemyAssetPointer(actor))
-                    return true;
-            }
-        }
-    }
 
     return false;
 }
@@ -813,12 +807,8 @@ uint8_t ReadBotBrokenFlag(uintptr_t actor)
     if (broken == 1)
         return 1;
 
-    // Wasp-type / regular bots: treat depleted HealthComponent as dead.
-    const double h = Engine::ReadHealthComponentStat(actor, Offsets::Health);
-    const double m = Engine::ReadHealthComponentStat(actor, Offsets::MaxHealth);
-    if (std::isfinite(h) && std::isfinite(m) && m > 0.0 && h <= 0.0)
-        return 1;
-
+    // Do not treat Health≤0 as dead here — spawn frames often read 0 HP and
+    // that blocked snitch admits until the next healthy admission window.
     return 0;
 }
 
@@ -899,17 +889,60 @@ std::string ResolveBotDrawLabel(
     const std::string& cachedLabel,
     const std::string& fnameHint)
 {
-    if (!cachedLabel.empty()
-        && cachedLabel != kBotStructAdmissionToken
-        && IsAcceptedBotEspLabel(engine, cachedLabel, fnameHint))
-        return cachedLabel;
+    auto acceptOrNormalize = [](const std::string& label, const std::string& hint) -> std::string {
+        if (label.empty() || label == kBotStructAdmissionToken)
+            return {};
+        if (label == "ARC" || label == "Bot" || label == "Oil")
+            return {};
+        if (IsAcceptedBotEspLabel(engine, label, hint))
+            return label;
+        const std::string normalized = NormalizeBotDisplayName(label);
+        if (IsRobotsListType(normalized))
+            return normalized;
+        if (const std::string mapped = LookupEnemyBotByFName(label); !mapped.empty())
+            return mapped;
+        if (const std::string mapped = LookupEnemyBotDisplayLabel(label); !mapped.empty()
+            && IsRobotsListType(NormalizeBotDisplayName(mapped)))
+            return NormalizeBotDisplayName(mapped);
+        return {};
+    };
 
-    const std::string resolved = ResolveBotTypeLabel(actor, fnameHint);
-    if (resolved.empty())
+    if (const std::string hit = acceptOrNormalize(cachedLabel, fnameHint); !hit.empty())
+        return hit;
+
+    if (const std::string resolved = ResolveBotTypeLabel(actor, fnameHint); !resolved.empty()) {
+        if (const std::string hit = acceptOrNormalize(resolved, fnameHint); !hit.empty())
+            return hit;
+    }
+
+    // Bot-only fallbacks when FName decrypt flakes — do not use item/world naming.
+    auto tryToken = [&](const std::string& name) -> std::string {
+        if (name.empty())
+            return {};
+        if (const std::string tok = LookupBotClassToken(name); !tok.empty())
+            return acceptOrNormalize(tok, fnameHint);
+        if (const std::string fromPat = LookupEnemyBotByFName(name); !fromPat.empty())
+            return acceptOrNormalize(fromPat, fnameHint);
         return {};
-    if (!IsAcceptedBotEspLabel(engine, resolved, fnameHint))
-        return {};
-    return resolved;
+    };
+
+    if (const std::string hit = tryToken(fnameHint); !hit.empty())
+        return hit;
+
+    if (actor) {
+        if (const std::string hit = tryToken(engine.GetActorClassFName(actor)); !hit.empty())
+            return hit;
+        if (const std::string enemy = GetEnemyTypeDataAssetFName(actor); !enemy.empty()) {
+            if (const std::string hit = tryToken(enemy); !hit.empty())
+                return hit;
+            if (const std::string fromEnemy = ResolveEnemyAssetBotLabel(actor); !fromEnemy.empty()) {
+                if (const std::string hit = acceptOrNormalize(fromEnemy, fnameHint); !hit.empty())
+                    return hit;
+            }
+        }
+    }
+
+    return {};
 }
 
 void Engine::RobotList()
@@ -959,8 +992,8 @@ void Engine::RobotList()
                 localPos = rootPos;
         }
     }
-    if (var::obstruction_check)
-        CollisionLos::ScheduleWorldRebuild(sGWorld, localPos);
+    // LOS mesh rebuild is owned by Update — calling it every RobotList tick
+    // kept VisCheck rebuilding=1 with smc thousands (overlay lag).
 
     const float maxDistM = var::bot_esp_distance > 0.f ? var::bot_esp_distance : var::kMaxDistanceSliderM;
     const float maxDistSq = maxDistM * maxDistM * 10000.0f;
@@ -979,8 +1012,7 @@ void Engine::RobotList()
             ++it;
     }
 
-    static IntervalTimer admissionTimer(50);
-    const bool doAdmission = admissionTimer.fire() || localCache.empty();
+    const bool doAdmission = true;
 
     int dbgScanned = 0;
     int dbgAdmitted = 0;
@@ -1059,41 +1091,21 @@ void Engine::RobotList()
     }
     }
 
-    // Scatter-batch root transforms for the hot update pass.
-    std::vector<std::unordered_map<uintptr_t, WorldCacheEntry>::iterator> updateIters;
-    std::vector<Vector3> rootPosBufs;
-    updateIters.reserve(localCache.size());
-    rootPosBufs.reserve(localCache.size());
-
+    // ComponentToWorld only — RelativeLocation is local-space and looked
+    // "plausible" as WorldPos (console: distSkip=130 maxDist=188, drawing=6).
+    int dbgScenePosOk = 0;
+    int dbgScenePosFail = 0;
     for (auto it = localCache.begin(); it != localCache.end(); ++it) {
-        const uintptr_t key = it->first;
-        it->second.rootComponent = ResolveBotSceneRoot(key);
+        it->second.rootComponent = ResolveBotSceneRoot(it->first);
         if (!it->second.rootComponent)
             continue;
-        updateIters.push_back(it);
-        rootPosBufs.emplace_back();
-    }
-
-    if (!updateIters.empty()) {
-        ScatterSession scatter;
-        if (scatter.isValid()) {
-            bool ok = true;
-            for (size_t i = 0; i < updateIters.size(); ++i) {
-                ok = ok && scatter.prepare(
-                    updateIters[i]->second.rootComponent + Offsets::RelativeLocation,
-                    rootPosBufs[i]);
-            }
-            if (ok && scatter.execute()) {
-                for (size_t i = 0; i < updateIters.size(); ++i) {
-                    Vector3 pos = rootPosBufs[i];
-                    const Vector3 scene =
-                        Engine::ReadSceneWorldPos(updateIters[i]->second.rootComponent);
-                    if (IsPlausibleWorldPos(scene))
-                        pos = scene;
-                    if (IsPlausibleWorldPos(pos))
-                        updateIters[i]->second.WorldPos = pos;
-                }
-            }
+        const Vector3 scene =
+            Engine::ReadSceneWorldPos(it->second.rootComponent);
+        if (IsPlausibleWorldPos(scene)) {
+            it->second.WorldPos = scene;
+            ++dbgScenePosOk;
+        } else {
+            ++dbgScenePosFail;
         }
     }
 
@@ -1117,17 +1129,20 @@ void Engine::RobotList()
 
         // CHECK #2 — cheap retain gate (admission already ran full VerifyBotActor).
         if (!StillLooksLikeBot(key, sAcknowledgedPawn, actor.category, localPos)) {
+            ClearBotVisualMiss(key);
             it = localCache.erase(it);
             continue;
         }
 
         if (!getAllowType(actor.ActorName, 3)) {
+            ClearBotVisualMiss(key);
             it = localCache.erase(it);
             continue;
         }
 
         actor.rootComponent = ResolveBotSceneRoot(key);
         if (!actor.rootComponent) {
+            ClearBotVisualMiss(key);
             it = localCache.erase(it);
             continue;
         }
@@ -1138,6 +1153,7 @@ void Engine::RobotList()
         const uint8_t broken = ReadBotBrokenFlag(key);
         actor.IsBreaked = broken != 0;
         if (broken != 0 && !var::show_dead_bots) {
+            ClearBotVisualMiss(key);
             it = localCache.erase(it);
             continue;
         }
@@ -1169,12 +1185,9 @@ void Engine::RobotList()
         PopulateBotPartCache(actor, key);
 
         // Destroyed bots can linger in the actor list with a stale root transform.
+        // Do not rescue with WorldPos alone — that kept ghosts Drawing at old spots.
         if (!broken) {
             bool visualOk = HasLiveBotVisual(key, actor.Mesh);
-            // Scatter-read WorldPos is authoritative once plausible — do not hide
-            // bots when mesh child probes fail transiently.
-            if (!visualOk && IsPlausibleWorldPos(actor.WorldPos))
-                visualOk = true;
             if (!visualOk) {
                 ++dbgVisSkip;
                 if (BotVisualMissShouldEvict(key, false)) {
@@ -1191,19 +1204,15 @@ void Engine::RobotList()
 
         if (!IsPlausibleWorldPos(actor.WorldPos)) {
             ++dbgZeroPos;
+            ClearBotVisualMiss(key);
             it = localCache.erase(it);
             continue;
         }
 
         UpdateBotVelocity(actor, actor.WorldPos);
 
-        Vector3 losTarget = IsPlausibleWorldPos(actor.CenterWorldPos)
-            ? actor.CenterWorldPos
-            : actor.WorldPos;
-
         actor.isVisible = var::visiblecheck
-            ? (VisibleBotActor(key)
-                && (!var::obstruction_check || HasLineOfSight(cam.Location, losTarget)))
+            ? VisibleBotActor(key)
             : true;
 
         Vector3 delta = actor.WorldPos - cam.Location;
@@ -1256,6 +1265,8 @@ void Engine::RobotList()
             << " distSkip=" << dbgDistSkip
             << " maxDist=" << static_cast<int>(maxDistM)
             << " zeroPos=" << dbgZeroPos
+            << " sceneOk=" << dbgScenePosOk
+            << " sceneFail=" << dbgScenePosFail
             << " enemyCount=" << dbgEnemyCount
             << std::endl;
     }

@@ -270,6 +270,27 @@ void FillSegment(ImDrawList* dl, ImVec2 a, ImVec2 b, float halfWa, float halfWb,
     dl->AddConvexPolyFilled(quad, 4, fill);
 }
 
+void StrokeSegment(ImDrawList* dl, ImVec2 a, ImVec2 b, float halfWa, float halfWb, ImU32 col, float thickness)
+{
+    float nx = 0.f, ny = 0.f, len = 0.f;
+    if (!AxisPerp(a, b, nx, ny, len))
+        return;
+    const ImVec2 quad[4] = {
+        OffsetPt(a, nx, ny, halfWa),
+        OffsetPt(a, -nx, -ny, halfWa),
+        OffsetPt(b, -nx, -ny, halfWb),
+        OffsetPt(b, nx, ny, halfWb),
+    };
+    dl->AddPolyline(quad, 4, col, ImDrawFlags_Closed, thickness);
+}
+
+/** Skip limb segments that are absurdly long on screen (DMA bone spikes → blobs). */
+bool SegOk(ImVec2 a, ImVec2 b, float bodyH, float maxFrac = 0.55f)
+{
+    const float len = std::hypot(b.x - a.x, b.y - a.y);
+    return len >= 1.5f && len <= bodyH * maxFrac;
+}
+
 void FillLimbChainSmooth(
     ImDrawList* dl,
     const ImVec2* joints,
@@ -306,7 +327,10 @@ void FillTorsoAlongSpine(
     float wChest,
     float wWaist,
     float wHip,
-    ImU32 fill)
+    ImU32 fill,
+    bool stroke,
+    ImU32 strokeCol,
+    float strokeTh)
 {
     const ImVec2 spineTop = in.neck;
     ImVec2 spineBot = in.pelvis;
@@ -332,7 +356,7 @@ void FillTorsoAlongSpine(
     float wTop = wNeck;
     if (in.hasClavicleL && in.hasClavicleR) {
         const float shoulderSpan = std::hypot(in.clavicleR.x - in.clavicleL.x, in.clavicleR.y - in.clavicleL.y);
-        wTop = std::max(wChest * 0.85f, shoulderSpan * 0.42f);
+        wTop = std::max(wChest * 0.78f, shoulderSpan * 0.36f);
     }
 
     ImVec2 poly[10]{};
@@ -345,11 +369,78 @@ void FillTorsoAlongSpine(
     poly[pn++] = OffsetPt(waistPt, -nx, -ny, wWaist);
     poly[pn++] = OffsetPt(chestPt, -nx, -ny, wChest);
     poly[pn++] = OffsetPt(spineTop, -nx, -ny, wTop);
-    if (pn >= 3)
+    if (pn >= 3) {
         dl->AddConvexPolyFilled(poly, pn, fill);
+        if (stroke)
+            dl->AddPolyline(poly, pn, strokeCol, ImDrawFlags_Closed, strokeTh);
+    }
 }
 
-void DrawHumanSilhouetteFilledImpl(ImDrawList* dl, const Visuals::HumanSilhouetteInput& in, ImU32 fill)
+void DrawBlackAfro(
+    ImDrawList* dl,
+    const Visuals::HumanSilhouetteInput& in,
+    ImVec2 headCenter,
+    float headR,
+    float headRot,
+    float hux,
+    float huy)
+{
+    if (!dl || !in.hasHead || !in.hasNeck || headR < 2.f)
+        return;
+
+    float sideScale = 1.f;
+    float sideBiasX = 0.f;
+    float sideBiasY = 0.f;
+    if (in.hasClavicleL && in.hasClavicleR) {
+        const float sx = in.clavicleR.x - in.clavicleL.x;
+        const float sy = in.clavicleR.y - in.clavicleL.y;
+        const float span = std::hypot(sx, sy);
+        // Facing camera → wide span; profile → narrower afro width + slight shift.
+        sideScale = std::clamp(span / (headR * 3.2f), 0.55f, 1.25f);
+        const float midX = (in.clavicleL.x + in.clavicleR.x) * 0.5f;
+        sideBiasX = (midX - headCenter.x) * 0.12f;
+        sideBiasY = ((in.clavicleL.y + in.clavicleR.y) * 0.5f - headCenter.y) * 0.06f;
+    }
+
+    // Up vector from neck→head; afro volume sits above / slightly behind the skull.
+    const ImVec2 afroCenter(
+        headCenter.x + hux * headR * 0.22f + sideBiasX,
+        headCenter.y + huy * headR * 0.22f + sideBiasY);
+
+    const float rx = headR * (1.55f * sideScale);
+    const float ry = headR * 1.15f;
+    const ImU32 afro = IM_COL32(8, 8, 8, 245);
+    const ImU32 afroDark = IM_COL32(0, 0, 0, 255);
+
+    dl->AddEllipseFilled(afroCenter, ImVec2(rx, ry), afro, headRot, 28);
+    dl->AddEllipseFilled(
+        ImVec2(afroCenter.x - hux * headR * 0.08f + (-huy) * headR * 0.35f * sideScale,
+               afroCenter.y - huy * headR * 0.08f + hux * headR * 0.35f * sideScale),
+        ImVec2(rx * 0.72f, ry * 0.78f),
+        afroDark,
+        headRot,
+        22);
+    dl->AddEllipseFilled(
+        ImVec2(afroCenter.x - hux * headR * 0.08f - (-huy) * headR * 0.35f * sideScale,
+               afroCenter.y - huy * headR * 0.08f - hux * headR * 0.35f * sideScale),
+        ImVec2(rx * 0.72f, ry * 0.78f),
+        afroDark,
+        headRot,
+        22);
+    // Crown puff
+    dl->AddEllipseFilled(
+        ImVec2(afroCenter.x + hux * headR * 0.38f, afroCenter.y + huy * headR * 0.38f),
+        ImVec2(rx * 0.58f, ry * 0.52f),
+        afro,
+        headRot,
+        20);
+}
+
+void DrawHumanSilhouetteFilledImpl(
+    ImDrawList* dl,
+    const Visuals::HumanSilhouetteInput& in,
+    ImU32 fill,
+    bool softFill)
 {
     if (!dl || !in.hasHead || !in.hasNeck)
         return;
@@ -371,105 +462,156 @@ void DrawHumanSilhouetteFilledImpl(ImDrawList* dl, const Visuals::HumanSilhouett
         footMid = in.neck;
 
     const float bodyH = static_cast<float>((std::max)(std::hypot(in.head.x - footMid.x, in.head.y - footMid.y), 32.f));
-    const float headR = std::clamp(
-        static_cast<float>(std::hypot(in.head.x - in.neck.x, in.head.y - in.neck.y)) * 1.14f,
-        7.f,
-        bodyH * 0.115f);
 
-    // Slightly more anatomical proportions (less blob, more human form).
-    const float wNeck = bodyH * 0.032f;
-    const float wChest = bodyH * 0.128f;
-    const float wWaist = bodyH * 0.078f;
-    const float wHip = bodyH * 0.108f;
-    const float wArm = bodyH * 0.044f;
-    const float wFore = bodyH * 0.032f;
-    const float wHand = bodyH * 0.022f;
-    const float wThigh = bodyH * 0.064f;
-    const float wCalf = bodyH * 0.045f;
-    const float wFoot = bodyH * 0.028f;
+    // Screen "up" = away from feet along body, so a collapsed Head≈Neck still
+    // gets a visible skull above the neck instead of a zero-height ellipse.
+    float upx = in.neck.x - footMid.x;
+    float upy = in.neck.y - footMid.y;
+    float upLen = std::hypot(upx, upy);
+    if (upLen < 0.001f) {
+        upx = 0.f;
+        upy = -1.f;
+        upLen = 1.f;
+    } else {
+        upx /= upLen;
+        upy /= upLen;
+    }
 
-    const ImU32 fillSolid = fill;
+    ImVec2 headPt = in.head;
+    const float rawNeckHead = static_cast<float>(
+        std::hypot(in.head.x - in.neck.x, in.head.y - in.neck.y));
+    // If Head bone sits on/near Neck (common bad index / tight mesh), lift it.
+    const float minHeadLift = bodyH * 0.11f;
+    if (rawNeckHead < minHeadLift) {
+        headPt = ImVec2(
+            in.neck.x + upx * minHeadLift,
+            in.neck.y + upy * minHeadLift);
+    }
 
-    FillTorsoAlongSpine(dl, in, wNeck, wChest, wWaist, wHip, fillSolid);
+    const float headMax = (std::max)(bodyH * 0.12f, 8.f);
+    const float headMin = (std::min)(6.f, headMax);
+    float headR = rawNeckHead * 1.15f;
+    if (rawNeckHead < minHeadLift)
+        headR = minHeadLift * 0.85f;
+    headR = std::clamp(headR, headMin, headMax);
+
+    // Tighter proportions — less chalk blob.
+    const float wNeck = bodyH * 0.026f;
+    const float wChest = bodyH * 0.102f;
+    const float wWaist = bodyH * 0.062f;
+    const float wHip = bodyH * 0.088f;
+    const float wArm = bodyH * 0.034f;
+    const float wFore = bodyH * 0.026f;
+    const float wHand = bodyH * 0.018f;
+    const float wThigh = bodyH * 0.052f;
+    const float wCalf = bodyH * 0.036f;
+    const float wFoot = bodyH * 0.022f;
+
+    const int srcA = static_cast<int>((fill >> IM_COL32_A_SHIFT) & 0xFF);
+    const int fillA = softFill
+        ? std::clamp(static_cast<int>(srcA * 0.50f), 40, 130)
+        : std::clamp(srcA, 90, 220);
+    const ImU32 fillBody = (fill & 0x00FFFFFFu)
+        | (static_cast<ImU32>(fillA) << IM_COL32_A_SHIFT);
+    // Head stays more opaque so soft fill doesn't erase the skull.
+    const int headA = softFill
+        ? std::clamp(static_cast<int>(srcA * 0.75f), 90, 200)
+        : std::clamp(srcA, 120, 230);
+    const ImU32 fillHead = (fill & 0x00FFFFFFu)
+        | (static_cast<ImU32>(headA) << IM_COL32_A_SHIFT);
+    const ImU32 strokeCol = IM_COL32(12, 12, 12, softFill ? 160 : 200);
+    const float strokeTh = std::clamp(bodyH * 0.012f, 1.15f, 2.4f);
+
+    auto tryFill = [&](ImVec2 a, ImVec2 b, float wa, float wb, float maxFrac = 0.55f) {
+        if (!SegOk(a, b, bodyH, maxFrac))
+            return;
+        FillSegment(dl, a, b, wa, wb, fillBody);
+        StrokeSegment(dl, a, b, wa, wb, strokeCol, strokeTh);
+    };
+
+    FillTorsoAlongSpine(
+        dl, in, wNeck, wChest, wWaist, wHip, fillBody, true, strokeCol, strokeTh);
 
     if (in.hasClavicleL && in.hasClavicleR)
-        FillSegment(dl, in.clavicleL, in.clavicleR, wNeck * 0.9f, wNeck * 0.9f, fillSolid);
+        tryFill(in.clavicleL, in.clavicleR, wNeck * 0.85f, wNeck * 0.85f, 0.45f);
 
-    if (in.hasThighL && in.hasThighR)
-        FillSegment(dl, in.thighL, in.thighR, wHip * 0.7f, wHip * 0.65f, fillSolid);
-
-    // Legs: pairwise only — never assume missing joints are (0,0).
+    // Legs: pairwise only.
     if (in.hasLegL) {
         if (in.hasPelvis && in.hasThighL)
-            FillSegment(dl, in.pelvis, in.thighL, (std::min)(wHip, wThigh), wThigh, fillSolid);
+            tryFill(in.pelvis, in.thighL, (std::min)(wHip, wThigh), wThigh);
         if (in.hasThighL && in.hasCalfL)
-            FillSegment(dl, in.thighL, in.calfL, wThigh, wCalf, fillSolid);
+            tryFill(in.thighL, in.calfL, wThigh, wCalf);
         if (in.hasCalfL && in.hasFootL)
-            FillSegment(dl, in.calfL, in.footL, wCalf, wFoot, fillSolid);
+            tryFill(in.calfL, in.footL, wCalf, wFoot, 0.35f);
     }
     if (in.hasLegR) {
         if (in.hasPelvis && in.hasThighR)
-            FillSegment(dl, in.pelvis, in.thighR, (std::min)(wHip, wThigh), wThigh, fillSolid);
+            tryFill(in.pelvis, in.thighR, (std::min)(wHip, wThigh), wThigh);
         if (in.hasThighR && in.hasCalfR)
-            FillSegment(dl, in.thighR, in.calfR, wThigh, wCalf, fillSolid);
+            tryFill(in.thighR, in.calfR, wThigh, wCalf);
         if (in.hasCalfR && in.hasFootR)
-            FillSegment(dl, in.calfR, in.footR, wCalf, wFoot, fillSolid);
+            tryFill(in.calfR, in.footR, wCalf, wFoot, 0.35f);
     }
 
     // Arms: pairwise only.
     if (in.hasArmL) {
         if (in.hasClavicleL && in.hasUpperArmL)
-            FillSegment(dl, in.clavicleL, in.upperArmL, wArm * 0.92f, wArm, fillSolid);
+            tryFill(in.clavicleL, in.upperArmL, wArm * 0.9f, wArm);
         else if (in.hasChest && in.hasUpperArmL)
-            FillSegment(dl, in.chest, in.upperArmL, wChest * 0.38f, wArm, fillSolid);
+            tryFill(in.chest, in.upperArmL, wChest * 0.32f, wArm);
         if (in.hasUpperArmL && in.hasLowerArmL)
-            FillSegment(dl, in.upperArmL, in.lowerArmL, wArm, wFore, fillSolid);
+            tryFill(in.upperArmL, in.lowerArmL, wArm, wFore);
         if (in.hasLowerArmL && in.hasHandL)
-            FillSegment(dl, in.lowerArmL, in.handL, wFore, wHand, fillSolid);
+            tryFill(in.lowerArmL, in.handL, wFore, wHand, 0.35f);
     }
 
     if (in.hasArmR) {
         if (in.hasClavicleR && in.hasUpperArmR)
-            FillSegment(dl, in.clavicleR, in.upperArmR, wArm * 0.92f, wArm, fillSolid);
+            tryFill(in.clavicleR, in.upperArmR, wArm * 0.9f, wArm);
         else if (in.hasChest && in.hasUpperArmR)
-            FillSegment(dl, in.chest, in.upperArmR, wChest * 0.38f, wArm, fillSolid);
+            tryFill(in.chest, in.upperArmR, wChest * 0.32f, wArm);
         if (in.hasUpperArmR && in.hasLowerArmR)
-            FillSegment(dl, in.upperArmR, in.lowerArmR, wArm, wFore, fillSolid);
+            tryFill(in.upperArmR, in.lowerArmR, wArm, wFore);
         if (in.hasLowerArmR && in.hasHandR)
-            FillSegment(dl, in.lowerArmR, in.handR, wFore, wHand, fillSolid);
+            tryFill(in.lowerArmR, in.handR, wFore, wHand, 0.35f);
     }
 
-    const float hdx = in.head.x - in.neck.x;
-    const float hdy = in.head.y - in.neck.y;
+    const float hdx = headPt.x - in.neck.x;
+    const float hdy = headPt.y - in.neck.y;
     const float hLen = std::hypot(hdx, hdy);
-    const float hux = hLen > 0.001f ? hdx / hLen : 0.f;
-    const float huy = hLen > 0.001f ? hdy / hLen : -1.f;
-    const float headRot = std::atan2(hdy, hdx) - IM_PI * 0.5f;
+    const float hux = hLen > 0.001f ? hdx / hLen : upx;
+    const float huy = hLen > 0.001f ? hdy / hLen : upy;
+    const float headRot = std::atan2(huy, hux) - IM_PI * 0.5f;
     const ImVec2 headCenter(
-        in.head.x + hux * headR * 0.08f,
-        in.head.y + huy * headR * 0.08f);
-    const float neckJoin = (std::min)(headR * 0.62f, wNeck * 1.35f);
-    if (neckJoin > 0.5f)
-        dl->AddCircleFilled(in.neck, neckJoin, fillSolid, 14);
+        headPt.x + hux * headR * 0.12f,
+        headPt.y + huy * headR * 0.12f);
+    const float neckJoin = (std::min)(headR * 0.55f, wNeck * 1.2f);
+    if (neckJoin > 0.5f) {
+        dl->AddCircleFilled(in.neck, neckJoin, fillBody, 14);
+        dl->AddCircle(in.neck, neckJoin, strokeCol, 14, strokeTh);
+    }
 
     if (in.hasFootL)
-        dl->AddCircleFilled(in.footL, wFoot * 0.65f, fillSolid, 10);
+        dl->AddCircleFilled(in.footL, wFoot * 0.6f, fillBody, 10);
     if (in.hasFootR)
-        dl->AddCircleFilled(in.footR, wFoot * 0.65f, fillSolid, 10);
+        dl->AddCircleFilled(in.footR, wFoot * 0.6f, fillBody, 10);
 
-    dl->AddEllipseFilled(
-        headCenter,
-        ImVec2(headR * 0.82f, headR * 1.08f),
-        fillSolid,
-        headRot,
-        24);
+    const ImVec2 headRadii(headR * 0.88f, headR * 1.12f);
+    dl->AddEllipseFilled(headCenter, headRadii, fillHead, headRot, 24);
+    dl->AddEllipse(headCenter, headRadii, strokeCol, headRot, 24, strokeTh);
+
+    DrawBlackAfro(dl, in, headCenter, headR, headRot, hux, huy);
 }
 
 } // namespace
 
-void Visuals::DrawHumanSilhouetteFilled(ImDrawList* dl, const HumanSilhouetteInput& in, ImU32 fill)
+void Visuals::DrawHumanSilhouetteFilled(
+    ImDrawList* dl,
+    const HumanSilhouetteInput& in,
+    ImU32 fill,
+    bool softFill)
 {
-    DrawHumanSilhouetteFilledImpl(dl, in, fill);
+    DrawHumanSilhouetteFilledImpl(dl, in, fill, softFill);
 }
 
 void Visuals::Names(const std::string& name, float center_x, float top_y, const EspDrawScale& scale, ImColor color)

@@ -327,9 +327,11 @@ void Engine::ContainerList()
     int dbgPosSkip = 0;
     int dbgDrawing = 0;
 
-    static IntervalTimer admissionTimer(50);
     static IntervalTimer metadataTimer(250);
-    const bool doAdmission = admissionTimer.fire() || localCache.empty();
+    // Always admit — gating on a 50ms timer while the worker is already 50ms
+    // left new crates waiting on flaky open/distance until the next lucky pass
+    // (user saw ~30s blank then labels appear).
+    const bool doAdmission = true;
     const bool doMetadata = metadataTimer.fire();
 
     if (doAdmission) {
@@ -620,17 +622,8 @@ void Engine::ContainerList()
         if (displayName.empty())
             displayName = "Container";
 
-        const float distM = Engine::EspDistanceMeters(
-            worldPos, ctx.camera, 0);
-        WorldLootFilterView distView{
-            static_cast<uint8_t>(cat),
-            fname,
-            displayName,
-            0,
-            0};
-        if (distM > WorldLootPickupMaxDrawMeters(cat, &distView))
-            continue;
-
+        // Distance/Drawing owned by FinalizeWorldCacheMap (item parity) — do not
+        // cull at admit or crates beyond loot_distance never enter cache.
         auto& entry = localCache[key];
         entry.rootComponent = root;
         entry.APawn = key;
@@ -749,7 +742,7 @@ void Engine::ContainerList()
         }
     }
 
-    FinalizeWorldCacheMap(localCache, ctx.camera, ctx.acknowledgedPawn, dbgDrawing);
+    FinalizeWorldCacheMap(localCache, ctx.camera, dbgDrawing);
 
     if (m_worldGeneration.load(std::memory_order_acquire) != genAtStart)
         return;

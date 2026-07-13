@@ -172,7 +172,6 @@
     <ClCompile Include="Functions\BoneList.cpp" />
     <ClCompile Include="Functions\Esp.cpp" />
     <ClCompile Include="Functions\VisCheck.cpp" />
-    <ClCompile Include="Functions\CollisionLos.cpp" />
     <ClCompile Include="Functions\Aimbot.cpp" />
     <ClCompile Include="Core\AssetNames.cpp" />
     <ClCompile Include="Core\WorldItemCategory.cpp" />
@@ -221,7 +220,6 @@
     <ClInclude Include="Core\Memory.h" />
     <ClInclude Include="Core\Offsets.h" />
     <ClInclude Include="Core\Vector.hpp" />
-    <ClInclude Include="Functions\CollisionLos.h" />
     <!-- DMA -->
     <ClInclude Include="DMA\DmaKeyboard.h" />
     <ClInclude Include="DMA\DmaVmm.h" />

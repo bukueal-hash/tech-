@@ -3,16 +3,35 @@
 #include "../Core/IntervalTimer.h"
 #include "../Interface/Utils/Variables/index.h"
 #include "WorldScanCommon.h"
-#include "CollisionLos.h"
 
 #include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <mutex>
+#include <sstream>
 #include <string>
 
 namespace {
+
+// #region agent log
+inline void RaidDbgLog(const char* event, const std::string& dataJson)
+{
+	static std::mutex m;
+	std::lock_guard<std::mutex> lock(m);
+	std::ofstream f("F:/Test/ARCs/debug-5681af.log", std::ios::app);
+	if (!f)
+		return;
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::system_clock::now().time_since_epoch()).count();
+	f << "{\"sessionId\":\"5681af\",\"runId\":\"raid-gate\",\"hypothesisId\":\"R\""
+	  << ",\"location\":\"Update.cpp:TickRaidGate\",\"message\":\"" << event
+	  << "\",\"data\":" << dataJson
+	  << ",\"timestamp\":" << ms << "}\n";
+}
+// #endregion
 
 bool LooksLikeUtf16Garbage(uintptr_t p)
 {
@@ -249,6 +268,84 @@ static bool PawnHasRaidCombatComponents(uintptr_t pawn)
 	const uintptr_t invComp =
 		Memory::read<uintptr_t>(pawn + Offsets::InventoryComponent);
 	return invComp && Memory::IsValidPtrFast2(invComp);
+}
+
+/** Human-readable reason for IsInRaidRaw==false (diagnostics only — does not change gates). */
+static const char* DiagnoseRaidRawReason(
+	uintptr_t gw, uintptr_t pl, uintptr_t actors, uintptr_t pawn,
+	uintptr_t pc, uintptr_t root, bool espActive)
+{
+	if (!gw || !pl)
+		return "no_world";
+	if (espActive) {
+		if (LooksLikeStrictHubWorld(gw, pl))
+			return "strict_hub_world";
+		if (pawn && PawnLooksLikeHubCharacter(pawn))
+			return "hub_pawn";
+		return "ok_stay";
+	}
+	if (!actors)
+		return "no_actors";
+	if (!pawn)
+		return "no_pawn";
+	if (!pc)
+		return "no_pc";
+	const int actorCount = Memory::read<int>(pl + Offsets::ActorsCount);
+	if (actorCount <= 0 || actorCount > 10000)
+		return "bad_actor_count";
+	uintptr_t r = root;
+	if (!Memory::IsValidPtrFast2(r))
+		r = 0;
+	if (!r)
+		r = Engine::ResolveActorRoot(pawn);
+	if (!r)
+		return "no_root";
+	Vector3 pos = Memory::read<Vector3>(r + Offsets::RelativeLocation);
+	if (!IsPlausibleWorldPos(pos))
+		pos = Engine::ReadSceneWorldPos(r);
+	if (!IsPlausibleWorldPos(pos))
+		return "bad_pos";
+	if (LooksLikeHubWorld(gw, pl))
+		return "hub_world";
+	if (PawnLooksLikeHubCharacter(pawn))
+		return "hub_pawn";
+	if (!PawnHasRaidCombatComponents(pawn))
+		return "no_combat_comps";
+	return "ok_enter";
+}
+
+static std::string RaidJsonEscape(std::string s)
+{
+	std::string o;
+	o.reserve(s.size());
+	for (char c : s) {
+		if (c == '"' || c == '\\')
+			o.push_back('\\');
+		if (static_cast<unsigned char>(c) < 32)
+			continue;
+		o.push_back(c);
+	}
+	return o;
+}
+
+static std::string PeekObjFName(uintptr_t obj)
+{
+	if (!obj || !Memory::IsValidPtrFast2(obj))
+		return {};
+	return steam_decrypt::GetActorFNameString(obj);
+}
+
+static const char* MatchHubToken(uintptr_t world, uintptr_t level)
+{
+	static const char* kTokens[] = {
+		"sprocket", "mainmenu", "frontend", "front_end",
+		"lobby", "loadout", "hideout", "menuworld", "bilguun",
+	};
+	for (const char* tok : kTokens) {
+		if (ObjectFNameContains(world, tok) || ObjectFNameContains(level, tok))
+			return tok;
+	}
+	return "";
 }
 
 } // namespace
@@ -604,6 +701,7 @@ void Engine::Update() {
 		RefreshCameraFromViewTarget();
 
 	TickRaidGate();
+	TickEspCacheReadiness();
 
 	// Only drop the PC fast-path when ESP raid is fully inactive (hub/menu).
 	// Do NOT clear on a transient RaidRaw flicker caused by a missing PC — that
@@ -641,10 +739,12 @@ bool Engine::IsInRaidRaw() const
 	if (!sGWorld || !sPersistentLevel)
 		return false;
 
-	// Stay path: once ESP raid is active, only lose raid on world loss or strict hub.
+	// Stay path: once ESP raid is active, only lose raid on world loss or hub.
 	// Do not require PC/pawn/root/combat — mid-raid DMA flakes were firing [raid] left.
 	if (m_espRaidActive.load(std::memory_order_acquire)) {
 		if (LooksLikeStrictHubWorld(sGWorld, sPersistentLevel))
+			return false;
+		if (sAcknowledgedPawn && PawnLooksLikeHubCharacter(sAcknowledgedPawn))
 			return false;
 		return true;
 	}
@@ -748,11 +848,16 @@ void Engine::HandleWorldLost()
 	m_lastWorldPtr = 0;
 	m_lastPersistentLevel = 0;
 	m_espRaidActive.store(false, std::memory_order_release);
+	m_espDrawReady.store(false, std::memory_order_release);
 	m_raidEnterPending = false;
+	m_partyEnterPending = false;
 	m_raidFalseSince = {};
 	ResetRaidTransitionState();
 	ClearEspCaches();
 	std::cout << "[raid] world_lost" << std::endl;
+	// #region agent log
+	RaidDbgLog("world_lost", "{}");
+	// #endregion
 }
 
 void Engine::CheckWorldTransition(uintptr_t newWorld, uintptr_t newPersistentLevel)
@@ -764,13 +869,6 @@ void Engine::CheckWorldTransition(uintptr_t newWorld, uintptr_t newPersistentLev
 	// immediately (otherwise READCACHE/PROCCACHE TTLs can stall until restart).
 	PCIMemory::FullRefresh();
 
-	Vector3 localPos{};
-	{
-		std::shared_lock<std::shared_mutex> stateLock(m_stateMutex);
-		if (RootComponent && IsValidPointer(RootComponent))
-			localPos = ReadSceneWorldPos(RootComponent);
-	}
-
 	ResetRaidTransitionState();
 	ClearEspCaches();
 
@@ -778,11 +876,10 @@ void Engine::CheckWorldTransition(uintptr_t newWorld, uintptr_t newPersistentLev
 	m_lastPersistentLevel = newPersistentLevel;
 	m_worldGeneration.fetch_add(1, std::memory_order_release);
 	m_espRaidActive.store(false, std::memory_order_release);
+	m_espDrawReady.store(false, std::memory_order_release);
 	m_raidEnterPending = false;
+	m_partyEnterPending = false;
 	m_raidFalseSince = {};
-
-	if (newWorld)
-		CollisionLos::ScheduleWorldRebuild(newWorld, localPos);
 }
 
 void Engine::ClearEspCaches()
@@ -812,6 +909,81 @@ void Engine::ClearEspCaches()
 		m_lastEspFrame = {};
 	}
 	entityStarted.store(false, std::memory_order_release);
+	m_espDrawReady.store(false, std::memory_order_release);
+}
+
+int Engine::CountGameStatePlayerArray() const
+{
+	uintptr_t gs = 0;
+	{
+		std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+		gs = AGameStateBase;
+	}
+	if (!gs || !IsUsableObjectPtr(gs))
+		return 0;
+
+	const int32_t arrNum =
+		Memory::read<int32_t>(gs + Offsets::GameState_PlayerArray + 8);
+	if (arrNum < 0 || arrNum > 64)
+		return 0;
+	return static_cast<int>(arrNum);
+}
+
+void Engine::TickEspCacheReadiness()
+{
+	if (!m_espRaidActive.load(std::memory_order_acquire)) {
+		m_espDrawReady.store(false, std::memory_order_release);
+		return;
+	}
+	if (m_espDrawReady.load(std::memory_order_acquire))
+		return;
+
+	const size_t players = PlayerCacheCount();
+	const size_t bots = RobotCacheCount();
+	const size_t world = WorldCacheCount();
+
+	if (players > 0 && bots > 0 && world > 0) {
+		m_espDrawReady.store(true, std::memory_order_release);
+		std::cout << "[raid] caches_ready"
+			<< " players=" << players
+			<< " bots=" << bots
+			<< " world=" << world
+			<< std::endl;
+		// #region agent log
+		{
+			std::ostringstream d;
+			d << "{\"players\":" << players << ",\"bots\":" << bots
+			  << ",\"world\":" << world << ",\"mode\":\"hard\"}";
+			RaidDbgLog("caches_ready", d.str());
+		}
+		// #endregion
+		return;
+	}
+
+	const auto now = std::chrono::steady_clock::now();
+	if (m_raidArmedSince.time_since_epoch().count() == 0)
+		return;
+	if (now - m_raidArmedSince < kEspCacheReadySoftMs)
+		return;
+	if (!entityStarted.load(std::memory_order_acquire))
+		return;
+	if (players + bots + world == 0)
+		return;
+
+	m_espDrawReady.store(true, std::memory_order_release);
+	std::cout << "[raid] caches_ready_soft"
+		<< " players=" << players
+		<< " bots=" << bots
+		<< " world=" << world
+		<< std::endl;
+	// #region agent log
+	{
+		std::ostringstream d;
+		d << "{\"players\":" << players << ",\"bots\":" << bots
+		  << ",\"world\":" << world << ",\"mode\":\"soft\"}";
+		RaidDbgLog("caches_ready_soft", d.str());
+	}
+	// #endregion
 }
 
 void Engine::TickRaidGate()
@@ -821,9 +993,69 @@ void Engine::TickRaidGate()
 
 	const auto now = std::chrono::steady_clock::now();
 	const bool active = m_espRaidActive.load(std::memory_order_acquire);
+	const bool drawReady = m_espDrawReady.load(std::memory_order_acquire);
+
+	uintptr_t gw = 0, pl = 0, actors = 0, pc = 0, pawn = 0, root = 0;
+	{
+		std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+		gw = GWorld;
+		pl = PersistentLevel;
+		actors = Actors;
+		pc = PlayerController;
+		pawn = AcknowledgedPawn;
+		root = RootComponent;
+	}
+	const int partyCount = CountGameStatePlayerArray();
+	const int actorCount = (pl && Memory::IsValidPtrFast2(pl))
+		? Memory::read<int>(pl + Offsets::ActorsCount) : -1;
+	const char* rawReason = DiagnoseRaidRawReason(
+		gw, pl, actors, pawn, pc, root, active);
+
+	// #region agent log
+	{
+		static bool s_lastRaw = false;
+		static bool s_lastActive = false;
+		static bool s_lastDraw = false;
+		static uintptr_t s_lastGw = 0;
+		static std::chrono::steady_clock::time_point s_lastHb{};
+		const bool changed = (raw != s_lastRaw) || (active != s_lastActive)
+			|| (drawReady != s_lastDraw) || (gw != s_lastGw);
+		const bool due = s_lastHb.time_since_epoch().count() == 0
+			|| now - s_lastHb >= std::chrono::seconds(2);
+		if (changed || due) {
+			s_lastHb = now;
+			s_lastRaw = raw;
+			s_lastActive = active;
+			s_lastDraw = drawReady;
+			s_lastGw = gw;
+			const std::string worldFn = PeekObjFName(gw);
+			const std::string levelFn = PeekObjFName(pl);
+			const std::string pawnFn = PeekObjFName(pawn);
+			const char* hubTok = MatchHubToken(gw, pl);
+			std::ostringstream d;
+			d << "{\"raw\":" << (raw ? 1 : 0)
+			  << ",\"esp\":" << (active ? 1 : 0)
+			  << ",\"draw\":" << (drawReady ? 1 : 0)
+			  << ",\"reason\":\"" << rawReason << "\""
+			  << ",\"hubTok\":\"" << hubTok << "\""
+			  << ",\"world\":\"" << RaidJsonEscape(worldFn) << "\""
+			  << ",\"level\":\"" << RaidJsonEscape(levelFn) << "\""
+			  << ",\"pawnName\":\"" << RaidJsonEscape(pawnFn) << "\""
+			  << ",\"party\":" << partyCount
+			  << ",\"actors\":" << actorCount
+			  << ",\"partyPend\":" << (m_partyEnterPending ? 1 : 0)
+			  << ",\"enterPend\":" << (m_raidEnterPending ? 1 : 0)
+			  << ",\"gw\":\"" << std::hex << gw
+			  << "\",\"pc\":\"" << pc
+			  << "\",\"pawn\":\"" << pawn << std::dec << "\"}";
+			RaidDbgLog(changed ? "raid_state_change" : "raid_heartbeat", d.str());
+		}
+	}
+	// #endregion
 
 	if (!raw) {
 		m_raidEnterPending = false;
+		m_partyEnterPending = false;
 		if (!active) {
 			m_raidFalseSince = {};
 			return;
@@ -836,20 +1068,13 @@ void Engine::TickRaidGate()
 			if (s_lastHoldLog.time_since_epoch().count() == 0
 				|| now - s_lastHoldLog >= std::chrono::seconds(1)) {
 				s_lastHoldLog = now;
-				uintptr_t gw = 0, pl = 0, pc = 0, pawn = 0;
-				{
-					std::shared_lock<std::shared_mutex> lock(m_stateMutex);
-					gw = GWorld;
-					pl = PersistentLevel;
-					pc = PlayerController;
-					pawn = AcknowledgedPawn;
-				}
 				const bool hub = LooksLikeStrictHubWorld(gw, pl);
 				std::cout << "[raid] raw_false_hold"
 					<< " gWorld=" << std::hex << gw
 					<< " hub=" << std::dec << (hub ? 1 : 0)
 					<< " pc=" << std::hex << pc
 					<< " pawn=" << pawn << std::dec
+					<< " reason=" << rawReason
 					<< std::endl;
 			}
 		}
@@ -858,10 +1083,19 @@ void Engine::TickRaidGate()
 			return;
 
 		m_espRaidActive.store(false, std::memory_order_release);
+		m_espDrawReady.store(false, std::memory_order_release);
 		m_raidFalseSince = {};
+		m_raidArmedSince = {};
 		ResetRaidTransitionState();
 		ClearEspCaches();
 		std::cout << "[raid] left" << std::endl;
+		// #region agent log
+		{
+			std::ostringstream d;
+			d << "{\"reason\":\"" << rawReason << "\",\"party\":" << partyCount << "}";
+			RaidDbgLog("left", d.str());
+		}
+		// #endregion
 		return;
 	}
 
@@ -869,28 +1103,62 @@ void Engine::TickRaidGate()
 	if (active)
 		return;
 
-	if (kRaidEnterDelayMs.count() <= 0) {
-		m_raidEnterPending = false;
-		ResetRaidTransitionState();
-		m_espRaidActive.store(true, std::memory_order_release);
-		ClearEspCaches();
-		m_worldGeneration.fetch_add(1, std::memory_order_release);
-		std::cout << "[raid] entered" << std::endl;
-		return;
+	if (partyCount >= kPartyMinPlayers) {
+		if (!m_partyEnterPending) {
+			m_partyEnterPending = true;
+			m_partyDebSince = now;
+			m_raidEnterPending = false;
+			std::cout << "[raid] party_wait players=" << partyCount << std::endl;
+			// #region agent log
+			{
+				std::ostringstream d;
+				d << "{\"party\":" << partyCount
+				  << ",\"delayMs\":" << kPartyEnterDelayMs.count() << "}";
+				RaidDbgLog("party_wait", d.str());
+			}
+			// #endregion
+			return;
+		}
+		if (now - m_partyDebSince < kPartyEnterDelayMs)
+			return;
+	} else {
+		m_partyEnterPending = false;
 	}
 
 	if (!m_raidEnterPending) {
 		m_raidEnterPending = true;
 		m_raidDebSince = now;
+		std::cout << "[raid] enter_wait players=" << partyCount << std::endl;
+		// #region agent log
+		{
+			std::ostringstream d;
+			d << "{\"party\":" << partyCount
+			  << ",\"delayMs\":" << kRaidEnterDelayMs.count() << "}";
+			RaidDbgLog("enter_wait", d.str());
+		}
+		// #endregion
 		return;
 	}
 
-	if (now - m_raidDebSince >= kRaidEnterDelayMs) {
-		m_raidEnterPending = false;
-		ResetRaidTransitionState();
-		m_espRaidActive.store(true, std::memory_order_release);
-		ClearEspCaches();
-		m_worldGeneration.fetch_add(1, std::memory_order_release);
-		std::cout << "[raid] entered" << std::endl;
+	if (now - m_raidDebSince < kRaidEnterDelayMs)
+		return;
+
+	m_raidEnterPending = false;
+	m_partyEnterPending = false;
+	ResetRaidTransitionState();
+	ClearEspCaches();
+	m_espDrawReady.store(false, std::memory_order_release);
+	m_raidArmedSince = now;
+	m_espRaidActive.store(true, std::memory_order_release);
+	m_worldGeneration.fetch_add(1, std::memory_order_release);
+	std::cout << "[raid] entered players=" << partyCount << std::endl;
+	// #region agent log
+	{
+		std::ostringstream d;
+		d << "{\"party\":" << partyCount
+		  << ",\"actors\":" << actorCount
+		  << ",\"reason\":\"" << rawReason << "\"}";
+		RaidDbgLog("entered", d.str());
 	}
+	// #endregion
 }

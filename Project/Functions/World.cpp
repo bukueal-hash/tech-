@@ -5,6 +5,8 @@
 #include "../Core/WorldItemCategory.h"
 #include "../Interface/Utils/Variables/index.h"
 
+#include <cmath>
+
 bool Engine::GatherWorldScanContext(WorldScanContext& ctx)
 {
     ctx = {};
@@ -43,32 +45,24 @@ bool Engine::GatherWorldScanContext(WorldScanContext& ctx)
 void Engine::FinalizeWorldCacheMap(
     std::unordered_map<uintptr_t, WorldCacheEntry>& cache,
     const CameraCache& cam,
-    uintptr_t localPawn,
     int& outDrawing)
 {
     outDrawing = 0;
     for (auto it = cache.begin(); it != cache.end(); ) {
         auto& entry = it->second;
-        const uintptr_t actorKey = it->first;
 
-        auto cat = static_cast<WorldItemCategory>(entry.worldCategory);
-        const bool pickupLike = cat == WorldItemCategory::DroppedPickup
-            || cat == WorldItemCategory::Items
-            || cat == WorldItemCategory::Harvestable;
-
-        uintptr_t root = entry.rootComponent;
-        if (pickupLike && actorKey) {
-            if (const uintptr_t lootRoot = ResolveLootActorRoot(actorKey, true))
-                root = lootRoot;
-        }
+        const uintptr_t root = entry.rootComponent;
         if (root && IsValidPointer(root)) {
             const Vector3 freshPos = ReadSceneWorldPos(root);
             if (!WorldScan::IsOldStyleInvalidXY(freshPos))
                 entry.WorldPos = freshPos;
-            entry.rootComponent = root;
         }
 
-        entry.Distance = EspDistanceMeters(entry.WorldPos, cam, 0);
+        Vector3 delta = entry.WorldPos - cam.Location;
+        entry.Distance = static_cast<float>(std::sqrt(
+            delta.x * delta.x + delta.y * delta.y + delta.z * delta.z) / 100.0);
+
+        auto cat = static_cast<WorldItemCategory>(entry.worldCategory);
 
         if (WorldCategoryIsContainerProp(cat)
             && cat != WorldItemCategory::DroppedPickup
@@ -83,12 +77,6 @@ void Engine::FinalizeWorldCacheMap(
             }
             entry.worldCategory = static_cast<uint8_t>(WorldItemCategory::OpenedContainer);
             cat = WorldItemCategory::OpenedContainer;
-            if (!entry.ItemDisplayName.empty()
-                && entry.ItemDisplayName.find("(Open)") == std::string::npos) {
-                entry.ItemDisplayName = FormatEspDisplayLabel(
-                    entry.ItemDisplayName + " (Open)");
-                entry.ItemType = entry.ItemDisplayName;
-            }
         }
 
         WorldLootFilterView filterView{
@@ -100,21 +88,21 @@ void Engine::FinalizeWorldCacheMap(
         const bool espVisible = WorldCategoryEnabled(entry.worldCategory);
         const bool radarVisible = WorldCategoryVisibleOnRadar(filterView);
 
-        // ESP and radar keep separate distance budgets — do not let radar_range
-        // inflate ESP Drawing (render culls by loot/SP only; mismatch hid crates).
-        const float espMaxM = WorldLootPickupMaxDrawMeters(cat, &filterView);
-        const float radarMaxM =
-            var::radar_range > 0.f ? var::radar_range : 100.f;
-        const bool inEspRange = entry.Distance <= espMaxM;
-        const bool inRadarRange = radarVisible && entry.Distance <= radarMaxM;
+        // Same tier rules as render: row SP checkbox → loot or SP slider.
+        float maxDrawM = WorldLootPickupMaxDrawMeters(cat, &filterView);
+        if (radarVisible) {
+            const float radarRangeM =
+                var::radar_range > 0.f ? var::radar_range : 100.f;
+            maxDrawM = (std::max)(maxDrawM, radarRangeM);
+        }
 
-        if (!espVisible && !radarVisible) {
+        if (entry.Distance > maxDrawM) {
             entry.Drawing = false;
             ++it;
             continue;
         }
 
-        if (!(espVisible && inEspRange) && !inRadarRange) {
+        if (!espVisible && !radarVisible) {
             entry.Drawing = false;
             ++it;
             continue;

@@ -190,6 +190,68 @@ static bool ResolveAimBoneWorld(
     return fallbackTorso();
 }
 
+/** Acquisition snap: Head when far / new lock; menu bone (Closest etc.) when close. */
+static constexpr float kPlayerAimSnapPx = 48.f;
+static uint64_t g_playerAimLockedKey = 0;
+static bool g_playerAimClosePhase = false;
+
+static float NormalizeYawDelta(float degrees)
+{
+    while (degrees > 180.f)
+        degrees -= 360.f;
+    while (degrees < -180.f)
+        degrees += 360.f;
+    return degrees;
+}
+
+static float CameraRotDeltaDeg(const Vector3& a, const Vector3& b)
+{
+    const float dp = std::abs(a.x - b.x);
+    const float dy = std::abs(NormalizeYawDelta(a.y - b.y));
+    return std::sqrt(dp * dp + dy * dy);
+}
+
+static bool ResolvePlayerAimBoneWorldTwoPhase(
+    Engine& eng,
+    const BoneData& bones,
+    uint64_t key,
+    float currentTime,
+    const Vector3& screenCenter,
+    float fovRadius,
+    const Engine::CameraCache& cam,
+    Vector3& outWorld)
+{
+    Vector3 headWorld{};
+    const bool haveHead = TryBoneWorld(bones, UniBone::Head, headWorld)
+        || TryBoneWorld(bones, UniBone::Neck, headWorld);
+
+    const bool lockedOnThis = (g_playerAimLockedKey != 0 && key == g_playerAimLockedKey);
+    if (!lockedOnThis)
+        g_playerAimClosePhase = false;
+
+    if (haveHead) {
+        Vector3 headScreen{};
+        float headErr = FLT_MAX;
+        if (eng.ProjectWorldLocationToScreen(headWorld, headScreen, cam)) {
+            const float dx = static_cast<float>(headScreen.x - screenCenter.x);
+            const float dy = static_cast<float>(headScreen.y - screenCenter.y);
+            headErr = std::sqrt(dx * dx + dy * dy);
+        }
+
+        // New lock or still far from head → fast Head snap. Once close, stay on menu
+        // bone until unlock — avoids head/chest flip when reload shakes the view.
+        if (!lockedOnThis || (!g_playerAimClosePhase && headErr > kPlayerAimSnapPx)) {
+            outWorld = headWorld;
+            return true;
+        }
+        if (!g_playerAimClosePhase && headErr <= kPlayerAimSnapPx)
+            g_playerAimClosePhase = true;
+    }
+
+    return ResolveAimBoneWorld(
+        eng, bones, key, currentTime, screenCenter, fovRadius, cam, outWorld);
+}
+
 static float ScoreAimTarget(
     float distToCenter,
     float fovRadius,
@@ -241,6 +303,15 @@ static float EffectiveAimFovForKey(uint64_t key, float baseFov)
     if (g_aimStickyKey != 0 && key == g_aimStickyKey && g_aimStickyExtraFovPx > 0.f)
         return baseFov + g_aimStickyExtraFovPx;
     return baseFov;
+}
+
+// Sticky lock must retain the locked target even when menu sticky FOV bias is 0
+// (otherwise movers leave the tiny FOV cone and unlock / grace at empty space).
+static bool AimStickyBypassFov(uint64_t key)
+{
+    return var::sticky_target_lock
+        && g_aimStickyKey != 0
+        && key == g_aimStickyKey;
 }
 
 // ============================================
@@ -560,7 +631,7 @@ void Engine::AimAssistPlayer(
         Vector3 worldPos{};
 
         const auto& bones = actor.boneData;
-        if (!ResolveAimBoneWorld(
+        if (!ResolvePlayerAimBoneWorldTwoPhase(
                 *this, bones, key, currentTime, screenCenter, fovRadius, g_aimProjCam, worldPos))
         {
             worldPos = actor.WorldPos;
@@ -585,7 +656,8 @@ void Engine::AimAssistPlayer(
         const float dy = static_cast<float>(aimPos.y - screenCenter.y);
         const float distToCenter = std::sqrt(dx * dx + dy * dy);
 
-        if (distToCenter > EffectiveAimFovForKey(key, fovRadius))
+        if (!AimStickyBypassFov(key)
+            && distToCenter > EffectiveAimFovForKey(key, fovRadius))
             continue;
 
         const float totalScore = ScoreAimTarget(
@@ -662,7 +734,8 @@ void Engine::AimAssistRobot(
         const float dy = static_cast<float>(aimPos.y - screenCenter.y);
         const float distToCenter = std::sqrt(dx * dx + dy * dy);
 
-        if (distToCenter > EffectiveAimFovForKey(key, fovRadius))
+        if (!AimStickyBypassFov(key)
+            && distToCenter > EffectiveAimFovForKey(key, fovRadius))
             return;
 
         const float totalScore = ScoreAimTarget(
@@ -710,6 +783,10 @@ namespace {
 constexpr int kKmAimChunkPx = 512;
 constexpr float kMaxAimStepFraction = 1.0f;
 constexpr float kHumanizerSkipDistPx = 40.f;
+/** Per-tick view rotation jump — reload / flinch; don't fight the animation. */
+constexpr float kAimViewShakeSuppressDeg = 1.35f;
+/** ESP-frame camera only when live view is stable (avoids stale-cam jitter). */
+constexpr float kAimEspFrameCamMaxDriftDeg = 0.65f;
 
 float SendKmAimDelta(float dx, float dy, float* outGain = nullptr)
 {
@@ -810,6 +887,8 @@ void Engine::AimAssistence()
     static AimTarget s_graceTarget{};
     static uint64_t s_graceUntilMs = 0;
     static bool s_graceActive = false;
+    static Vector3 s_graceVelocity{};
+    static uint64_t s_graceStampMs = 0;
 
     s_aimDbg = {};
     g_aimStickyKey = 0;
@@ -835,6 +914,7 @@ void Engine::AimAssistence()
     {
         lockedTarget = 0;
         previousTarget = 0;
+        g_playerAimClosePhase = false;
         humanizer.Reset();
         kmboxFailStreak = 0;
         s_graceActive = false;
@@ -885,6 +965,15 @@ void Engine::AimAssistence()
         aimCam = g_Camera;
     }
 
+    static Vector3 s_lastLiveViewRot{};
+    static bool s_haveLastLiveView = false;
+    float viewShakeDeg = 0.f;
+    if (s_haveLastLiveView)
+        viewShakeDeg = CameraRotDeltaDeg(aimCam.Rotation, s_lastLiveViewRot);
+    s_lastLiveViewRot = aimCam.Rotation;
+    s_haveLastLiveView = true;
+    const bool suppressAimOutput = viewShakeDeg >= kAimViewShakeSuppressDeg;
+
     EspRenderFrame espFrame{};
     {
         std::shared_lock<std::shared_mutex> lock(m_espFrameMutex);
@@ -892,9 +981,12 @@ void Engine::AimAssistence()
     }
 
     CameraCache aimProjCam = aimCam;
-    if (espFrame.valid
+    if (!suppressAimOutput
+        && espFrame.valid
         && IsPlausibleWorldPos(espFrame.camera.Location)
-        && espFrame.camera.FOV > 1.f && espFrame.camera.FOV < 179.f)
+        && espFrame.camera.FOV > 1.f && espFrame.camera.FOV < 179.f
+        && CameraRotDeltaDeg(aimCam.Rotation, espFrame.camera.Rotation)
+            <= kAimEspFrameCamMaxDriftDeg)
         aimProjCam = espFrame.camera;
 
     g_aimProjCam = aimProjCam;
@@ -932,6 +1024,8 @@ void Engine::AimAssistence()
         g_aimStickyExtraFovPx = (std::max)(0.f, var::aim_sticky_fov_bias_px);
     }
 
+    g_playerAimLockedKey = lockedTarget;
+
     const float currentTime = GetTimeSeconds();
     const float bulletSpeed = var::aim_bullet_speed_cm_s > 0.f
         ? var::aim_bullet_speed_cm_s
@@ -959,6 +1053,16 @@ void Engine::AimAssistence()
                 s_graceTarget = target;
                 s_graceActive = false;
                 s_graceUntilMs = 0;
+                s_graceStampMs = nowMs;
+                s_graceVelocity = {};
+                if (target.isRobot) {
+                    std::shared_lock<std::shared_mutex> rlock(m_robotCacheMutex);
+                    if (const auto it = robotCache.find(static_cast<uintptr_t>(target.entityKey));
+                        it != robotCache.end())
+                        s_graceVelocity = it->second.cachedVelocity;
+                } else {
+                    s_graceVelocity = GetActorVelocity(static_cast<uintptr_t>(target.entityKey));
+                }
                 break;
             }
         }
@@ -969,15 +1073,38 @@ void Engine::AimAssistence()
                 if (!s_graceActive) {
                     s_graceActive = true;
                     s_graceUntilMs = nowMs + static_cast<uint64_t>(var::aim_loss_of_sight_grace_ms);
+                    if (s_graceStampMs == 0)
+                        s_graceStampMs = nowMs;
                 }
                 if (nowMs <= s_graceUntilMs) {
-                    allTargets.push_back(s_graceTarget);
+                    // Lead grace world pos each tick — do not replay frozen screen aimPos.
+                    AimTarget grace = s_graceTarget;
+                    const float dtSec = (s_graceStampMs > 0)
+                        ? static_cast<float>(nowMs - s_graceStampMs) * 0.001f
+                        : 0.f;
+                    if (dtSec > 0.f && dtSec < 0.6f) {
+                        grace.worldPos.x += s_graceVelocity.x * dtSec;
+                        grace.worldPos.y += s_graceVelocity.y * dtSec;
+                        grace.worldPos.z += s_graceVelocity.z * dtSec;
+                    }
+                    s_graceTarget.worldPos = grace.worldPos;
+                    s_graceStampMs = nowMs;
+                    Vector3 screen{};
+                    if (ProjectWorldLocationToScreen(grace.worldPos, screen, g_aimProjCam)) {
+                        grace.aimPos = screen;
+                        const float dx = static_cast<float>(screen.x - screenCenter.x);
+                        const float dy = static_cast<float>(screen.y - screenCenter.y);
+                        grace.distToCenter = std::sqrt(dx * dx + dy * dy);
+                    }
+                    allTargets.push_back(grace);
                     s_aimDbg.grace = 1;
                 } else {
                     lockedTarget = 0;
                     previousTarget = 0;
                     humanizer.Reset();
                     s_graceActive = false;
+                    s_graceVelocity = {};
+                    s_graceStampMs = 0;
                     s_aimDbg.locked = 0;
                     s_aimDbg.grace = 0;
                     return;
@@ -987,6 +1114,8 @@ void Engine::AimAssistence()
                 previousTarget = 0;
                 humanizer.Reset();
                 s_graceActive = false;
+                s_graceVelocity = {};
+                s_graceStampMs = 0;
                 s_aimDbg.locked = 0;
                 return;
             }
@@ -1004,18 +1133,11 @@ void Engine::AimAssistence()
             break;
         }
 
-        float priorityBonus = 0.f;
-        const bool priorizePlayers = true;
-        if (!target.isRobot && priorizePlayers)
-            priorityBonus = 1000.f;
-
-        const float adjustedScore = target.score + priorityBonus;
-
-        if (adjustedScore > bestScore ||
-            (adjustedScore == bestScore &&
+        if (target.score > bestScore ||
+            (target.score == bestScore &&
                 target.distToCenter < (bestTarget ? bestTarget->distToCenter : FLT_MAX)))
         {
-            bestScore = adjustedScore;
+            bestScore = target.score;
             bestTarget = &target;
         }
     }
@@ -1110,7 +1232,9 @@ void Engine::AimAssistence()
         dy += static_cast<float>(jitterY * 2.5);
     }
 
-    s_aimDbg.lastGain = SendKmAimDelta(dx, dy, &s_aimDbg.lastGain);
+    // Reload / flinch moves the view — skip hardware pull for this tick (keep lock).
+    if (!suppressAimOutput)
+        s_aimDbg.lastGain = SendKmAimDelta(dx, dy, &s_aimDbg.lastGain);
 
     // Triggerbot: fire when locked and within deadzone (or very close), if hardware
     // can report physical buttons and user isn't already holding LMB.
@@ -1145,6 +1269,8 @@ void Engine::AimAssistence()
                 << " gain=" << s_aimDbg.lastGain
                 << " kmbox=" << s_aimDbg.kmbox
                 << " grace=" << s_aimDbg.grace
+                << " viewShakeDeg=" << viewShakeDeg
+                << " suppress=" << (suppressAimOutput ? 1 : 0)
                 << " src=" << srcTag
                 << " worldAgeMs=" << s_aimDbg.worldAgeMs
                 << " camFov=" << aimProjCam.FOV

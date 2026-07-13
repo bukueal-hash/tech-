@@ -193,6 +193,10 @@ bool LooksLikePlayerPawn(uintptr_t actor, uintptr_t localPawn)
         return true;
     if (ArcActorType::IsBotClassId(masked))
         return false;
+    // Floor loot class id can have garbage PS/mesh pointers — never treat as player
+    // (console: ShouldExclude wiped masked=0xC0000 rack/floor items).
+    if (ArcActorType::IsGroundLootClassId(masked))
+        return false;
 
     const uintptr_t playerState =
         Memory::read<uintptr_t>(actor + Offsets::APlayerState);
@@ -358,7 +362,11 @@ bool LooksLikeContainerActor(uintptr_t actor, const std::string& fname)
     return false;
 }
 
-// SHARED GATE — grep callers before edit
+// SHARED GATE — grep callers before edit.
+// Used only to EXCLUDE actors from item/container caches (not bot admission).
+// tech- (bukueal-hash/tech-) early-outs floor loot via LootInteractionComponent.
+// Our HasArcEnemyAssetPointer / fname path was false-positive on BP_ItemActor
+// salvage (Ruined Parachute, Canister, …) and wiped majority floor coverage.
 bool LooksLikeBotPawn(uintptr_t actor, uintptr_t localPawn)
 {
     if (!actor || (localPawn && actor == localPawn))
@@ -368,6 +376,29 @@ bool LooksLikeBotPawn(uintptr_t actor, uintptr_t localPawn)
         ArcActorType::MaskActorTypeId(ArcActorType::ReadActorTypeId(actor));
     if (ArcActorType::IsPlayerClassId(masked))
         return false;
+
+    // Ground-loot class id is authoritative floor salvage/pickup — never a bot.
+    if (ArcActorType::IsGroundLootClassId(masked))
+        return false;
+
+    std::string probe = engine.GetActorClassFName(actor);
+    if (probe.empty())
+        probe = engine.GetActorFNameStringCached(actor);
+    if (probe.empty())
+        probe = engine.GetActorFNameString(actor);
+    if (!probe.empty()) {
+        if (FnameLooksLikeDroppedPickup(probe) || FnameLooksLikeHarvestableActor(probe))
+            return false;
+    }
+
+    // tech- parity: anything with a loot interaction is world loot, not a bot.
+    const uintptr_t lootComp =
+        Memory::read<uintptr_t>(actor + Offsets::LootInteractionComponent);
+    if (lootComp && engine.IsValidPointer(lootComp))
+        return false;
+
+    if (ArcActorType::IsBotClassId(masked))
+        return true;
 
     if (ArcActorType::IsAnyBotActor(actor))
         return true;
@@ -388,8 +419,7 @@ bool LooksLikeBotPawn(uintptr_t actor, uintptr_t localPawn)
         return !LookupEnemyBotByFName(name).empty();
     };
 
-    const std::string classFname = engine.GetActorClassFName(actor);
-    if (fnameResolvesToBot(classFname))
+    if (fnameResolvesToBot(probe))
         return true;
 
     const std::string fnameCached = engine.GetActorFNameStringCached(actor);
@@ -401,6 +431,16 @@ bool LooksLikeBotPawn(uintptr_t actor, uintptr_t localPawn)
 
 bool ShouldExcludeFromWorldCaches(uintptr_t actor, uintptr_t localPawn)
 {
+    if (!actor)
+        return true;
+
+    // Never strip authoritative floor-loot class actors (0xC0000). Console proof:
+    // skip_ground_loot_class ShouldExclude wiped rack items next to the player.
+    const uint32_t masked =
+        ArcActorType::MaskActorTypeId(ArcActorType::ReadActorTypeId(actor));
+    if (ArcActorType::IsGroundLootClassId(masked))
+        return false;
+
     if (LooksLikePlayerPawn(actor, localPawn) || LooksLikeBotPawn(actor, localPawn))
         return true;
     if (IsHeldEquipmentActor(actor))
@@ -412,6 +452,8 @@ bool ShouldExcludeFromWorldCaches(uintptr_t actor, uintptr_t localPawn)
     if (probe.empty())
         probe = engine.GetActorFNameString(actor);
     if (!probe.empty()) {
+        if (FnameLooksLikeDroppedPickup(probe) || FnameLooksLikeHarvestableActor(probe))
+            return false;
         std::string probeLower = probe;
         for (char& c : probeLower)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -427,6 +469,9 @@ bool IsHeldEquipmentActor(uintptr_t actor)
     if (!actor)
         return false;
 
+    // Narrow gate for WORLD exclusion only. Broad consumable/BP_ItemActor
+    // matching here hid Prickly Pear (consumable_*) and Canister (BP_ItemActor_*)
+    // via ShouldExcludeFromWorldCaches. Held-item ESP uses ScoreHeldUseActor below.
     auto checkName = [](const std::string& name) -> bool {
         if (name.empty())
             return false;
@@ -471,6 +516,130 @@ bool IsHeldEquipmentActor(uintptr_t actor)
         return false;
 
     return false;
+}
+
+namespace {
+
+/** Name score for held-use ESP only — NEVER used for world-cache exclusion. */
+int ScoreHeldUseActor(uintptr_t actor)
+{
+    if (!actor || !engine.IsValidPointer(actor))
+        return -1;
+
+    std::string cls = engine.GetActorClassFName(actor);
+    std::string fname = engine.GetActorFNameStringCached(actor);
+    if (fname.empty())
+        fname = engine.GetActorFNameString(actor);
+    std::string lower = cls.empty() ? fname : cls;
+    for (char& c : lower)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower.empty())
+        return -1;
+    if (lower.find("inventoryservice") != std::string::npos
+        || lower.find("fakeinventory") != std::string::npos)
+        return -1;
+    // Plant harvestables never count as held. Floor salvage shells (Canister)
+    // must not win via bare bp_itemactor — only known use-item tokens.
+    if (FnameLooksLikeHarvestableActor(lower))
+        return -1;
+    const uint32_t masked =
+        ArcActorType::MaskActorTypeId(ArcActorType::ReadActorTypeId(actor));
+    if (ArcActorType::IsGroundLootClassId(masked)
+        && lower.find("bp_weaponactor") == std::string::npos
+        && lower.find("weaponactor") == std::string::npos
+        && lower.find("healinghot") == std::string::npos
+        && lower.find("adrenaline") == std::string::npos
+        && lower.find("defibrillator") == std::string::npos
+        && lower.find("shieldovertime") == std::string::npos
+        && lower.find("armor_patcher") == std::string::npos
+        && lower.find("grenade") == std::string::npos
+        && lower.find("throwable") == std::string::npos
+        && lower.find("jumpmine") == std::string::npos
+        && lower.find("bandage") == std::string::npos)
+        return -1;
+
+    int score = -1;
+    if (lower.find("stowedweapon") != std::string::npos)
+        score = 2;
+    else if (lower.find("bp_weaponactor") != std::string::npos
+        || lower.find("weaponactor") != std::string::npos)
+        score = 100;
+    else if (lower.find("healinghot") != std::string::npos
+        || lower.find("adrenaline") != std::string::npos
+        || lower.find("defibrillator") != std::string::npos
+        || lower.find("shieldovertime") != std::string::npos
+        || lower.find("armor_patcher") != std::string::npos
+        || lower.find("grenade") != std::string::npos
+        || lower.find("throwable") != std::string::npos
+        || lower.find("jumpmine") != std::string::npos
+        || lower.find("bandage") != std::string::npos)
+        score = 90;
+    // Bare BP_ItemActor / DA shells are floor loot, not auto-held.
+    return score;
+}
+
+} // namespace
+
+uintptr_t ResolvePreferredHeldItemActor(uintptr_t pawn)
+{
+    if (!pawn)
+        return 0;
+
+    // (1) Inventory CurrentItemActors[0] — local + remotes when replicated.
+    const uintptr_t inv =
+        Memory::read<uintptr_t>(pawn + Offsets::InventoryComponent);
+    if (inv && engine.IsValidPointer(inv)) {
+        const uint64_t data =
+            Memory::read<uint64_t>(inv + Offsets::LocalCurrentItemActors);
+        const int32_t count =
+            Memory::read<int32_t>(inv + Offsets::LocalCurrentItemActors + 0x8);
+        if (data && count > 0 && count <= 64) {
+            const uintptr_t item = Memory::read<uintptr_t>(data);
+            // Inventory slot is authoritative for "in hand" — including BP_ItemActor
+            // bandages/nades. Do not apply floor-shell reject scores here.
+            if (item && engine.IsValidPointer(item)) {
+                std::string cls = engine.GetActorClassFName(item);
+                std::string lower = cls;
+                for (char& c : lower)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (lower.find("inventoryservice") == std::string::npos
+                    && lower.find("fakeinventory") == std::string::npos
+                    && !FnameLooksLikeHarvestableActor(lower))
+                    return item;
+            }
+        }
+    }
+
+    // (2) Remotes: scan level actors whose Instigator/Owner is this pawn.
+    // Do NOT reuse IsHeldEquipmentActor here — that gate must stay weapon-only
+    // so floor Canister / Prickly Pear stay in item ESP.
+#pragma pack(push, 1)
+    struct ActorOwnerInstigatorLocal {
+        uintptr_t owner;
+        uint8_t _pad[Offsets::ActorInstigator - Offsets::ActorOwner - sizeof(uintptr_t)];
+        uintptr_t instigator;
+    };
+#pragma pack(pop)
+
+    uintptr_t best = 0;
+    int bestScore = -1;
+    for (uintptr_t a : WorldScan::CachedActorPtrs()) {
+        if (!a || a == pawn)
+            continue;
+        const ActorOwnerInstigatorLocal oi =
+            Memory::read<ActorOwnerInstigatorLocal>(a + Offsets::ActorOwner);
+        const bool linked =
+            (oi.instigator == pawn && Memory::IsValidPtrFast2(oi.instigator))
+            || (oi.owner == pawn && Memory::IsValidPtrFast2(oi.owner));
+        if (!linked)
+            continue;
+        const int s = ScoreHeldUseActor(a);
+        if (s > bestScore) {
+            bestScore = s;
+            best = a;
+        }
+    }
+    return best;
 }
 
 namespace {
@@ -530,8 +699,21 @@ void CollectHeldItemActors(uintptr_t pawn, std::unordered_set<uintptr_t>& out)
             for (int32_t i = 0; i < count; ++i) {
                 const uintptr_t item = Memory::read<uintptr_t>(
                     data + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
-                if (item && engine.IsValidPointer(item))
-                    out.insert(item);
+                if (!item || !engine.IsValidPointer(item))
+                    continue;
+                // Never blacklist floor/world harvest shells via inventory array
+                // if DMA ever aliases them — held weapons/use-items still exclude.
+                std::string cls = engine.GetActorClassFName(item);
+                if (cls.empty())
+                    cls = engine.GetActorFNameStringCached(item);
+                if (!cls.empty() && FnameLooksLikeHarvestableActor(cls))
+                    continue;
+                // Console+NDJSON proof: occupied_held skipped masked=0xC0000 keys
+                // (incl. CameraMgr) — LocalCurrentItemActors can alias floor loot /
+                // garbage pointers. Only blacklist real held/use actors.
+                if (ScoreHeldUseActor(item) < 0 && !IsHeldEquipmentActor(item))
+                    continue;
+                out.insert(item);
             }
         }
     }
@@ -651,7 +833,20 @@ void DedupeWorldCacheByRoot(std::unordered_map<uintptr_t, Engine::WorldCacheEntr
         return aKey;
     };
 
+    // Only collapse ground-loot twins that share a root. Real crates/lockers/safes
+    // often resolve to the same RootComponent via DMA — full dedupe erased ~half.
+    auto isRealContainer = [](const Engine::WorldCacheEntry& entry) -> bool {
+        const auto cat = static_cast<WorldItemCategory>(entry.worldCategory);
+        return WorldCategoryIsContainerProp(cat)
+            && cat != WorldItemCategory::DroppedPickup
+            && cat != WorldItemCategory::Items
+            && cat != WorldItemCategory::Harvestable
+            && cat != WorldItemCategory::Keys;
+    };
+
     for (const auto& [key, entry] : cache) {
+        if (isRealContainer(entry))
+            continue;
         const uintptr_t root = entry.rootComponent;
         if (!root)
             continue;
