@@ -354,11 +354,21 @@ void DrawHumanSilhouetteFilledImpl(ImDrawList* dl, const Visuals::HumanSilhouett
     if (!dl || !in.hasHead || !in.hasNeck)
         return;
 
-    ImVec2 footMid = in.footL;
-    if (in.hasLegL && in.hasLegR)
+    ImVec2 footMid = in.hasFootL ? in.footL : ImVec2{};
+    if (in.hasFootL && in.hasFootR)
         footMid = ImVec2((in.footL.x + in.footR.x) * 0.5f, (in.footL.y + in.footR.y) * 0.5f);
-    else if (in.hasLegR)
+    else if (in.hasFootR)
         footMid = in.footR;
+    else if (in.hasCalfL && in.hasCalfR)
+        footMid = ImVec2((in.calfL.x + in.calfR.x) * 0.5f, (in.calfL.y + in.calfR.y) * 0.5f);
+    else if (in.hasCalfL)
+        footMid = in.calfL;
+    else if (in.hasCalfR)
+        footMid = in.calfR;
+    else if (in.hasPelvis)
+        footMid = in.pelvis;
+    else
+        footMid = in.neck;
 
     const float bodyH = static_cast<float>((std::max)(std::hypot(in.head.x - footMid.x, in.head.y - footMid.y), 32.f));
     const float headR = std::clamp(
@@ -385,60 +395,48 @@ void DrawHumanSilhouetteFilledImpl(ImDrawList* dl, const Visuals::HumanSilhouett
     if (in.hasClavicleL && in.hasClavicleR)
         FillSegment(dl, in.clavicleL, in.clavicleR, wNeck * 0.9f, wNeck * 0.9f, fillSolid);
 
-    if (in.hasLegL && in.hasLegR)
+    if (in.hasThighL && in.hasThighR)
         FillSegment(dl, in.thighL, in.thighR, wHip * 0.7f, wHip * 0.65f, fillSolid);
 
+    // Legs: pairwise only — never assume missing joints are (0,0).
     if (in.hasLegL) {
-        if (in.hasPelvis) {
-            const float hipBridge = (std::min)(wHip, wThigh);
-            FillSegment(dl, in.pelvis, in.thighL, hipBridge, wThigh, fillSolid);
-        }
-        ImVec2 chain[3]{ in.thighL, in.calfL, in.footL };
-        const float widths[3]{ wThigh, wCalf, wFoot };
-        FillLimbChainSmooth(dl, chain, 3, widths, fillSolid);
+        if (in.hasPelvis && in.hasThighL)
+            FillSegment(dl, in.pelvis, in.thighL, (std::min)(wHip, wThigh), wThigh, fillSolid);
+        if (in.hasThighL && in.hasCalfL)
+            FillSegment(dl, in.thighL, in.calfL, wThigh, wCalf, fillSolid);
+        if (in.hasCalfL && in.hasFootL)
+            FillSegment(dl, in.calfL, in.footL, wCalf, wFoot, fillSolid);
     }
     if (in.hasLegR) {
-        if (in.hasPelvis) {
-            const float hipBridge = (std::min)(wHip, wThigh);
-            FillSegment(dl, in.pelvis, in.thighR, hipBridge, wThigh, fillSolid);
-        }
-        ImVec2 chain[3]{ in.thighR, in.calfR, in.footR };
-        const float widths[3]{ wThigh, wCalf, wFoot };
-        FillLimbChainSmooth(dl, chain, 3, widths, fillSolid);
+        if (in.hasPelvis && in.hasThighR)
+            FillSegment(dl, in.pelvis, in.thighR, (std::min)(wHip, wThigh), wThigh, fillSolid);
+        if (in.hasThighR && in.hasCalfR)
+            FillSegment(dl, in.thighR, in.calfR, wThigh, wCalf, fillSolid);
+        if (in.hasCalfR && in.hasFootR)
+            FillSegment(dl, in.calfR, in.footR, wCalf, wFoot, fillSolid);
     }
 
+    // Arms: pairwise only.
     if (in.hasArmL) {
-        if (in.hasClavicleL)
+        if (in.hasClavicleL && in.hasUpperArmL)
             FillSegment(dl, in.clavicleL, in.upperArmL, wArm * 0.92f, wArm, fillSolid);
-        else if (in.hasChest)
+        else if (in.hasChest && in.hasUpperArmL)
             FillSegment(dl, in.chest, in.upperArmL, wChest * 0.38f, wArm, fillSolid);
-        const float handDist = std::hypot(in.handL.x - in.lowerArmL.x, in.handL.y - in.lowerArmL.y);
-        if (handDist > 2.f) {
-            ImVec2 chain[3]{ in.upperArmL, in.lowerArmL, in.handL };
-            const float widths[3]{ wArm, wFore, wHand };
-            FillLimbChainSmooth(dl, chain, 3, widths, fillSolid);
-        } else {
-            ImVec2 chain[2]{ in.upperArmL, in.lowerArmL };
-            const float widths[2]{ wArm, wFore };
-            FillLimbChainSmooth(dl, chain, 2, widths, fillSolid);
-        }
+        if (in.hasUpperArmL && in.hasLowerArmL)
+            FillSegment(dl, in.upperArmL, in.lowerArmL, wArm, wFore, fillSolid);
+        if (in.hasLowerArmL && in.hasHandL)
+            FillSegment(dl, in.lowerArmL, in.handL, wFore, wHand, fillSolid);
     }
 
     if (in.hasArmR) {
-        if (in.hasClavicleR)
+        if (in.hasClavicleR && in.hasUpperArmR)
             FillSegment(dl, in.clavicleR, in.upperArmR, wArm * 0.92f, wArm, fillSolid);
-        else if (in.hasChest)
+        else if (in.hasChest && in.hasUpperArmR)
             FillSegment(dl, in.chest, in.upperArmR, wChest * 0.38f, wArm, fillSolid);
-        const float handDist = std::hypot(in.handR.x - in.lowerArmR.x, in.handR.y - in.lowerArmR.y);
-        if (handDist > 2.f) {
-            ImVec2 chain[3]{ in.upperArmR, in.lowerArmR, in.handR };
-            const float widths[3]{ wArm, wFore, wHand };
-            FillLimbChainSmooth(dl, chain, 3, widths, fillSolid);
-        } else {
-            ImVec2 chain[2]{ in.upperArmR, in.lowerArmR };
-            const float widths[2]{ wArm, wFore };
-            FillLimbChainSmooth(dl, chain, 2, widths, fillSolid);
-        }
+        if (in.hasUpperArmR && in.hasLowerArmR)
+            FillSegment(dl, in.upperArmR, in.lowerArmR, wArm, wFore, fillSolid);
+        if (in.hasLowerArmR && in.hasHandR)
+            FillSegment(dl, in.lowerArmR, in.handR, wFore, wHand, fillSolid);
     }
 
     const float hdx = in.head.x - in.neck.x;
@@ -454,9 +452,9 @@ void DrawHumanSilhouetteFilledImpl(ImDrawList* dl, const Visuals::HumanSilhouett
     if (neckJoin > 0.5f)
         dl->AddCircleFilled(in.neck, neckJoin, fillSolid, 14);
 
-    if (in.hasLegL)
+    if (in.hasFootL)
         dl->AddCircleFilled(in.footL, wFoot * 0.65f, fillSolid, 10);
-    if (in.hasLegR)
+    if (in.hasFootR)
         dl->AddCircleFilled(in.footR, wFoot * 0.65f, fillSolid, 10);
 
     dl->AddEllipseFilled(

@@ -153,25 +153,37 @@ WorldItemCategory ClassifyItem(
     }
     if ((fnameIsPickup || classGroundLoot) && !fnameIsContainer && !classChest)
         return WorldItemCategory::DroppedPickup;
-    // Item scanner only feeds item-tab rows — never crate/locker/industrial tabs.
+
+    // Item scanner feeds item/dropped rows only. Medical/Ammo/Grenade/Backpack/
+    // ArcLoot/WeaponCase are container-type menu rows — never classify pickups
+    // as those (e.g. a syringe must not inherit Medical SP distance).
+    const auto remapContainerTyped = [&](WorldItemCategory c) -> WorldItemCategory {
+        switch (c) {
+        case WorldItemCategory::Medical:
+        case WorldItemCategory::Ammo:
+        case WorldItemCategory::Grenade:
+        case WorldItemCategory::Backpack:
+        case WorldItemCategory::ArcLoot:
+        case WorldItemCategory::WeaponCase:
+            return (classGroundLoot || fnameIsPickup)
+                ? WorldItemCategory::DroppedPickup
+                : WorldItemCategory::Items;
+        default:
+            return c;
+        }
+    };
+    cat = remapContainerTyped(cat);
+
+    // Remaining container props (crate/locker/…) → Items / DroppedPickup.
     if (WorldCategoryIsContainerProp(cat)
         && cat != WorldItemCategory::DroppedPickup
         && cat != WorldItemCategory::Harvestable
-        && cat != WorldItemCategory::Ammo
-        && cat != WorldItemCategory::ArcLoot
-        && cat != WorldItemCategory::Backpack
-        && cat != WorldItemCategory::Grenade
-        && cat != WorldItemCategory::Medical
+        && cat != WorldItemCategory::Items
         && cat != WorldItemCategory::Keys)
         return classGroundLoot || fnameIsPickup
             ? WorldItemCategory::DroppedPickup : WorldItemCategory::Items;
     if (cat != WorldItemCategory::DroppedPickup
         && cat != WorldItemCategory::Items
-        && cat != WorldItemCategory::Ammo
-        && cat != WorldItemCategory::ArcLoot
-        && cat != WorldItemCategory::Backpack
-        && cat != WorldItemCategory::Grenade
-        && cat != WorldItemCategory::Medical
         && cat != WorldItemCategory::Keys
         && cat != WorldItemCategory::Harvestable) {
         if (classGroundLoot || fnameIsPickup)
@@ -184,7 +196,24 @@ WorldItemCategory ClassifyItem(
 
 static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> s_depletedDeny;
 static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> s_pickupEvictAfter;
+static std::unordered_map<uintptr_t, uint8_t> s_itemPosMisses;
 static constexpr std::chrono::seconds kItemPickupDenyDuration{5};
+static constexpr uint8_t kItemPosMissEvict = 12;
+
+static bool ItemPosMissShouldEvict(uintptr_t key, bool posOk)
+{
+    if (posOk) {
+        s_itemPosMisses.erase(key);
+        return false;
+    }
+    const uint8_t misses = ++s_itemPosMisses[key];
+    return misses >= kItemPosMissEvict;
+}
+
+static void ClearItemPosMiss(uintptr_t key)
+{
+    s_itemPosMisses.erase(key);
+}
 
 static bool IsItemAdmissionDenied(uintptr_t key)
 {
@@ -203,6 +232,7 @@ static void MarkItemDepleted(uintptr_t key)
         std::chrono::steady_clock::now() + kItemPickupDenyDuration;
     s_depletedDeny[key] = until;
     s_pickupEvictAfter[key] = until;
+    ClearItemPosMiss(key);
 }
 
 static void SchedulePickupEvict(uintptr_t key)
@@ -431,9 +461,18 @@ void Engine::ItemList()
             }
             if (displayName.empty() && !labelFname.empty())
                 displayName = HumanizeActorFName(labelFname);
+            // Final fallback: try the class FName — it is a different memory read
+            // and often still decryptable when the actor FName read fails.
+            if ((displayName.empty() || IsGenericWorldEspLabel(displayName))
+                && !classFname.empty()
+                && !FnameLooksLikeEngineSubobjectClass(classFname)) {
+                const std::string classHuman = HumanizeActorFName(classFname);
+                if (!classHuman.empty() && !IsGenericWorldEspLabel(classHuman)
+                    && !IsJunkWorldEspLabel(classHuman) && IsPlausibleEspLabel(classHuman))
+                    displayName = classHuman;
+            }
             if (displayName.empty()) {
-                if (fnameIsPickup) displayName = "Loot";
-                else if (classGroundLoot) displayName = "Loot";
+                if (fnameIsPickup || classGroundLoot) displayName = "Pickup";
                 else displayName = "Item";
             }
         }
@@ -442,8 +481,10 @@ void Engine::ItemList()
         if (displayName.empty() || IsJunkWorldEspLabel(displayName)
             || IsGarbledEspLabel(displayName)
             || IsGenericWorldEspLabel(displayName)) {
+            // "Pickup" is intentionally not in IsGenericWorldEspLabel so the render
+            // path won't loop-replace it; use it rather than "Dropped Pickup".
             if (fnameIsPickup || classGroundLoot)
-                displayName = "Dropped Pickup";
+                displayName = "Pickup";
             else
                 displayName = "Item";
         }
@@ -524,6 +565,23 @@ void Engine::ItemList()
             continue;
         }
 
+        // Re-home stale Medical/Ammo/… categories so old cache entries cannot
+        // keep Medical SP distance after ClassifyItem remapping.
+        {
+            const bool fnameIsPickup = FnameLooksLikeDroppedPickup(retainFname)
+                || FnameLooksLikeDroppedPickup(retainClass);
+            const WorldItemCategory fixed = ClassifyItem(
+                ToLowerCopy(retainFname),
+                ToLowerCopy(it->second.ItemDisplayName),
+                false,
+                ArcActorType::IsGroundLootClassId(
+                    ArcActorType::MaskActorTypeId(ArcActorType::ReadActorTypeId(key))),
+                false,
+                fnameIsPickup,
+                FnameLooksLikeWorldContainer(retainFname));
+            it->second.worldCategory = static_cast<uint8_t>(fixed);
+        }
+
         retainIters.push_back(it);
         retainRoots.push_back(0);
         ++it;
@@ -545,11 +603,17 @@ void Engine::ItemList()
     for (size_t i = 0; i < retainIters.size(); ++i) {
         const uintptr_t key = retainIters[i]->first;
         const uintptr_t root = retainRoots[i];
-        if (!root || !IsValidPointer(root)
-            || !IsPlausibleWorldPos(retainIters[i]->second.WorldPos)) {
+        const bool posOk = root && IsValidPointer(root)
+            && IsPlausibleWorldPos(retainIters[i]->second.WorldPos);
+        if (!posOk) {
             ++dbgPosSkip;
-            MarkItemDepleted(key);
-            localCache.erase(key);
+            // Grace like containers — never MarkItemDepleted on a one-frame DMA miss.
+            if (ItemPosMissShouldEvict(key, false)) {
+                ClearItemPosMiss(key);
+                localCache.erase(key);
+            }
+        } else {
+            ItemPosMissShouldEvict(key, true);
         }
     }
 

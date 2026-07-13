@@ -148,11 +148,4 @@ int kmNet_CfgDescriptor(int wrflag, char* buff, int length);//读写设备配置
 int kmNet_EndPointDescriptor(int wrflag, int ep, char* buff, int length);//读写端点描述符
 
 
-//视频采集类函数
-#if 0
-int kvm_setvideo(int width, int height, int fps);//设置采集视频分辨与帧率
-int kvm_getframe(Mat* frame);					 //获取最新一帧图像数据
-int kvm_load_yolo_module(char* path);			 //加载yolo模型路径
-int kvm_run_yolo(Mat* frame, int cpu_gpu);		 //图像推导
-#endif
 

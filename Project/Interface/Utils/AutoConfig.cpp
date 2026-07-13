@@ -113,6 +113,7 @@ struct Snapshot {
     float bot_color_invisible[4]{};
 
     bool enable_aimbot{};
+    bool enable_triggerbot{};
     bool robotAimEnabled{};
     int aim_hold_key{};
     int aim_bone_mode{};
@@ -295,6 +296,7 @@ Snapshot CaptureSnapshot()
     std::memcpy(s.color_dead_bots, var::color_dead_bots, sizeof(s.color_dead_bots));
 
     s.enable_aimbot = var::enable_aimbot;
+    s.enable_triggerbot = var::enable_triggerbot;
     s.robotAimEnabled = var::robotAimEnabled;
     s.aim_hold_key = var::aim_hold_key;
     s.aim_bone_mode = static_cast<int>(var::aim_bone_mode);
@@ -436,6 +438,7 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         ColorsEqual(a.bot_color_invisible, b.bot_color_invisible) &&
         ColorsEqual(a.color_dead_bots, b.color_dead_bots) &&
         a.enable_aimbot == b.enable_aimbot &&
+        a.enable_triggerbot == b.enable_triggerbot &&
         a.robotAimEnabled == b.robotAimEnabled &&
         a.aim_hold_key == b.aim_hold_key &&
         a.aim_bone_mode == b.aim_bone_mode &&
@@ -760,6 +763,7 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     else if (key == "bot_color_visible") ParseColor4(val, var::bot_color_visible);
     else if (key == "bot_color_invisible") ParseColor4(val, var::bot_color_invisible);
     else if (key == "enable_aimbot") var::enable_aimbot = ParseBool(val, var::enable_aimbot);
+    else if (key == "enable_triggerbot") var::enable_triggerbot = ParseBool(val, var::enable_triggerbot);
     else if (key == "robotAimEnabled") var::robotAimEnabled = ParseBool(val, var::robotAimEnabled);
     else if (key == "aim_hold_key") var::aim_hold_key = std::atoi(val.c_str());
     else if (key == "aim_bone_mode") {
@@ -901,6 +905,7 @@ void WriteIni()
     WriteColor4(file, "bot_color_invisible", var::bot_color_invisible);
 
     file << "enable_aimbot=" << (var::enable_aimbot ? 1 : 0) << '\n';
+    file << "enable_triggerbot=" << (var::enable_triggerbot ? 1 : 0) << '\n';
     file << "robotAimEnabled=" << (var::robotAimEnabled ? 1 : 0) << '\n';
     file << "aim_hold_key=" << var::aim_hold_key << '\n';
     file << "aim_bone_mode=" << static_cast<int>(var::aim_bone_mode) << '\n';

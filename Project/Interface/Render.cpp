@@ -50,7 +50,7 @@ void Render(HWND hwnd)
     }
 
     if (engine.IsEspRaidActive() && var::show_radar)
-        engine.RenderRadar();
+        engine.RenderRadar(showmenu);
 
     if (var::show_debug_overlay && !showmenu) {
         DrawDebugOffsetValidation(engine);

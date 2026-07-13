@@ -208,16 +208,6 @@ public:
         return g_mem.read(reinterpret_cast<uintptr_t>(address), buffer, static_cast<size_t>(size));
     }
 
-    static bool read_cached(const void* address, void* buffer, DWORD64 size)
-    {
-        if (!g_mem.IsInitialized() || !address || !buffer || !size)
-            return false;
-        return PCIMemory::ReadVirtualMemoryCached(
-            reinterpret_cast<uintptr_t>(address),
-            buffer,
-            static_cast<size_t>(size));
-    }
-
     static bool read(DWORD64 address, void* buffer, DWORD64 size)
     {
         return read(reinterpret_cast<void*>(address), buffer, size);
@@ -235,14 +225,6 @@ public:
     static T read(uint64_t address)
     {
         return read<T>(reinterpret_cast<void*>(address));
-    }
-
-    template <typename T>
-    static T read_cache(uint64_t address)
-    {
-        T buffer{};
-        read_cached(reinterpret_cast<void*>(address), &buffer, sizeof(T));
-        return buffer;
     }
 
     template <typename T>

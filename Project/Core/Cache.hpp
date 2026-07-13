@@ -146,45 +146,4 @@ struct FTransform
 
         return m;
     }
-
-    D3DMATRIX ToMatrixWithScaleArcRaiders() const
-    {
-        D3DMATRIX m{};
-        m._41 = static_cast<float>(Translation.x);
-        m._42 = static_cast<float>(Translation.y);
-        m._43 = static_cast<float>(Translation.z);
-
-        const double x2 = Rotation.x + Rotation.x;
-        const double y2 = Rotation.y + Rotation.y;
-        const double z2 = Rotation.z + Rotation.z;
-        const double xx2 = Rotation.x * x2;
-        const double yy2 = Rotation.y * y2;
-        const double zz2 = Rotation.z * z2;
-
-        m._11 = static_cast<float>((1.0 - (yy2 + zz2)) * Scale3D.x);
-        m._22 = static_cast<float>((1.0 - (xx2 + zz2)) * Scale3D.y);
-        m._33 = static_cast<float>((1.0 - (xx2 + yy2)) * Scale3D.z);
-
-        const double yz2 = Rotation.y * z2;
-        const double wx2 = Rotation.w * x2;
-        m._32 = static_cast<float>((yz2 - wx2) * Scale3D.z);
-        m._23 = static_cast<float>((yz2 + wx2) * Scale3D.y);
-
-        const double xy2 = Rotation.x * y2;
-        const double wz2 = Rotation.w * z2;
-        m._21 = static_cast<float>((xy2 - wz2) * Scale3D.y);
-        m._12 = static_cast<float>((xy2 + wz2) * Scale3D.x);
-
-        const double xz2 = Rotation.x * z2;
-        const double wy2 = Rotation.w * y2;
-        m._31 = static_cast<float>((xz2 + wy2) * Scale3D.z);
-        m._13 = static_cast<float>((xz2 - wy2) * Scale3D.x);
-
-        m._14 = 0.0f;
-        m._24 = 0.0f;
-        m._34 = 0.0f;
-        m._44 = 1.0f;
-
-        return m;
-    }
 };

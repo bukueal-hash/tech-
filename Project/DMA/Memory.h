@@ -60,8 +60,6 @@ public:
 
     static bool ReadVirtualMemoryEx(uintptr_t address, void* buffer, size_t size);
     static bool ReadVirtualMemory(uintptr_t address, void* buffer, size_t size);
-    /** Stable pointers/chains — allow VMM cache. */
-    static bool ReadVirtualMemoryCached(uintptr_t address, void* buffer, size_t size);
     /** Per-frame camera / actor positions — bypass VMM data cache. */
     static bool ReadVirtualMemoryNoCache(uintptr_t address, void* buffer, size_t size);
 
@@ -71,10 +69,6 @@ public:
     bool IsInitialized() const { return hVMM != nullptr; }
 
     static bool FullRefresh();
-    static bool PartialMemRefresh();
-    static bool PartialTlbRefresh();
-    /** VMMDLL TLB partial refresh, at most once per 2s (hot path). */
-    static bool SmartTlbRefreshIfDue();
 
     static void* GetScatterHandle();
     static bool RequestReadScatter(void* handle, uintptr_t address, void* buffer, size_t size);
@@ -165,22 +159,6 @@ inline bool PCIMemory::ReadVirtualMemoryEx(uintptr_t address, void* buffer, size
 
 inline bool PCIMemory::ReadVirtualMemory(uintptr_t address, void* buffer, size_t size) {
     return ReadVirtualMemoryEx(address, buffer, size);
-}
-
-inline bool PCIMemory::ReadVirtualMemoryCached(uintptr_t address, void* buffer, size_t size) {
-    if (hVMM && processId) {
-        DWORD cbRead = 0;
-        return VMMDLL_MemReadEx(
-                   hVMM,
-                   processId,
-                   address,
-                   static_cast<PBYTE>(buffer),
-                   static_cast<DWORD>(size),
-                   &cbRead,
-                   0)
-            && cbRead == size;
-    }
-    return false;
 }
 
 inline bool PCIMemory::ReadVirtualMemoryNoCache(uintptr_t address, void* buffer, size_t size) {

@@ -42,6 +42,9 @@ static const WorldPropTokenEntry kWorldPropTokens[] = {
     { "environmentalloot", WorldItemCategory::Harvestable, "Harvestable" },
     { "consumableagave", WorldItemCategory::Harvestable, "Agave" },
     { "consumable_agave", WorldItemCategory::Harvestable, "Agave" },
+    { "consumable_prickly", WorldItemCategory::Harvestable, "Prickly Pear" },
+    { "pricklypear", WorldItemCategory::Harvestable, "Prickly Pear" },
+    { "consumablepricklypear", WorldItemCategory::Harvestable, "Prickly Pear" },
     { "arcdeforesterhusk", WorldItemCategory::ArcCargoship, "Arc Husk" },
     { "arcdeforester", WorldItemCategory::ArcCargoship, "ARC Deforester" },
     { "arcentry", WorldItemCategory::ArcCargoship, "ARC Entry" },
@@ -919,6 +922,7 @@ void InitContainerRangeDefaults()
     if (initialized)
         return;
     initialized = true;
+    // All rows default SP off → loot_distance. User checks SP per row for far range.
     g_containerRangeSp.fill(0);
 }
 
@@ -1005,7 +1009,7 @@ static bool CategoryRowUsesSp(WorldItemCategory cat)
 
 float WorldCategoryMaxDrawMeters(WorldItemCategory cat)
 {
-    // Loot tab: row SP checked → SP slider; unchecked → loot slider.
+    // Per-row SP: unchecked = loot_distance, checked = container_distance_sp.
     return CategoryRowUsesSp(cat)
         ? var::container_distance_sp
         : var::loot_distance;
@@ -1044,56 +1048,53 @@ bool WorldLootEntryLooksLikeContainer(const WorldLootFilterView& loot)
         && wcat != WorldItemCategory::Harvestable;
 }
 
-namespace {
-
-/** Menu Loot tab: SP checked → SP slider; unchecked → loot slider (per filter row). */
-float LootMenuRowDrawMeters(bool spChecked)
-{
-    return spChecked ? var::container_distance_sp : var::loot_distance;
-}
-
-} // namespace
-
 float WorldLootPickupMaxDrawMeters(WorldItemCategory cat, const WorldLootFilterView* loot)
 {
-    const float maxM = WorldCategoryMaxDrawMeters(cat);
-    // Container-type row SP checkbox (Loot tab table) — not the filter-row SP boxes.
-    if (CategoryRowUsesSp(cat))
-        return maxM;
     if (!loot)
-        return maxM;
+        return WorldCategoryMaxDrawMeters(cat);
 
-    if (WorldLootEntryLooksLikeContainer(*loot))
-        return maxM;
+    // Every loot-tab SP box: unchecked → loot_distance, checked → container_distance_sp.
+    // Ground items (syringe, etc.) use Items/Dropped/Keys/Harvestable row SP only —
+    // never Medical/Ammo/Grenade container-row SP. Value/rarity SP stretch matching
+    // pickups the same way (unchecked = stay on item-row distance).
+    const bool fnameIsContainer =
+        !loot->actorName.empty() && FnameLooksLikeWorldContainer(loot->actorName);
+    const bool pickupPath =
+        LootItemLooksLikePickup(*loot)
+        || cat == WorldItemCategory::DroppedPickup
+        || cat == WorldItemCategory::Items
+        || cat == WorldItemCategory::Keys
+        || cat == WorldItemCategory::Harvestable
+        || (loot->lootValue > 0 && !fnameIsContainer);
 
-    if (!LootItemLooksLikePickup(*loot))
-        return maxM;
+    if (pickupPath) {
+        WorldItemCategory itemRow = WorldItemCategory::DroppedPickup;
+        if (cat == WorldItemCategory::Items
+            || cat == WorldItemCategory::Keys
+            || cat == WorldItemCategory::DroppedPickup
+            || cat == WorldItemCategory::Harvestable)
+            itemRow = cat;
 
-    const float minValue = var::loot_min_value;
-    const int minTier = LootMinRarityMenuToMinTier(var::loot_min_rarity);
+        float drawM = WorldCategoryMaxDrawMeters(itemRow);
 
-    const bool valueFilterOn = minValue > 0.f;
-    const bool rarityFilterOn = minTier > 0;
+        const float minValue = var::loot_min_value;
+        const int minTier = LootMinRarityMenuToMinTier(var::loot_min_rarity);
+        const bool meetsValue = minValue > 0.f
+            && loot->lootValue > 0
+            && static_cast<float>(loot->lootValue) >= minValue;
+        const bool meetsRarity = minTier > 0
+            && loot->lootRarityTier > 0
+            && loot->lootRarityTier >= minTier;
 
-    const bool meetsValue = valueFilterOn
-        && loot->lootValue > 0
-        && static_cast<float>(loot->lootValue) >= minValue;
-    const bool meetsRarity = rarityFilterOn
-        && loot->lootRarityTier > 0
-        && loot->lootRarityTier >= minTier;
+        if (meetsValue && var::loot_min_val_sp)
+            drawM = (std::max)(drawM, var::container_distance_sp);
+        if (meetsRarity && var::loot_min_rar_sp)
+            drawM = (std::max)(drawM, var::container_distance_sp);
+        return drawM;
+    }
 
-    // Pickups below every active filter use the default loot slider (maxM).
-    if (!meetsValue && !meetsRarity)
-        return maxM;
-
-    // Each active filter row applies its own SP / loot distance; use the widest
-    // range when an item qualifies for more than one row (menu: per-row SP column).
-    float drawM = maxM;
-    if (meetsValue)
-        drawM = (std::max)(drawM, LootMenuRowDrawMeters(var::loot_min_val_sp));
-    if (meetsRarity)
-        drawM = (std::max)(drawM, LootMenuRowDrawMeters(var::loot_min_rar_sp));
-    return drawM;
+    // Real containers (medical bag, crate, locker, …): that row's SP only.
+    return WorldCategoryMaxDrawMeters(cat);
 }
 
 float WorldLootScanRadiusMeters()
@@ -1137,7 +1138,8 @@ bool LootItemLooksLikePickup(const WorldLootFilterView& loot)
 
 bool PassesLootPickupFilters(const WorldLootFilterView& loot)
 {
-    // Distance tiers live in WorldLootPickupMaxDrawMeters; filters never hide pickups.
+    // Never hide. Value/rarity + SP only choose close vs far draw distance
+    // (see WorldLootPickupMaxDrawMeters). Call sites keep this gate for wiring.
     (void)loot;
     return true;
 }
@@ -1695,6 +1697,18 @@ bool PointerIsLootInteractionComponent(uintptr_t obj)
         || lower.find("constructablelootinteractioncomponent") != std::string::npos;
 }
 
+bool LootInteractionOwnedByActor(uintptr_t component, uintptr_t actor)
+{
+    if (!component || !actor || !Memory::IsValidPtrFast2(component))
+        return false;
+    // UObject::OuterPrivate @ 0x20 — component must belong to this actor.
+    const uintptr_t outer = Memory::read<uintptr_t>(component + 0x20);
+    if (outer == actor)
+        return true;
+    // Decrypt path when OuterPrivate layout differs or is encrypted.
+    return PointerIsLootInteractionComponent(component);
+}
+
 bool FnameExcludedFromContainerEsp(const std::string& fnameLower)
 {
     if (fnameLower.empty())
@@ -1848,6 +1862,11 @@ bool IsJunkWorldEspLabel(const std::string& label)
         "local player",
         "game instance",
         "explosion ref",
+        "ui meta",
+        "uimeta",
+        "metadata",
+        "weapon mod",
+        "weaponmod",
     };
     for (const char* token : kBlocked) {
         if (lower.find(token) != std::string::npos)
@@ -2016,33 +2035,18 @@ void AppendUniqueItemContainerPointer(std::vector<uintptr_t>& out, uintptr_t can
 
 bool ItemContainerPtrLooksOpened(uintptr_t containerComp)
 {
-    if (!PointerIsItemContainerComponent(containerComp))
-        return false;
-
-    const std::string classLower = ToLowerLocal(engine.GetActorClassFName(containerComp));
-    const bool constructable = Contains(classLower, "constructableitemcontainer");
-
-    const std::ptrdiff_t primaryOff = constructable
-        ? Offsets::ConstructableItemContainer_OpenTime
-        : Offsets::ItemContainer_OpenTime;
-    const std::ptrdiff_t altOff = constructable
-        ? Offsets::ItemContainer_OpenTime
-        : Offsets::ConstructableItemContainer_OpenTime;
-
-    const double primary = Memory::read<double>(
-        containerComp + static_cast<uint64_t>(primaryOff));
-    if (primary > 0.001)
-        return true;
-
-    const double alt = Memory::read<double>(
-        containerComp + static_cast<uint64_t>(altOff));
-    return alt > 0.001;
+    // OpenTime / alt@0x490 (DynamicLootType) caused room-wide false opens.
+    // ItemContainer is not used as an open signal; keep helper for debug callers.
+    (void)containerComp;
+    return false;
 }
 
 void CollectActorItemContainerPointers(uintptr_t actor, std::vector<uintptr_t>& out)
 {
     out.clear();
 
+    AppendUniqueItemContainerPointer(out,
+        Memory::read<uintptr_t>(actor + Offsets::LootContainer_ItemContainer));
     AppendUniqueItemContainerPointer(out,
         Memory::read<uintptr_t>(actor + Offsets::SimpleLootActivity_ItemContainer));
 
@@ -2075,9 +2079,10 @@ bool LootComponentLooksSearched(uintptr_t lootComp)
     if (!PointerIsLootInteractionComponent(lootComp))
         return false;
 
-    const uint8_t searched = Memory::read<uint8_t>(
+    // Offsets::LootInteraction_Searched == bHasBeenOpened @0x870 (mask 0x1).
+    const uint8_t opened = Memory::read<uint8_t>(
         lootComp + static_cast<uint64_t>(Offsets::LootInteraction_Searched));
-    return (searched & 0x1) != 0;
+    return (opened & 0x1) != 0;
 }
 
 bool ActorLooksHiddenOrDestroyed(uintptr_t actor)
@@ -2113,11 +2118,30 @@ ContainerOpenSignal ProbeContainerOpenSignals(uintptr_t actor, const std::string
     if (FnameExcludedFromContainerEsp(fnameLower))
         return ContainerOpenSignal::None;
 
+    // Fast path: directly read bHasBeenOpened from the LootInteractionComponent
+    // pointer.  We skip the class-name gate (which fails on DMA reads) but
+    // validate via UObject::OuterPrivate (offset 0x20 in this engine's layout)
+    // — it must point back to the owning actor so we know the pointer is real.
+    // SDK: LootContainerSingle::LootInteraction@0xB58,
+    //      LootInteractionComponent::bHasBeenOpened@0x870 mask=0x1.
+    {
+        const uintptr_t lootCompDirect =
+            Memory::read<uintptr_t>(actor + static_cast<uint64_t>(Offsets::LootInteractionComponent));
+        if (lootCompDirect && Memory::IsValidPtrFast2(lootCompDirect)) {
+            const uintptr_t outer = Memory::read<uintptr_t>(lootCompDirect + 0x20);
+            if (outer == actor) {
+                const uint8_t openedByte = Memory::read<uint8_t>(
+                    lootCompDirect + static_cast<uint64_t>(Offsets::LootInteraction_Searched));
+                if (openedByte & 0x1)
+                    return ContainerOpenSignal::LootSearched;
+            }
+        }
+    }
+
     if (SalvageChosenMeshLooksOpened(actor, fnameLower))
         return ContainerOpenSignal::SalvageMesh;
 
-    if (ActorItemContainerLooksOpened(actor))
-        return ContainerOpenSignal::ItemContainer;
+    // Do not use ItemContainer OpenTime (false DynamicLootType opens).
 
     std::vector<uintptr_t> lootPointers;
     CollectLootInteractionPointers(actor, fnameLower, lootPointers);
@@ -2139,14 +2163,26 @@ bool GroundLootPickupHasStrongSignal(GroundLootPickupSignal sig)
     using S = GroundLootPickupSignal;
     if ((sig & S::HiddenOrDestroyed) != S::None)
         return true;
-    if ((sig & S::LootSearched) != S::None)
+    // LootSearched is a container bit — never strong for ground loot.
+
+    // After pickup the game often leaves the item DA / asset id on the shell
+    // and only clears collision or SpawnItems. Alone, those weaks never hit
+    // the old >=2 bar → ESP lingered ~30–40s until destroy. Treat lingering
+    // identity + one physical clear as picked up.
+    const bool stillId = (sig & S::StillHasAssetId) != S::None;
+    if (stillId
+        && ((sig & S::NoCollision) != S::None
+            || (sig & S::SpawnItemsEmpty) != S::None
+            || (sig & S::NoItemDa) != S::None))
         return true;
-    // Live ground loot often exposes game asset id without readable item-DA pointers.
-    if ((sig & S::StillHasAssetId) != S::None)
-        return false;
-    return (sig & S::NoItemDa) != S::None
-        || (sig & S::NoCollision) != S::None
-        || (sig & S::SpawnItemsEmpty) != S::None;
+
+    int weakSignals = 0;
+    if ((sig & S::NoItemDa) != S::None) ++weakSignals;
+    if ((sig & S::NoCollision) != S::None) ++weakSignals;
+    if ((sig & S::SpawnItemsEmpty) != S::None) ++weakSignals;
+
+    // Two independent weaks without asset id (DA cleared + collision/spawn).
+    return weakSignals >= 2;
 }
 
 GroundLootPickupSignal ProbeGroundLootPickupSignals(
@@ -2166,15 +2202,7 @@ GroundLootPickupSignal ProbeGroundLootPickupSignals(
     if (fname.empty())
         fname = engine.GetActorFNameString(actor);
 
-    const std::string fnameLower = ToLowerLocal(fname);
-    std::vector<uintptr_t> lootPointers;
-    CollectLootInteractionPointers(actor, fnameLower, lootPointers);
-    for (const uintptr_t lootComp : lootPointers) {
-        if (LootComponentLooksSearched(lootComp)) {
-            sig = sig | GroundLootPickupSignal::LootSearched;
-            break;
-        }
-    }
+    // Do not collect container LootInteraction / bHasBeenOpened for pickups.
 
     const uint64_t itemDaPrimary =
         Memory::read<uint64_t>(actor + static_cast<uint64_t>(Offsets::ItemDataAsset));

@@ -92,6 +92,157 @@ static UniBone GetSequentialBone(uint64_t targetKey, float currentTime, const Bo
     return targetBone;
 }
 
+static bool TryBoneWorld(const BoneData& bones, UniBone bone, Vector3& outWorld)
+{
+    const size_t idx = static_cast<size_t>(bone);
+    if (!bones.valid.test(idx))
+        return false;
+    outWorld = bones.bonesWorldDouble[idx];
+    return true;
+}
+
+static bool ResolveAimBoneWorld(
+    Engine& eng,
+    const BoneData& bones,
+    uint64_t key,
+    float currentTime,
+    const Vector3& screenCenter,
+    float fovRadius,
+    const Engine::CameraCache& cam,
+    Vector3& outWorld)
+{
+    auto fallbackTorso = [&]() -> bool {
+        if (TryBoneWorld(bones, UniBone::Head, outWorld))
+            return true;
+        if (TryBoneWorld(bones, UniBone::Neck, outWorld))
+            return true;
+        return false;
+    };
+
+    if (var::randombone) {
+        const UniBone bone = GetSequentialBone(key, currentTime, bones);
+        if (TryBoneWorld(bones, bone, outWorld))
+            return true;
+        return fallbackTorso();
+    }
+
+    switch (var::aim_bone_mode) {
+    case AimBoneMode::Head:
+        if (TryBoneWorld(bones, UniBone::Head, outWorld))
+            return true;
+        break;
+    case AimBoneMode::Chest:
+        if (TryBoneWorld(bones, UniBone::Chest, outWorld))
+            return true;
+        break;
+    case AimBoneMode::Pelvis:
+        if (TryBoneWorld(bones, UniBone::Pelvis, outWorld))
+            return true;
+        break;
+    case AimBoneMode::Arms:
+        if (TryBoneWorld(bones, UniBone::UpperArmL, outWorld))
+            return true;
+        if (TryBoneWorld(bones, UniBone::UpperArmR, outWorld))
+            return true;
+        break;
+    case AimBoneMode::Legs:
+        if (TryBoneWorld(bones, UniBone::ThighL, outWorld))
+            return true;
+        if (TryBoneWorld(bones, UniBone::ThighR, outWorld))
+            return true;
+        break;
+    case AimBoneMode::ClosestBone: {
+        static const UniBone kClosestBones[] = {
+            UniBone::Head, UniBone::Neck, UniBone::Chest, UniBone::Spine3,
+            UniBone::Spine2, UniBone::Spine1, UniBone::Pelvis,
+            UniBone::UpperArmL, UniBone::UpperArmR,
+            UniBone::ThighL, UniBone::ThighR,
+        };
+        float bestDist = FLT_MAX;
+        bool found = false;
+        Vector3 bestWorld{};
+        for (UniBone bone : kClosestBones) {
+            Vector3 world{};
+            if (!TryBoneWorld(bones, bone, world))
+                continue;
+            Vector3 screen{};
+            if (!eng.ProjectWorldLocationToScreen(world, screen, cam))
+                continue;
+            const float dx = static_cast<float>(screen.x - screenCenter.x);
+            const float dy = static_cast<float>(screen.y - screenCenter.y);
+            const float dist = std::sqrt(dx * dx + dy * dy);
+            if (dist > fovRadius)
+                continue;
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestWorld = world;
+                found = true;
+            }
+        }
+        if (found) {
+            outWorld = bestWorld;
+            return true;
+        }
+        break;
+    }
+    }
+
+    return fallbackTorso();
+}
+
+static float ScoreAimTarget(
+    float distToCenter,
+    float fovRadius,
+    float worldDistanceM,
+    float health,
+    float maxHealth,
+    int weaponQuality,
+    bool isRobot)
+{
+    const float fovScore = fovRadius - distToCenter;
+    const float distScore = (worldDistanceM > 0.1f)
+        ? (1000.f / worldDistanceM)
+        : 1000.f;
+    float hpPct = 100.f;
+    if (maxHealth > 1.f)
+        hpPct = std::clamp((health / maxHealth) * 100.f, 0.f, 100.f);
+    else if (health > 0.f)
+        hpPct = std::clamp(health, 0.f, 100.f);
+    const float lowHpScore = 100.f - hpPct;
+
+    switch (var::aimbot_priority) {
+    case AimbotPriority::Fov:
+        return fovScore;
+    case AimbotPriority::Distance:
+        return distScore;
+    case AimbotPriority::Threat: {
+        float threat = fovScore * 0.5f + distScore * 0.5f;
+        if (!isRobot && weaponQuality > 0)
+            threat += static_cast<float>(weaponQuality) * 40.f;
+        return threat;
+    }
+    case AimbotPriority::LowHealth:
+        if (maxHealth > 1.f || health > 0.f)
+            return lowHpScore * 2.f + fovScore * 0.25f;
+        return fovScore;
+    case AimbotPriority::FovDistance:
+    default:
+        if (isRobot)
+            return fovScore;
+        return lowHpScore * 1.5f + fovScore;
+    }
+}
+
+static uint64_t g_aimStickyKey = 0;
+static float g_aimStickyExtraFovPx = 0.f;
+
+static float EffectiveAimFovForKey(uint64_t key, float baseFov)
+{
+    if (g_aimStickyKey != 0 && key == g_aimStickyKey && g_aimStickyExtraFovPx > 0.f)
+        return baseFov + g_aimStickyExtraFovPx;
+    return baseFov;
+}
+
 // ============================================
 // MOTOR SYNERGY HUMANIZER (pixel jitter)
 // ============================================
@@ -400,7 +551,8 @@ void Engine::AimAssistPlayer(
     for (const auto& [key, actor] : playerCache)
     {
         if (!actor.Drawing) continue;
-        if (actor.health <= 0.f) continue;
+        // Do not hard-skip health<=0 — same soft policy as ShouldDrawPlayerEsp
+        // (HealthInfo@PS+0x530 is wrong; health often reads 0 while boxes still draw).
         if (var::visiblecheck && !actor.isVisible) continue;
         if (actor.Distance > var::aimbot_distance) continue;
 
@@ -408,34 +560,11 @@ void Engine::AimAssistPlayer(
         Vector3 worldPos{};
 
         const auto& bones = actor.boneData;
-
-        if (var::randombone)
+        if (!ResolveAimBoneWorld(
+                *this, bones, key, currentTime, screenCenter, fovRadius, g_aimProjCam, worldPos))
         {
-            const UniBone targetBone = GetSequentialBone(key, currentTime, bones);
-
-            if (bones.valid.test(static_cast<size_t>(targetBone)))
-                worldPos = bones.bonesWorldDouble[static_cast<size_t>(targetBone)];
-            else if (bones.valid.test(static_cast<size_t>(UniBone::Head)))
-                worldPos = bones.bonesWorldDouble[static_cast<size_t>(UniBone::Head)];
-            else if (bones.valid.test(static_cast<size_t>(UniBone::Neck)))
-                worldPos = bones.bonesWorldDouble[static_cast<size_t>(UniBone::Neck)];
-            else
-            {
-                worldPos = actor.WorldPos;
-                worldPos.z += 160.0;
-            }
-        }
-        else
-        {
-            if (bones.valid.test(static_cast<size_t>(UniBone::Head)))
-                worldPos = bones.bonesWorldDouble[static_cast<size_t>(UniBone::Head)];
-            else if (bones.valid.test(static_cast<size_t>(UniBone::Neck)))
-                worldPos = bones.bonesWorldDouble[static_cast<size_t>(UniBone::Neck)];
-            else
-            {
-                worldPos = actor.WorldPos;
-                worldPos.z += 160.0;
-            }
+            worldPos = actor.WorldPos;
+            worldPos.z += 160.0;
         }
 
         if (var::predict)
@@ -456,12 +585,17 @@ void Engine::AimAssistPlayer(
         const float dy = static_cast<float>(aimPos.y - screenCenter.y);
         const float distToCenter = std::sqrt(dx * dx + dy * dy);
 
-        if (distToCenter > fovRadius)
+        if (distToCenter > EffectiveAimFovForKey(key, fovRadius))
             continue;
 
-        const float healthScore = (100.f - actor.health) * 1.5f;
-        const float distanceScore = fovRadius - distToCenter;
-        const float totalScore = healthScore + distanceScore;
+        const float totalScore = ScoreAimTarget(
+            distToCenter,
+            fovRadius,
+            actor.Distance,
+            actor.health,
+            actor.maxhealth,
+            actor.weaponQuality,
+            false);
 
         AimTarget target;
         target.entityKey = key;
@@ -521,17 +655,24 @@ void Engine::AimAssistRobot(
         if (!ResolveRobotAimEntry(key, robot, g_aimEspFrame, resolvedEntry, posSrc))
             return;
 
-        if (!GetRobotAimScreenFromDraw(*this, resolvedEntry, g_aimProjCam, aimPos, worldPos))
+        if (!GetRobotAimPoint2D(resolvedEntry, fovRadius, aimPos, worldPos, partID, resistGroup))
             return;
 
         const float dx = static_cast<float>(aimPos.x - screenCenter.x);
         const float dy = static_cast<float>(aimPos.y - screenCenter.y);
         const float distToCenter = std::sqrt(dx * dx + dy * dy);
 
-        if (distToCenter > fovRadius)
+        if (distToCenter > EffectiveAimFovForKey(key, fovRadius))
             return;
 
-        const float totalScore = fovRadius - distToCenter;
+        const float totalScore = ScoreAimTarget(
+            distToCenter,
+            fovRadius,
+            robot.Distance,
+            robot.health,
+            robot.maxhealth,
+            0,
+            true);
 
         AimTarget target;
         target.entityKey = key;
@@ -650,6 +791,7 @@ struct AimDebugSnapshot {
     int kmbox = 0;
     uint8_t posSrc = 0;
     float worldAgeMs = 0.f;
+    int grace = 0;
 };
 static AimDebugSnapshot s_aimDbg;
 
@@ -665,8 +807,13 @@ void Engine::AimAssistence()
     static MotorSynergyHumanizer humanizer;
     static int kmboxFailStreak = 0;
     static bool kmboxFailLogged = false;
+    static AimTarget s_graceTarget{};
+    static uint64_t s_graceUntilMs = 0;
+    static bool s_graceActive = false;
 
     s_aimDbg = {};
+    g_aimStickyKey = 0;
+    g_aimStickyExtraFovPx = 0.f;
 
     const bool playerAimEnabled = var::enable_aimbot;
     const bool robotAimEnabled = var::robotAimEnabled;
@@ -677,6 +824,7 @@ void Engine::AimAssistence()
         previousTarget = 0;
         humanizer.Reset();
         kmboxFailStreak = 0;
+        s_graceActive = false;
         return;
     }
 
@@ -689,6 +837,7 @@ void Engine::AimAssistence()
         previousTarget = 0;
         humanizer.Reset();
         kmboxFailStreak = 0;
+        s_graceActive = false;
         return;
     }
 
@@ -706,6 +855,7 @@ void Engine::AimAssistence()
         lockedTarget = 0;
         previousTarget = 0;
         humanizer.Reset();
+        s_graceActive = false;
         return;
     }
 
@@ -714,6 +864,7 @@ void Engine::AimAssistence()
         lockedTarget = 0;
         previousTarget = 0;
         humanizer.Reset();
+        s_graceActive = false;
         return;
     }
 
@@ -776,10 +927,16 @@ void Engine::AimAssistence()
         return;
     }
 
+    if (var::sticky_target_lock && lockedTarget != 0) {
+        g_aimStickyKey = lockedTarget;
+        g_aimStickyExtraFovPx = (std::max)(0.f, var::aim_sticky_fov_bias_px);
+    }
+
     const float currentTime = GetTimeSeconds();
     const float bulletSpeed = var::aim_bullet_speed_cm_s > 0.f
         ? var::aim_bullet_speed_cm_s
         : 80000.f;
+    const uint64_t nowMs = NowMs();
 
     std::vector<AimTarget> allTargets;
     allTargets.reserve(64);
@@ -791,21 +948,48 @@ void Engine::AimAssistence()
         AimAssistRobot(screenCenter, fovRadius, currentTime, allTargets);
 
     g_aimEspFrame = nullptr;
+    g_aimStickyKey = 0;
+    g_aimStickyExtraFovPx = 0.f;
 
     if (lockedTarget != 0) {
         bool lockedInCandidates = false;
         for (const AimTarget& target : allTargets) {
             if (target.entityKey == lockedTarget) {
                 lockedInCandidates = true;
+                s_graceTarget = target;
+                s_graceActive = false;
+                s_graceUntilMs = 0;
                 break;
             }
         }
         if (!lockedInCandidates) {
-            lockedTarget = 0;
-            previousTarget = 0;
-            humanizer.Reset();
-            s_aimDbg.locked = 0;
-            return;
+            if (var::aim_loss_of_sight_grace_enabled
+                && var::aim_loss_of_sight_grace_ms > 0
+                && s_graceTarget.entityKey == lockedTarget) {
+                if (!s_graceActive) {
+                    s_graceActive = true;
+                    s_graceUntilMs = nowMs + static_cast<uint64_t>(var::aim_loss_of_sight_grace_ms);
+                }
+                if (nowMs <= s_graceUntilMs) {
+                    allTargets.push_back(s_graceTarget);
+                    s_aimDbg.grace = 1;
+                } else {
+                    lockedTarget = 0;
+                    previousTarget = 0;
+                    humanizer.Reset();
+                    s_graceActive = false;
+                    s_aimDbg.locked = 0;
+                    s_aimDbg.grace = 0;
+                    return;
+                }
+            } else {
+                lockedTarget = 0;
+                previousTarget = 0;
+                humanizer.Reset();
+                s_graceActive = false;
+                s_aimDbg.locked = 0;
+                return;
+            }
         }
     }
 
@@ -841,6 +1025,7 @@ void Engine::AimAssistence()
         lockedTarget = 0;
         previousTarget = 0;
         humanizer.Reset();
+        s_graceActive = false;
         s_aimDbg.locked = 0;
         return;
     }
@@ -853,10 +1038,12 @@ void Engine::AimAssistence()
     if (lockedTarget != bestTarget->entityKey)
     {
         const float sinceLastSwitch = currentTime - lastSwitchTime;
+        const bool allowSwitch = !var::sticky_target_lock
+            || lockedTarget == 0
+            || bestTarget->score > lastTargetScore * 1.2f
+            || sinceLastSwitch > 0.45f;
 
-        if (lockedTarget == 0 ||
-            bestTarget->score > lastTargetScore * 1.2f ||
-            sinceLastSwitch > 0.45f)
+        if (allowSwitch)
         {
             previousTarget = lockedTarget;
             lockedTarget = bestTarget->entityKey;
@@ -864,7 +1051,19 @@ void Engine::AimAssistence()
             lastSwitchTime = currentTime;
             lastTargetScore = bestTarget->score;
             humanizer.Reset();
+            s_graceActive = false;
+            s_graceTarget = *bestTarget;
+        } else if (lockedTarget != 0) {
+            // Keep hysteresis lock; re-find locked entry if present.
+            for (auto& target : allTargets) {
+                if (target.entityKey == lockedTarget) {
+                    bestTarget = &target;
+                    break;
+                }
+            }
         }
+    } else {
+        s_graceTarget = *bestTarget;
     }
 
     (void)previousTarget;
@@ -883,6 +1082,7 @@ void Engine::AimAssistence()
             lockedTarget = 0;
             previousTarget = 0;
             humanizer.Reset();
+            s_graceActive = false;
         }
         return;
     }
@@ -912,6 +1112,23 @@ void Engine::AimAssistence()
 
     s_aimDbg.lastGain = SendKmAimDelta(dx, dy, &s_aimDbg.lastGain);
 
+    // Triggerbot: fire when locked and within deadzone (or very close), if hardware
+    // can report physical buttons and user isn't already holding LMB.
+    if (var::enable_triggerbot && g_kmbox.FiringProxyAvailable()) {
+        const float onTargetPx = (std::max)(var::aim_deadzone_px, 4.f);
+        const float distPx = hypotf(dx, dy);
+        if (distPx <= onTargetPx && !g_kmbox.IsPhysicalLeftDown()) {
+            static auto s_lastTriggerClick = std::chrono::steady_clock::time_point{};
+            const auto nowTp = std::chrono::steady_clock::now();
+            if (s_lastTriggerClick.time_since_epoch().count() == 0
+                || std::chrono::duration_cast<std::chrono::milliseconds>(
+                       nowTp - s_lastTriggerClick).count() >= 80) {
+                g_kmbox.LeftClick();
+                s_lastTriggerClick = nowTp;
+            }
+        }
+    }
+
     if (var::show_debug_overlay) {
         static IntervalTimer aimDebugTimer(500);
         if (aimDebugTimer.fire()) {
@@ -927,6 +1144,7 @@ void Engine::AimAssistence()
                 << " dy=" << s_aimDbg.lastDy
                 << " gain=" << s_aimDbg.lastGain
                 << " kmbox=" << s_aimDbg.kmbox
+                << " grace=" << s_aimDbg.grace
                 << " src=" << srcTag
                 << " worldAgeMs=" << s_aimDbg.worldAgeMs
                 << " camFov=" << aimProjCam.FOV

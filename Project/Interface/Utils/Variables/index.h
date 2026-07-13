@@ -29,7 +29,6 @@ namespace var {
     /* Esp */
     extern bool enableesp;
     extern bool box;
-    extern float esp_smooth_alpha;
     extern bool health;
     extern bool names;
     extern bool show_weapon;
@@ -47,8 +46,6 @@ namespace var {
     }
     extern float esp_color_visible[4];
     extern float esp_color_invisible[4];
-    extern int esp_smoothing_mode;
-    extern bool esp_disable_box_cache;
 
     /* Bot ESP */
     extern bool bot_box;
@@ -64,6 +61,7 @@ namespace var {
 
     /* Aimbot */
     extern bool enable_aimbot;
+    extern bool enable_triggerbot;
     extern bool robotAimEnabled;
     extern int aim_hold_key;
     extern AimBoneMode aim_bone_mode;

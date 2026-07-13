@@ -14,9 +14,12 @@ struct MeshVisProbe {
 	float lastSubmit = 0.f;
 	float lastRender = 0.f;
 	float lastRenderOnScreen = 0.f;
+	float decryptedLrtos = 0.f;
+	float worldTimeSeconds = 0.f;
 	bool onScreen = false;
 	bool recent = false;
 	bool visible = false;
+	const char* pathUsed = "fail";
 };
 
 static bool IsPlausibleRenderTime(float t)
@@ -24,10 +27,20 @@ static bool IsPlausibleRenderTime(float t)
 	return std::isfinite(t) && t > 0.001f && t < 1e8f;
 }
 
-static bool MeshRenderTimeVisibleEncrypted(uintptr_t mesh)
+// UC pg185 #3689 — encrypted LastRenderTimeOnScreen @ mesh+0x488.
+// structuralOk=false means caller should try the legacy plain path.
+struct EncVisAttempt {
+	bool structuralOk = false;
+	bool visible = false;
+	float lrtos = 0.f;
+	float worldTime = 0.f;
+};
+
+static EncVisAttempt TryEncryptedRenderVis(uintptr_t mesh)
 {
+	EncVisAttempt out{};
 	if (!mesh || !Memory::IsValidPtrFast2(mesh))
-		return true;
+		return out;
 
 	constexpr uint32_t kXorKey = 0xFA3CBF38u;
 	constexpr std::ptrdiff_t kEncLrtosOff = 0x488;
@@ -37,23 +50,65 @@ static bool MeshRenderTimeVisibleEncrypted(uintptr_t mesh)
 
 	const uint32_t enc = Memory::read<uint32_t>(mesh + kEncLrtosOff);
 	if (enc == 0)
-		return true;
+		return out; // structural — try plain
 
 	const uint32_t decrypted = _byteswap_ulong(enc ^ kXorKey);
 	float lastRenderOnScreen = 0.f;
 	std::memcpy(&lastRenderOnScreen, &decrypted, sizeof(lastRenderOnScreen));
-	if (!IsPlausibleRenderTime(lastRenderOnScreen))
-		return true;
 
 	const uintptr_t worldPrivate = Memory::read<uintptr_t>(mesh + kWorldPrivateOff);
 	if (!worldPrivate || !Memory::IsValidPtrFast2(worldPrivate))
-		return true;
+		return out; // structural — try plain
 
 	const double timeSeconds = Memory::read<double>(worldPrivate + kTimeSecondsOff);
-	if (!std::isfinite(timeSeconds) || timeSeconds <= 0.0)
-		return true;
 
-	return static_cast<float>(timeSeconds) - lastRenderOnScreen < kThreshold;
+	out.structuralOk = true;
+	out.lrtos = lastRenderOnScreen;
+	out.worldTime = static_cast<float>(timeSeconds);
+
+	// Encrypted path is authoritative once structure is valid. Implausible
+	// timing fail-opens (do not fall back to dead plain fields).
+	if (!IsPlausibleRenderTime(lastRenderOnScreen)
+		|| !std::isfinite(timeSeconds) || timeSeconds <= 0.0) {
+		out.visible = true;
+		return out;
+	}
+
+	out.visible = static_cast<float>(timeSeconds) - lastRenderOnScreen < kThreshold;
+	return out;
+}
+
+static bool TryPlainRenderVis(uintptr_t mesh, MeshVisProbe* probeOut)
+{
+	if (!mesh || !Memory::IsValidPtrFast2(mesh))
+		return false;
+
+	const float lastSubmitTime =
+		Memory::read<float>(mesh + Offsets::LastSubmitTime);
+	const float lastRenderTime =
+		Memory::read<float>(mesh + Offsets::LastRenderTime);
+	const float lastRenderTimeOnScreen =
+		Memory::read<float>(mesh + Offsets::LastRenderTimeOnScreen);
+
+	if (probeOut) {
+		probeOut->lastSubmit = lastSubmitTime;
+		probeOut->lastRender = lastRenderTime;
+		probeOut->lastRenderOnScreen = lastRenderTimeOnScreen;
+	}
+
+	if (!IsPlausibleRenderTime(lastSubmitTime)
+		|| !IsPlausibleRenderTime(lastRenderTime)
+		|| !IsPlausibleRenderTime(lastRenderTimeOnScreen))
+		return false;
+
+	const bool isOnScreen = (lastRenderTime == lastRenderTimeOnScreen);
+	const bool isRecent = (lastSubmitTime - lastRenderTime) <= 0.06f;
+	if (probeOut) {
+		probeOut->onScreen = isOnScreen;
+		probeOut->recent = isRecent;
+		probeOut->decryptedLrtos = lastRenderTimeOnScreen;
+	}
+	return isOnScreen && isRecent;
 }
 
 static bool MeshRenderTimeVisible(uintptr_t mesh)
@@ -61,27 +116,13 @@ static bool MeshRenderTimeVisible(uintptr_t mesh)
 	if (!mesh || !Memory::IsValidPtrFast2(mesh))
 		return false;
 
-	auto tryRenderTimes = [&](std::ptrdiff_t baseOff) -> bool {
-		const float lastSubmitTime =
-			Memory::read<float>(mesh + baseOff);
-		const float lastRenderTime =
-			Memory::read<float>(mesh + baseOff + sizeof(float));
-		const float lastRenderTimeOnScreen =
-			Memory::read<float>(mesh + baseOff + sizeof(float) * 2);
+	// Primary: UC-confirmed encrypted decrypt (CL-1315578 / UC pg185 #3689).
+	const EncVisAttempt enc = TryEncryptedRenderVis(mesh);
+	if (enc.structuralOk)
+		return enc.visible;
 
-		// Help has no LastRender layout — when DMA/offsets yield 0/NaN, try UC
-		// encrypted fallback @ mesh+0x488 before assuming visible.
-		if (!IsPlausibleRenderTime(lastSubmitTime)
-			|| !IsPlausibleRenderTime(lastRenderTime)
-			|| !IsPlausibleRenderTime(lastRenderTimeOnScreen))
-			return MeshRenderTimeVisibleEncrypted(mesh);
-
-		const bool isOnScreen = (lastRenderTime == lastRenderTimeOnScreen);
-		const bool isRecent = (lastSubmitTime - lastRenderTime) <= 0.06f;
-		return isOnScreen && isRecent;
-	};
-
-	return tryRenderTimes(Offsets::LastSubmitTime);
+	// Structural failure only — legacy plain triple-read @ mesh+0x4C4.
+	return TryPlainRenderVis(mesh, nullptr);
 }
 
 static MeshVisProbe ProbeMeshVisibility(uintptr_t mesh)
@@ -90,11 +131,11 @@ static MeshVisProbe ProbeMeshVisibility(uintptr_t mesh)
 	if (!mesh)
 		return probe;
 
+	// Always capture legacy plain fields for debug comparison.
 	probe.lastSubmit = Memory::read<float>(mesh + Offsets::LastSubmitTime);
 	probe.lastRender = Memory::read<float>(mesh + Offsets::LastRenderTime);
 	probe.lastRenderOnScreen =
 		Memory::read<float>(mesh + Offsets::LastRenderTimeOnScreen);
-
 	if (IsPlausibleRenderTime(probe.lastSubmit)
 		&& IsPlausibleRenderTime(probe.lastRender)
 		&& IsPlausibleRenderTime(probe.lastRenderOnScreen)) {
@@ -102,7 +143,33 @@ static MeshVisProbe ProbeMeshVisibility(uintptr_t mesh)
 		probe.recent = (probe.lastSubmit - probe.lastRender) <= 0.06f;
 	}
 
-	probe.visible = MeshRenderTimeVisible(mesh);
+	const EncVisAttempt enc = TryEncryptedRenderVis(mesh);
+	if (enc.structuralOk) {
+		probe.pathUsed = "enc";
+		probe.decryptedLrtos = enc.lrtos;
+		probe.worldTimeSeconds = enc.worldTime;
+		probe.visible = enc.visible;
+		return probe;
+	}
+
+	MeshVisProbe plainProbe = probe;
+	const bool plainVis = TryPlainRenderVis(mesh, &plainProbe);
+	if (IsPlausibleRenderTime(plainProbe.lastSubmit)
+		|| IsPlausibleRenderTime(plainProbe.lastRender)
+		|| IsPlausibleRenderTime(plainProbe.lastRenderOnScreen)) {
+		probe.pathUsed = "plain";
+		probe.lastSubmit = plainProbe.lastSubmit;
+		probe.lastRender = plainProbe.lastRender;
+		probe.lastRenderOnScreen = plainProbe.lastRenderOnScreen;
+		probe.onScreen = plainProbe.onScreen;
+		probe.recent = plainProbe.recent;
+		probe.decryptedLrtos = plainProbe.decryptedLrtos;
+		probe.visible = plainVis;
+		return probe;
+	}
+
+	probe.pathUsed = "fail";
+	probe.visible = false;
 	return probe;
 }
 
@@ -120,17 +187,6 @@ bool Engine::HasLineOfSight(const Vector3& from, const Vector3& to) const
 	return CollisionLos::IsVisible(from, to);
 }
 
-bool Engine::EvaluateTargetVisibility(uintptr_t mesh, const Vector3& from, const Vector3& to) const
-{
-	if (!var::visiblecheck)
-		return true;
-	if (!mesh || !Visible(mesh))
-		return false;
-	if (var::obstruction_check)
-		return HasLineOfSight(from, to);
-	return true;
-}
-
 Engine::VisCheckDebugStats Engine::CollectVisCheckDebugStats() const
 {
 	VisCheckDebugStats stats{};
@@ -138,6 +194,19 @@ Engine::VisCheckDebugStats Engine::CollectVisCheckDebugStats() const
 	stats.collisionTriCount = static_cast<int>(CollisionLos::TriangleCount());
 	stats.collisionSmcCount = static_cast<int>(CollisionLos::LastSmcCount());
 	stats.collisionRebuilding = CollisionLos::IsRebuilding();
+
+	auto applySample = [&](const MeshVisProbe& probe) {
+		stats.sampleSubmit = probe.lastSubmit;
+		stats.sampleRender = probe.lastRender;
+		stats.sampleRenderScr = probe.lastRenderOnScreen;
+		stats.sampleOnScreen = probe.onScreen;
+		stats.sampleRecent = probe.recent;
+		stats.sampleVisible = probe.visible;
+		stats.sampleDecryptedLrtos = probe.decryptedLrtos;
+		stats.sampleWorldTimeSeconds = probe.worldTimeSeconds;
+		stats.samplePathUsed = probe.pathUsed ? probe.pathUsed : "fail";
+		stats.hasSample = true;
+	};
 
 	{
 		std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
@@ -151,16 +220,8 @@ Engine::VisCheckDebugStats Engine::CollectVisCheckDebugStats() const
 				const uintptr_t mesh = actor.actorMesh
 					? actor.actorMesh
 					: GetActorSkeletalMesh(key);
-				if (mesh && IsValidPointer(mesh)) {
-					const MeshVisProbe probe = ProbeMeshVisibility(mesh);
-					stats.sampleSubmit = probe.lastSubmit;
-					stats.sampleRender = probe.lastRender;
-					stats.sampleRenderScr = probe.lastRenderOnScreen;
-					stats.sampleOnScreen = probe.onScreen;
-					stats.sampleRecent = probe.recent;
-					stats.sampleVisible = probe.visible;
-					stats.hasSample = true;
-				}
+				if (mesh && IsValidPointer(mesh))
+					applySample(ProbeMeshVisibility(mesh));
 			}
 		}
 	}
@@ -177,16 +238,8 @@ Engine::VisCheckDebugStats Engine::CollectVisCheckDebugStats() const
 				const uintptr_t mesh = entry.Mesh
 					? entry.Mesh
 					: GetActorSkeletalMesh(key);
-				if (mesh && IsValidPointer(mesh)) {
-					const MeshVisProbe probe = ProbeMeshVisibility(mesh);
-					stats.sampleSubmit = probe.lastSubmit;
-					stats.sampleRender = probe.lastRender;
-					stats.sampleRenderScr = probe.lastRenderOnScreen;
-					stats.sampleOnScreen = probe.onScreen;
-					stats.sampleRecent = probe.recent;
-					stats.sampleVisible = probe.visible;
-					stats.hasSample = true;
-				}
+				if (mesh && IsValidPointer(mesh))
+					applySample(ProbeMeshVisibility(mesh));
 			}
 		}
 	}
@@ -212,7 +265,12 @@ void Engine::PrintVisCheckDebugConsole()
 		<< " players=" << stats.playersMeshVisible << '/' << stats.playersTotal
 		<< " bots=" << stats.botsMeshVisible << '/' << stats.botsTotal;
 	if (stats.hasSample) {
-		std::cout << " sample submit=" << stats.sampleSubmit
+		const float delta = stats.sampleWorldTimeSeconds - stats.sampleDecryptedLrtos;
+		std::cout << " path=" << (stats.samplePathUsed ? stats.samplePathUsed : "fail")
+			<< " lrtos=" << stats.sampleDecryptedLrtos
+			<< " worldTime=" << stats.sampleWorldTimeSeconds
+			<< " delta=" << delta
+			<< " sample submit=" << stats.sampleSubmit
 			<< " render=" << stats.sampleRender
 			<< " onScr=" << stats.sampleRenderScr
 			<< " onScreen=" << (stats.sampleOnScreen ? 1 : 0)
@@ -267,7 +325,7 @@ static bool MeshHasEncryptedBoneBlock(uintptr_t mesh)
 		return true;
 
 	__m128i enc830{};
-	return Memory::ReadRaw(mesh + 0x830, &enc830, sizeof(enc830))
+	return Memory::ReadRaw(mesh + Offsets::LodSelect, &enc830, sizeof(enc830))
 		&& _mm_cvtsi128_si64(enc830) != 0;
 }
 

@@ -171,6 +171,12 @@ inline void ResetTables()
 	}
 }
 
+inline void ClearNameCache()
+{
+	std::unique_lock<std::shared_mutex> lk(g_name_cache_mtx());
+	g_name_cache().clear();
+}
+
 inline bool InitTables(uint64_t module_base)
 {
 	ResetTables();
@@ -712,104 +718,3 @@ inline std::uintptr_t GetBoneArrayDecrypt(std::uintptr_t MeshAddr)
 }
 
 } // namespace steam_decrypt
-
-#if 0 // CL-1233465 bone path removed — qwe900 CL-1315578 only
-inline uint64_t DecryptBoneArrayPtr(const uint8_t seed[16])
-{
-	uint64_t s = 0;
-	memcpy(&s, seed, 8);
-	const uint64_t rotated = steam_decrypt::rotl64(s, 8);
-
-	alignas(16) uint8_t r16[16]{};
-	memcpy(r16, &rotated, 8);
-	memcpy(r16 + 8, seed + 8, 8);
-
-	alignas(16) __m128i shuffled =
-		_mm_shufflelo_epi16(_mm_load_si128(reinterpret_cast<const __m128i*>(r16)), 0x1E);
-	__m128i xored = _mm_xor_si128(
-		shuffled,
-		_mm_load_si128(reinterpret_cast<const __m128i*>(PTR_XOR_KEY)));
-	__m128i result = _mm_shuffle_epi8(
-		xored,
-		_mm_load_si128(reinterpret_cast<const __m128i*>(PTR_SHUF_MASK)));
-
-	uint64_t ptr = 0;
-	memcpy(&ptr, &result, 8);
-	return ptr;
-}
-
-inline FTransformD DecryptBone(const double raw[12], const double keys[12])
-{
-	FTransformD t{};
-
-	const double kx = keys[0], ky = keys[1], kz = keys[2], kw = keys[3];
-	const double rx = raw[0], ry = raw[1], rz = raw[2], rw = raw[3];
-	t.RotW = kw * rw - kx * rx - ky * ry - kz * rz;
-	t.RotX = kw * rx + kx * rw + ky * rz - kz * ry;
-	t.RotY = kw * ry - kx * rz + ky * rw + kz * rx;
-	t.RotZ = kw * rz + kx * ry - ky * rx + kz * rw;
-
-	uint64_t tx = 0, ty = 0, tz = 0, kx4 = 0, ky4 = 0, kz4 = 0;
-	memcpy(&tx, &raw[4], 8); memcpy(&kx4, &keys[4], 8);
-	memcpy(&ty, &raw[5], 8); memcpy(&ky4, &keys[5], 8);
-	memcpy(&tz, &raw[6], 8); memcpy(&kz4, &keys[6], 8);
-	tx ^= kx4; ty ^= ky4; tz ^= kz4;
-	memcpy(&t.TransX, &tx, 8); memcpy(&t.TransY, &ty, 8); memcpy(&t.TransZ, &tz, 8);
-
-	uint64_t sx = 0, sy = 0, sz = 0, kx8 = 0, ky8 = 0, kz8 = 0;
-	memcpy(&sx, &raw[8], 8); memcpy(&kx8, &keys[8], 8);
-	memcpy(&sy, &raw[9], 8); memcpy(&ky8, &keys[9], 8);
-	memcpy(&sz, &raw[10], 8); memcpy(&kz8, &keys[10], 8);
-	sx ^= kx8; sy ^= ky8; sz ^= kz8;
-	memcpy(&t.ScaleX, &sx, 8); memcpy(&t.ScaleY, &sy, 8); memcpy(&t.ScaleZ, &sz, 8);
-
-	return t;
-}
-
-inline FTransform DecryptBoneToTransform(
-	uintptr_t mesh,
-	uintptr_t boneArray,
-	int boneIndex)
-{
-	double raw[12]{};
-	double keys[12]{};
-	Memory::ReadRaw(boneArray + static_cast<uintptr_t>(boneIndex) * BONE_STRIDE, raw, sizeof(raw));
-	Memory::ReadRaw(mesh + OFF_BONE_KEYS, keys, sizeof(keys));
-
-	const FTransformD t = DecryptBone(raw, keys);
-	FTransform out{};
-	out.Rotation.x = t.RotX;
-	out.Rotation.y = t.RotY;
-	out.Rotation.z = t.RotZ;
-	out.Rotation.w = t.RotW;
-	out.Translation.x = t.TransX;
-	out.Translation.y = t.TransY;
-	out.Translation.z = t.TransZ;
-	out.Scale3D.x = t.ScaleX;
-	out.Scale3D.y = t.ScaleY;
-	out.Scale3D.z = t.ScaleZ;
-	return out;
-}
-
-inline std::uintptr_t GetBoneArrayDecrypt(std::uintptr_t meshAddr)
-{
-	if (!meshAddr || !steam_decrypt::ValidPtr(meshAddr))
-		return 0;
-
-	alignas(16) uint8_t seed[16]{};
-	if (!Memory::ReadRaw(meshAddr + OFF_BONE_SEED, seed, sizeof(seed)))
-		return 0;
-
-	uint64_t probe = 0;
-	memcpy(&probe, seed, 8);
-	if (!probe)
-		return 0;
-
-	const uint64_t ptr = DecryptBoneArrayPtr(seed);
-	if (!steam_decrypt::ValidPtr(ptr))
-		return 0;
-	return static_cast<std::uintptr_t>(ptr);
-}
-
-} // namespace bone_decrypt_cl1233465
-#endif // CL-1233465 removed

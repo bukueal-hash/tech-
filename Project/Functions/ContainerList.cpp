@@ -176,7 +176,12 @@ bool AdmitContainerActor(
                     hasLootInteraction, classChest || actorTypeChest, lower, std::string{}))
                 return true;
         }
+        // OuterPrivate-validated loot interaction with no readable fname still counts.
+        return true;
     }
+
+    if (hasContainerLoot && !fnameIsPickup && !classGroundLoot)
+        return true;
 
     if (!fname.empty() && FnameAdmitsWorldActor(fname)) {
         if (fnameIsPickup && !fnameIsContainer)
@@ -388,33 +393,57 @@ void Engine::ContainerList()
             fnameIsContainer = FnameLooksLikeWorldContainer(classFname);
 
         dataAssetFName = GetActorDataAssetFName(key);
-        if (!fnameIsPickup && !dataAssetFName.empty())
+
+        const uintptr_t containerLoot =
+            Memory::read<uintptr_t>(key + Offsets::LootInteraction_Container);
+        // Soft path: valid pointer at SDK offset is enough. Outer/class-FName
+        // decrypt flakes and was dropping locker banks (2 of 5). Player/bot
+        // excludes already ran above.
+        const bool hasContainerLoot =
+            (containerLoot != 0 && Memory::IsValidPtrFast2(containerLoot))
+            || LootInteractionOwnedByActor(containerLoot, key)
+            || PointerIsLootInteractionComponent(containerLoot);
+
+        const uintptr_t lootComp =
+            Memory::read<uintptr_t>(key + Offsets::LootInteractionComponent);
+        const bool hasLootInteraction =
+            (lootComp != 0 && Memory::IsValidPtrFast2(lootComp))
+            || LootInteractionOwnedByActor(lootComp, key)
+            || PointerIsLootInteractionComponent(lootComp);
+
+        // Data-asset DA_Item_* must NOT force a pickup skip when the actor is a
+        // chest/container by fname/class OR has a real loot-interaction pointer.
+        // That was dropping whole container banks (lockers, crates, etc.) whenever
+        // ItemDataAsset decrypted, while DA-flake siblings still showed.
+        if (!fnameIsPickup && !fnameIsContainer && !classChest && !actorTypeChest
+            && !hasContainerLoot && !hasLootInteraction
+            && !dataAssetFName.empty())
             fnameIsPickup = FnameLooksLikeDroppedPickup(dataAssetFName);
 
-        if (classGroundLoot || fnameIsPickup)
+        // Ground loot never belongs in the container cache — even if a loot
+        // interaction pointer is present (caused Oil ESP doubled as Crate).
+        if ((classGroundLoot || fnameIsPickup)
+            && !fnameIsContainer && !classChest && !actorTypeChest)
             continue;
-        if (!classFname.empty() && FnameLooksLikeDroppedPickup(classFname))
+        if (!classFname.empty() && FnameLooksLikeDroppedPickup(classFname)
+            && !fnameIsContainer && !classChest && !actorTypeChest)
+            continue;
+        if (!dataAssetFName.empty() && FnameLooksLikeDroppedPickup(dataAssetFName)
+            && !fnameIsContainer && !classChest && !actorTypeChest)
             continue;
 
         if (!fname.empty() && FnameExcludedFromContainerEsp(ToLowerCopy(fname)))
             continue;
 
-        const uintptr_t containerLoot =
-            Memory::read<uintptr_t>(key + Offsets::LootInteraction_Container);
-        const bool hasContainerLoot =
-            PointerIsLootInteractionComponent(containerLoot);
-
+        // Only drop clear ground-item actors. Do NOT skip when fname already looks
+        // like a container, or when either loot pointer is valid.
         const uint64_t itemDa =
             Memory::read<uint64_t>(key + static_cast<uint64_t>(Offsets::ItemDataAsset));
         if (itemDa != 0 && Memory::IsValidPtrFast2(itemDa)
-            && !hasContainerLoot && !actorTypeChest && !classChest
+            && !hasContainerLoot && !hasLootInteraction
+            && !actorTypeChest && !classChest && !fnameIsContainer
             && TryReadItemGameAssetIdFromActor(key) != 0)
             continue;
-
-        const uintptr_t lootComp =
-            Memory::read<uintptr_t>(key + Offsets::LootInteractionComponent);
-        const bool hasLootInteraction =
-            PointerIsLootInteractionComponent(lootComp);
 
         if (!QuickContainerCandidate(
                 maskedType, classChest, actorTypeChest, fname, classFname,
@@ -430,7 +459,10 @@ void Engine::ContainerList()
                     || IsSalvageContainerActor(classFname, key)
                     || IsRealSocketSalvageContainer(classFname, key)))
             || WorldScan::LooksLikeContainerActor(key, fname)
-            || (hasContainerLoot && fnameIsContainer);
+            || (hasContainerLoot && fnameIsContainer)
+            // Owned loot-interaction pointer is enough — do not require FName decrypt
+            // (identical lockers were admitting unevenly when one decrypt flaked).
+            || hasLootInteraction || hasContainerLoot;
 
         if (!looksLikeContainer) {
             if (!AdmitContainerActor(
@@ -481,7 +513,13 @@ void Engine::ContainerList()
         }
         if (displayName.empty() || IsGenericWorldEspLabel(displayName)
             || !IsPlausibleEspLabel(displayName)) {
-            displayName = GetEnglishItemName(key);
+            const std::string memName = GetEnglishItemName(key);
+            if (!memName.empty() && !IsGenericWorldEspLabel(memName)
+                && IsPlausibleEspLabel(memName) && !IsJunkWorldEspLabel(memName)
+                && !IsGarbledEspLabel(memName)
+                && memName.find('_') == std::string::npos
+                && memName.size() <= 28)
+                displayName = memName;
         }
         if (displayName.empty() || IsGenericWorldEspLabel(displayName)
             || !IsPlausibleEspLabel(displayName)) {
@@ -498,15 +536,38 @@ void Engine::ContainerList()
         if (IsJunkWorldEspLabel(displayName) || IsGarbledEspLabel(displayName)) {
             const std::string memName = GetEnglishItemName(key);
             if (!memName.empty() && !IsGenericWorldEspLabel(memName)
-                && IsPlausibleEspLabel(memName) && !IsJunkWorldEspLabel(memName))
+                && IsPlausibleEspLabel(memName) && !IsJunkWorldEspLabel(memName)
+                && !IsGarbledEspLabel(memName)
+                && memName.find('_') == std::string::npos
+                && memName.size() <= 28)
                 displayName = memName;
         }
 
         const std::string fnameLower = ToLowerCopy(fname);
         const std::string displayLower = ToLowerCopy(displayName);
 
-        const WorldItemCategory cat = ClassifyContainer(
+        WorldItemCategory cat = ClassifyContainer(
             fnameLower, displayLower, hasLootInteraction, classChest, fnameIsContainer);
+
+        // Owned loot-interaction actors with flaky FName often land in Other and
+        // disappear when only Locker/Furniture toggles are on. Re-home them.
+        if ((cat == WorldItemCategory::Other || cat == WorldItemCategory::Invalid
+                || cat == WorldItemCategory::Trash)
+            && (hasLootInteraction || hasContainerLoot || classChest || actorTypeChest)) {
+            WorldItemCategory fromDisplay = ClassifyWorldActor(std::string{}, displayLower);
+            if (fromDisplay != WorldItemCategory::Invalid
+                && fromDisplay != WorldItemCategory::Other
+                && fromDisplay != WorldItemCategory::Trash)
+                cat = fromDisplay;
+            else if (displayLower.find("locker") != std::string::npos)
+                cat = WorldItemCategory::Locker;
+            else if (displayLower.find("drawer") != std::string::npos)
+                cat = WorldItemCategory::Furniture;
+            else if (displayLower.find("safe") != std::string::npos)
+                cat = WorldItemCategory::Safe;
+            else
+                cat = WorldItemCategory::Crate;
+        }
 
         if (cat == WorldItemCategory::Trash)
             continue;
@@ -530,12 +591,17 @@ void Engine::ContainerList()
                 displayName = fallback;
         }
 
-        if (displayName.empty())
-            continue;
+        // Never silently skip an admitted container — use a generic fallback so
+        // the user always sees SOMETHING and can report the unknown type.
+        if (displayName.empty()) {
+            const char* catFallback = WorldItemCategoryLabel(cat);
+            displayName = (catFallback && catFallback[0] && std::string(catFallback) != "Unknown")
+                ? std::string(catFallback) : "Container";
+        }
 
         displayName = FormatEspDisplayLabel(displayName);
         if (displayName.empty())
-            continue;
+            displayName = "Container";
 
         const float distM = Engine::EspDistanceMeters(
             worldPos, ctx.camera, 0);
@@ -605,21 +671,14 @@ void Engine::ContainerList()
             continue;
         }
         if (IsJunkWorldEspLabel(it->second.ItemDisplayName)
-            || IsGarbledEspLabel(it->second.ItemDisplayName)) {
+            || IsGarbledEspLabel(it->second.ItemDisplayName)
+            || it->second.ItemDisplayName.empty()) {
             const auto cat = static_cast<WorldItemCategory>(it->second.worldCategory);
-            if (const char* catLabel = WorldItemCategoryLabel(cat)) {
-                const std::string s(catLabel);
-                if (!s.empty() && !IsJunkWorldEspLabel(s)
-                    && IsPlausibleEspLabel(s) && !IsGenericWorldEspLabel(s))
-                    it->second.ItemDisplayName = s;
-                else {
-                    it = localCache.erase(it);
-                    continue;
-                }
-            } else {
-                it = localCache.erase(it);
-                continue;
-            }
+            std::string fixed = ContainerCategoryFallbackEspLabel(cat);
+            if (fixed.empty())
+                fixed = "Container";
+            it->second.ItemDisplayName = fixed;
+            it->second.ItemType = fixed;
         }
 
         retainIters.push_back(it);

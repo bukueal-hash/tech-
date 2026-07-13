@@ -96,6 +96,12 @@ std::string ResolveSocketContainerDisplayName(const std::string& fname);
 bool IsSalvageContainerActor(const std::string& fname, uintptr_t actor);
 /** UObject pointer whose UClass fname is LootInteractionComponent (strict, no fallbacks). */
 bool PointerIsLootInteractionComponent(uintptr_t obj);
+/**
+ * True when a component pointer at a loot-interaction slot is owned by `actor`
+ * (UObject::OuterPrivate @ 0x20). Does not require class-FName decrypt — DMA
+ * decrypt flakes were causing identical lockers/drawers to admit unevenly.
+ */
+bool LootInteractionOwnedByActor(uintptr_t component, uintptr_t actor);
 /** Zipline anchors, corpses, pioneer characters — never container/open-container targets. */
 bool FnameExcludedFromContainerEsp(const std::string& fnameLower);
 /** True when container loot has already been searched/opened. */

@@ -39,11 +39,6 @@ namespace Offsets {
     constexpr std::ptrdiff_t LocalPlayers = 0x120;
     constexpr std::ptrdiff_t LocalPlayer_PlayerController = 0x00A0;
     constexpr std::ptrdiff_t LocalPlayer_ControllerId = 0x0270;
-    /** @deprecated CL-1315578 — do not use as primary; kept only for compile refs. */
-    constexpr std::ptrdiff_t LocalPlayersAlt = LocalPlayers;
-    constexpr std::ptrdiff_t LocalPlayersFlat = LocalPlayers;
-    /** @deprecated — was wrong object; use LocalPlayer_PlayerController. */
-    constexpr std::ptrdiff_t APlayerController = LocalPlayer_PlayerController;
 
     // ── Level ────────────────────────────────────────────────────────────────
     constexpr std::ptrdiff_t ActorsCount = 0x110;
@@ -76,10 +71,11 @@ namespace Offsets {
     constexpr std::ptrdiff_t AController_PlayerState = 0x3A8;
     constexpr std::ptrdiff_t LocalAckPlayerState = 0x3F0; // CHARACTER on PC (help)
     constexpr std::ptrdiff_t APlayerCameraManager = 0x4E0;
-    constexpr std::ptrdiff_t APlayerState = 0x3A8; // Actor/PC PlayerState
+    constexpr std::ptrdiff_t APlayerState = 0x3A8; // Actor/PC PlayerState (restore world cache)
     constexpr std::ptrdiff_t PlayerNamePrivate = 0x440;
     constexpr std::ptrdiff_t PlayerNameOnPawn = 0x438;
-    constexpr std::ptrdiff_t PlayerState_PawnPrivate = 0x418;
+    constexpr std::ptrdiff_t PlayerState_PawnPrivate = 0x410; // probed: local PS+0x410 == AcknowledgedPawn
+    constexpr std::ptrdiff_t PlayerState_PlayerStatus = 0x548; // Alive=0 DBNO=1 (ARC Copy)
     constexpr std::ptrdiff_t Pawn_Controller = 0x3D8;
 
     // ── PlayerCameraManager ──────────────────────────────────────────────────
@@ -88,9 +84,8 @@ namespace Offsets {
     constexpr std::ptrdiff_t ViewTargetTarget = ViewTarget;
     constexpr std::ptrdiff_t ViewTargetPOV = 0x10;
     constexpr std::ptrdiff_t CameraCachePOV = 0x10;
-    constexpr std::ptrdiff_t CameraCachePOVAlt = 0xC;
 
-    // POV relative (help: Location +0x00, Rotation +0x28, FOV +0x50)
+    // POV relative (UC CL-1315578: Location +0x00, Rotation +0x28, FOV +0x50)
     constexpr std::ptrdiff_t CameraPOV_Location = 0x00;
     constexpr std::ptrdiff_t CameraPOV_Rotation = 0x28;
     constexpr std::ptrdiff_t CameraPOV_FOV = 0x50;
@@ -112,7 +107,6 @@ namespace Offsets {
     constexpr std::ptrdiff_t ActorTypeId = 0xB0;
     constexpr std::ptrdiff_t IsRenderedTime = 0x1F0;
     constexpr std::ptrdiff_t ActorID = 0x18;
-    constexpr std::ptrdiff_t Super = ActorTypeId;
     constexpr std::ptrdiff_t ActorOwner = 0x1c0;
     constexpr std::ptrdiff_t ActorInstigator = 0x210;
     constexpr std::ptrdiff_t Actor_bHiddenByte = 0xd9;
@@ -146,9 +140,9 @@ namespace Offsets {
 
     // ── Bone decrypt (CL-1315578) ────────────────────────────────────────────
     constexpr std::ptrdiff_t Encrypted = 0x7A0;
+    // Bone decrypt LOD dword (DecryptBoneArray, CL-1315578) — mesh+0x830, not camera
     constexpr std::ptrdiff_t LodSelect = 0x830;
     constexpr std::ptrdiff_t BoneArrayLodStride = 0xB8;
-    constexpr uint64_t BonePshufMaskRva = GObjPshufbMaskRva; // unused by help bone path
 
     // ── Mesh / character ─────────────────────────────────────────────────────
     constexpr std::ptrdiff_t USkeletalMeshComponent = 0x428;
@@ -159,35 +153,42 @@ namespace Offsets {
     constexpr std::ptrdiff_t Velocity = 0x1A8;
     constexpr std::ptrdiff_t PioneerCharacterMovement = 0xb38;
     constexpr std::ptrdiff_t HealthComponent = 0xDC8;
-    constexpr std::ptrdiff_t InventoryComponent = 0xCB0;
+    constexpr std::ptrdiff_t InventoryComponent = 0xCA0; // PioneerPlayerCharacter; 0xCB0 is FieldSalvagingComponent
 
     constexpr std::ptrdiff_t HealthInfo = 0x530;
     constexpr std::ptrdiff_t PlayerState_Health = HealthInfo;
     constexpr std::ptrdiff_t PlayerState_MaxHealth = 0x538;
     constexpr std::ptrdiff_t PlayerState_Armor = 0x540;
     constexpr std::ptrdiff_t PlayerState_MaxArmor = 0x548;
-    constexpr std::ptrdiff_t Health = 0x640;
+    constexpr std::ptrdiff_t Health = 0x668;  // HealthComponent::CachedHealth (SDK-confirmed)
     constexpr std::ptrdiff_t MaxHealth = 0x2E0;
     constexpr std::ptrdiff_t Shield = 0x140;
     constexpr std::ptrdiff_t MaxDBNO = 0x2E8;
     constexpr std::ptrdiff_t TeamID = 0x812;
 
-    constexpr std::ptrdiff_t LocalCurrentItemActors = 0x4D0;
+    // CurrentItemActors (replicated) — LocalCurrentItemActors@0x4D0 is empty for remotes.
+    constexpr std::ptrdiff_t LocalCurrentItemActors = 0x4B0;
     constexpr std::ptrdiff_t EquippedPrimaryItem = 0x520;
     constexpr std::ptrdiff_t WeaponQuality = 0x472;
 
-    constexpr std::ptrdiff_t LootInteractionComponent = 0xB68;
+    // LootContainerSingle (help SDK): LootInteraction@0xB58, ItemContainer@0xB60.
+    // 0xB68 is MetadataTagComponent — do not use as loot interaction.
+    constexpr std::ptrdiff_t LootInteractionComponent = 0xB58;
+    constexpr std::ptrdiff_t LootContainer_ItemContainer = 0xB60;
     constexpr std::ptrdiff_t LootInteraction_Container = 0xBB8;
-    constexpr std::ptrdiff_t SalvageContainer_ChosenMesh = 0xCF0;
-    constexpr std::ptrdiff_t LootInteraction_Searched = 0x810;
+    // SalvageContainerSingle::ChosenMesh / MeshVariants (help SDK).
+    constexpr std::ptrdiff_t SalvageContainer_ChosenMesh = 0xC90;
+    // LootInteractionComponent::bHasBeenOpened (help SDK) — was wrongly 0x810.
+    constexpr std::ptrdiff_t LootInteraction_Searched = 0x870;
     constexpr std::ptrdiff_t SimpleLootActivity_LootInteraction = 0x4E0;
     constexpr std::ptrdiff_t SimpleLootActivity_LootStateMachine = 0x508;
     constexpr std::ptrdiff_t SimpleLootActivity_ItemContainer = 0x4F8;
-    constexpr std::ptrdiff_t SalvageContainer_MeshVariants = 0xCB8;
+    constexpr std::ptrdiff_t SalvageContainer_MeshVariants = 0xC58;
     constexpr std::ptrdiff_t ItemDataAsset = 0x8F8;
-    constexpr std::ptrdiff_t BP_PickupBase_SpawnItems = 0x5b0;
-    constexpr std::ptrdiff_t ItemContainer_OpenTime = 0x530;
-    constexpr std::ptrdiff_t ConstructableItemContainer_OpenTime = 0x4c0;
+    constexpr std::ptrdiff_t BP_PickupBase_SpawnItems = 0x540;
+    // ItemContainerComponent::OpenTime @0x500; ConstructableItemContainer @0x490.
+    constexpr std::ptrdiff_t ItemContainer_OpenTime = 0x500;
+    constexpr std::ptrdiff_t ConstructableItemContainer_OpenTime = 0x490;
     constexpr std::ptrdiff_t ItemDataAsset_OverrideItemAssetId = 0x120;
     constexpr std::ptrdiff_t ItemDataAsset_bOverrideItemAssetId = 0x118;
     constexpr std::ptrdiff_t UIHoverData = 0x550;
@@ -208,7 +209,6 @@ namespace Offsets {
     constexpr std::ptrdiff_t BotHealthCached = 0x668;
     constexpr std::ptrdiff_t BotHealthMax = 0x308;
     constexpr std::ptrdiff_t LastSubmitTimeAlt = 0x4CC;
-    constexpr std::ptrdiff_t ActorHealthComponent = 0x4D0;
     constexpr std::ptrdiff_t CurrentHealth = 0x1D0;
     constexpr std::ptrdiff_t UseDistance = 0x268;
 

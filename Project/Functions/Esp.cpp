@@ -420,9 +420,11 @@ static ImU32 PlayerEspColor(const Engine::PlayerCacheEntry& actor)
         static_cast<int>(c[3] * 255.f));
 }
 
-static ImU32 BotEspColor(bool visible)
+static ImU32 BotEspColor(bool visible, bool isBreaked = false)
 {
-    const float* c = visible ? var::bot_color_visible : var::bot_color_invisible;
+    const float* c = isBreaked
+        ? var::color_dead_bots
+        : (visible ? var::bot_color_visible : var::bot_color_invisible);
     return IM_COL32(
         static_cast<int>(c[0] * 255.f),
         static_cast<int>(c[1] * 255.f),
@@ -480,14 +482,15 @@ static float StackPlayerLabels(
     float& labelStackY,
     const Visuals::EspDrawScale& scale)
 {
-    if (var::names && !actor.ActorName.empty()) {
+    if (var::names) {
+        const char* nameLabel = actor.ActorName.empty() ? "Raider" : actor.ActorName.c_str();
         Visuals::Names(
-            actor.ActorName,
+            nameLabel,
             headX,
             labelStackY,
             scale,
             ImColor(255, 255, 255, 255));
-        labelStackY -= LabelTextHeight(actor.ActorName.c_str(), actor.Distance) + 6.f;
+        labelStackY -= LabelTextHeight(nameLabel, actor.Distance) + 6.f;
     }
 
     if (var::show_weapon && !actor.weaponName.empty()) {
@@ -523,8 +526,9 @@ static void RenderRobotEspFromFrame(
 
 static void DrawPlayerSkeletonFromCache(
     ImDrawList* drawList,
-    const Engine& eng,
+    Engine& eng,
     const Engine::PlayerCacheEntry& actor,
+    const Engine::CameraCache& frameCam,
     ImU32 color,
     float distanceM)
 {
@@ -535,22 +539,16 @@ static void DrawPlayerSkeletonFromCache(
         Visuals::ComputeEspScaleFromDistance(distanceM);
     const float thickness = scale.lineThickness;
 
+    // Re-project world-space bones with the live render camera — bonesDouble[]
+    // were baked on the entity-list thread with a stale ambient g_Camera.
+    // Only draw anatomically plausible segments (both ends + length/pelvis gate).
     for (const auto& [boneA, boneB] : eng.SkeletonLinksArcRaiders) {
-        const size_t idxA = static_cast<size_t>(boneA);
-        const size_t idxB = static_cast<size_t>(boneB);
-        if (!actor.boneData.valid.test(idxA) || !actor.boneData.valid.test(idxB))
+        ImVec2 a{};
+        ImVec2 b{};
+        if (!EspDraw::TrySkeletonSegmentScreen(eng, frameCam, actor, boneA, boneB, a, b))
             continue;
 
-        const Vector3& a = actor.boneData.bonesDouble[idxA];
-        const Vector3& b = actor.boneData.bonesDouble[idxB];
-        if (a.x <= 0.0 || a.y <= 0.0 || b.x <= 0.0 || b.y <= 0.0)
-            continue;
-
-        drawList->AddLine(
-            ImVec2(static_cast<float>(a.x), static_cast<float>(a.y)),
-            ImVec2(static_cast<float>(b.x), static_cast<float>(b.y)),
-            color,
-            thickness);
+        drawList->AddLine(a, b, color, thickness);
     }
 }
 
@@ -565,8 +563,7 @@ bool Engine::ShouldDrawPlayerEsp(const PlayerCacheEntry& entry) const
     }
     if (entry.isAlly && var::hide_allies)
         return false;
-    if (!entry.bIsDeathVerge && entry.health <= 0.f)
-        return false;
+    // HealthInfo@PS+0x530 is wrong on PioneerPS; health may read 0 — still draw.
     if (entry.Distance < 2.f)
         return false;
     const float maxM = PlayerCollectMaxM();
@@ -624,26 +621,7 @@ bool Engine::ShouldDrawWorldEsp(const WorldCacheEntry& entry) const
         AnyWorldEspEnabled() && getAllowWorldEntry(entry);
     const bool allowRadar =
         var::show_radar && WorldCategoryVisibleOnRadar(filterView);
-    return allowEsp || allowRadar;
-}
-
-void Engine::PublishEspSnapshot(
-    CameraCache camera,
-    std::unordered_map<uintptr_t, PlayerCacheEntry>&& players,
-    std::unordered_map<uintptr_t, WorldCacheEntry>&& world,
-    std::unordered_map<uintptr_t, WorldCacheEntry>&& robots)
-{
-    const int writeIdx = 1 - m_espSnapshotReadIdx.load(std::memory_order_acquire);
-    m_espSnapshots[writeIdx].camera = camera;
-    m_espSnapshots[writeIdx].players = std::move(players);
-    m_espSnapshots[writeIdx].world = std::move(world);
-    m_espSnapshots[writeIdx].robots = std::move(robots);
-    m_espSnapshots[writeIdx].sequence =
-        m_espSnapshotSequence.fetch_add(1, std::memory_order_relaxed) + 1;
-    m_espSnapshots[writeIdx].timestampMs = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-    m_espSnapshotReadIdx.store(writeIdx, std::memory_order_release);
+	return allowEsp || allowRadar;
 }
 
 bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
@@ -671,9 +649,14 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         }
         out.world.reserve(worldReserve);
 
+        // Same actor must not draw twice (e.g. Oil pickup + Crate mis-admit).
+        // Prefer item/pickup cache over container cache for a shared key.
+        std::unordered_set<uintptr_t> worldKeys;
         auto appendWorld = [&](const std::unordered_map<uintptr_t, WorldCacheEntry>& cache) {
             for (const auto& [key, entry] : cache) {
                 if (!ShouldDrawWorldEsp(entry))
+                    continue;
+                if (!worldKeys.insert(key).second)
                     continue;
 
                 EspFrameWorld frameWorld{};
@@ -684,12 +667,12 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         };
 
         {
-            std::shared_lock<std::shared_mutex> lock(m_containerCacheMutex);
-            appendWorld(containerCache);
-        }
-        {
             std::shared_lock<std::shared_mutex> lock(m_itemCacheMutex);
             appendWorld(itemCache);
+        }
+        {
+            std::shared_lock<std::shared_mutex> lock(m_containerCacheMutex);
+            appendWorld(containerCache);
         }
     }
 
@@ -929,6 +912,143 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
     return true;
 }
 
+// help: root RelativeLocation 0x218 first; then scene; net fallback
+static constexpr std::ptrdiff_t kACharacterMesh = 0x428;
+static constexpr std::ptrdiff_t kACharacterMovement = 0x430;
+static constexpr std::ptrdiff_t kACharacterCapsule = 0x438;
+static constexpr std::ptrdiff_t kCmcLastUpdateLocation = 0x3e0;
+static constexpr std::ptrdiff_t kReplicatedMovement = 0x150;
+static constexpr std::ptrdiff_t kRepMovLocation = 0x30;
+static constexpr std::ptrdiff_t kStateInterpolator = 0x7c0;
+static constexpr std::ptrdiff_t kReplicatedRootTransform = 0x1f8;
+
+static Vector3 ResolvePlayerWorldPosLive(uintptr_t pawn, uintptr_t root, uintptr_t /*legacy*/)
+{
+    auto tryScene = [](uintptr_t comp) -> Vector3 {
+        if (!comp || !engine.IsValidPointer(comp))
+            return {};
+        const Vector3 p = Engine::ReadSceneWorldPos(comp);
+        return IsPlausibleWorldPos(p) ? p : Vector3{};
+    };
+    auto tryFVector3d = [](uintptr_t addr) -> Vector3 {
+        if (!addr || !engine.IsValidPointer(addr))
+            return {};
+        const Engine::FVector3d loc = Memory::read_nocache<Engine::FVector3d>(addr);
+        const Vector3 p = Engine::ToVector3(loc);
+        return IsPlausibleWorldPos(p) ? p : Vector3{};
+    };
+
+    if (pawn && engine.IsValidPointer(pawn)) {
+        // Prefer live CompToWorld — RelativeLocation freezes on remotes (posSame).
+        const uintptr_t comps[] = {
+            Memory::read_nocache<uintptr_t>(pawn + Offsets::EmbarkMesh),
+            Memory::read_nocache<uintptr_t>(pawn + kACharacterMesh),
+            Memory::read_nocache<uintptr_t>(pawn + kACharacterCapsule),
+        };
+        for (uintptr_t c : comps) {
+            if (const Vector3 p = tryScene(c); IsPlausibleWorldPos(p))
+                return p;
+        }
+        if (const Vector3 p = tryScene(root); IsPlausibleWorldPos(p))
+            return p;
+
+        if (root && engine.IsValidPointer(root)) {
+            const Vector3 rel = Memory::read_nocache<Vector3>(
+                root + Offsets::RelativeLocation);
+            if (IsPlausibleWorldPos(rel))
+                return rel;
+        }
+
+        {
+            const uintptr_t interp =
+                Memory::read_nocache<uintptr_t>(pawn + kStateInterpolator);
+            if (interp && engine.IsValidPointer(interp)) {
+                if (const Vector3 p = tryFVector3d(interp + kReplicatedRootTransform);
+                    IsPlausibleWorldPos(p))
+                    return p;
+            }
+        }
+
+        if (const Vector3 p = tryFVector3d(
+                pawn + kReplicatedMovement + kRepMovLocation);
+            IsPlausibleWorldPos(p))
+            return p;
+
+        uintptr_t cmc = Memory::read_nocache<uintptr_t>(
+            pawn + Offsets::PioneerCharacterMovement);
+        if (!cmc || !engine.IsValidPointer(cmc))
+            cmc = Memory::read_nocache<uintptr_t>(pawn + kACharacterMovement);
+        if (cmc && engine.IsValidPointer(cmc)) {
+            if (const Vector3 p = tryFVector3d(cmc + kCmcLastUpdateLocation); IsPlausibleWorldPos(p))
+                return p;
+        }
+    }
+
+    return tryScene(root);
+}
+
+static Vector3 ReadLivePlayerWorldPos(uintptr_t pawn, Engine::PlayerCacheEntry& live)
+{
+    Vector3 pos = live.WorldPos;
+    if (pawn && engine.IsValidPointer(pawn)) {
+        const uintptr_t root =
+            Memory::read_nocache<uintptr_t>(pawn + Offsets::RootComponent);
+        const Vector3 fresh = ResolvePlayerWorldPosLive(pawn, root, 0);
+        if (IsPlausibleWorldPos(fresh))
+            pos = fresh;
+    }
+
+    // Match bot extrapolateEntry — bridge network-tick gaps with cachedVelocity.
+    if (live.lastVelocityUpdate > 0.f) {
+        const uint64_t nowMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        const float dtSec =
+            (nowMs - static_cast<uint64_t>(live.lastVelocityUpdate)) * 0.001f;
+        if (dtSec > 0.f && dtSec < 0.12f) {
+            pos.x += live.cachedVelocity.x * dtSec;
+            pos.y += live.cachedVelocity.y * dtSec;
+            pos.z += live.cachedVelocity.z * dtSec;
+        }
+    }
+    return pos;
+}
+
+/** Re-decrypt bone array + ComponentToWorld at render time (UE double-buffer). */
+static void RefreshBoneWorldPositions(Engine& eng, Engine::PlayerCacheEntry& live)
+{
+    uintptr_t boneMesh = 0;
+    const uintptr_t resolved = eng.ResolveBoneArray(
+        live.APawn, live.actorMesh, &boneMesh);
+    if (resolved && eng.IsValidPointer(resolved) && boneMesh
+        && eng.IsValidPointer(boneMesh)) {
+        live.boneArray = resolved;
+        live.boneMesh = boneMesh;
+    } else if (!live.boneArray || !eng.IsValidPointer(live.boneArray)) {
+        return;
+    }
+
+    boneMesh = live.boneMesh ? live.boneMesh : live.actorMesh;
+    if (!boneMesh || !eng.IsValidPointer(boneMesh))
+        return;
+
+    const FTransform ctw = Engine::ReadComponentToWorld(boneMesh);
+    for (const auto& [gameIndex, uniBone] : eng.GameBoneMapArcRaiders) {
+        const size_t idx = static_cast<size_t>(uniBone);
+        if (!live.boneData.valid.test(idx))
+            continue;
+        const FTransform bone =
+            Memory::read_nocache<FTransform>(live.boneArray + (gameIndex * 0x60));
+        const D3DMATRIX mat = eng.MatrixMultiplication(
+            bone.ToMatrixWithScale(),
+            ctw.ToMatrixWithScale());
+        const Vector3 world(mat._41, mat._42, mat._43);
+        if (IsPlausibleWorldPos(world))
+            live.boneData.bonesWorldDouble[idx] = world;
+    }
+}
+
 static void DrawPlayerEspList(
     const std::vector<const Engine::PlayerCacheEntry*>& actors,
     const Engine::CameraCache& frameCam)
@@ -949,19 +1069,25 @@ static void DrawPlayerEspList(
             continue;
         if (actor->Distance < 2.f)
             continue;
-        if (!IsPlausibleWorldPos(actor->WorldPos))
+
+        Engine::PlayerCacheEntry live = *actor;
+        live.WorldPos = ReadLivePlayerWorldPos(actor->APawn, live);
+        if (!IsPlausibleWorldPos(live.WorldPos))
+            continue;
+        live.Distance = engine.EspDistanceMeters(live.WorldPos, frameCam, 0);
+        RefreshBoneWorldPositions(engine, live);
+
+        Vector3 headWorld{};
+        Vector3 feetWorld{};
+        if (!EspDraw::ResolvePlayerHeadFeetWorld(live, headWorld, feetWorld))
             continue;
 
-        if (actor->ScreenTop.x <= 0.0 || actor->ScreenTop.y <= 0.0
-            || actor->ScreenBottom.x <= 0.0 || actor->ScreenBottom.y <= 0.0)
+        ImVec2 head{};
+        ImVec2 feet{};
+        if (!EspDraw::WorldToScreenBox(engine, frameCam, headWorld, feetWorld, head, feet))
             continue;
-
-        const ImVec2 head(
-            static_cast<float>(actor->ScreenTop.x),
-            static_cast<float>(actor->ScreenTop.y));
-        const ImVec2 feet(
-            static_cast<float>(actor->ScreenBottom.x),
-            static_cast<float>(actor->ScreenBottom.y));
+        if (!EspDraw::IsEspBoxOnScreen(head, feet))
+            continue;
 
         const ImU32 color = PlayerEspColor(*actor);
         const float boxH = feet.y - head.y;
@@ -969,16 +1095,16 @@ static void DrawPlayerEspList(
             continue;
 
         const Visuals::EspDrawScale scale =
-            Visuals::ComputeEspScaleFromBox(boxH, actor->Distance);
+            Visuals::ComputeEspScaleFromBox(boxH, live.Distance);
 
         const bool drawSilhouette =
-            var::silhouette && actor->Distance <= silhouetteMaxM;
+            var::silhouette && live.Distance <= silhouetteMaxM;
         const bool drawSkeleton =
             var::skeleton && !drawSilhouette;
 
         if (drawSilhouette) {
             Visuals::HumanSilhouetteInput silIn{};
-            if (EspDraw::BuildHumanSilhouetteInput(engine, *actor, frameCam, silIn)) {
+            if (EspDraw::BuildHumanSilhouetteInput(engine, live, frameCam, silIn)) {
                 const ImU32 fill = (color & 0x00FFFFFFu)
                     | (static_cast<ImU32>(std::clamp(
                            static_cast<int>((color >> IM_COL32_A_SHIFT) & 0xFF) / 2 + 64,
@@ -987,7 +1113,8 @@ static void DrawPlayerEspList(
                 Visuals::DrawHumanSilhouetteFilled(drawList, silIn, fill);
             }
         } else if (drawSkeleton) {
-            DrawPlayerSkeletonFromCache(drawList, engine, *actor, color, actor->Distance);
+            DrawPlayerSkeletonFromCache(
+                drawList, engine, live, frameCam, color, live.Distance);
         }
 
         if (var::box) {
@@ -1012,10 +1139,10 @@ static void DrawPlayerEspList(
         }
 
         if (var::names || var::show_weapon || var::show_distance)
-            StackPlayerLabels(drawList, *actor, head.x, labelStackY, scale);
+            StackPlayerLabels(drawList, live, head.x, labelStackY, scale);
 
         if (var::snaplines && EspDraw::IsEspPointOnScreen(feet))
-            EspDraw::DrawSnaplineEsp(drawList, feet, color, actor->Distance);
+            EspDraw::DrawSnaplineEsp(drawList, feet, color, live.Distance);
     }
 }
 
@@ -1081,9 +1208,7 @@ static void RenderRobotEspFromFrame(
             continue;
         if (!IsPlausibleWorldPos(robot.WorldPos))
             continue;
-        if (WorldScan::LooksLikeContainerActor(key, robot.ActorName)
-            && !IsAcceptedBotEspLabel(engine, robot.ActorName))
-            continue;
+        // Container veto already applied in ShouldDrawRobotEsp / collect.
 
         const Vector3& wp = robot.WorldPos;
         const double bdx = static_cast<double>(wp.x) - distRef.x;
@@ -1109,7 +1234,7 @@ static void RenderRobotEspFromFrame(
         if (!EspDraw::WorldToScreenBox(engine, frameCam, headWorld, feetWorld, head, feet))
             continue;
 
-        const ImU32 color = BotEspColor(robot.isVisible);
+        const ImU32 color = BotEspColor(robot.isVisible, robot.IsBreaked);
         const float boxH = feet.y - head.y;
         const Visuals::EspDrawScale scale =
             Visuals::ComputeEspScaleFromBox(boxH > 1.f ? boxH : 24.f, distM);
@@ -1132,8 +1257,19 @@ static void RenderRobotEspFromFrame(
         if (!EspDraw::IsEspBoxOnScreen(head, feet))
             continue;
 
-        if (var::showRobots && var::bot_heart)
-            DrawBotHeartIfEnabled(drawList, head, feet, boxH, scale, color);
+        // Health bar for constructable bots (maxhealth > 0 means HealthService read succeeded).
+        // Regular bots fall back to the pulsating heart — no live health field available for them.
+        float botLabelY = head.y;
+        if (var::showRobots && var::bot_heart) {
+            if (robot.maxhealth > 0.f) {
+                botLabelY = Visuals::HealthShieldBarsAboveHead(
+                    head.x, head.y, boxH * 0.65f,
+                    robot.health, robot.maxhealth,
+                    0.f, 0.f, scale, drawList);
+            } else {
+                DrawBotHeartIfEnabled(drawList, head, feet, boxH, scale, color);
+            }
+        }
 
         if (var::bot_box) {
             const Vector3 screenTop{ head.x, head.y, 0.0 };
@@ -1145,7 +1281,7 @@ static void RenderRobotEspFromFrame(
             Visuals::Names(
                 botLabel,
                 head.x,
-                head.y,
+                botLabelY,
                 scale,
                 ImColor(255, 255, 255, 255));
         }
@@ -1489,7 +1625,7 @@ void Engine::RenderFovCircle()
     Visuals::FovCircle(var::aimbot_fov, gameFov);
 }
 
-void Engine::RenderRadar()
+void Engine::RenderRadar(bool interactive)
 {
     if (!var::show_radar)
         return;
@@ -1525,12 +1661,40 @@ void Engine::RenderRadar()
     const float screenW = ImGui::GetIO().DisplaySize.x;
     const float screenH = ImGui::GetIO().DisplaySize.y;
     const float radarPx = var::radar_scale > 0.f ? var::radar_scale : 80.f;
-    const float cx = screenW * std::clamp(var::radar_pos_x_norm, 0.05f, 0.95f);
-    const float cy = screenH * std::clamp(var::radar_pos_y_norm, 0.05f, 0.95f);
+    float cx = screenW * std::clamp(var::radar_pos_x_norm, 0.05f, 0.95f);
+    float cy = screenH * std::clamp(var::radar_pos_y_norm, 0.05f, 0.95f);
     const float rangeM = var::radar_range > 0.f ? var::radar_range : 100.f;
     const float yawRad = static_cast<float>(engine.DegToRad(static_cast<double>(frameCam.Rotation.y)));
     const float cosYaw = std::cos(yawRad);
     const float sinYaw = std::sin(yawRad);
+
+    if (interactive && screenW > 1.f && screenH > 1.f) {
+        ImGui::SetNextWindowPos(ImVec2(0.f, 0.f));
+        ImGui::SetNextWindowSize(ImVec2(screenW, screenH));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+        ImGui::Begin(
+            "##radar_drag_layer",
+            nullptr,
+            ImGuiWindowFlags_NoDecoration
+                | ImGuiWindowFlags_NoBackground
+                | ImGuiWindowFlags_NoMove
+                | ImGuiWindowFlags_NoSavedSettings
+                | ImGuiWindowFlags_NoNav
+                | ImGuiWindowFlags_NoBringToFrontOnFocus);
+        ImGui::SetCursorScreenPos(ImVec2(cx - radarPx, cy - radarPx));
+        ImGui::InvisibleButton("##radar_drag", ImVec2(radarPx * 2.f, radarPx * 2.f));
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            const ImVec2 delta = ImGui::GetIO().MouseDelta;
+            var::radar_pos_x_norm = std::clamp(
+                var::radar_pos_x_norm + delta.x / screenW, 0.05f, 0.95f);
+            var::radar_pos_y_norm = std::clamp(
+                var::radar_pos_y_norm + delta.y / screenH, 0.05f, 0.95f);
+            cx = screenW * var::radar_pos_x_norm;
+            cy = screenH * var::radar_pos_y_norm;
+        }
+        ImGui::End();
+        ImGui::PopStyleVar();
+    }
 
     const ImU32 bgCol = IM_COL32(16, 16, 22, 190);
     const ImU32 borderCol = IM_COL32(80, 80, 100, 220);
@@ -1652,9 +1816,11 @@ void Engine::RenderRadar()
         if (!projectBlip(robot.WorldPos, rx, ry))
             continue;
 
-        const ImU32 color = robot.isVisible
-            ? pickerColor(var::bot_color_visible)
-            : pickerColor(var::bot_color_invisible);
+        const ImU32 color = robot.IsBreaked
+            ? pickerColor(var::color_dead_bots)
+            : (robot.isVisible
+                ? pickerColor(var::bot_color_visible)
+                : pickerColor(var::bot_color_invisible));
         drawBlip(rx, ry, color, robot.Distance);
     }
 

@@ -131,23 +131,4 @@ inline bool IsAnyBotActor(uintptr_t actor)
     return IsBotClassId(masked) || IsTargetBotActor(actor);
 }
 
-inline std::string GetNicknameByClassId(uint32_t id)
-{
-    const uint32_t masked = MaskActorTypeId(id);
-    switch (masked) {
-    case static_cast<uint32_t>(EActorType::EACTOR_PLAYER):
-        return "PLAYER";
-    case static_cast<uint32_t>(EActorType::EACTOR_ARC_WASP):
-        return {};
-    case static_cast<uint32_t>(EActorType::EACTOR_CHEST):
-        return "CHEST";
-    case static_cast<uint32_t>(EActorType::EACTOR_LOOT):
-        return "LOOT";
-    case static_cast<uint32_t>(EActorType::EACTOR_SPAWN):
-        return "SPAWN";
-    default:
-        return {};
-    }
-}
-
 } // namespace ArcActorType

@@ -19,32 +19,15 @@ bool Engine::GatherWorldScanContext(WorldScanContext& ctx)
     if (!ctx.gWorld || !ctx.persistentLevel)
         return false;
 
-    int32_t actorCount = 0;
-    int32_t actorMax = 0;
-
-    if (ctx.actors) {
-        actorCount = Memory::read<int32_t>(ctx.persistentLevel + Offsets::ActorsCount);
-        actorMax = actorCount;
-        if (actorCount > 0 && actorCount <= 10000) {
-            ctx.currentActors.resize(static_cast<size_t>(actorCount));
-            if (Memory::ReadRaw(
-                    ctx.actors,
-                    ctx.currentActors.data(),
-                    static_cast<size_t>(actorCount) * sizeof(uint64_t)))
-            {
-                while (!ctx.currentActors.empty() && ctx.currentActors.back() == 0)
-                    ctx.currentActors.pop_back();
-            } else {
-                ctx.currentActors.clear();
-            }
-        }
-    }
-
-    if (ctx.currentActors.empty())
-        WorldScan::CollectLevelActors(ctx.gWorld, ctx.persistentLevel, ctx.currentActors);
+    // Always union PersistentLevel + every UWorld::Levels entry. Persistent-only
+    // missed streaming-level containers (lockers/crates in POI sublevels).
+    WorldScan::CollectLevelActors(ctx.gWorld, ctx.persistentLevel, ctx.currentActors);
 
     if (ctx.currentActors.empty())
         return false;
+
+    const int32_t actorCount = static_cast<int32_t>(ctx.currentActors.size());
+    const int32_t actorMax = actorCount;
 
     if (!WorldScan::RefreshCachedActorPtrs(ctx.currentActors, actorCount, actorMax))
         return false;

@@ -130,16 +130,17 @@ void Engine::GetBones(PlayerCacheEntry& actor)
     actor.boneArray = 0;
     actor.boneMesh = 0;
 
-    if (!IsValidPointer(actor.actorMesh))
+    if (!IsValidPointer(actor.actorMesh) && !IsValidPointer(actor.APawn))
         return;
 
-    actor.boneArray = GetBoneArrayDecrypt(actor.actorMesh);
+    actor.boneArray = ResolveBoneArray(actor.APawn, actor.actorMesh, &actor.boneMesh);
     if (!actor.boneArray || !IsValidPointer(actor.boneArray))
         return;
 
-    actor.boneMesh = actor.actorMesh;
+    if (!actor.boneMesh || !IsValidPointer(actor.boneMesh))
+        actor.boneMesh = actor.actorMesh;
 
-    const FTransform componentToWorld = Engine::ReadComponentToWorld(actor.actorMesh);
+    const FTransform componentToWorld = Engine::ReadComponentToWorld(actor.boneMesh);
 
     for (const auto& [gameIndex, uniBone] : GameBoneMapArcRaiders)
     {

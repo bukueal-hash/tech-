@@ -642,6 +642,25 @@ static bool ValidateGameInstance(uintptr_t gi, uintptr_t* outLocalPlayer = nullp
         }
     }
 
+    // Structural fallback: accept GI when LocalPlayers looks like a real TArray even
+    // if LP→PC validation failed (transient FOV/PCM glitch mid-raid). Still publish LP
+    // slot 0 when present so OwningGI/LocalPlayer do not go permanently red.
+    for (std::ptrdiff_t off : kLpArrOffs) {
+        const GITArrayHdr arr = ReadGIArray(gi, off);
+        if (!IsUsableObjectPtr(arr.Data))
+            continue;
+        if (arr.Num < 0 || arr.Num > 16)
+            continue;
+        if (arr.Max < arr.Num || arr.Max > 64)
+            continue;
+        const uintptr_t slot0 = Memory::read<uintptr_t>(arr.Data);
+        if (outLocalPlayer && IsUsableObjectPtr(slot0) && !LooksLikeUtf16GarbageQword(slot0))
+            *outLocalPlayer = slot0;
+        if (outPlayerController)
+            *outPlayerController = 0;
+        return true;
+    }
+
     return false;
 }
 
@@ -980,22 +999,18 @@ uintptr_t Engine::GetCameraManagerFromActors()
 // SHARED GATE — grep callers before edit
 bool Engine::getAllowType(const std::string& actorName, int category) const
 {
-    const bool wantBots = var::showRobots || var::robotAimEnabled;
+    // Radar-only mode must admit bots too (scanner already gates on show_radar).
+    const bool wantBots = var::showRobots || var::robotAimEnabled || var::show_radar;
 
     if (robotsList.find(actorName) != robotsList.end())
         return wantBots;
 
-    // category 3: RobotList only — require struct token or accepted bot label.
+    // category 3: RobotList — Lookup fname/display maps first, then accepted labels.
     if (wantBots && category == 3) {
         if (actorName.empty())
             return false;
         if (actorName == kBotStructAdmissionToken)
             return true;
-        return IsAcceptedBotEspLabel(
-            *const_cast<Engine*>(this), actorName, std::string{});
-    }
-
-    if (wantBots && !actorName.empty()) {
         if (!LookupEnemyBotByFName(actorName).empty())
             return true;
         if (robotsList.find(actorName) == robotsList.end()) {
@@ -1003,6 +1018,8 @@ bool Engine::getAllowType(const std::string& actorName, int category) const
             if (!fromDisplay.empty())
                 return true;
         }
+        return IsAcceptedBotEspLabel(
+            *const_cast<Engine*>(this), actorName, std::string{});
     }
 
     if (actorName == "Loot Item" || actorName == "World Item")
@@ -1262,6 +1279,16 @@ namespace {
 
 std::string TryReadEnglishItemNameFromHover(uint64_t actor, std::ptrdiff_t hover_off)
 {
+    auto accept = [](std::string s) -> std::string {
+        if (s.empty())
+            return {};
+        s = FormatEspDisplayLabel(s);
+        if (s.empty() || IsGenericWorldEspLabel(s) || IsJunkWorldEspLabel(s)
+            || IsGarbledEspLabel(s) || !IsPlausibleEspLabel(s))
+            return {};
+        return s;
+    };
+
     const uint64_t hover_base = actor + static_cast<uint64_t>(hover_off);
 
     uint64_t l0 = Memory::read<uint64_t>(hover_base);
@@ -1282,12 +1309,12 @@ std::string TryReadEnglishItemNameFromHover(uint64_t actor, std::ptrdiff_t hover
 
         if (loc_key.find("ST_") != 0 && loc_key.find("ID_") != 0) {
             if (const std::string fromLoc = LookupByLocKey(loc_key); fromLoc.length() >= 2)
-                return FormatEspDisplayLabel(fromLoc);
+                return accept(fromLoc);
             goto fallback;
         }
 
         if (const std::string fromLoc = LookupByLocKey(loc_key); fromLoc.length() >= 2)
-            return FormatEspDisplayLabel(fromLoc);
+            return accept(fromLoc);
 
         uint64_t l2 = Memory::read<uint64_t>(l1 + 0x30);
         if (!l2 || !Memory::IsValidPtrFast2(l2)) goto fallback;
@@ -1312,7 +1339,7 @@ std::string TryReadEnglishItemNameFromHover(uint64_t actor, std::ptrdiff_t hover
             }
         }
         if (result.length() >= 2)
-            return FormatEspDisplayLabel(result);
+            return accept(result);
     }
 
 fallback:
@@ -1323,17 +1350,17 @@ fallback:
 
         std::string name = steam_decrypt::GetActorFNameString(da);
         if (const std::string fromAsset = LookupByAssetName(name); !fromAsset.empty())
-            return FormatEspDisplayLabel(fromAsset);
+            return accept(fromAsset);
         if (const std::string fromWorld = LookupWorldObjectByFName(name); !fromWorld.empty())
-            return FormatEspDisplayLabel(fromWorld);
+            return accept(fromWorld);
         for (const char* p : { "DA_", "WID_", "BP_", "Item_" }) {
             if (name.find(p) == 0) { name.erase(0, strlen(p)); break; }
         }
         for (auto& c : name) if (c == '_') c = ' ';
         if (!name.empty() && name.find("Default__") == std::string::npos) {
             if (const std::string human = HumanizeActorFName(name); !human.empty())
-                return human;
-            return FormatEspDisplayLabel(name);
+                return accept(human);
+            return accept(name);
         }
     }
 
@@ -1452,7 +1479,11 @@ std::string Engine::GetEnglishItemName(uint64_t actor)
     auto polish = [](std::string s) -> std::string {
         if (s.empty() || IsGenericWorldEspLabel(s))
             return {};
-        return FormatEspDisplayLabel(s);
+        s = FormatEspDisplayLabel(s);
+        if (s.empty() || IsJunkWorldEspLabel(s) || IsGarbledEspLabel(s)
+            || !IsPlausibleEspLabel(s))
+            return {};
+        return s;
     };
 
     static const std::ptrdiff_t kHoverOffsets[] = {
@@ -1521,31 +1552,13 @@ std::string Engine::GetActorFNameStringCached(uintptr_t actor_base)
     if (!IsValidPointer(actor_base))
         return "";
 
-    if (!g_bReadSimdConsts) {
+    if (!g_fnameTablesReady) {
         if (!InitConsts())
             return GetActorFNameString(actor_base);
     }
 
-    // Pega o FNameId2 (mesmo que GetActorFNameString usa internamente)
-    int32_t fnameId2 = GetActorFNameId(actor_base);
-    if (fnameId2 == 0)
-        return GetActorFNameString(actor_base);
-
-    // Tenta pegar do cache
-    std::string cachedName;
-    if (FNameCache::Instance().TryGet(fnameId2, cachedName)) {
-        return cachedName;
-    }
-
-    // Cache miss - faz a descriptografia completa
-    std::string name = GetActorFNameString(actor_base);
-
-    // Salva no cache
-    if (!name.empty() && steam_decrypt::IsPlausibleFNameText(name)) {
-        FNameCache::Instance().Add(fnameId2, name);
-    }
-
-    return name;
+    // Single cache layer: steam_decrypt::CachedNameString (by comp_index).
+    return GetActorFNameString(actor_base);
 }
 
 std::string Engine::GetActorClassFName(uintptr_t actor_base)
@@ -1591,11 +1604,12 @@ std::string Engine::GetActorClassFName(uintptr_t actor_base)
 void Engine::ClearFNameCache()
 {
     FNameCache::Instance().Clear();
+    steam_decrypt::ClearNameCache();
 }
 
 bool Engine::InitConsts()
 {
-    if (g_bReadFNameKeyTable && g_bReadSimdConsts)
+    if (g_fnameTablesReady)
         return true;
 
     const uint64_t base = Memory::getBaseAddress();
@@ -1608,7 +1622,6 @@ bool Engine::InitConsts()
     if (!steam_decrypt::InitTables(base))
         return false;
 
-    g_bReadFNameKeyTable = true;
-    g_bReadSimdConsts = true;
+    g_fnameTablesReady = true;
     return true;
 }

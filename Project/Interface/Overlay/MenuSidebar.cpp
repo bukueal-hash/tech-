@@ -318,7 +318,8 @@ void DrawArcEspTab()
         (void)0;
     }
     ArcMenuHoverTooltip(
-        "ON: mesh render-time visibility (CL-1233465). OFF: treat all players as visible.");
+        "ON: UC encrypted render-time decrypt (mesh+0x488, CL-1315578 / UC pg185 #3689); "
+        "legacy plain fallback @ mesh+0x4C4. OFF: treat all as visible.");
     ArcMenuLayout::Checkbox("Obstruction LOS", &var::obstruction_check);
     ArcMenuHoverTooltip(
         "UC-style static-mesh KD-tree line-of-sight. Requires Visible check. Rebuilds on move.");
@@ -413,7 +414,9 @@ void DrawArcLootTab()
     ArcMenuHoverTooltip("Append coin value to resolved pickup names.");
     ImGui::SetCursorPosX(ImGui::GetCursorStartPos().x + kContainerSpColumnX);
     ImGui::TextUnformatted("SP");
-    ArcMenuHoverTooltip("Per-filter SP: checked = SP distance, unchecked = loot distance.");
+    ArcMenuHoverTooltip(
+        "Nothing is hidden. Per-filter SP: checked = far (SP distance) for matching pickups; "
+        "unchecked = close (loot / category distance). Non-matches stay at close distance.");
     static const char* kMinRarityLabels[] = {
         "Any", "Uncommon+", "Rare+", "Epic+", "Legendary only"
     };
@@ -425,9 +428,11 @@ void DrawArcLootTab()
             5000.f,
             "%.0f c",
             &var::loot_min_val_sp,
-            "Min value filter range: SP distance when checked, loot distance when unchecked."))
+            "Distance only — never hides. SP checked = far for pickups at/above min value."))
         RequestArcSlowCache();
-    ArcMenuHoverTooltip("Pickups at/above min value use SP distance when checked, loot distance when unchecked. 0 = off.");
+    ArcMenuHoverTooltip(
+        "Never hides. Pickups at/above min value use SP distance when checked, "
+        "loot/category distance when unchecked. Below-threshold pickups stay at close distance. 0 = off.");
     if (LootFilterComboWithSp(
             "Min rarity",
             "##loot_min_rarity",
@@ -435,9 +440,11 @@ void DrawArcLootTab()
             kMinRarityLabels,
             IM_ARRAYSIZE(kMinRarityLabels),
             &var::loot_min_rar_sp,
-            "Min rarity filter range: SP distance when checked, loot distance when unchecked."))
+            "Distance only — never hides. SP checked = far for pickups at/above min rarity."))
         RequestArcSlowCache();
-    ArcMenuHoverTooltip("Pickups at/above min rarity use SP distance when checked, loot distance when unchecked. Any = off.");
+    ArcMenuHoverTooltip(
+        "Never hides. Pickups at/above min rarity use SP distance when checked, "
+        "loot/category distance when unchecked. Below-threshold pickups stay at close distance. Any = off.");
     ArcMenuLayout::SliderFloat(
         "Loot distance", "##loot_distance", &var::loot_distance, 20.f, var::kMaxDistanceSliderM, "%.0f m");
     ArcMenuHoverTooltip("Default loot draw distance. Used whenever SP is unchecked on that row.");
@@ -513,7 +520,7 @@ void DrawArcRadarTab()
     ArcMenuHoverTooltip(
         "Show container types with SP checked under Visuals on the radar (within world range).");
     ImGui::Separator();
-    ImGui::TextWrapped("Close the menu (INSERT), then click and drag the radar to move it.");
+    ImGui::TextWrapped("While this menu is open, click and drag the radar to move it. Position saves automatically when you close the menu.");
     ImGui::TextWrapped("Players/bots use Visuals ESP colors; rare loot uses rarity colors; SP containers use their type colors.");
     ImGui::EndDisabled();
 }
@@ -522,6 +529,11 @@ void DrawArcAimbotTab()
 {
     ArcMenuLayout::Checkbox("Enable Aimbot", &var::enable_aimbot);
     ArcMenuHoverTooltip("KmBox hardware aim — requires MAKCU or Net device connected.");
+    if (g_kmbox.FiringProxyAvailable()) {
+        ArcMenuLayout::Checkbox("Triggerbot", &var::enable_triggerbot);
+        ArcMenuHoverTooltip(
+            "When locked and on-target, send LeftClick via hardware. Skips if physical LMB already down.");
+    }
     if (ArcMenuLayout::Checkbox("Robot aim", &var::robotAimEnabled))
         RequestArcSlowCache();
     ArcMenuHoverTooltip("Aim at robots (works without Show robots on Visuals).");
@@ -563,7 +575,61 @@ void DrawArcAimbotTab()
         "%.0f");
     ArcMenuHoverTooltip("Travel speed used for lead prediction. Default 80000 (~800 m/s).");
     ArcMenuLayout::Checkbox("Random bone", &var::randombone);
-    ArcMenuHoverTooltip("Cycle through torso bones over time instead of locking head only.");
+    ArcMenuHoverTooltip("Cycle through torso bones over time. Overrides Aim bone while enabled.");
+    static const char* kAimBoneLabels[] = {
+        "Head", "Chest", "Pelvis", "Arms", "Legs", "Closest bone"
+    };
+    int aimBone = static_cast<int>(var::aim_bone_mode);
+    if (ArcMenuLayout::Combo(
+            "Aim bone",
+            "##aim_bone_mode",
+            &aimBone,
+            kAimBoneLabels,
+            IM_ARRAYSIZE(kAimBoneLabels)))
+        var::aim_bone_mode = static_cast<AimBoneMode>(aimBone);
+    ArcMenuHoverTooltip("Fixed bone, or closest bone inside the FOV circle each tick. Ignored while Random bone is on.");
+
+    static const char* kAimPriorityLabels[] = {
+        "FOV", "Distance", "Threat", "Low health", "FOV + distance"
+    };
+    int aimPriority = static_cast<int>(var::aimbot_priority);
+    if (ArcMenuLayout::Combo(
+            "Target priority",
+            "##aimbot_priority",
+            &aimPriority,
+            kAimPriorityLabels,
+            IM_ARRAYSIZE(kAimPriorityLabels)))
+        var::aimbot_priority = static_cast<AimbotPriority>(aimPriority);
+    ArcMenuHoverTooltip("How candidates are scored inside the FOV. Threat uses weapon tier when available.");
+
+    ArcMenuLayout::Checkbox("Sticky lock", &var::sticky_target_lock);
+    ArcMenuHoverTooltip("Prefer the currently locked target; resists hopping to a marginal rival.");
+    ImGui::BeginDisabled(!var::sticky_target_lock);
+    ArcMenuLayout::SliderFloat(
+        "Sticky FOV bias",
+        "##aim_sticky_fov_bias_px",
+        &var::aim_sticky_fov_bias_px,
+        0.f,
+        120.f,
+        "%.0f px");
+    ArcMenuHoverTooltip("Extra FOV pixels granted to the locked target so it is harder to lose.");
+    ImGui::EndDisabled();
+
+    ArcMenuLayout::Checkbox("Loss of sight grace", &var::aim_loss_of_sight_grace_enabled);
+    ArcMenuHoverTooltip("Keep aiming at the last known point briefly after the target leaves candidates.");
+    ImGui::BeginDisabled(!var::aim_loss_of_sight_grace_enabled);
+    {
+        float graceMs = static_cast<float>(var::aim_loss_of_sight_grace_ms);
+        if (ArcMenuLayout::SliderFloat(
+                "Grace (ms)",
+                "##aim_loss_of_sight_grace_ms",
+                &graceMs,
+                0.f,
+                2000.f,
+                "%.0f"))
+            var::aim_loss_of_sight_grace_ms = static_cast<int>(graceMs);
+    }
+    ImGui::EndDisabled();
 
     static const char* kAimAlgoLabels[] = { "Linear", "Accelerated" };
     int aimAlgo = static_cast<int>(var::aim_algorithm);
@@ -688,7 +754,8 @@ void DrawArcDebugTab()
     ImGui::Text("KmBox ready: %s", g_kmbox.kmboxConfig.initialized ? "yes" : "no");
     ImGui::Separator();
     ImGui::TextWrapped(
-        "Visible check: mesh render-time (LastSubmitTime/LastRenderTime @ mesh+0x4C4). "
+        "Visible check: UC encrypted decrypt (mesh+0x488, CL-1315578 / UC pg185 #3689); "
+        "legacy plain fallback @ mesh+0x4C4. "
         "Obstruction LOS: UC static-mesh KD-tree rebuild (see [debugVisCheck] collisionLos/tris).");
     if (var::visiblecheck)
         ImGui::TextColored(ImVec4(0.45f, 1.0f, 0.55f, 1.0f), "Visible check: ON");
@@ -731,26 +798,27 @@ void DrawArcHelpTab()
     ImGui::TextWrapped("Visuals — Player ESP:");
     WrappedBulletText("Enable ESP + visible/invisible colors, distance slider.");
     WrappedBulletText(
-        "Visible check: mesh render-time test (LastSubmitTime/LastRenderTime @ mesh+0x4C4, CL-1233465).");
+        "Visible check: UC encrypted render-time decrypt (mesh+0x488, CL-1315578 / UC pg185 #3689); "
+        "legacy plain fallback @ mesh+0x4C4.");
     WrappedBulletText("Box, health/shield bar, names, weapon tier color, snaplines.");
     WrappedBulletText("Silhouette fill within max m; skeleton beyond that when both enabled.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Visuals — Bot ESP:");
     WrappedBulletText("Show robots + bot visible/invisible colors, bot distance.");
-    WrappedBulletText("Box, health bar, names, snaplines, distance, dead bot wrecks + color.");
-    WrappedBulletText("Heart toggle: pulsating marker at box center; robot Center aim uses the same point.");
+    WrappedBulletText("Box, health bar when data is available, names, snaplines, distance, dead bot wrecks + color.");
+    WrappedBulletText("Heart toggle: pulsating marker when no health max; robot Center aim uses the same point.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Visuals — World / loot:");
     WrappedBulletText("World ESP: corpses, dropped items, raider stock, ARC entities + per-type colors.");
-    WrappedBulletText("Loot: containers, hide opened, rarity color, value filter, min rarity, distances.");
+    WrappedBulletText("Loot: containers, open-container color, rarity color, value/rarity distance tiers (never hide), distances.");
     WrappedBulletText("Container types: per-category toggles, colors, SP = SP distance else loot distance.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Loot tab:");
-    WrappedBulletText("Show loot, hide opened, rarity color, loot label color, show value on label.");
-    WrappedBulletText("Min value slider + SP, min rarity combo + SP, loot distance & SP distance sliders.");
+    WrappedBulletText("Show loot, open-container color, rarity color, loot label color, show value on label.");
+    WrappedBulletText("Min value/rarity + SP only choose close vs far — never hide pickups or containers.");
     WrappedBulletText("Container types: per-category toggles, colors, SP checkboxes.");
 
     ImGui::Spacing();

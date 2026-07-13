@@ -1,146 +1,289 @@
 #include "../Core/Engine.h"
 #include "../Core/ActorType.h"
-#include "../Core/AssetNames.h"
 #include "../Core/IntervalTimer.h"
+#include "EspDraw.h"
 
 #include <iostream>
 #include <chrono>
 #include <thread>
-#include <unordered_map>
 #include <unordered_set>
-#include <algorithm>
+#include <vector>
 
 namespace {
 
-#pragma pack(push, 1)
-struct ActorOwnerInstigator {
-    uintptr_t owner;
-    uint8_t   _pad[Offsets::ActorInstigator - Offsets::ActorOwner - sizeof(uintptr_t)];
-    uintptr_t instigator;
-};
-#pragma pack(pop)
+// help FrostDumper 2026-07-12:
+// Prefer root RelativeLocation 0x218, then scene CompToWorld, then net snapshots.
+// EmbarkCharacterBase: StateInterpolator 0x7c0 → ReplicatedRootTransform 0x1f8
+// AActor: ReplicatedMovement 0x150; FRepMovement::Location 0x30
+// ACharacter: Mesh 0x428, CharacterMovement 0x430, Capsule 0x438
+// CMC: LastUpdateLocation 0x3e0
+constexpr std::ptrdiff_t kACharacterMesh = 0x428;
+constexpr std::ptrdiff_t kACharacterMovement = 0x430;
+constexpr std::ptrdiff_t kACharacterCapsule = 0x438;
+constexpr std::ptrdiff_t kCmcLastUpdateLocation = 0x3e0;
+constexpr std::ptrdiff_t kReplicatedMovement = 0x150; // help dump — Project Offsets.h still 0x148
+constexpr std::ptrdiff_t kRepMovLocation = 0x30;
+constexpr std::ptrdiff_t kStateInterpolator = 0x7c0;
+constexpr std::ptrdiff_t kReplicatedRootTransform = 0x1f8; // Location at +0
 
-bool ClassLooksLikeEquippedWeapon(const std::string& cls)
+// help FrostDumper / SDK: Pawn::PlayerState is 0x3c0 (Controller uses 0x3A8).
+// Base PlayerState::PawnPrivate = 0x418; live probe also saw 0x410.
+// PioneerPlayerState: PioneerCharacter 0x538, CurrentPawn 0x540 (ARC remotes).
+// Keep Offsets::APlayerState (0x3A8) for world/bot — do not change globals.
+constexpr std::ptrdiff_t kPawnPlayerState = 0x3c0;
+constexpr std::ptrdiff_t kPsPawnPrivate = 0x418;
+constexpr std::ptrdiff_t kPsPawnPrivateAlt = 0x410;
+constexpr std::ptrdiff_t kPioneerCharacter = 0x538;
+constexpr std::ptrdiff_t kPioneerCurrentPawn = 0x540;
+
+bool PsBacklinksToPawn(uintptr_t ps, uintptr_t pawn)
 {
-    if (cls.empty())
-        return false;
-    if (cls.find("Stowed") != std::string::npos)
-        return false;
-    return cls.find("BP_WeaponActor_") != std::string::npos
-        || cls.find("BP_Weapon_") != std::string::npos;
+    const std::ptrdiff_t offs[] = {
+        kPioneerCurrentPawn,
+        kPioneerCharacter,
+        kPsPawnPrivate,
+        kPsPawnPrivateAlt,
+    };
+    for (const std::ptrdiff_t off : offs) {
+        const uintptr_t linked = Memory::read<uintptr_t>(ps + off);
+        if (linked == pawn)
+            return true;
+    }
+    return false;
 }
 
-std::string ResolveWeaponEspLabel(
-    Engine& eng, const std::string& cls, uintptr_t weaponActor)
+bool TryResolvePawnPlayerState(uintptr_t pawn, uintptr_t& outPs)
 {
-    std::string label = eng.GetWeaponName(cls);
-    if (label.empty() || label == cls) {
-        const std::string dataAsset = GetActorDataAssetFName(weaponActor);
-        if (!dataAsset.empty()) {
-            if (const std::string fromAsset = LookupByAssetName(dataAsset);
-                !fromAsset.empty())
-                label = fromAsset;
-            else if (const std::string human = HumanizeActorFName(dataAsset);
-                !human.empty())
-                label = human;
+    if (!pawn || !Memory::IsValidPtrFast2(pawn))
+        return false;
+    // Step 3: nocache on forward PS read — stale VMM page cache was suspected.
+    const uintptr_t ps =
+        Memory::read_nocache<uintptr_t>(pawn + kPawnPlayerState);
+    if (!ps || !Memory::IsValidPtrFast2(ps))
+        return false;
+    if (!PsBacklinksToPawn(ps, pawn))
+        return false;
+    outPs = ps;
+    return true;
+}
+
+bool IsActorTypePlayerPawn(uintptr_t actor)
+{
+    if (!actor || !Memory::IsValidPtrFast2(actor))
+        return false;
+    const uint32_t masked =
+        ArcActorType::MaskActorTypeId(ArcActorType::ReadActorTypeId(actor));
+    return ArcActorType::IsPlayerClassId(masked);
+}
+
+/** Primary pawn+0x3C0 PS chase; fallback ActorType + 0x3C0 without backlink. */
+bool TryResolvePlayerStateAny(uintptr_t pawn, uintptr_t& outPs, bool& outViaActorType)
+{
+    outViaActorType = false;
+    if (TryResolvePawnPlayerState(pawn, outPs))
+        return true;
+    if (!IsActorTypePlayerPawn(pawn))
+        return false;
+    // Offsets::APlayerState (0x3A8) is Controller-only; on Pawn use 0x3C0.
+    const uintptr_t ps =
+        Memory::read_nocache<uintptr_t>(pawn + kPawnPlayerState);
+    if (!ps || !Memory::IsValidPtrFast2(ps))
+        return false;
+    outPs = ps;
+    outViaActorType = true;
+    return true;
+}
+
+constexpr std::ptrdiff_t kPlayerStateBIsABot = 0x3aa;
+constexpr uint8_t kPlayerStateBIsABotMask = 0x8;
+
+bool PlayerStateIsBot(uintptr_t ps)
+{
+    if (!ps || !Memory::IsValidPtrFast2(ps))
+        return false;
+    const uint8_t flags = Memory::read<uint8_t>(ps + kPlayerStateBIsABot);
+    return (flags & kPlayerStateBIsABotMask) != 0;
+}
+
+uintptr_t ResolvePawnFromPlayerState(uintptr_t ps)
+{
+    if (!ps || !Memory::IsValidPtrFast2(ps))
+        return 0;
+    const std::ptrdiff_t offs[] = {
+        kPioneerCurrentPawn,
+        kPioneerCharacter,
+        kPsPawnPrivate,
+        kPsPawnPrivateAlt,
+    };
+    for (const std::ptrdiff_t off : offs) {
+        const uintptr_t pawn = Memory::read<uintptr_t>(ps + off);
+        if (pawn && Memory::IsValidPtrFast2(pawn))
+            return pawn;
+    }
+    return 0;
+}
+
+/** PioneerPlayerState+0x530 is bIsInEncounter, not HealthInfo — use HealthComponent. */
+float ReadPawnHealthForAdmit(uintptr_t pawn)
+{
+    return static_cast<float>(Engine::ReadHealthComponentStat(pawn, Offsets::Health));
+}
+
+Vector3 ResolvePlayerWorldPos(uintptr_t pawn, uintptr_t root, uintptr_t /*legacy*/)
+{
+    // Bypass VMM page cache — Memory::read was freezing remotes (posSame=N).
+    auto trySceneNC = [](uintptr_t comp) -> Vector3 {
+        if (!comp || !Memory::IsValidPtrFast2(comp))
+            return {};
+        const Engine::FVector3d world =
+            Memory::read_nocache<Engine::FVector3d>(comp + Offsets::WorldLocation);
+        const Vector3 w = Engine::ToVector3(world);
+        if (IsPlausibleWorldPos(w))
+            return w;
+        const Vector3 rel =
+            Memory::read_nocache<Vector3>(comp + Offsets::RelativeLocation);
+        return IsPlausibleWorldPos(rel) ? rel : Vector3{};
+    };
+    auto tryFVector3dNC = [](uintptr_t addr) -> Vector3 {
+        if (!addr || !Memory::IsValidPtrFast2(addr))
+            return {};
+        const Engine::FVector3d loc = Memory::read_nocache<Engine::FVector3d>(addr);
+        const Vector3 p = Engine::ToVector3(loc);
+        return IsPlausibleWorldPos(p) ? p : Vector3{};
+    };
+
+    if (pawn && Memory::IsValidPtrFast2(pawn)) {
+        // Prefer live CompToWorld — RelativeLocation stays frozen on remotes (posSame).
+        const uintptr_t comps[] = {
+            Memory::read_nocache<uintptr_t>(pawn + Offsets::EmbarkMesh),
+            Memory::read_nocache<uintptr_t>(pawn + kACharacterMesh),
+            Memory::read_nocache<uintptr_t>(pawn + kACharacterCapsule),
+        };
+        for (uintptr_t c : comps) {
+            if (const Vector3 p = trySceneNC(c); IsPlausibleWorldPos(p))
+                return p;
+        }
+        if (const Vector3 p = trySceneNC(root); IsPlausibleWorldPos(p))
+            return p;
+
+        // Fallback: root RelativeLocation (local may update; remotes often stale).
+        if (root && Memory::IsValidPtrFast2(root)) {
+            const Vector3 rel =
+                Memory::read_nocache<Vector3>(root + Offsets::RelativeLocation);
+            if (IsPlausibleWorldPos(rel))
+                return rel;
+        }
+
+        // StateInterpolator → ReplicatedRootTransform.Location
+        {
+            const uintptr_t interp =
+                Memory::read_nocache<uintptr_t>(pawn + kStateInterpolator);
+            if (interp && Memory::IsValidPtrFast2(interp)) {
+                if (const Vector3 p = tryFVector3dNC(interp + kReplicatedRootTransform);
+                    IsPlausibleWorldPos(p))
+                    return p;
+            }
+        }
+
+        // FRepMovement::Location @ Actor+0x150+0x30
+        if (const Vector3 p = tryFVector3dNC(
+                pawn + kReplicatedMovement + kRepMovLocation);
+            IsPlausibleWorldPos(p))
+            return p;
+
+        // CMC LastUpdateLocation @ 0x3e0
+        uintptr_t cmc =
+            Memory::read_nocache<uintptr_t>(pawn + Offsets::PioneerCharacterMovement);
+        if (!cmc || !Memory::IsValidPtrFast2(cmc))
+            cmc = Memory::read_nocache<uintptr_t>(pawn + kACharacterMovement);
+        if (cmc && Memory::IsValidPtrFast2(cmc)) {
+            if (const Vector3 p = tryFVector3dNC(cmc + kCmcLastUpdateLocation);
+                IsPlausibleWorldPos(p))
+                return p;
         }
     }
-    if (label.empty())
-        label = eng.GetWeaponName(cls);
-    if (label.empty())
-        return {};
-    return FormatEspDisplayLabel(label);
+
+    return trySceneNC(root);
 }
 
-void CollectGameStatePlayerPawns(
+uintptr_t ResolvePlayerSkeletalMesh(uintptr_t pawn)
+{
+    if (!pawn || !Memory::IsValidPtrFast2(pawn))
+        return 0;
+    const uintptr_t embark = Memory::read<uintptr_t>(pawn + Offsets::EmbarkMesh);
+    if (embark && Memory::IsValidPtrFast2(embark))
+        return embark;
+    const uintptr_t mesh = Memory::read<uintptr_t>(pawn + kACharacterMesh);
+    if (mesh && Memory::IsValidPtrFast2(mesh))
+        return mesh;
+    return 0;
+}
+
+/** GameState PlayerArray → set of PlayerState pointers (membership only, not pawns). */
+bool BuildGameStatePlayerStateAllowlist(
     Engine& eng,
     uintptr_t gWorld,
-    std::unordered_set<uint64_t>& outPawns,
-    std::unordered_map<uintptr_t, uintptr_t>& outPawnToPlayerState)
+    std::unordered_set<uintptr_t>& outPs,
+    int& outArraySize)
 {
-    outPawns.clear();
-    outPawnToPlayerState.clear();
-    if (!gWorld)
-        return;
+    outPs.clear();
+    outArraySize = 0;
 
-    const uintptr_t gameState = eng.ResolveGameStateFromWorld(gWorld);
-    if (!gameState || !Memory::IsValidPtrFast2(gameState))
-        return;
+    uintptr_t bestGs = 0;
+    int32_t bestArrNum = 0;
 
+    auto considerGameState = [&](uintptr_t gs) {
+        if (!gs || !Memory::IsValidPtrFast2(gs))
+            return;
+        const uintptr_t arrData =
+            Memory::read<uintptr_t>(gs + Offsets::GameState_PlayerArray);
+        const int32_t arrNum =
+            Memory::read<int32_t>(gs + Offsets::GameState_PlayerArray + 8);
+        if (!arrData || !Memory::IsValidPtrFast2(arrData) || arrNum <= 0 || arrNum > 128)
+            return;
+        if (arrNum > bestArrNum) {
+            bestArrNum = arrNum;
+            bestGs = gs;
+        }
+    };
+
+    if (gWorld && Memory::IsValidPtrFast2(gWorld)) {
+        const uintptr_t collectionsData =
+            Memory::read<uintptr_t>(gWorld + Offsets::LevelCollections);
+        const int32_t collectionsNum =
+            Memory::read<int32_t>(gWorld + Offsets::LevelCollections + 8);
+        if (collectionsData && Memory::IsValidPtrFast2(collectionsData)
+            && collectionsNum > 0 && collectionsNum <= 16) {
+            const int limit = (collectionsNum > 4) ? 4 : collectionsNum;
+            for (int i = 0; i < limit; ++i) {
+                const uintptr_t collection =
+                    collectionsData + static_cast<uintptr_t>(i) * Offsets::LevelCollection_Stride;
+                considerGameState(Memory::read<uintptr_t>(
+                    collection + Offsets::LevelCollection_GameState));
+            }
+        }
+    }
+
+    if (const uint64_t base = Memory::getBaseAddress())
+        considerGameState(Memory::read<uintptr_t>(base + Offsets::GameStateGlobalRva));
+
+    (void)eng;
+    if (!bestGs)
+        return false;
+
+    outArraySize = bestArrNum;
     const uintptr_t arrData =
-        Memory::read<uintptr_t>(gameState + Offsets::GameState_PlayerArray);
-    const int32_t arrNum =
-        Memory::read<int32_t>(gameState + Offsets::GameState_PlayerArray + 8);
-    if (!arrData || !Memory::IsValidPtrFast2(arrData) || arrNum <= 0 || arrNum > 128)
-        return;
+        Memory::read<uintptr_t>(bestGs + Offsets::GameState_PlayerArray);
 
-    const int limit = (std::min)(arrNum, 128);
-    for (int i = 0; i < limit; ++i) {
+    outPs.reserve(static_cast<size_t>(bestArrNum));
+    for (int32_t i = 0; i < bestArrNum; ++i) {
         const uintptr_t playerState = Memory::read<uintptr_t>(
-            arrData + static_cast<size_t>(i) * sizeof(uintptr_t));
-        if (!playerState || !Memory::IsValidPtrFast2(playerState))
-            continue;
-
-        const uintptr_t pawn = Memory::read<uintptr_t>(
-            playerState + Offsets::PlayerState_PawnPrivate);
-        if (!pawn || !Memory::IsValidPtrFast2(pawn))
-            continue;
-
-        outPawns.insert(pawn);
-        outPawnToPlayerState[pawn] = playerState;
+            arrData + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
+        if (playerState && Memory::IsValidPtrFast2(playerState))
+            outPs.insert(playerState);
     }
-}
 
-bool TryAdmitOriginalPlayer(
-    Engine& eng,
-    uintptr_t actor,
-    uintptr_t ackPawn,
-    uintptr_t playerStateHint,
-    bool fromGameState,
-    std::unordered_map<uintptr_t, Engine::PlayerCacheEntry>& localCache)
-{
-    if (!actor || actor == ackPawn || localCache.contains(actor))
-        return false;
-
-    uintptr_t playerState = playerStateHint;
-    if (!playerState || !eng.IsValidPointer(playerState))
-        playerState = Memory::read<uintptr_t>(actor + Offsets::APlayerState);
-    if (!playerState || !eng.IsValidPointer(playerState))
-        return false;
-
-    const Engine::PlayerHealthInfo healthInfo =
-        Memory::read<Engine::PlayerHealthInfo>(playerState + Offsets::HealthInfo);
-    const bool bIsDeathVerge = healthInfo.bIsDbno;
-
-    float health = static_cast<float>(healthInfo.Health);
-    if (health < 1.0f && !bIsDeathVerge)
-        health = static_cast<float>(eng.get_health(actor));
-    if (health < 1.0f && !bIsDeathVerge)
-        return false;
-
-    std::string playerName = eng.GetPlayerName(playerState, actor);
-    if (playerName.empty())
-        playerName = eng.GetPlayerNameFromActor(actor);
-
-    const uintptr_t root =
-        Memory::read<uintptr_t>(actor + Offsets::RootComponent);
-    if (!root || !eng.IsValidPointer(root))
-        return false;
-
-    uintptr_t mesh =
-        Memory::read<uintptr_t>(actor + Offsets::USkeletalMeshComponent);
-    if (!mesh || !eng.IsValidPointer(mesh)) {
-        if (fromGameState)
-            mesh = eng.GetActorSkeletalMesh(actor);
-    }
-    if (!mesh || !eng.IsValidPointer(mesh))
-        return false;
-
-    Engine::PlayerCacheEntry entry(playerName.c_str(), root, actor, mesh);
-    entry.actorState = playerState;
-    entry.APawn = actor;
-    localCache.emplace(actor, std::move(entry));
-    return true;
+    return !outPs.empty();
 }
 
 } // namespace
@@ -162,7 +305,9 @@ void Engine::EntityList()
 
     const uint64_t gen = m_worldGeneration.load(std::memory_order_acquire);
 
-    const int actor_count = Memory::read<int>(sPersistentLevel + Offsets::ActorsCount);
+    const int actor_count =
+        Memory::read<int>(sPersistentLevel + Offsets::ActorsCount);
+
     if (sActors == 0 || actor_count <= 0 || actor_count > 10000) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         return;
@@ -179,20 +324,36 @@ void Engine::EntityList()
     }
 
     int dbgScanned = actor_count;
+    int dbgAdmitted = 0;
     int dbgPreAdmit = 0;
     int dbgDrawing = 0;
-    int dbgGsPawns = 0;
-    int dbgGsAdmit = 0;
-    int dbgClassSkip = 0;
+    int dbgTeamEvict = 0;
+    int dbgPsEvict = 0;
+    int dbgPosEvict = 0;
+    int dbgDistEvict = 0;
+    int dbgDistSkip = 0;
+    int dbgBoneMiss = 0;
+    int dbgWorldBox = 0;
+    int dbgGhostEvict = 0;
+    int dbgRootStale = 0;
+    int dbgRootSkip = 0;
+    int dbgMeshSkip = 0;
+    int dbgPsSkip = 0;
+    int dbgHealthSkip = 0;
+    int dbgGsArray = 0;
+    int dbgGsEvict = 0;
+    int dbgPosSame = 0;
+    int dbgGsPawnHit = 0;
+    int dbgGsPawnMiss = 0;
+    int dbgGsPawnNull = 0;
+    int dbgFwdMatch = 0;
+    int dbgFwdMismatch = 0;
+    int dbgActorTypeAdmit = 0;
+    int dbgGsBot = 0;
 
     std::unordered_set<uint64_t> currentActorSet(
         currentActors.begin(),
         currentActors.end());
-
-    std::unordered_set<uint64_t> gameStatePawns;
-    std::unordered_map<uintptr_t, uintptr_t> gameStatePawnToPs;
-    CollectGameStatePlayerPawns(*this, sGWorld, gameStatePawns, gameStatePawnToPs);
-    dbgGsPawns = static_cast<int>(gameStatePawns.size());
 
     UpdateCamera();
 
@@ -200,10 +361,6 @@ void Engine::EntityList()
     {
         std::shared_lock<std::shared_mutex> lock(m_cameraMutex);
         cam = g_Camera;
-    }
-    if (!IsUsableCameraFov(cam.FOV) || !IsPlausibleWorldPos(cam.Location)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        return;
     }
 
     const float maxDistSq =
@@ -216,96 +373,182 @@ void Engine::EntityList()
     }
 
     for (auto it = localCache.begin(); it != localCache.end(); ) {
-        const bool inLevel = currentActorSet.contains(it->first);
-        const bool inGameState = gameStatePawns.contains(it->first);
-        if (!inLevel && !inGameState)
+        if (!currentActorSet.contains(it->first))
             it = localCache.erase(it);
         else
             ++it;
     }
 
+    uintptr_t localPlayerState = 0;
+    if (!TryResolvePawnPlayerState(sAcknowledgedPawn, localPlayerState) && sPlayerController)
+        localPlayerState = Memory::read<uintptr_t>(
+            sPlayerController + Offsets::AController_PlayerState);
+
+    // gsArray is diagnostic only — do not gate admission on GameState membership.
+    // Wrong/stale GS PlayerArray pointers were zeroing PlayerCache (gsEvict).
+    std::unordered_set<uintptr_t> gsPlayerStates;
+    BuildGameStatePlayerStateAllowlist(*this, sGWorld, gsPlayerStates, dbgGsArray);
+
+    // Primary admission: GameState PlayerArray → PS → pawn (proven by gsPawnHit).
+    // Forward pawn→PS chase fails remotes; HealthInfo@PS+0x530 is wrong on PioneerPS.
+    for (const uintptr_t ps : gsPlayerStates) {
+        if (ps == localPlayerState)
+            continue;
+        if (PlayerStateIsBot(ps)) {
+            ++dbgGsBot;
+            continue;
+        }
+
+        const uintptr_t backPawn = ResolvePawnFromPlayerState(ps);
+        if (!backPawn) {
+            ++dbgGsPawnNull;
+            continue;
+        }
+        if (backPawn == sAcknowledgedPawn)
+            continue;
+
+        if (currentActorSet.contains(backPawn)) {
+            ++dbgGsPawnHit;
+            const uintptr_t fwdPs =
+                Memory::read_nocache<uintptr_t>(backPawn + kPawnPlayerState);
+            if (fwdPs == ps)
+                ++dbgFwdMatch;
+            else
+                ++dbgFwdMismatch;
+        } else {
+            ++dbgGsPawnMiss;
+            continue; // need actor in this level's list for cache key / prune
+        }
+
+        if (localCache.contains(backPawn))
+            continue;
+
+        const float health = ReadPawnHealthForAdmit(backPawn);
+        if (health < 1.0f) {
+            // Soft: still admit GS humans; refresh can drop dead.
+            // Count only — do not skip (HealthInfo@0x530 was false-rejecting everyone).
+            ++dbgHealthSkip;
+        }
+
+        const uintptr_t root =
+            Memory::read<uintptr_t>(backPawn + Offsets::RootComponent);
+        if (!root) {
+            ++dbgRootSkip;
+            continue;
+        }
+
+        const uintptr_t mesh =
+            Memory::read<uintptr_t>(backPawn + Offsets::USkeletalMeshComponent);
+        const uintptr_t charMesh = ResolvePlayerSkeletalMesh(backPawn);
+        if (!charMesh && !mesh) {
+            ++dbgMeshSkip;
+            continue;
+        }
+
+        const std::string playerName = GetPlayerName(ps, backPawn);
+        auto [it, inserted] = localCache.emplace(
+            backPawn,
+            PlayerCacheEntry(
+                playerName.c_str(),
+                root,
+                backPawn,
+                charMesh ? charMesh : mesh));
+        if (inserted) {
+            it->second.actorState = ps;
+            ++dbgAdmitted;
+        }
+    }
+
+    // Secondary: level actor scan (local PS chase / ActorType) for any missed.
     for (uint64_t actor : currentActors)
     {
         if (!actor || actor == sAcknowledgedPawn || localCache.contains(actor))
             continue;
 
-        const uint32_t masked =
-            ArcActorType::MaskActorTypeId(ArcActorType::ReadActorTypeId(actor));
-        if (!ArcActorType::IsPlayerClassId(masked)) {
-            ++dbgClassSkip;
+        uintptr_t playerState = 0;
+        bool viaActorType = false;
+        if (!TryResolvePlayerStateAny(actor, playerState, viaActorType)) {
+            ++dbgPsSkip;
+            continue;
+        }
+        if (viaActorType)
+            ++dbgActorTypeAdmit;
+
+        if (localPlayerState && playerState == localPlayerState) {
+            ++dbgGhostEvict;
             continue;
         }
 
-        const uintptr_t quickPs =
-            Memory::read<uintptr_t>(actor + Offsets::APlayerState);
-        TryAdmitOriginalPlayer(
-            *this, actor, sAcknowledgedPawn, quickPs, false, localCache);
-    }
+        if (!gsPlayerStates.empty() && !gsPlayerStates.contains(playerState))
+            ++dbgGsEvict; // count only — still admit
 
-    for (uint64_t pawn : gameStatePawns)
-    {
-        if (!pawn || pawn == sAcknowledgedPawn || localCache.contains(pawn))
+        const float health = ReadPawnHealthForAdmit(actor);
+        if (health < 1.0f) {
+            ++dbgHealthSkip;
+            // Soft skip — GS path already admits; secondary path requires some health signal.
             continue;
+        }
 
-        const auto psIt = gameStatePawnToPs.find(pawn);
-        const uintptr_t psHint =
-            psIt != gameStatePawnToPs.end() ? psIt->second : 0;
-        if (TryAdmitOriginalPlayer(
-                *this, pawn, sAcknowledgedPawn, psHint, true, localCache))
-            ++dbgGsAdmit;
+        const uintptr_t root =
+            Memory::read<uintptr_t>(actor + Offsets::RootComponent);
+        if (!root) {
+            ++dbgRootSkip;
+            continue;
+        }
+
+        const uintptr_t mesh =
+            Memory::read<uintptr_t>(actor + Offsets::USkeletalMeshComponent);
+        const uintptr_t charMesh = ResolvePlayerSkeletalMesh(actor);
+        if (!charMesh && !mesh) {
+            ++dbgMeshSkip;
+            continue;
+        }
+
+        const std::string playerName = GetPlayerName(playerState, actor);
+        auto [it, inserted] = localCache.emplace(
+            actor,
+            PlayerCacheEntry(playerName.c_str(), root, actor, charMesh ? charMesh : mesh));
+        if (inserted) {
+            it->second.actorState = playerState;
+            ++dbgAdmitted;
+        }
     }
 
     dbgPreAdmit = static_cast<int>(localCache.size());
 
-    struct WeaponHit {
-        uintptr_t actor = 0;
-        std::string name;
-        int quality = -1;
-    };
-    std::unordered_map<uintptr_t, WeaponHit> pawnToWeapon;
+    const uint8_t myTeamId =
+        Memory::read<uint8_t>(sAcknowledgedPawn + Offsets::TeamID);
 
-    static IntervalTimer weaponScanTimer(500);
-    const bool doWeaponScan = weaponScanTimer.fire() && var::show_weapon && !localCache.empty();
-    if (doWeaponScan) {
-        for (uint64_t a : currentActors) {
-            if (!a || a == sAcknowledgedPawn)
-                continue;
+    // Prefer mesh CompToWorld (bot parity); root fallback — root alone stays frozen on remotes.
+    for (auto it = localCache.begin(); it != localCache.end(); ++it) {
+        const uintptr_t key = it->first;
+        if (key == sAcknowledgedPawn)
+            continue;
 
-            const ActorOwnerInstigator oi =
-                Memory::read<ActorOwnerInstigator>(a + Offsets::ActorOwner);
-            uintptr_t holder = 0;
-            if (oi.instigator && localCache.contains(oi.instigator))
-                holder = oi.instigator;
-            else if (oi.owner && localCache.contains(oi.owner))
-                holder = oi.owner;
-            if (!holder || pawnToWeapon.contains(holder))
-                continue;
+        uintptr_t root = Memory::read<uintptr_t>(key + Offsets::RootComponent);
+        if (!root || !IsValidPointer(root))
+            continue;
 
-            const std::string cls = GetActorClassFName(a);
-            if (!ClassLooksLikeEquippedWeapon(cls)) {
-                const std::string dataAsset = GetActorDataAssetFName(a);
-                if (dataAsset.find("DA_Item_") == std::string::npos
-                    && dataAsset.find("Weapon") == std::string::npos)
-                    continue;
-            }
+        it->second.rootComponent = root;
+        const uintptr_t charMesh = ResolvePlayerSkeletalMesh(key);
+        if (charMesh)
+            it->second.actorMesh = charMesh;
 
-            WeaponHit hit;
-            hit.actor = a;
-            hit.quality = GetWeaponQualityFromActor(a);
-            hit.name = ResolveWeaponEspLabel(*this, cls, a);
-            if (hit.name.empty())
-                hit.name = GetWeaponName(cls);
-            pawnToWeapon.emplace(holder, std::move(hit));
+        const Vector3 pos = ResolvePlayerWorldPos(key, root, it->second.actorMesh);
+        if (!IsPlausibleWorldPos(pos))
+            continue;
+
+        auto& entry = it->second;
+        if (IsPlausibleWorldPos(entry.lastWorldPos)) {
+            const double dx = static_cast<double>(pos.x - entry.lastWorldPos.x);
+            const double dy = static_cast<double>(pos.y - entry.lastWorldPos.y);
+            const double dz = static_cast<double>(pos.z - entry.lastWorldPos.z);
+            if (dx * dx + dy * dy + dz * dz < 4.0)
+                ++dbgPosSame;
         }
+        entry.lastWorldPos = pos;
+        entry.WorldPos = pos;
     }
-
-    const uint8_t myTeamId = Memory::read<uint8_t>(sAcknowledgedPawn + Offsets::TeamID);
-
-    int dbgTeamEvict = 0;
-    int dbgPsEvict = 0;
-    int dbgPosEvict = 0;
-    int dbgDistSkip = 0;
-    int dbgBoneMiss = 0;
 
     for (auto it = localCache.begin(); it != localCache.end(); )
     {
@@ -318,6 +561,15 @@ void Engine::EntityList()
             continue;
         }
 
+        const uintptr_t freshRoot =
+            Memory::read<uintptr_t>(key + Offsets::RootComponent);
+        if (!freshRoot || !IsValidPointer(freshRoot)) {
+            ++dbgRootStale;
+            it = localCache.erase(it);
+            continue;
+        }
+        actor.rootComponent = freshRoot;
+
         const uint8_t enemyTeamId = Memory::read<uint8_t>(key + Offsets::TeamID);
         actor.isAlly = (myTeamId != 0 && myTeamId == enemyTeamId);
         if (actor.isAlly && var::hide_allies) {
@@ -326,30 +578,38 @@ void Engine::EntityList()
             continue;
         }
 
-        const uintptr_t playerState =
-            Memory::read<uintptr_t>(key + Offsets::APlayerState);
-        if (!playerState || !IsValidPointer(playerState)) {
-            ++dbgPsEvict;
+        uintptr_t playerState = actor.actorState;
+        if (!playerState || !Memory::IsValidPtrFast2(playerState)) {
+            bool viaActorType = false;
+            if (!TryResolvePlayerStateAny(key, playerState, viaActorType)) {
+                ++dbgPsEvict;
+                it = localCache.erase(it);
+                continue;
+            }
+            (void)viaActorType;
+        }
+
+        if (localPlayerState && playerState == localPlayerState) {
+            ++dbgGhostEvict;
             it = localCache.erase(it);
             continue;
         }
 
-        const PlayerHealthInfo healthInfo =
-            Memory::read<PlayerHealthInfo>(playerState + Offsets::HealthInfo);
-        actor.bIsDeathVerge = healthInfo.bIsDbno;
         actor.actorState = playerState;
+        actor.bIsDeathVerge = false;
 
-        const uintptr_t freshRoot =
-            Memory::read<uintptr_t>(key + Offsets::RootComponent);
-        if (freshRoot && IsValidPointer(freshRoot))
-            actor.rootComponent = freshRoot;
+        const std::string liveName = GetPlayerName(playerState, key);
+        if (!liveName.empty())
+            actor.ActorName = liveName;
 
-        const uintptr_t freshMesh = GetActorSkeletalMesh(key);
-        if (freshMesh && IsValidPointer(freshMesh))
-            actor.actorMesh = freshMesh;
+        const uintptr_t charMesh = ResolvePlayerSkeletalMesh(key);
+        if (charMesh)
+            actor.actorMesh = charMesh;
 
-        actor.WorldPos = ReadSceneWorldPos(actor.rootComponent);
-        if (!IsPlausibleWorldPos(actor.WorldPos)) {
+        actor.WorldPos = ResolvePlayerWorldPos(key, freshRoot, actor.actorMesh);
+
+        if (!IsPlausibleWorldPos(actor.WorldPos))
+        {
             ++dbgPosEvict;
             it = localCache.erase(it);
             continue;
@@ -368,57 +628,54 @@ void Engine::EntityList()
             continue;
         }
 
-        actor.health = static_cast<float>(healthInfo.Health);
-        actor.maxhealth = static_cast<float>(healthInfo.MaxHealth);
-        actor.shield = static_cast<float>(healthInfo.Armor);
-        actor.maxshield = static_cast<float>(healthInfo.MaxArmor);
-        if (actor.maxhealth < 1.0f) {
-            actor.health = static_cast<float>(get_health(key));
-            actor.maxhealth = static_cast<float>(get_maxhealth(key));
-            actor.shield = static_cast<float>(get_armor(key));
-            actor.maxshield = static_cast<float>(get_maxarmor(key));
-        }
-        if (actor.maxshield <= 0.f) {
-            actor.shield = 0.f;
-            actor.maxshield = 0.f;
-        }
+        actor.health = static_cast<float>(get_health(key));
+        actor.maxhealth = static_cast<float>(get_maxhealth(key));
+        actor.shield = static_cast<float>(get_armor(key));
+        actor.maxshield = static_cast<float>(get_maxarmor(key));
 
-        if (var::show_weapon) {
-            if (doWeaponScan) {
-                if (auto wIt = pawnToWeapon.find(key); wIt != pawnToWeapon.end()) {
-                    actor.lastWeaponPtr = wIt->second.actor;
-                    actor.weaponName = wIt->second.name.empty() ? "Armed" : wIt->second.name;
-                    actor.weaponQuality = wIt->second.quality + 1;
-                } else {
-                    actor.lastWeaponPtr = 0;
-                    actor.weaponName = "Unarmed";
-                    actor.weaponQuality = -1;
-                }
-            }
-        }
+        const uintptr_t currentWeapon = GetCurrentWeaponActor(key);
+        const int quality = GetWeaponQuality(key);
+        const std::string weaponNames = GetActorFNameString(currentWeapon);
 
-        if (!actor.ActorName.empty()) {
-            std::string freshName = GetPlayerName(playerState, key);
-            if (!freshName.empty())
-                actor.ActorName = freshName;
-        } else {
-            const std::string freshName = GetPlayerName(playerState, key);
-            if (!freshName.empty())
-                actor.ActorName = freshName;
-        }
+        actor.weaponName = currentWeapon ? GetWeaponName(weaponNames) : "Unarmed";
+        actor.weaponQuality = currentWeapon ? (quality + 1) : -1;
 
         GetBones(actor);
 
-        const Vector3 headBone = actor.boneData.bonesDouble[static_cast<size_t>(UniBone::Head)];
-        Vector3 footBone = actor.boneData.bonesDouble[static_cast<size_t>(UniBone::FootL)];
-        if (!actor.boneData.valid.test(static_cast<size_t>(UniBone::FootL)))
-            footBone = actor.boneData.bonesDouble[static_cast<size_t>(UniBone::Pelvis)];
+        Vector3 headScr{};
+        Vector3 footScr{};
+        bool haveScreenBox = false;
 
-        if (!actor.boneData.isVisible) {
-            actor.Drawing = false;
-            ++dbgBoneMiss;
-            ++it;
-            continue;
+        if (actor.boneData.isVisible) {
+            const Vector3 headBone =
+                actor.boneData.bonesDouble[static_cast<size_t>(UniBone::Head)];
+            Vector3 footBone =
+                actor.boneData.bonesDouble[static_cast<size_t>(UniBone::FootL)];
+            if (!actor.boneData.valid.test(static_cast<size_t>(UniBone::FootL)))
+                footBone = actor.boneData.bonesDouble[static_cast<size_t>(UniBone::Pelvis)];
+
+            if (headBone.x > 0.0 && headBone.y > 0.0 &&
+                footBone.x > 0.0 && footBone.y > 0.0)
+            {
+                headScr = headBone;
+                footScr = footBone;
+                haveScreenBox = true;
+            }
+        }
+
+        if (!haveScreenBox) {
+            Vector3 headWorld{};
+            Vector3 feetWorld{};
+            if (EspDraw::ResolvePlayerHeadFeetWorld(actor, headWorld, feetWorld)) {
+                ImVec2 head{};
+                ImVec2 feet{};
+                if (EspDraw::WorldToScreenBox(*this, cam, headWorld, feetWorld, head, feet)) {
+                    headScr = Vector3{ head.x, head.y, 0.0 };
+                    footScr = Vector3{ feet.x, feet.y, 0.0 };
+                    haveScreenBox = true;
+                    ++dbgWorldBox;
+                }
+            }
         }
 
         ProjectWorldLocationToRadar(
@@ -427,19 +684,16 @@ void Engine::EntityList()
             static_cast<float>(cam.Rotation.y),
             actor.RadarPos);
 
-        if (headBone.x <= 0 || headBone.y <= 0 ||
-            footBone.x <= 0 || footBone.y <= 0)
-        {
-            actor.Drawing = false;
-            ++it;
-            continue;
+        if (!haveScreenBox)
+            ++dbgBoneMiss;
+
+        if (haveScreenBox) {
+            actor.ScreenTop = headScr;
+            actor.ScreenBottom = footScr;
         }
 
-        actor.ScreenTop = headBone;
-        actor.ScreenBottom = footBone;
-
         if (var::visiblecheck)
-            actor.isVisible = Visible(key);
+            actor.isVisible = VisibleActor(key);
         else
             actor.isVisible = true;
 
@@ -467,17 +721,33 @@ void Engine::EntityList()
         if (playerDebugTimer.fire()) {
             std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
             std::cout << "[debugPlayer] scanned=" << dbgScanned
-                << " gsPawns=" << dbgGsPawns
-                << " gsAdmit=" << dbgGsAdmit
+                << " admitted=" << dbgAdmitted
                 << " preAdmit=" << dbgPreAdmit
                 << " cache=" << playerCache.size()
                 << " drawing=" << dbgDrawing
                 << " teamEvict=" << dbgTeamEvict
                 << " psEvict=" << dbgPsEvict
                 << " posEvict=" << dbgPosEvict
-                << " classSkip=" << dbgClassSkip
                 << " distSkip=" << dbgDistSkip
+                << " distEvict=" << dbgDistEvict
                 << " boneMiss=" << dbgBoneMiss
+                << " worldBox=" << dbgWorldBox
+                << " ghostEvict=" << dbgGhostEvict
+                << " rootStale=" << dbgRootStale
+                << " rootSkip=" << dbgRootSkip
+                << " meshSkip=" << dbgMeshSkip
+                << " psSkip=" << dbgPsSkip
+                << " healthSkip=" << dbgHealthSkip
+                << " posSame=" << dbgPosSame
+                << " gsArray=" << dbgGsArray
+                << " gsEvict=" << dbgGsEvict
+                << " gsPawnHit=" << dbgGsPawnHit
+                << " gsPawnMiss=" << dbgGsPawnMiss
+                << " gsPawnNull=" << dbgGsPawnNull
+                << " fwdMatch=" << dbgFwdMatch
+                << " fwdMismatch=" << dbgFwdMismatch
+                << " actorTypeAdmit=" << dbgActorTypeAdmit
+                << " gsBot=" << dbgGsBot
                 << std::endl;
         }
     }

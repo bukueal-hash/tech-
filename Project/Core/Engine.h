@@ -75,8 +75,8 @@ private:
     bool m_raidEnterPending{ false };
     std::chrono::steady_clock::time_point m_raidDebSince{};
 
-    static constexpr std::chrono::milliseconds kRaidEnterDelayMs{ 5000 };
-    static constexpr std::chrono::milliseconds kRaidRawFalseGraceMs{ 750 };
+    static constexpr std::chrono::milliseconds kRaidEnterDelayMs{ 1500 };
+    static constexpr std::chrono::milliseconds kRaidRawFalseGraceMs{ 5000 };
 
     std::chrono::steady_clock::time_point m_raidFalseSince{};
 
@@ -136,7 +136,7 @@ public:
     void RenderEsp();
     void RenderPlayerEspFromCache(const CameraCache& renderCam);
     void RenderFovCircle();
-    void RenderRadar();
+    void RenderRadar(bool interactive = false);
 
     struct EspFramePlayer;
     struct EspFrameWorld;
@@ -227,8 +227,6 @@ public:
     bool VisibleBotActor(uintptr_t actor) const;
     /** Collision KD-tree LOS when obstruction_check; else true. */
     bool HasLineOfSight(const Vector3& from, const Vector3& to) const;
-    /** Mesh render-time vis + optional collision LOS when visiblecheck. */
-    bool EvaluateTargetVisibility(uintptr_t mesh, const Vector3& from, const Vector3& to) const;
 
     struct VisCheckDebugStats {
         int playersTotal = 0;
@@ -245,6 +243,11 @@ public:
         bool sampleOnScreen = false;
         bool sampleRecent = false;
         bool sampleVisible = false;
+        /** Decrypted LastRenderTimeOnScreen (UC enc path) or plain onScr. */
+        float sampleDecryptedLrtos = 0.f;
+        float sampleWorldTimeSeconds = 0.f;
+        /** "enc" | "plain" | "fail" */
+        const char* samplePathUsed = "fail";
         bool hasSample = false;
     };
     VisCheckDebugStats CollectVisCheckDebugStats() const;
@@ -266,13 +269,8 @@ public:
     int32_t GetActorFNameId(uint64_t actor_base);
     std::string GetActorFNameString(uint64_t actor_base);
 
-    uint64_t DecryptFNameRaw(const __m128i& enc);
-    uint32_t ComputeHashAndIndex(uint64_t base_addr, uint32_t& out_idx);
-    uint8_t ComputeBlockIdx(uint64_t chunk_ptr);
-
     std::string GetActorFNameStringCached(uintptr_t actor_base);
     std::string GetActorClassFName(uintptr_t actor_base);
-    uint64_t DecryptBlockRaw(const __m128i& raw);
 
     void ClearFNameCache();
 
@@ -304,6 +302,7 @@ public: // Local Cache
     uintptr_t PioneerPlayerController;
     uintptr_t GWorld;
     uintptr_t m_lastWorldPtr = 0;
+    uintptr_t m_lastPersistentLevel = 0;
 
     uintptr_t PersistentLevel;
     uintptr_t GameInstance;
@@ -381,29 +380,7 @@ public: // PlayerCache
         };
     };
 
-    struct EspRenderSnapshot {
-        CameraCache camera{};
-        std::unordered_map<uintptr_t, PlayerCacheEntry> players;
-        std::unordered_map<uintptr_t, WorldCacheEntry> robots;
-        std::unordered_map<uintptr_t, WorldCacheEntry> world;
-        uint64_t sequence = 0;
-        // Steady-clock ms when this snapshot was published. Render thread
-        // uses (now - timestampMs) as dt for velocity extrapolation.
-        uint64_t timestampMs = 0;
-    };
-
     std::unordered_map<uintptr_t, PlayerCacheEntry> playerCache;
-
-private:
-    static constexpr int kEspSnapshotBuffers = 2;
-    EspRenderSnapshot m_espSnapshots[kEspSnapshotBuffers]{};
-    std::atomic<int> m_espSnapshotReadIdx{ 0 };
-    std::atomic<uint64_t> m_espSnapshotSequence{ 0 };
-    void PublishEspSnapshot(
-        CameraCache camera,
-        std::unordered_map<uintptr_t, PlayerCacheEntry>&& players,
-        std::unordered_map<uintptr_t, WorldCacheEntry>&& world,
-        std::unordered_map<uintptr_t, WorldCacheEntry>&& robots);
 
 public:
     size_t PlayerCacheCount() const {
@@ -468,6 +445,8 @@ public:
         size_t count = 0;
         for (const auto& [key, entry] : playerCache) {
             (void)key;
+            if (!entry.Drawing)
+                continue;
             if (entry.isAlly && var::hide_allies)
                 continue;
             ++count;
@@ -593,15 +572,15 @@ public:
         double z = 0.0;
     };
 
-    // message (1).txt CameraPOV: Location +0x08, Rotation +0x30, FOV +0x58 (each vector 0x18 = FVector3d)
+    // UC CL-1315578 (qwe900 #3687): POV Relative Location+0x00, Rotation+0x28, FOV+0x50
     struct FMinimalViewInfo
     {
-        char Pad_0[0x8];
-        FVector3d Location;
-        char pad_to_rotation[0x10];
-        FVector3d Rotation;
-        char pad_to_fov[0x10];
-        float FOV;
+        FVector3d Location;         // 0x00 (UC: POV+0x00)
+        char pad_to_rotation[0x10]; // 0x18–0x27
+        FVector3d Rotation;         // 0x28 (UC: POV+0x28)
+        char pad_to_fov[0x10];      // 0x40–0x4F
+        float FOV;                  // 0x50 (UC: POV+0x50)
+        // DesiredFOV / AspectRatio / PostProcessSettings omitted (not read)
     };
 
     static Vector3 ToVector3(const FVector3d& v)
@@ -914,65 +893,77 @@ public:
         return (v << s) | (v >> (32 - s));
     }
 
-    void decode_in_place(std::vector<uint16_t>& buf, int max_len) {
-        steam_decrypt::DecryptPlayerName(buf, max_len);
-    }
-
     std::string GetPlayerName(uintptr_t playerStateAddr, uintptr_t pawnAddr = 0) {
         if (!playerStateAddr && !pawnAddr)
             return "";
         return steam_decrypt::ResolvePlayerDisplayName(pawnAddr, playerStateAddr);
     }
 
-    std::string GetPlayerNameFromActor(uintptr_t actorAddr) {
-        if (!actorAddr)
-            return "";
-        const uintptr_t ps = Memory::read<uintptr_t>(actorAddr + Offsets::APlayerState);
-        return steam_decrypt::ResolvePlayerDisplayName(actorAddr, ps);
+    static bool IsPlausibleUsermodePtr(uintptr_t ptr)
+    {
+        return ptr > 0x10000 && ptr < 0x00007FFFFFFFFFFF;
+    }
+
+    static double ReadHealthComponentStat(uintptr_t actor, std::ptrdiff_t compOff)
+    {
+        const uintptr_t health_comp =
+            Memory::read<uintptr_t>(actor + Offsets::HealthComponent);
+        if (!health_comp || !IsPlausibleUsermodePtr(health_comp))
+            return 0.0;
+        const double value = Memory::read<double>(health_comp + compOff);
+        return std::isfinite(value) ? value : 0.0;
+    }
+
+    static double ReadPlayerStatWithHealthFallback(
+        uintptr_t actor,
+        std::ptrdiff_t psOff,
+        std::ptrdiff_t compOff)
+    {
+        if (!actor)
+            return 0.0;
+
+        const uintptr_t ps = Memory::read<uintptr_t>(actor + Offsets::APlayerState);
+        if (ps && IsPlausibleUsermodePtr(ps)) {
+            const double psValue = Memory::read<double>(ps + psOff);
+            if (std::isfinite(psValue) && psValue > 0.0)
+                return psValue;
+        }
+
+        return ReadHealthComponentStat(actor, compOff);
     }
 
     double get_health(uintptr_t actor)
     {
-        if (!actor) return 0.0;
-        const uintptr_t ps = Memory::read<uintptr_t>(actor + Offsets::APlayerState);
-        if (ps && IsUsermodePtr(ps))
-            return Memory::read<double>(ps + Offsets::PlayerState_Health);
-        const uintptr_t health_comp = Memory::read<uintptr_t>(actor + Offsets::HealthComponent);
-        if (!health_comp) return 0.0;
-        return Memory::read<double>(health_comp + Offsets::Health);
+        return ReadPlayerStatWithHealthFallback(
+            actor, Offsets::PlayerState_Health, Offsets::Health);
     }
 
     double get_maxhealth(uintptr_t actor)
     {
-        if (!actor) return 0.0;
-        const uintptr_t ps = Memory::read<uintptr_t>(actor + Offsets::APlayerState);
-        if (ps && IsUsermodePtr(ps))
-            return Memory::read<double>(ps + Offsets::PlayerState_MaxHealth);
-        const uintptr_t health_comp = Memory::read<uintptr_t>(actor + Offsets::HealthComponent);
-        if (!health_comp) return 0.0;
-        return Memory::read<double>(health_comp + Offsets::MaxHealth);
+        return ReadPlayerStatWithHealthFallback(
+            actor, Offsets::PlayerState_MaxHealth, Offsets::MaxHealth);
     }
 
     double get_armor(uintptr_t actor)
     {
-        if (!actor) return 0.0;
-        const uintptr_t ps = Memory::read<uintptr_t>(actor + Offsets::APlayerState);
-        if (ps && IsUsermodePtr(ps))
-            return Memory::read<double>(ps + Offsets::PlayerState_Armor);
-        const uintptr_t health_comp = Memory::read<uintptr_t>(actor + Offsets::HealthComponent);
-        if (!health_comp) return 0.0;
-        return Memory::read<double>(health_comp + Offsets::Shield);
+        return ReadPlayerStatWithHealthFallback(
+            actor, Offsets::PlayerState_Armor, Offsets::Shield);
     }
 
     double get_maxarmor(uintptr_t actor)
     {
-        if (!actor) return 0.0;
+        if (!actor)
+            return 0.0;
+
         const uintptr_t ps = Memory::read<uintptr_t>(actor + Offsets::APlayerState);
-        if (ps && IsUsermodePtr(ps))
-            return Memory::read<double>(ps + Offsets::PlayerState_MaxArmor);
-        const uintptr_t health_comp = Memory::read<uintptr_t>(actor + Offsets::HealthComponent);
-        if (!health_comp) return 0.0;
-        return Memory::read<double>(health_comp + Offsets::Shield + 0x8);
+        if (ps && IsPlausibleUsermodePtr(ps)) {
+            const double psValue =
+                Memory::read<double>(ps + Offsets::PlayerState_MaxArmor);
+            if (std::isfinite(psValue) && psValue > 0.0)
+                return psValue;
+        }
+
+        return ReadHealthComponentStat(actor, Offsets::Shield + 0x8);
     }
 
     struct PlayerHealthInfo {
@@ -1172,24 +1163,10 @@ public:
 
 
 public:
-    bool g_bReadFNameKeyTable = false;
-    bool g_bReadSimdConsts = false;
+    bool g_fnameTablesReady = false;
 
-    void CheckWorldChange(uintptr_t newWorld)
-    {
-        if (newWorld != m_lastWorldPtr)
-        {
-            ResetRaidTransitionState();
-            ClearEspCaches();
-
-            m_lastWorldPtr = newWorld;
-            m_worldGeneration.fetch_add(1, std::memory_order_release);
-
-            m_espRaidActive.store(false, std::memory_order_release);
-            m_raidEnterPending = false;
-            m_raidFalseSince = {};
-        }
-    }
+    void HandleWorldLost();
+    void CheckWorldTransition(uintptr_t newWorld, uintptr_t newPersistentLevel);
 };
 
 extern Engine engine;

@@ -34,28 +34,6 @@ void Render(HWND hwnd);
 
 static DWORD g_pid = 0;
 
-HWND FoundWindow = nullptr;
-BOOL CALLBACK EnumWindowsCallback(HWND hwnd, LPARAM lParam)
-{
-    DWORD windowPID = 0;
-    GetWindowThreadProcessId(hwnd, &windowPID);
-
-    if (windowPID == g_pid)
-    {
-        FoundWindow = hwnd;
-        return FALSE;
-    }
-
-    return TRUE;
-}
-
-HWND FindWindowByPID(DWORD pid)
-{
-    FoundWindow = nullptr;
-    EnumWindows(EnumWindowsCallback, 0);
-    return FoundWindow;
-}
-
 int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 {
     ImGui_ImplWin32_EnableDpiAwareness();

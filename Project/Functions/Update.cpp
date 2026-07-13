@@ -1,9 +1,14 @@
 #include "../Core/Engine.h"
+#include "../Core/ActorType.h"
+#include "../Core/IntervalTimer.h"
+#include "../Interface/Utils/Variables/index.h"
 #include "WorldScanCommon.h"
+#include "CollisionLos.h"
 
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <string>
 
@@ -32,7 +37,8 @@ bool IsPlausibleObjPtr(uintptr_t p)
 
 uintptr_t ReadWorldFromSlot(uint64_t base, std::ptrdiff_t slotOff)
 {
-	const uintptr_t slot = Memory::read<uintptr_t>(base + slotOff);
+	// Bypass VMM page cache — stale GWorld blocks raid re-entry until exe restart.
+	const uintptr_t slot = Memory::read_nocache<uintptr_t>(base + slotOff);
 	return IsPlausibleObjPtr(slot) ? slot : 0;
 }
 
@@ -147,6 +153,19 @@ static uintptr_t s_cachedPC = 0;
 static uintptr_t s_cachedPawn = 0;
 static uintptr_t s_cachedLocalPlayer = 0;
 
+// Soft retain when a single Update() frame fails to re-resolve the PC chain.
+static uintptr_t s_retainPC = 0;
+static uintptr_t s_retainPawn = 0;
+static uintptr_t s_retainRoot = 0;
+static uintptr_t s_retainGI = 0;
+static uintptr_t s_retainLP = 0;
+static uintptr_t s_retainPCM = 0;
+static uintptr_t s_retainPS = 0;
+static std::chrono::steady_clock::time_point s_retainGoodAt{};
+static int s_cacheFailStreak = 0;
+static constexpr int kCacheFailClearAfter = 8; // ~8 Update ticks before nuking s_cachedPC
+static constexpr auto kPcChainRetainMs = std::chrono::milliseconds(2500);
+
 static bool IsGoodLocalPlayer(uintptr_t lp)
 {
 	return lp != 0 && lp != UINTPTR_MAX
@@ -171,8 +190,6 @@ static bool ObjectFNameContains(uintptr_t obj, const char* token)
 	return FNameLowerContains(steam_decrypt::GetActorFNameString(obj), token);
 }
 
-static constexpr int kRaidPopulationThreshold = 80;
-
 static bool FNameTokensMatch(uintptr_t world, uintptr_t level, const char* const* tokens, int count)
 {
 	for (int i = 0; i < count; ++i) {
@@ -195,18 +212,14 @@ static bool LooksLikeStrictHubWorld(uintptr_t world, uintptr_t level)
 
 static bool LooksLikeHubWorld(uintptr_t world, uintptr_t level)
 {
-	if (LooksLikeStrictHubWorld(world, level))
-		return true;
-
-	static const char* kExtraHubTokens[] = { "persistence" };
-	return FNameTokensMatch(world, level, kExtraHubTokens,
-		static_cast<int>(sizeof(kExtraHubTokens) / sizeof(kExtraHubTokens[0])));
+	// Strict hub only — do NOT treat "persistence" as hub (false mid-raid leaves).
+	return LooksLikeStrictHubWorld(world, level);
 }
 
 static bool PawnLooksLikeHubCharacter(uintptr_t pawn)
 {
 	static const char* kHubPawnTokens[] = {
-		"persistence", "sprocket", "mainmenu", "lobby", "loadout", "hideout",
+		"sprocket", "mainmenu", "lobby", "loadout", "hideout",
 	};
 	for (const char* tok : kHubPawnTokens) {
 		if (ObjectFNameContains(pawn, tok))
@@ -268,36 +281,12 @@ uintptr_t Engine::ResolveBestGWorld(uint64_t base)
 }
 
 void Engine::Update() {
-	static int s_gworldMissStreak = 0;
-	static auto s_gworldMissSince = std::chrono::steady_clock::time_point{};
-
 	const uint64_t base = Memory::getBaseAddress();
 	const uintptr_t tGWorld = ResolveBestGWorld(base);
 	if (!tGWorld) {
-		const auto now = std::chrono::steady_clock::now();
-		if (s_gworldMissSince.time_since_epoch().count() == 0)
-			s_gworldMissSince = now;
-		++s_gworldMissStreak;
-		if (s_gworldMissStreak >= 180
-			|| now - s_gworldMissSince >= std::chrono::seconds(3)) {
-			ResetRaidTransitionState();
-			s_gworldMissStreak = 0;
-			s_gworldMissSince = {};
-		}
+		HandleWorldLost();
 		TickRaidGate();
 		return;
-	}
-	s_gworldMissStreak = 0;
-	s_gworldMissSince = {};
-
-	// Check for world transition (clears caches under their own locks)
-	CheckWorldChange(tGWorld);
-	{
-		static uintptr_t s_lastGWorldForLp = 0;
-		if (tGWorld != s_lastGWorldForLp) {
-			s_cachedLocalPlayer = 0;
-			s_lastGWorldForLp = tGWorld;
-		}
 	}
 
 	// --- Read entire pointer chain into locals (NO lock held, slow I/O here) ---
@@ -307,27 +296,64 @@ void Engine::Update() {
 
 	tPersistentLevel = ResolvePersistentLevelHelp(tGWorld);
 
+	CheckWorldTransition(tGWorld, tPersistentLevel);
+	{
+		static uintptr_t s_lastGWorldForLp = 0;
+		if (tGWorld != s_lastGWorldForLp) {
+			s_cachedLocalPlayer = 0;
+			s_lastGWorldForLp = tGWorld;
+		}
+	}
+
 	int actorCount = 0;
 	if (tPersistentLevel)
 		ResolveLevelActors(tPersistentLevel, tActors, actorCount);
 
 	// Resolve PC via actor scan (backup: Pioneer PC owns PCM @ PC+0x48).
+	// [debugPcChain] path tags: none / cached / actor_scan / cam_mgr
+	const char* pcPath = "none";
+	float dbgPcmFov = 0.f;
+	uintptr_t dbgPcmPtr = 0;
+	const char* cacheInvalidateReason = "none";
+	bool cacheInvalidatedThisFrame = false;
 	{
+		if (s_cachedPC && IsValidPointer(s_cachedPC)) {
+			dbgPcmPtr = Memory::read<uintptr_t>(s_cachedPC + Offsets::APlayerCameraManager);
+			if (dbgPcmPtr && Memory::IsValidPtrFast2(dbgPcmPtr))
+				dbgPcmFov = Memory::read<float>(dbgPcmPtr + Offsets::DefaultFOV);
+		}
+
 		if (s_cachedPC && s_cachedPawn && Engine::ControllerHasValidPcm(s_cachedPC)
 			&& IsValidPointer(s_cachedPC) && IsValidPointer(s_cachedPawn)) {
 			const uintptr_t root = Memory::read<uintptr_t>(s_cachedPawn + Offsets::RootComponent);
 			if (root && IsValidPointer(root)) {
 				const Vector3 pos = Memory::read<Vector3>(root + Offsets::RelativeLocation);
 				const float magSq = static_cast<float>(
-		pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
+					pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
 				if (magSq > 10000.f && magSq < 1.0e14f) {
 					tPlayerController = s_cachedPC;
 					tAcknowledgedPawn = s_cachedPawn;
+					pcPath = "cached";
+					s_cacheFailStreak = 0;
+				} else {
+					cacheInvalidateReason = "pos_magSq";
+					++s_cacheFailStreak;
 				}
+			} else {
+				cacheInvalidateReason = "pos_magSq";
+				++s_cacheFailStreak;
 			}
 		} else if (s_cachedPC || s_cachedPawn) {
-			s_cachedPC = 0;
-			s_cachedPawn = 0;
+			cacheInvalidateReason = Engine::ControllerHasValidPcm(s_cachedPC) ? "pos_magSq" : "fov_gate";
+			++s_cacheFailStreak;
+			// Don't nuke the fast-path on a single bad FOV/pos frame — DMA glitches and
+			// transient cinematic FOV spikes are common mid-raid.
+			if (s_cacheFailStreak >= kCacheFailClearAfter) {
+				cacheInvalidatedThisFrame = true;
+				s_cachedPC = 0;
+				s_cachedPawn = 0;
+				s_cacheFailStreak = 0;
+			}
 		}
 
 		if (!tPlayerController && tPersistentLevel && tActors && actorCount > 0) {
@@ -338,6 +364,7 @@ void Engine::Update() {
 				&& Engine::ControllerHasValidPcm(scannedPc)) {
 				tPlayerController = s_cachedPC = scannedPc;
 				tAcknowledgedPawn = s_cachedPawn = scannedPawn;
+				pcPath = "actor_scan";
 			}
 		}
 	}
@@ -350,6 +377,10 @@ void Engine::Update() {
 			tPersistentLevel, tActors, pcmPc, pcmPawn, pcmDummy)) {
 			tPlayerController = s_cachedPC = pcmPc;
 			tAcknowledgedPawn = s_cachedPawn = pcmPawn;
+			pcPath = "cam_mgr";
+			dbgPcmPtr = pcmDummy;
+			if (dbgPcmPtr && Memory::IsValidPtrFast2(dbgPcmPtr))
+				dbgPcmFov = Memory::read<float>(dbgPcmPtr + Offsets::DefaultFOV);
 		}
 	}
 
@@ -458,6 +489,52 @@ void Engine::Update() {
 		}
 	}
 
+	// Retain last known-good PC chain for a short window so a transient FOV/PCM
+	// glitch cannot zero the entire local-player pipeline mid-raid.
+	const auto nowRetain = std::chrono::steady_clock::now();
+	bool usedRetain = false;
+	if (tPlayerController && tAcknowledgedPawn) {
+		s_retainPC = tPlayerController;
+		s_retainPawn = tAcknowledgedPawn;
+		s_retainRoot = tRootComponent;
+		s_retainGI = tGameInstance;
+		s_retainLP = tLocalPlayer;
+		s_retainPCM = tPCM;
+		s_retainPS = tPlayerState;
+		s_retainGoodAt = nowRetain;
+	} else if (s_retainPC && (nowRetain - s_retainGoodAt) < kPcChainRetainMs) {
+		if (!tPlayerController) {
+			tPlayerController = s_retainPC;
+			usedRetain = true;
+			pcPath = "retain";
+		}
+		if (!tAcknowledgedPawn)
+			tAcknowledgedPawn = s_retainPawn;
+		if (!tRootComponent)
+			tRootComponent = s_retainRoot;
+		if (!tGameInstance)
+			tGameInstance = s_retainGI;
+		if (!IsGoodLocalPlayer(tLocalPlayer) && IsGoodLocalPlayer(s_retainLP))
+			tLocalPlayer = s_retainLP;
+		if (!tPCM)
+			tPCM = s_retainPCM;
+		if (!tPlayerState)
+			tPlayerState = s_retainPS;
+		if (!s_cachedPC) {
+			s_cachedPC = s_retainPC;
+			s_cachedPawn = s_retainPawn;
+		}
+	} else if (!tPlayerController) {
+		s_retainPC = 0;
+		s_retainPawn = 0;
+		s_retainRoot = 0;
+		s_retainGI = 0;
+		s_retainLP = 0;
+		s_retainPCM = 0;
+		s_retainPS = 0;
+	}
+	(void)usedRetain;
+
 	// --- Publish all state atomically (brief lock ~microseconds) ---
 	{
 		std::unique_lock<std::shared_mutex> stateLock(m_stateMutex);
@@ -467,12 +544,48 @@ void Engine::Update() {
 		PersistentLevel = tPersistentLevel;
 		localplayer = tLocalPlayer;
 		PlayerController = tPlayerController;
-		PioneerPlayerController = tPlayerController;
+		// Only actor-scan finds the real PioneerPlayerController by fname;
+		// do not mirror generic GI/PCM PC into this field.
+		if (std::strcmp(pcPath, "actor_scan") == 0)
+			PioneerPlayerController = tPlayerController;
 		AcknowledgedPawn = tAcknowledgedPawn;
 		RootComponent = tRootComponent;
 		PlayerState = tPlayerState;
 		Actors = tActors;
 		PlayerCameraManager = tPCM;
+		AGameStateBase = ResolveGameStateFromWorld(tGWorld);
+	}
+
+	if (var::show_debug_overlay) {
+		static int s_framesSincePcOk = 0;
+		static IntervalTimer pcChainTimer(1000);
+		if (tPlayerController)
+			s_framesSincePcOk = 0;
+		else
+			++s_framesSincePcOk;
+
+		if ((!dbgPcmPtr || dbgPcmFov <= 0.f) && tPlayerController) {
+			dbgPcmPtr = tPCM ? tPCM
+				: Memory::read<uintptr_t>(tPlayerController + Offsets::APlayerCameraManager);
+			if (dbgPcmPtr && Memory::IsValidPtrFast2(dbgPcmPtr))
+				dbgPcmFov = Memory::read<float>(dbgPcmPtr + Offsets::DefaultFOV);
+		}
+
+		if (pcChainTimer.fire()) {
+			std::cout << "[debugPcChain] path=" << pcPath
+				<< " pc=" << (void*)tPlayerController
+				<< " pawn=" << (void*)tAcknowledgedPawn
+				<< " gi=" << (void*)tGameInstance
+				<< " lp=" << (void*)tLocalPlayer
+				<< " pcm=" << (void*)dbgPcmPtr
+				<< " fov=" << dbgPcmFov
+				<< " framesSincePcOk=" << s_framesSincePcOk
+				<< " cacheDrop=" << (cacheInvalidatedThisFrame ? 1 : 0)
+				<< " dropReason=" << cacheInvalidateReason
+				<< " raidRaw=" << (m_raidRaw.load(std::memory_order_relaxed) ? 1 : 0)
+				<< " actors=" << actorCount
+				<< std::endl;
+		}
 	}
 
 	{
@@ -492,8 +605,11 @@ void Engine::Update() {
 
 	TickRaidGate();
 
-	// Original baseline re-resolved PC every Update; never reuse last raid's cached chain in hub/load.
-	if (!m_raidRaw.load(std::memory_order_acquire)) {
+	// Only drop the PC fast-path when ESP raid is fully inactive (hub/menu).
+	// Do NOT clear on a transient RaidRaw flicker caused by a missing PC — that
+	// creates a death spiral where PC loss → RaidRaw false → cache clear → never recover.
+	if (!m_espRaidActive.load(std::memory_order_acquire)
+		&& !m_raidRaw.load(std::memory_order_acquire)) {
 		s_cachedPC = 0;
 		s_cachedPawn = 0;
 	}
@@ -522,7 +638,19 @@ bool Engine::IsInRaidRaw() const
 		sRootComponent = RootComponent;
 	}
 
-	if (!sGWorld || !sPersistentLevel || !sActors || !sAcknowledgedPawn || !sPlayerController)
+	if (!sGWorld || !sPersistentLevel)
+		return false;
+
+	// Stay path: once ESP raid is active, only lose raid on world loss or strict hub.
+	// Do not require PC/pawn/root/combat — mid-raid DMA flakes were firing [raid] left.
+	if (m_espRaidActive.load(std::memory_order_acquire)) {
+		if (LooksLikeStrictHubWorld(sGWorld, sPersistentLevel))
+			return false;
+		return true;
+	}
+
+	// Enter / cold path — stricter.
+	if (!sActors || !sAcknowledgedPawn || !sPlayerController)
 		return false;
 
 	const int actorCount = Memory::read<int>(sPersistentLevel + Offsets::ActorsCount);
@@ -542,18 +670,6 @@ bool Engine::IsInRaidRaw() const
 		pos = Engine::ReadSceneWorldPos(root);
 	if (!IsPlausibleWorldPos(pos))
 		return false;
-
-	const bool populatedWorld = actorCount >= kRaidPopulationThreshold;
-
-	if (populatedWorld) {
-		if (PawnLooksLikeHubCharacter(sAcknowledgedPawn))
-			return false;
-		if (LooksLikeHubWorld(sGWorld, sPersistentLevel))
-			return false;
-		if (!PawnHasRaidCombatComponents(sAcknowledgedPawn))
-			return false;
-		return true;
-	}
 
 	if (LooksLikeHubWorld(sGWorld, sPersistentLevel))
 		return false;
@@ -588,11 +704,85 @@ void Engine::ResetRaidTransitionState()
 	s_cachedPC = 0;
 	s_cachedPawn = 0;
 	s_cachedLocalPlayer = 0;
+	s_retainPC = 0;
+	s_retainPawn = 0;
+	s_retainRoot = 0;
+	s_retainGI = 0;
+	s_retainLP = 0;
+	s_retainPCM = 0;
+	s_retainPS = 0;
+	s_cacheFailStreak = 0;
 	g_Camera = {};
 	ClearFNameCache();
-	g_bReadSimdConsts = false;
-	g_bReadFNameKeyTable = false;
+	g_fnameTablesReady = false;
 	steam_decrypt::ResetTables();
+	ArcActorType::RuntimeActorTypeOffset() = -1;
+}
+
+void Engine::HandleWorldLost()
+{
+	if (m_lastWorldPtr == 0
+		&& !m_espRaidActive.load(std::memory_order_acquire))
+		return;
+
+	// Drop VMM page/TLB/VAD caches so the next GWorld resolve is live.
+	PCIMemory::FullRefresh();
+
+	{
+		std::unique_lock<std::shared_mutex> stateLock(m_stateMutex);
+		GWorld = 0;
+		GameInstance = 0;
+		OwningGameInstance = 0;
+		PersistentLevel = 0;
+		localplayer = 0;
+		PlayerController = 0;
+		PioneerPlayerController = 0;
+		AcknowledgedPawn = 0;
+		RootComponent = 0;
+		PlayerState = 0;
+		Actors = 0;
+		PlayerCameraManager = 0;
+		AGameStateBase = 0;
+	}
+
+	m_lastWorldPtr = 0;
+	m_lastPersistentLevel = 0;
+	m_espRaidActive.store(false, std::memory_order_release);
+	m_raidEnterPending = false;
+	m_raidFalseSince = {};
+	ResetRaidTransitionState();
+	ClearEspCaches();
+	std::cout << "[raid] world_lost" << std::endl;
+}
+
+void Engine::CheckWorldTransition(uintptr_t newWorld, uintptr_t newPersistentLevel)
+{
+	if (newWorld == m_lastWorldPtr && newPersistentLevel == m_lastPersistentLevel)
+		return;
+
+	// Drop VMM page/TLB/VAD caches so freshly-allocated raid memory is visible
+	// immediately (otherwise READCACHE/PROCCACHE TTLs can stall until restart).
+	PCIMemory::FullRefresh();
+
+	Vector3 localPos{};
+	{
+		std::shared_lock<std::shared_mutex> stateLock(m_stateMutex);
+		if (RootComponent && IsValidPointer(RootComponent))
+			localPos = ReadSceneWorldPos(RootComponent);
+	}
+
+	ResetRaidTransitionState();
+	ClearEspCaches();
+
+	m_lastWorldPtr = newWorld;
+	m_lastPersistentLevel = newPersistentLevel;
+	m_worldGeneration.fetch_add(1, std::memory_order_release);
+	m_espRaidActive.store(false, std::memory_order_release);
+	m_raidEnterPending = false;
+	m_raidFalseSince = {};
+
+	if (newWorld)
+		CollisionLos::ScheduleWorldRebuild(newWorld, localPos);
 }
 
 void Engine::ClearEspCaches()
@@ -613,11 +803,6 @@ void Engine::ClearEspCaches()
 	{
 		std::unique_lock<std::shared_mutex> lk(m_robotCacheMutex);
 		robotCache.clear();
-	}
-	for (EspRenderSnapshot& snap : m_espSnapshots) {
-		snap.players.clear();
-		snap.world.clear();
-		snap.robots.clear();
 	}
 	{
 		std::unique_lock<std::shared_mutex> lock(m_espFrameMutex);
@@ -642,6 +827,30 @@ void Engine::TickRaidGate()
 		}
 		if (m_raidFalseSince.time_since_epoch().count() == 0)
 			m_raidFalseSince = now;
+
+		if (var::show_debug_overlay) {
+			static std::chrono::steady_clock::time_point s_lastHoldLog{};
+			if (s_lastHoldLog.time_since_epoch().count() == 0
+				|| now - s_lastHoldLog >= std::chrono::seconds(1)) {
+				s_lastHoldLog = now;
+				uintptr_t gw = 0, pl = 0, pc = 0, pawn = 0;
+				{
+					std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+					gw = GWorld;
+					pl = PersistentLevel;
+					pc = PlayerController;
+					pawn = AcknowledgedPawn;
+				}
+				const bool hub = LooksLikeStrictHubWorld(gw, pl);
+				std::cout << "[raid] raw_false_hold"
+					<< " gWorld=" << std::hex << gw
+					<< " hub=" << std::dec << (hub ? 1 : 0)
+					<< " pc=" << std::hex << pc
+					<< " pawn=" << pawn << std::dec
+					<< std::endl;
+			}
+		}
+
 		if (now - m_raidFalseSince < kRaidRawFalseGraceMs)
 			return;
 
@@ -656,6 +865,16 @@ void Engine::TickRaidGate()
 	m_raidFalseSince = {};
 	if (active)
 		return;
+
+	if (kRaidEnterDelayMs.count() <= 0) {
+		m_raidEnterPending = false;
+		ResetRaidTransitionState();
+		m_espRaidActive.store(true, std::memory_order_release);
+		ClearEspCaches();
+		m_worldGeneration.fetch_add(1, std::memory_order_release);
+		std::cout << "[raid] entered" << std::endl;
+		return;
+	}
 
 	if (!m_raidEnterPending) {
 		m_raidEnterPending = true;

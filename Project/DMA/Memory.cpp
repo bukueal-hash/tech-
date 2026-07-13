@@ -570,22 +570,3 @@ bool PCIMemory::FullRefresh()
         return false;
     return VMMDLL_ConfigSet(hVMM, VMMDLL_OPT_REFRESH_ALL, 1) != FALSE;
 }
-
-bool PCIMemory::PartialMemRefresh()
-{
-    if (!hVMM)
-        return false;
-    return VMMDLL_ConfigSet(hVMM, VMMDLL_OPT_REFRESH_FREQ_MEM_PARTIAL, 1) != FALSE;
-}
-
-bool PCIMemory::PartialTlbRefresh()
-{
-    if (!hVMM)
-        return false;
-    return VMMDLL_ConfigSet(hVMM, VMMDLL_OPT_REFRESH_FREQ_TLB_PARTIAL, 1) != FALSE;
-}
-
-bool PCIMemory::SmartTlbRefreshIfDue()
-{
-    return false;
-}

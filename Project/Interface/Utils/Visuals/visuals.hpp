@@ -70,8 +70,22 @@ struct HumanSilhouetteInput {
     bool hasPelvis = false;
     bool hasClavicleL = false;
     bool hasClavicleR = false;
+    bool hasUpperArmL = false;
+    bool hasLowerArmL = false;
+    bool hasHandL = false;
+    bool hasUpperArmR = false;
+    bool hasLowerArmR = false;
+    bool hasHandR = false;
+    bool hasThighL = false;
+    bool hasCalfL = false;
+    bool hasFootL = false;
+    bool hasThighR = false;
+    bool hasCalfR = false;
+    bool hasFootR = false;
+    /** True only when upper+lower arm both projected (hand optional). */
     bool hasArmL = false;
     bool hasArmR = false;
+    /** True only when thigh+calf both projected (foot optional). */
     bool hasLegL = false;
     bool hasLegR = false;
 };

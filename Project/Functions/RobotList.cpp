@@ -34,6 +34,8 @@ bool IsMislabeledLootName(const std::string& label, const std::string& fname)
 {
     if (label.empty())
         return false;
+    if (IsWorldEspLabel(label))
+        return true;
     if (IsAcceptedBotEspLabel(engine, label, fname))
         return false;
     int rarity = 0;
@@ -41,7 +43,6 @@ bool IsMislabeledLootName(const std::string& label, const std::string& fname)
     return LookupItemMeta(label, rarity, value);
 }
 
-std::string ReadActorClassFName(uintptr_t actor);
 std::string ResolveBotLabelFromFName(const std::string& name);
 std::string ResolveBotLabelFromActor(uintptr_t actor, const std::string& fnameHint);
 bool IsArcBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fnameHint);
@@ -70,88 +71,34 @@ std::string FinalizeBotAdmissionLabel(
     const std::string& fname,
     bool isBotEntry)
 {
-    std::string label = ResolveRobotTypeFromFName(engine, fname);
-    if (label.empty() && isBotEntry)
-        label = ResolveBotTypeLabel(actor, fname);
+    std::string label = ResolveBotTypeLabel(actor, fname);
 
-    if (!label.empty() && IsMislabeledLootName(label, fname)) {
+    if (!label.empty() && IsWorldEspLabel(label))
         label.clear();
-        if (isBotEntry)
-            label = ResolveBotTypeLabel(actor, fname);
-    }
+
+    if (!label.empty() && IsMislabeledLootName(label, fname))
+        label.clear();
+
+    if (!label.empty() && IsWorldEspLabel(label))
+        label.clear();
 
     if (!label.empty() && !isBotEntry && !IsAcceptedBotEspLabel(engine, label, fname))
         return {};
 
-    // ResolveBotTypeLabel already derives a real name from every readable
-    // identity (actor fname, mesh fname, enemy asset). Names can fail when
-    // fnames are encrypted — struct bots still need cache admission for boxes.
-    if (label.empty() && isBotEntry)
-        label = ResolveBotTypeLabel(actor, fname);
-
     return label;
-}
-
-std::string ReadActorClassFName(uintptr_t actor)
-{
-    if (!actor)
-        return {};
-
-    static const std::ptrdiff_t kClassOffsets[] = { 0x10, 0x8 };
-    for (const std::ptrdiff_t off : kClassOffsets) {
-        const uint64_t uclass =
-            Memory::read<uint64_t>(actor + static_cast<uint64_t>(off));
-        if (!uclass || !Memory::IsValidPtrFast2(uclass))
-            continue;
-
-        std::string name = engine.GetActorFNameStringCached(uclass);
-        if (name.empty())
-            name = engine.GetActorFNameString(uclass);
-        if (!name.empty())
-            return name;
-    }
-    return {};
 }
 
 std::string ResolveBotLabelFromFName(const std::string& name)
 {
     if (name.empty())
         return {};
-    // Must match ResolveRobotTypeFromFName — QualifiesAsConstructableBot uses the
-    // full resolver; a narrower table here caused structHit>>0 with admitted=0.
     return ResolveRobotTypeFromFName(engine, name);
 }
 
 std::string ResolveBotLabelFromActor(uintptr_t actor, const std::string& fnameHint)
 {
-    if (const std::string fromHint = ResolveBotLabelFromFName(fnameHint); !fromHint.empty())
-        return fromHint;
-    if (const std::string fromClass = ResolveBotLabelFromFName(ReadActorClassFName(actor));
-        !fromClass.empty())
-        return fromClass;
-
-    if (const std::string fromEnemy = ResolveEnemyAssetBotLabel(actor); !fromEnemy.empty())
-        return fromEnemy;
-
-    if (const uintptr_t mesh = engine.GetActorSkeletalMesh(actor); mesh) {
-        std::string meshFname = engine.GetActorFNameStringCached(mesh);
-        if (meshFname.empty())
-            meshFname = engine.GetActorFNameString(mesh);
-        if (const std::string fromMesh = ResolveBotLabelFromFName(meshFname); !fromMesh.empty())
-            return fromMesh;
-    }
-
-    const uintptr_t embarkMesh =
-        Memory::read<uintptr_t>(actor + Offsets::EmbarkMesh);
-    if (embarkMesh && engine.IsValidPointer(embarkMesh)) {
-        std::string emFname = engine.GetActorFNameStringCached(embarkMesh);
-        if (emFname.empty())
-            emFname = engine.GetActorFNameString(embarkMesh);
-        if (const std::string fromEmbark = ResolveBotLabelFromFName(emFname); !fromEmbark.empty())
-            return fromEmbark;
-    }
-
-    return {};
+    // Single chain — same as draw/admission.
+    return ResolveBotTypeLabel(actor, fnameHint);
 }
 
 bool ActorHasKnownBotIdentity(uintptr_t actor, const std::string& fnameHint)
@@ -349,6 +296,10 @@ bool QuickBotCandidate(uintptr_t actor)
     if (ArcActorType::IsAnyBotActor(actor))
         return true;
 
+    // Strong bot-exclusive DA signal (DA_EnemyType_* / mapped enemy asset).
+    if (HasStrongEnemyDataAsset(actor))
+        return true;
+
     if (WorldScan::HasArcEnemyAssetPointer(actor))
         return true;
 
@@ -450,27 +401,18 @@ std::string ResolveStructBotAdmissionLabel(uintptr_t actor, const std::string& f
     if (!label.empty())
         return label;
 
-    label = ResolveBotLabelFromActor(actor, fname);
-    if (!label.empty())
-        return label;
-
+    // Identity decrypt failed — still admit struct bots for boxes; draw resolves name.
     if (HasVerifiedEnemyAsset(actor, fname)
         || ActorHasKnownBotIdentity(actor, fname)
         || ArcActorType::IsAnyBotActor(actor)
-        || IsArcBotActor(actor, 0, fname)) {
-        label = ResolveBotTypeLabel(actor, fname);
-        if (!label.empty() && IsMislabeledLootName(label, fname))
-            label.clear();
-        if (!label.empty())
-            return label;
-        if (HasVerifiedEnemyAsset(actor, fname)
-            || ActorHasKnownBotIdentity(actor, fname)
-            || ArcActorType::IsAnyBotActor(actor))
-            return kBotStructAdmissionToken;
-    }
+        || IsArcBotActor(actor, 0, fname))
+        return kBotStructAdmissionToken;
 
     return {};
 }
+
+uintptr_t ResolveBotSceneRoot(uintptr_t actor);
+Vector3 ResolveBotWorldPos(uintptr_t actor, uintptr_t root, uintptr_t mesh);
 
 bool ShouldSkipBotActor(
     uintptr_t actor,
@@ -486,6 +428,26 @@ bool ShouldSkipBotActor(
 
     if (engine.IsCachedPlayer(actor))
         return true;
+
+    // Near-self skip: coincident ghost/duplicate pawn near local position.
+    // Never skip proven ARC bots (melee/on-top Wasps must still admit).
+    if (IsPlausibleWorldPos(localPos)) {
+        const uintptr_t root = ResolveBotSceneRoot(actor);
+        if (root) {
+            const Vector3 botPos = ResolveBotWorldPos(actor, root, 0);
+            if (IsPlausibleWorldPos(botPos)) {
+                const double dx = botPos.x - localPos.x;
+                const double dy = botPos.y - localPos.y;
+                const double dz = botPos.z - localPos.z;
+                const double distM = std::sqrt(dx * dx + dy * dy + dz * dz) / 100.0;
+                if (distM < 0.5
+                    && !ArcActorType::IsAnyBotActor(actor)
+                    && !HasStrongEnemyDataAsset(actor)
+                    && !WorldScan::HasArcEnemyAssetPointer(actor))
+                    return true;
+            }
+        }
+    }
 
     return false;
 }
@@ -843,7 +805,16 @@ uint8_t ReadBotBrokenFlag(uintptr_t actor)
     uint8_t broken = Memory::read<uint8_t>(actor + Offsets::bIsBreaked);
     if (broken != 1)
         broken = Memory::read<uint8_t>(actor + Offsets::Constructable_bIsDestroyed);
-    return broken == 1 ? 1 : 0;
+    if (broken == 1)
+        return 1;
+
+    // Wasp-type / regular bots: treat depleted HealthComponent as dead.
+    const double h = Engine::ReadHealthComponentStat(actor, Offsets::Health);
+    const double m = Engine::ReadHealthComponentStat(actor, Offsets::MaxHealth);
+    if (std::isfinite(h) && std::isfinite(m) && m > 0.0 && h <= 0.0)
+        return 1;
+
+    return 0;
 }
 
 static std::atomic<int> g_botDrawLabelMiss{ 0 };
@@ -868,55 +839,51 @@ std::string FinalizeBotTypeLabel(const std::string& label, const std::string& fn
 
 std::string ResolveBotTypeLabel(uintptr_t actor, const std::string& fname)
 {
-    if (const std::string fromIdentity = ResolveBotLabelFromActor(actor, fname);
-        !fromIdentity.empty())
-        return FinalizeBotTypeLabel(fromIdentity, fname);
-
-    // CL-1315578 enemy DA fname (cached + steam_decrypt) before weaker paths.
-    if (actor) {
-        if (const std::string fromEnemyLabel = ResolveEnemyAssetBotLabel(actor);
-            !fromEnemyLabel.empty())
-            return FinalizeBotTypeLabel(fromEnemyLabel, fname);
-
-        if (const std::string enemyAsset = GetEnemyTypeDataAssetFName(actor);
-            !enemyAsset.empty()) {
-            if (const std::string fromEnemy = ResolveRobotTypeFromFName(engine, enemyAsset);
-                !fromEnemy.empty())
-                return FinalizeBotTypeLabel(fromEnemy, fname);
-        }
-    }
-
-    if (!fname.empty()) {
-        if (const std::string fromFname = ResolveRobotTypeFromFName(engine, fname);
-            !fromFname.empty())
-            return FinalizeBotTypeLabel(fromFname, fname);
-    }
-
-    if (const std::string fromActor = ResolveRobotTypeForActor(engine, actor, fname);
-        !fromActor.empty())
-        return FinalizeBotTypeLabel(fromActor, fname);
-
-    std::string meshFname;
-    if (actor) {
-        if (const uintptr_t mesh = engine.GetActorSkeletalMesh(actor); mesh) {
-            meshFname = engine.GetActorFNameStringCached(mesh);
-            if (meshFname.empty())
-                meshFname = engine.GetActorFNameString(mesh);
-        }
-    }
-    if (!meshFname.empty()) {
-        if (const std::string fromMesh = ResolveRobotTypeFromFName(engine, meshFname);
-            !fromMesh.empty())
-            return FinalizeBotTypeLabel(fromMesh, fname);
-    }
-
-    if (!fname.empty()) {
-        if (const std::string husk = ResolveHuskBotLabel(fname); !husk.empty())
+    // Single ordered chain: fname → class → enemy DA → mesh → embark → husk.
+    auto tryName = [&](const std::string& name) -> std::string {
+        if (name.empty())
+            return {};
+        if (const std::string fromType = ResolveRobotTypeFromFName(engine, name);
+            !fromType.empty())
+            return FinalizeBotTypeLabel(fromType, fname);
+        if (const std::string husk = ResolveHuskBotLabel(name); !husk.empty())
             return FinalizeBotTypeLabel(husk, fname);
+        return {};
+    };
+
+    if (const std::string hit = tryName(fname); !hit.empty())
+        return hit;
+
+    if (!actor)
+        return {};
+
+    if (const std::string hit = tryName(engine.GetActorClassFName(actor)); !hit.empty())
+        return hit;
+
+    if (const std::string fromEnemy = ResolveEnemyAssetBotLabel(actor); !fromEnemy.empty())
+        return FinalizeBotTypeLabel(fromEnemy, fname);
+
+    if (const std::string enemyAsset = GetEnemyTypeDataAssetFName(actor); !enemyAsset.empty()) {
+        if (const std::string hit = tryName(enemyAsset); !hit.empty())
+            return hit;
     }
-    if (!meshFname.empty()) {
-        if (const std::string husk = ResolveHuskBotLabel(meshFname); !husk.empty())
-            return FinalizeBotTypeLabel(husk, fname);
+
+    if (const uintptr_t mesh = engine.GetActorSkeletalMesh(actor); mesh) {
+        std::string meshFname = engine.GetActorFNameStringCached(mesh);
+        if (meshFname.empty())
+            meshFname = engine.GetActorFNameString(mesh);
+        if (const std::string hit = tryName(meshFname); !hit.empty())
+            return hit;
+    }
+
+    const uintptr_t embarkMesh =
+        Memory::read<uintptr_t>(actor + Offsets::EmbarkMesh);
+    if (embarkMesh && engine.IsValidPointer(embarkMesh)) {
+        std::string emFname = engine.GetActorFNameStringCached(embarkMesh);
+        if (emFname.empty())
+            emFname = engine.GetActorFNameString(embarkMesh);
+        if (const std::string hit = tryName(emFname); !hit.empty())
+            return hit;
     }
 
     return {};
@@ -1143,8 +1110,8 @@ void Engine::RobotList()
                 actor.ActorName = resolved;
         }
 
-        // CHECK #2 — re-verify every cached bot each pass.
-        if (!VerifyBotActor(key, sAcknowledgedPawn, fname)) {
+        // CHECK #2 — cheap retain gate (admission already ran full VerifyBotActor).
+        if (!StillLooksLikeBot(key, sAcknowledgedPawn, actor.category, localPos)) {
             it = localCache.erase(it);
             continue;
         }
@@ -1168,6 +1135,27 @@ void Engine::RobotList()
         if (broken != 0 && !var::show_dead_bots) {
             it = localCache.erase(it);
             continue;
+        }
+
+        // Health: constructables via HealthService; regular bots via HealthComponent.
+        if (WorldScan::HasArcEnemyAssetPointer(key)) {
+            const uintptr_t healthSvc =
+                Memory::read<uintptr_t>(key + static_cast<uint64_t>(Offsets::Constructable_HealthService));
+            if (healthSvc && Memory::IsValidPtrFast2(healthSvc)) {
+                const double h = Memory::read<double>(healthSvc + static_cast<uint64_t>(Offsets::BotHealthCached));
+                const double m = Memory::read<double>(healthSvc + static_cast<uint64_t>(Offsets::BotHealthMax));
+                if (std::isfinite(h) && std::isfinite(m) && m > 0.0) {
+                    actor.health    = static_cast<float>(h);
+                    actor.maxhealth = static_cast<float>(m);
+                }
+            }
+        } else {
+            const double h = Engine::ReadHealthComponentStat(key, Offsets::Health);
+            const double m = Engine::ReadHealthComponentStat(key, Offsets::MaxHealth);
+            if (std::isfinite(h) && std::isfinite(m) && m > 0.0) {
+                actor.health    = static_cast<float>(h);
+                actor.maxhealth = static_cast<float>(m);
+            }
         }
 
         if (!actor.Mesh || !IsValidPointer(actor.Mesh))

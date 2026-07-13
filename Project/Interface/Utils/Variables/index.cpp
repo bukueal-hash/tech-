@@ -13,12 +13,9 @@ namespace var {
     float silhouette_max_distance_m = 25.f;
     bool show_distance = false;
     bool hide_allies = true;
-    float esp_smooth_alpha = 0.f;
     float esp_distance = 500.f;
     float esp_color_visible[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     float esp_color_invisible[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
-    int esp_smoothing_mode = 0;
-    bool esp_disable_box_cache = false;
 
     /* Bot ESP */
     bool bot_box = true;
@@ -32,6 +29,7 @@ namespace var {
 
     /* Aimbot */
     bool enable_aimbot = false;
+    bool enable_triggerbot = false;
     bool robotAimEnabled = false;
     int aim_hold_key = 0x10; // VK_SHIFT
     AimBoneMode aim_bone_mode = AimBoneMode::Chest;

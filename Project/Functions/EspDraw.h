@@ -450,6 +450,62 @@ inline bool TryProjectBoneScreen(
     return std::isfinite(out.x) && std::isfinite(out.y);
 }
 
+/** World distance (cm) between two valid bones; -1 if either missing/implausible. */
+inline float BoneWorldDistCm(
+    const Engine::PlayerCacheEntry& actor,
+    UniBone a,
+    UniBone b)
+{
+    const size_t ia = static_cast<size_t>(a);
+    const size_t ib = static_cast<size_t>(b);
+    if (!actor.boneData.valid.test(ia) || !actor.boneData.valid.test(ib))
+        return -1.f;
+    const Vector3& wa = actor.boneData.bonesWorldDouble[ia];
+    const Vector3& wb = actor.boneData.bonesWorldDouble[ib];
+    if (!IsPlausibleWorldPos(wa) || !IsPlausibleWorldPos(wb))
+        return -1.f;
+    const double dx = wa.x - wb.x;
+    const double dy = wa.y - wb.y;
+    const double dz = wa.z - wb.z;
+    return static_cast<float>(std::sqrt(dx * dx + dy * dy + dz * dz));
+}
+
+/**
+ * True when both bones project and the world segment is anatomically plausible
+ * (drops wrong-index / garbage joints that otherwise draw as squiggles).
+ */
+inline bool TrySkeletonSegmentScreen(
+    Engine& eng,
+    const Engine::CameraCache& cam,
+    const Engine::PlayerCacheEntry& actor,
+    UniBone boneA,
+    UniBone boneB,
+    ImVec2& outA,
+    ImVec2& outB)
+{
+    constexpr float kMinSegCm = 2.f;
+    constexpr float kMaxSegCm = 120.f;
+    constexpr float kMaxFromPelvisCm = 250.f;
+
+    if (!TryProjectBoneScreen(eng, cam, actor, boneA, outA))
+        return false;
+    if (!TryProjectBoneScreen(eng, cam, actor, boneB, outB))
+        return false;
+
+    const float segCm = BoneWorldDistCm(actor, boneA, boneB);
+    if (segCm < kMinSegCm || segCm > kMaxSegCm)
+        return false;
+
+    if (actor.boneData.valid.test(static_cast<size_t>(UniBone::Pelvis))) {
+        const float da = BoneWorldDistCm(actor, boneA, UniBone::Pelvis);
+        const float db = BoneWorldDistCm(actor, boneB, UniBone::Pelvis);
+        if ((da >= 0.f && da > kMaxFromPelvisCm)
+            || (db >= 0.f && db > kMaxFromPelvisCm))
+            return false;
+    }
+    return true;
+}
+
 inline bool BuildHumanSilhouetteInput(
     Engine& eng,
     const Engine::PlayerCacheEntry& actor,
@@ -469,34 +525,25 @@ inline bool BuildHumanSilhouetteInput(
     project(UniBone::ClavicleL, out.clavicleL, out.hasClavicleL);
     project(UniBone::ClavicleR, out.clavicleR, out.hasClavicleR);
 
-    bool boneOk = false;
-    project(UniBone::UpperArmL, out.upperArmL, boneOk);
-    out.hasArmL = out.hasArmL || boneOk;
-    project(UniBone::LowerArmL, out.lowerArmL, boneOk);
-    out.hasArmL = out.hasArmL || boneOk;
-    project(UniBone::HandL, out.handL, boneOk);
-    out.hasArmL = out.hasArmL || boneOk;
+    project(UniBone::UpperArmL, out.upperArmL, out.hasUpperArmL);
+    project(UniBone::LowerArmL, out.lowerArmL, out.hasLowerArmL);
+    project(UniBone::HandL, out.handL, out.hasHandL);
+    out.hasArmL = out.hasUpperArmL && out.hasLowerArmL;
 
-    project(UniBone::UpperArmR, out.upperArmR, boneOk);
-    out.hasArmR = out.hasArmR || boneOk;
-    project(UniBone::LowerArmR, out.lowerArmR, boneOk);
-    out.hasArmR = out.hasArmR || boneOk;
-    project(UniBone::HandR, out.handR, boneOk);
-    out.hasArmR = out.hasArmR || boneOk;
+    project(UniBone::UpperArmR, out.upperArmR, out.hasUpperArmR);
+    project(UniBone::LowerArmR, out.lowerArmR, out.hasLowerArmR);
+    project(UniBone::HandR, out.handR, out.hasHandR);
+    out.hasArmR = out.hasUpperArmR && out.hasLowerArmR;
 
-    project(UniBone::ThighL, out.thighL, boneOk);
-    out.hasLegL = out.hasLegL || boneOk;
-    project(UniBone::CalfL, out.calfL, boneOk);
-    out.hasLegL = out.hasLegL || boneOk;
-    project(UniBone::FootL, out.footL, boneOk);
-    out.hasLegL = out.hasLegL || boneOk;
+    project(UniBone::ThighL, out.thighL, out.hasThighL);
+    project(UniBone::CalfL, out.calfL, out.hasCalfL);
+    project(UniBone::FootL, out.footL, out.hasFootL);
+    out.hasLegL = out.hasThighL && out.hasCalfL;
 
-    project(UniBone::ThighR, out.thighR, boneOk);
-    out.hasLegR = out.hasLegR || boneOk;
-    project(UniBone::CalfR, out.calfR, boneOk);
-    out.hasLegR = out.hasLegR || boneOk;
-    project(UniBone::FootR, out.footR, boneOk);
-    out.hasLegR = out.hasLegR || boneOk;
+    project(UniBone::ThighR, out.thighR, out.hasThighR);
+    project(UniBone::CalfR, out.calfR, out.hasCalfR);
+    project(UniBone::FootR, out.footR, out.hasFootR);
+    out.hasLegR = out.hasThighR && out.hasCalfR;
 
     if (out.hasChest && out.hasPelvis) {
         out.waist = ImVec2(
@@ -507,32 +554,6 @@ inline bool BuildHumanSilhouetteInput(
     }
 
     return out.hasHead && out.hasNeck;
-}
-
-inline void DrawSkeletonEsp(
-    ImDrawList* drawList,
-    Engine& eng,
-    const Engine::PlayerCacheEntry& actor,
-    const Engine::CameraCache& cam,
-    ImU32 color,
-    float distanceM)
-{
-    if (!drawList)
-        return;
-
-    const Visuals::EspDrawScale scale = Visuals::ComputeEspScaleFromDistance(distanceM);
-    const float thickness = scale.lineThickness;
-
-    for (const auto& [boneA, boneB] : eng.SkeletonLinksArcRaiders) {
-        ImVec2 scrA{};
-        ImVec2 scrB{};
-        if (!TryProjectBoneScreen(eng, cam, actor, boneA, scrA))
-            continue;
-        if (!TryProjectBoneScreen(eng, cam, actor, boneB, scrB))
-            continue;
-
-        drawList->AddLine(scrA, scrB, color, thickness);
-    }
 }
 
 } // namespace EspDraw

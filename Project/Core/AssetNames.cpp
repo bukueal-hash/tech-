@@ -1325,13 +1325,11 @@ std::string ResolveRobotTypeFromFName(Engine& eng, const std::string& fname)
     if (fname.empty())
         return {};
 
+    // getEntityType already covers LookupBotClassToken + LookupEnemyBotByFName.
     const std::string fromEntity = eng.getEntityType(fname);
     if (fromEntity != "Invalid" && fromEntity != "ARC"
         && IsAcceptedBotEspLabel(eng, fromEntity, fname))
         return fromEntity;
-
-    if (const std::string fromPat = LookupEnemyBotByFName(fname); !fromPat.empty())
-        return fromPat;
 
     if (const std::string fromAsset = LookupDisplayByFNameAssetIndex(fname); !fromAsset.empty()) {
         if (const std::string mapped = MapDisplayToRobotType(eng, fromAsset); !mapped.empty())
@@ -2667,25 +2665,45 @@ std::string ResolveWorldDisplayLabel(uintptr_t actor, const std::string& fnameHi
             return fromClass;
     }
 
-    if (actor != 0) {
-        if (const std::string mem = engine.GetEnglishItemName(actor); !mem.empty()
-            && !IsGenericWorldEspLabel(mem))
-            return mem;
-    }
-
+    // Fname / asset / CSV before hover memory so UI-meta garbage cannot win.
     if (const std::string resolved = ResolveWorldLabel(actor, effectiveFname);
-        !resolved.empty() && !IsGenericWorldEspLabel(resolved))
+        !resolved.empty() && !IsGenericWorldEspLabel(resolved)
+        && !IsJunkWorldEspLabel(resolved) && IsPlausibleEspLabel(resolved)
+        && !IsGarbledEspLabel(resolved))
         return resolved;
 
     if (!effectiveFname.empty()) {
         if (const std::string fromWorld = LookupWorldObjectByFName(effectiveFname);
-            !fromWorld.empty() && !IsGenericWorldEspLabel(fromWorld))
+            !fromWorld.empty() && !IsGenericWorldEspLabel(fromWorld)
+            && !IsJunkWorldEspLabel(fromWorld))
             return FormatEspDisplayLabel(fromWorld);
+        if (const std::string fromAsset = LookupByAssetName(effectiveFname);
+            !fromAsset.empty() && !IsGenericWorldEspLabel(fromAsset)
+            && !IsJunkWorldEspLabel(fromAsset))
+            return FormatEspDisplayLabel(fromAsset);
         if (const std::string human = HumanizeActorFName(effectiveFname);
             !human.empty() && !IsGenericWorldEspLabel(human)
             && !IsJunkWorldEspLabel(human) && IsPlausibleEspLabel(human)
             && !IsGarbledEspLabel(human))
             return human;
+    }
+
+    if (!dataAssetFname.empty()) {
+        if (const std::string fromAsset = LookupByAssetName(dataAssetFname);
+            !fromAsset.empty() && !IsGenericWorldEspLabel(fromAsset)
+            && !IsJunkWorldEspLabel(fromAsset))
+            return FormatEspDisplayLabel(fromAsset);
+        if (const std::string fromWorld = LookupWorldObjectByFName(dataAssetFname);
+            !fromWorld.empty() && !IsGenericWorldEspLabel(fromWorld)
+            && !IsJunkWorldEspLabel(fromWorld))
+            return FormatEspDisplayLabel(fromWorld);
+    }
+
+    if (actor != 0) {
+        if (const std::string mem = engine.GetEnglishItemName(actor); !mem.empty()
+            && !IsGenericWorldEspLabel(mem) && !IsJunkWorldEspLabel(mem)
+            && IsPlausibleEspLabel(mem) && !IsGarbledEspLabel(mem))
+            return mem;
     }
 
     const auto cat = static_cast<WorldItemCategory>(worldCategory);

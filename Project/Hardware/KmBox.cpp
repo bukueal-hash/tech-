@@ -314,6 +314,14 @@ void KmboxController::renderKmboxSettings() {
 
     ImGui::Spacing();
 
+    ImGui::SliderInt("Move delay (ms)", &kmboxConfig.minDelay, 0, 50);
+    ImGui::SetItemTooltip(
+        "Sleep after Move/MoveBlocking/LeftClick. MoveAim (aim hot path) ignores this.");
+    if (ImGui::IsItemDeactivatedAfterEdit())
+        AutoConfig_MarkDirty();
+
+    ImGui::Spacing();
+
     if (ImGui::Button("Initialize"))
         Initialize();
     ImGui::SetItemTooltip("Open the device and set initialized status. Required for hardware aim.");
@@ -332,11 +340,6 @@ void KmboxController::renderKmboxSettings() {
         ImGui::TextColored(ImVec4(0, 1, 0, 1.f), "Status: connected");
     else
         ImGui::TextColored(ImVec4(1, 0, 0, 1.f), "Status: not initialized");
-}
-
-bool KmboxController::SaveKmboxConfig() {
-    AutoConfig_MarkDirty();
-    return true;
 }
 
 bool KmboxController::LoadKmboxConfig() {

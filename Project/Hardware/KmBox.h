@@ -8,7 +8,6 @@ public:
 
     bool rememberKmboxInfo = false;
     const std::string CONFIG_FILE = "kmbox_config.ini";
-    bool SaveKmboxConfig();
     bool LoadKmboxConfig();
     bool GetRememberConfig() const { return rememberKmboxInfo; }
     void SetRememberConfig(bool remember) { rememberKmboxInfo = remember; }
