@@ -74,8 +74,9 @@ namespace Offsets {
     constexpr std::ptrdiff_t APlayerState = 0x3A8; // Actor/PC PlayerState (restore world cache)
     constexpr std::ptrdiff_t PlayerNamePrivate = 0x440;
     constexpr std::ptrdiff_t PlayerNameOnPawn = 0x438;
-    constexpr std::ptrdiff_t PlayerState_PawnPrivate = 0x410; // probed: local PS+0x410 == AcknowledgedPawn
-    constexpr std::ptrdiff_t PlayerState_PlayerStatus = 0x548; // Alive=0 DBNO=1 (ARC Copy)
+    constexpr std::ptrdiff_t PlayerState_PawnPrivate = 0x410; // probed local; EntityList uses kPsPawnPrivate 0x418 (#24)
+    // COLLISION @0x548: DBNO status vs max-armor — only MaxArmor is read today (#22/#27).
+    constexpr std::ptrdiff_t PlayerState_PlayerStatus = 0x548; // Alive=0 DBNO=1 — needs raid confirm
     constexpr std::ptrdiff_t Pawn_Controller = 0x3D8;
 
     // ── PlayerCameraManager ──────────────────────────────────────────────────
@@ -114,7 +115,7 @@ namespace Offsets {
     constexpr std::ptrdiff_t Actor_FlagsDd = 0xdd;
     constexpr uint8_t Actor_bActorEnableCollisionMask = 0x1;
     constexpr uint8_t Actor_bActorIsBeingDestroyedMask = 0x2;
-    constexpr std::ptrdiff_t ReplicatedMovement = 0x148;
+    constexpr std::ptrdiff_t ReplicatedMovement = 0x148; // velocity (Aimbot); position readers use actor+0x150 (#23)
     constexpr std::ptrdiff_t RepMov_LinearVelocity = 0x0;
     constexpr std::ptrdiff_t Actor_InstanceComponents = 0x328;
 
@@ -159,7 +160,7 @@ namespace Offsets {
     constexpr std::ptrdiff_t PlayerState_Health = HealthInfo;
     constexpr std::ptrdiff_t PlayerState_MaxHealth = 0x538;
     constexpr std::ptrdiff_t PlayerState_Armor = 0x540;
-    constexpr std::ptrdiff_t PlayerState_MaxArmor = 0x548;
+    constexpr std::ptrdiff_t PlayerState_MaxArmor = 0x548; // same slot as PlayerStatus — armor readers use this name (#22)
     constexpr std::ptrdiff_t Health = 0x668;  // HealthComponent::CachedHealth (SDK-confirmed)
     constexpr std::ptrdiff_t MaxHealth = 0x2E0;
     constexpr std::ptrdiff_t Shield = 0x140;

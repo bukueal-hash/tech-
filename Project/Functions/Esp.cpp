@@ -1507,7 +1507,7 @@ static void RenderWorldEspFromFrame(
                     && !IsGarbledEspLabel(entry.ItemDisplayName))
                     label = entry.ItemDisplayName;
                 else
-                    label = "Dropped Pickup";
+                    label = "Pickup";
             }
         }
         if (label.empty())
@@ -1534,21 +1534,24 @@ static void RenderWorldEspFromFrame(
             lootValue = 0;
             lootTier = 0;
         } else if (!isGroundLoot) {
-            ResolveItemMetaForActor(engine, key, fname, label, lootTier, lootValue);
             if (lootValue <= 0 || lootTier <= 0) {
-                const std::string memName = engine.GetEnglishItemName(key);
-                if (!memName.empty() && memName != label) {
-                    int altTier = 0;
-                    int altValue = 0;
-                    if (ResolveItemMetaForActor(engine, key, fname, memName, altTier, altValue)) {
-                        if (lootValue <= 0)
-                            lootValue = altValue;
-                        if (lootTier <= 0)
-                            lootTier = altTier;
+                ResolveItemMetaForActor(engine, key, fname, label, lootTier, lootValue);
+                if (lootValue <= 0 || lootTier <= 0) {
+                    const std::string memName = engine.GetEnglishItemName(key);
+                    if (!memName.empty() && memName != label) {
+                        int altTier = 0;
+                        int altValue = 0;
+                        if (ResolveItemMetaForActor(engine, key, fname, memName, altTier, altValue)) {
+                            if (lootValue <= 0)
+                                lootValue = altValue;
+                            if (lootTier <= 0)
+                                lootTier = altTier;
+                        }
                     }
                 }
             }
-        } else {
+        } else if (lootValue <= 0 || lootTier <= 0) {
+            // Trust scan-time meta; only resolve when still missing (#9).
             ResolveItemMetaForActor(
                 engine, key, fname, label.empty() ? entry.ItemDisplayName : label,
                 lootTier, lootValue);

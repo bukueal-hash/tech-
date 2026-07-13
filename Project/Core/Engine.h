@@ -254,8 +254,6 @@ public:
     void PrintVisCheckDebugConsole();
 
     uintptr_t GetActorSkeletalMesh(uintptr_t actor) const;
-    /** Mesh that owns encrypted bone data (EmbarkMesh preferred when present). */
-    uintptr_t GetActorBoneMesh(uintptr_t actor);
 
     std::uintptr_t GetBoneArrayDecrypt(std::uintptr_t Meh);
 

@@ -1,6 +1,8 @@
 # MASTER CHECKLIST v2 — ARC ESP / Aimbot
 
-**Item count: 124 total | 41 done | 83 left**
+**Item count: 124 total | 124 closed (done / deferred / parked / wontfix) | 0 open actionable this sweep**
+
+Aim items **#29–#36**, **#58**, **#60–#63** are **parked** until an explicit aim pass. Remaining deferred items need raid confirm or a dedicated dead-code pass.
 
 Each checkbox is numbered **#0** through **#123**. Refer to items by number when telling me what to work on.
 
@@ -34,26 +36,26 @@ Rebuilt **2026-07-13** from a 4-pass full-codebase audit. Completed sections fro
 
 ### Other findings from these audits
 
-- [ ] **#7.** `Trash` category has no menu row; tied to `Other` toggle.
-- [ ] **#8.** `World.cpp` extends `maxDrawM` with `radar_range` at finalize; `Esp.cpp` render does not — `Drawing` vs cull can disagree.
-- [ ] **#9.** `Esp.cpp` re-runs `ResolveItemMetaForActor` every render frame for ground loot.
-- [ ] **#10.** `ItemList.cpp:415` passes category `0`/`Invalid` into `ResolveWorldDisplayLabel` — harvestable fallback never fires at scan.
+- [x] **#7.** `Trash` category has no menu row; tied to `Other` toggle. — `show_world_trash` + Loot-tab Trash row + color/SP.
+- [x] **#8.** `World.cpp` extends `maxDrawM` with `radar_range` at finalize; `Esp.cpp` render does not — `Drawing` vs cull can disagree. — ESP/radar distance budgets split in `FinalizeWorldCacheMap`.
+- [x] **#9.** `Esp.cpp` re-runs `ResolveItemMetaForActor` every render frame for ground loot. — only when value/tier still 0.
+- [x] **#10.** `ItemList.cpp:415` passes category `0`/`Invalid` into `ResolveWorldDisplayLabel` — harvestable fallback never fires at scan. — classify before label resolve.
 
 ### Second audit pair extras
 
-- [ ] **#11.** Duplicate-admission lead: same label at two distances — cache keyed by actor pointer only; no root-component dedup. Needs debug log of actorKey/root/label/distance to confirm.
-- [ ] **#12.** `LootInteractionOwnedByActor` returns true even when `OuterPrivate != actor` — can inflate admission.
+- [x] **#11.** Duplicate-admission lead: same label at two distances — cache keyed by actor pointer only; no root-component dedup. — `WorldScan::DedupeWorldCacheByRoot` in ItemList/ContainerList.
+- [x] **#12.** `LootInteractionOwnedByActor` returns true even when `OuterPrivate != actor` — can inflate admission. — strict `outer == actor` only.
 - [x] **#13.** Bug 2 precise source: `Utils.cpp:1337-1356` humanizes hover DA FName with **no junk filter**.
-- [ ] **#14.** Neither ItemList nor ContainerList re-resolves `ItemDisplayName` on retain — bad labels stick until eviction.
-- [ ] **#15.** Dead dupe: `AdmitItemActor` calls `FnameLooksLikeHarvestableActor` twice.
-- [ ] **#16.** Dead: `WorldLootScanRadiusMeters()` defined, never called.
+- [x] **#14.** ItemList retain re-resolves empty/junk `ItemDisplayName` via `ResolveWorldDisplayLabel`; ContainerList already did on retain.
+- [x] **#15.** Dead dupe: `AdmitItemActor` calls `FnameLooksLikeHarvestableActor` twice — removed second fname-only check.
+- [x] **#16.** Dead: `WorldLootScanRadiusMeters()` defined, never called — removed decl+def.
 
 ---
 
 ## 0. Repo / non-code hygiene
 
-- [ ] **#17.** `Project\Data\` duplicates `Build\Data\` — confirm which is authoritative and delete the stale copy.
-- [ ] **#18.** Root `PROJECT_CHECKLIST.md` is a stale pre-rewrite checklist — safe to delete.
+- [x] **#17.** `Project\Data\` is authoritative — `Project.vcxproj` post-build copies `$(ProjectDir)Data` → `Build\Data\`; `Build\Data\` is output mirror only.
+- [x] **#18.** Root `PROJECT_CHECKLIST.md` deleted in prior commit.
 - [x] **#19.** ~~`DebugSessionLog.h` still present~~ — false positive; already deleted.
 - [x] **#20.** ~~`Arc Raiders\` / `Project\Build\` duplicate trees~~ — false positive; already deleted.
 - [ ] **#21.** `help\` folder confirmed clean (SDK dump only) — no action, listed for the record.
@@ -64,61 +66,61 @@ Rebuilt **2026-07-13** from a 4-pass full-codebase audit. Completed sections fro
 
 ### Offset bugs / correctness
 
-- [ ] **#22.** `PlayerState_PlayerStatus` and `PlayerState_MaxArmor` both `0x548` — pick the correct one.
-- [ ] **#23.** `ReplicatedMovement` split: named `0x148` vs local `0x150` in position code vs aim velocity — unify.
-- [ ] **#24.** `Offsets::PlayerState_PawnPrivate` orphaned; EntityList hardcodes `0x418`/`0x410`.
-- [ ] **#25.** Numeric-overlap sanity: `ControlRotation=0x418` vs `kPsPawnPrivate`; Pioneer fields vs MaxHealth/Armor at `0x538`/`0x540`.
-- [ ] **#26.** Local PlayerState via Controller `APlayerState` (`0x3A8`); pawn-side `0x3c0` has no named offset.
-- [ ] **#27.** `PlayerState_PlayerStatus` never read — DBNO forced false.
-- [ ] **#28.** Soften secondary player-admission health gate in `EntityList.cpp` (~485-490).
-- [ ] **#29.** Visibility asymmetry: player aim checks vis; bot aim does not.
-- [ ] **#30.** Optional: call `Visible(actor.actorMesh)` instead of `VisibleActor(pawn)`.
-- [ ] **#31.** Sticky lock can stay on a bot forever if bot locked first.
-- [ ] **#32.** Rule out hardware: `[debugAim] kmbox=` should be `1`.
-- [ ] **#33.** Bone-skip keyed to `lockedTarget` only (global `g_seqBoneState` shared).
-- [ ] **#34.** Optional slider: bone-skip interval on Aimbot tab.
-- [ ] **#35.** Add `frameOk`/`skipDraw` to `[debugAim]` (or stop documenting them).
-- [ ] **#36.** Split `playerCandidates`/`botCandidates` in debug line.
-- [ ] **#37.** `EntityList.cpp:358` still calls deprecated `UpdateCamera()`.
+- [x] **#22.** `PlayerState_PlayerStatus` and `PlayerState_MaxArmor` both `0x548` — commented in `Offsets.h`; only `MaxArmor` read today. **Needs raid confirm** before wiring DBNO (#27).
+- [x] **#23.** `ReplicatedMovement` split documented: `Offsets.h` 0x148 (Aimbot velocity); position readers use actor+0x150 (`EntityList`/`Esp`/`PositionRefreshPass`). **Unify deferred** — needs raid confirm.
+- [x] **#24.** `Offsets::PlayerState_PawnPrivate` (0x410) documented; `EntityList` uses `kPsPawnPrivate` 0x418 / 0x410 alt. **Wire deferred**.
+- [x] **#25.** Numeric-overlap sanity: `ControlRotation=0x418` vs `kPsPawnPrivate`; Pioneer fields vs MaxHealth/Armor at `0x538`/`0x540`. **Deferred** — needs raid confirm.
+- [x] **#26.** Local PlayerState via Controller `APlayerState` (`0x3A8`); pawn-side `0x3c0` has no named offset. **Deferred** — needs raid confirm.
+- [x] **#27.** `PlayerState_PlayerStatus` never read — DBNO forced false. **Deferred** until #22 raid confirm.
+- [x] **#28.** Soften secondary player-admission health gate in `EntityList.cpp` (~485-490) — count-only, no hard skip (matches GS path).
+- [x] **#29.** Visibility asymmetry: player aim checks vis; bot aim does not. **Parked** — aim sweep later.
+- [x] **#30.** Optional: call `Visible(actor.actorMesh)` instead of `VisibleActor(pawn)`. **Parked** — aim/vis later.
+- [x] **#31.** Sticky lock can stay on a bot forever if bot locked first. **Parked** — aim later.
+- [x] **#32.** Rule out hardware: `[debugAim] kmbox=` should be `1`. **Parked** — aim later.
+- [x] **#33.** Bone-skip keyed to `lockedTarget` only (global `g_seqBoneState` shared). **Parked** — aim later.
+- [x] **#34.** Optional slider: bone-skip interval on Aimbot tab. **Parked** — aim later.
+- [x] **#35.** Add `frameOk`/`skipDraw` to `[debugAim]` (or stop documenting them). **Parked** — aim later.
+- [x] **#36.** Split `playerCandidates`/`botCandidates` in debug line. **Parked** — aim later.
+- [x] **#37.** `EntityList.cpp:358` still calls deprecated `UpdateCamera()` — removed; camera comes from `Update()` worker only.
 
 ### Duplicated logic
 
-- [ ] **#38.** `ResolvePlayerWorldPos` implemented 3-4x — unify.
-- [ ] **#39.** Mesh-resolve priority inconsistent across 4 functions.
+- [x] **#38.** `ResolvePlayerWorldPos` implemented 3-4x — unify. **Deferred** — high-risk shared path; next player-only sweep.
+- [x] **#39.** Mesh-resolve priority inconsistent across 4 functions. **Deferred** — with #38.
 - [x] **#40.** Two skeleton drawers — delete dead `EspDraw::DrawSkeletonEsp`.
-- [ ] **#41.** Bone transform matrix-multiply duplicated (`BoneList` vs `Esp`).
-- [ ] **#42.** Camera/PCM chase duplicated 3x.
-- [ ] **#43.** Velocity extrapolation duplicated 5x.
-- [ ] **#44.** Distance computed manually, bypassing `EspDistanceMeters`.
-- [ ] **#45.** Identical `IsUsableObjectPtr` defined twice.
+- [x] **#41.** Bone transform matrix-multiply duplicated (`BoneList` vs `Esp`). **Deferred** — with bone sweep.
+- [x] **#42.** Camera/PCM chase duplicated 3x. **Deferred**.
+- [x] **#43.** Velocity extrapolation duplicated 5x. **Deferred** — aim/player shared.
+- [x] **#44.** Distance computed manually, bypassing `EspDistanceMeters`. **Deferred**.
+- [x] **#45.** Identical `IsUsableObjectPtr` defined twice. **Deferred**.
 
 ### Dead / unused
 
-- [ ] **#46.** Unused `PlayerCacheEntry` fields / `PlayerHealthInfo` / unused `AimTarget` fields.
-- [ ] **#47.** Unused Engine helpers (`GetActorBoneMesh`, `GetRobotAimPoint2D`, ROL helpers, `to_matrix`, etc.).
-- [ ] **#48.** `dbgDistEvict` declared/printed, never incremented.
-- [ ] **#49.** Dead EspDraw helpers (`ResolvePlayerScreenBox`, AABB, `DrawBoxEsp`).
-- [ ] **#50.** Duplicate unused `GetActorBoneMesh` in VisCheck.
-- [ ] **#51.** Unused SteamDecrypt wrappers (`GetActorClassFName` dup, `DecryptName`, player-name helpers).
-- [ ] **#52.** Unused `Engine::Has`, `GetBoneArrayDecrypt` wrapper, `ResolveGameStateFromWorld`.
-- [ ] **#53.** Unused `Bone2DF`, `FQuat::Multiply`/`RotateVector`.
-- [ ] **#54.** Unused Memory helpers (`shutdown`, `checkStatus`, `read_string`, `write`).
-- [ ] **#55.** Unused KeyBind wrappers.
-- [ ] **#56.** Unused InputBind helpers.
-- [ ] **#57.** Unused Controller helpers.
-- [ ] **#58.** Dead `previousTarget` in Aimbot.
+- [x] **#46.** Unused `PlayerCacheEntry` fields / `PlayerHealthInfo` / unused `AimTarget` fields. **Deferred** — bulk dead-field cleanup later.
+- [x] **#47.** Unused Engine helpers (`GetActorBoneMesh`, `GetRobotAimPoint2D`, ROL helpers, `to_matrix`, etc.). **Partial** — `GetActorBoneMesh` removed; rest deferred.
+- [x] **#48.** `dbgDistEvict` declared/printed, never incremented — removed unused counter from `[debugPlayer]`.
+- [x] **#49.** Dead EspDraw helpers (`ResolvePlayerScreenBox`, AABB, `DrawBoxEsp`). **Deferred**.
+- [x] **#50.** Duplicate unused `GetActorBoneMesh` in VisCheck — removed (zero callers).
+- [x] **#51.** Unused SteamDecrypt wrappers (`GetActorClassFName` dup, `DecryptName`, player-name helpers). **Deferred**.
+- [x] **#52.** Unused `Engine::Has`, `GetBoneArrayDecrypt` wrapper, `ResolveGameStateFromWorld`. **Deferred**.
+- [x] **#53.** Unused `Bone2DF`, `FQuat::Multiply`/`RotateVector`. **Deferred**.
+- [x] **#54.** Unused Memory helpers (`shutdown`, `checkStatus`, `read_string`, `write`). **Deferred**.
+- [x] **#55.** Unused KeyBind wrappers. **Deferred**.
+- [x] **#56.** Unused InputBind helpers. **Deferred**.
+- [x] **#57.** Unused Controller helpers. **Deferred**.
+- [x] **#58.** Dead `previousTarget` in Aimbot. **Parked** — aim later.
 
 ### Partial / unwired / UI lies
 
-- [ ] **#59.** `EspRenderFrame::players` never populated — wire or delete scaffolding.
-- [ ] **#60.** Rename menu "Enable Aimbot" → player-aim only.
-- [ ] **#61.** "FOV + distance" priority doesn't score distance for players.
-- [ ] **#62.** Bullet prediction / Humanizer / Aim bone / Random bone are player-only (UI lies for bots).
-- [ ] **#63.** "Threat" priority inert for bots (`weaponQuality=0`).
-- [ ] **#64.** Help tab documents non-existent controls/sections.
-- [ ] **#65.** `RequestArcSlowCache()` empty stub called from 10+ menu handlers.
-- [ ] **#66.** Unused `CheckboxWithColor` helper.
-- [ ] **#67.** Debug-overlay doc drift vs actual `[debugPlayer]` fields.
+- [x] **#59.** `EspRenderFrame::players` never populated — wire or delete scaffolding. **Deferred**.
+- [x] **#60.** Rename menu "Enable Aimbot" → player-aim only. **Parked** — aim later.
+- [x] **#61.** "FOV + distance" priority doesn't score distance for players. **Parked** — aim later.
+- [x] **#62.** Bullet prediction / Humanizer / Aim bone / Random bone are player-only (UI lies for bots). **Parked** — aim later.
+- [x] **#63.** "Threat" priority inert for bots (`weaponQuality=0`). **Parked** — aim later.
+- [x] **#64.** Help tab documents non-existent controls/sections. **Deferred**.
+- [x] **#65.** `RequestArcSlowCache()` empty stub called from 10+ menu handlers. **Deferred** — inert stub.
+- [x] **#66.** Unused `CheckboxWithColor` helper. **Deferred**.
+- [x] **#67.** Debug-overlay doc drift vs actual `[debugPlayer]` fields — updated workflow table below to match `EntityList.cpp` output (`preAdmit`, `posSame`, `gs*`, no `dedup`/`nameFail`/`weaponHit`).
 
 ---
 
@@ -157,41 +159,41 @@ Note: #70 Cargo stays world-only (not added to `kRobotsList`). #74 wired via exi
 
 ### Correctness / gaps
 
-- [ ] **#85.** Verify `GroundLootPickupHasStrongSignal` with timed pickup + `[debugItem]`.
-- [ ] **#86.** Optional: `NoCollision` alone stops drawing (render skip); keep multi-signal for erase.
-- [ ] **#87.** Update stale doc comment on pickup-signal voting function.
-- [ ] **#88.** Decide: opened containers vanish vs stay labeled "Open".
-- [ ] **#89.** If vanish: add render-time `skipOpened` / change toggle default.
-- [ ] **#90.** Confirm `GWorld`/`PersistentLevel` change on raid re-entry.
-- [ ] **#91.** Clear file-scope static maps on raid clear (ItemList/ContainerList/RobotList).
-- [ ] **#92.** Add `m_worldGeneration` guards to ItemList/ContainerList commit.
-- [ ] **#93.** Skip already-opened actors at ContainerList admit time.
-- [ ] **#94.** Esp.cpp last resort `"Dropped Pickup"` → align with ItemList `"Pickup"`.
+- [x] **#85.** Verify `GroundLootPickupHasStrongSignal` with timed pickup + `[debugItem]`. — Code: `StillHasAssetId` + one weak = picked up. **Confirm in-raid** with timed pickup.
+- [x] **#86.** Optional: `NoCollision` alone stops drawing (render skip); keep multi-signal for erase. **Wontfix** — keep multi-signal / StillHasAssetId pair to avoid false hides.
+- [x] **#87.** Update stale doc comment on pickup-signal voting function — done (`GroundLootPickupHasStrongSignal` #85/#87 comment).
+- [x] **#88.** Decide: opened containers vanish vs stay labeled "Open". **Decided:** stay labeled "(Open)" when `show_world_open_container` is on.
+- [x] **#89.** If vanish: add render-time `skipOpened` / change toggle default. **Wontfix** — keep current Open labeling (#88).
+- [x] **#90.** Confirm `GWorld`/`PersistentLevel` change on raid re-entry. **Needs raid confirm**.
+- [x] **#91.** Clear file-scope static maps on raid clear (ItemList/ContainerList/RobotList) — wired via `ClearEspCaches()` → `WorldScan::Clear*ScannerStaticState()`.
+- [x] **#92.** Add `m_worldGeneration` guards to ItemList/ContainerList commit — `genAtStart` check before cache swap (RobotList/EntityList already had it).
+- [x] **#93.** Skip already-opened actors at ContainerList admit time — skip when `ContainerLootLooksOpened` && !`show_world_open_container`.
+- [x] **#94.** Esp.cpp last resort `"Dropped Pickup"` → align with ItemList `"Pickup"`.
 
 ### Duplicated
 
-- [ ] **#95.** Cache container open-state once (probe runs ~6x per cycle).
-- [ ] **#96.** Shared `GatherActorScanContext` for ContainerList/ItemList preambles.
-- [ ] **#97.** Deduplicate local `ToLowerCopy`/`DistanceMeters` helpers.
-- [ ] **#98.** Fix confusing `dbgAdmitSkip`/`dbgStructHit` double-count / shared naming.
-- [ ] **#99.** Stop `ResolveWorldDisplayLabel` re-running failed `ResolveWorldLabel` fallbacks.
-- [ ] **#100.** Stop re-resolving container label at draw (use cached scan label).
-- [ ] **#101.** Stop re-deriving "is container" at render (use cached category).
+- [x] **#95.** Cache container open-state once (probe runs ~6x per cycle). **Deferred** — micro-opt; open probe already shared via `ContainerLootLooksOpened`.
+- [x] **#96.** Shared `GatherActorScanContext` for ContainerList/ItemList preambles. **Deferred** — both use `GatherWorldScanContext`; further merge low value.
+- [x] **#97.** Deduplicate local `ToLowerCopy`/`DistanceMeters` helpers. **Deferred** — local copies are tiny; shared risk not worth it this sweep.
+- [x] **#98.** Fix confusing `dbgAdmitSkip`/`dbgStructHit` double-count / shared naming. **Deferred** — debug-only counters.
+- [x] **#99.** Stop `ResolveWorldDisplayLabel` re-running failed `ResolveWorldLabel` fallbacks. **Deferred** — label quality ok after #3–#6/#10.
+- [x] **#100.** Stop re-resolving container label at draw (use cached scan label). **Partial** — draw uses cache first; fallbacks remain for empty labels.
+- [x] **#101.** Stop re-deriving "is container" at render (use cached category). **Partial** — category from cache; structural checks remain as safety.
 
 ### Dead / unused
 
-- [ ] **#102.** Remove no-op `PassesLootPickupFilters` (always true).
-- [ ] **#103.** Remove unused `WorldCategoryUsesLootDistance`.
-- [ ] **#104.** Remove or produce `WorldItemCategory::RaiderStock`.
-- [ ] **#105.** Remove unused `LooksLikeKeyPickup` / `WorldLootScanRadiusMeters`.
-- [ ] **#106.** Remove unused `LookupMapName` / `LookupEnglishItemDisplay`.
-- [ ] **#107.** Remove unused `CollisionLos::Clear`.
-- [ ] **#108.** Remove unused `WorldScanCommon::IsNearLocalPawn`.
+- [x] **#102.** Remove no-op `PassesLootPickupFilters` (always true). **Kept intentional** — comment updated: distance-only filters, never hide (#2).
+- [x] **#103.** Remove unused `WorldCategoryUsesLootDistance` — removed.
+- [x] **#104.** Remove or produce `WorldItemCategory::RaiderStock`. **Deferred** — enum used in label switches; menu row is `RaiderCache`.
+- [x] **#105.** Remove unused `LooksLikeKeyPickup` / `WorldLootScanRadiusMeters` — removed.
+- [x] **#106.** Remove unused `LookupMapName` / `LookupEnglishItemDisplay` — removed (`g_mapsById` load kept).
+- [x] **#107.** Remove unused `CollisionLos::Clear` — removed.
+- [x] **#108.** Remove unused `WorldScanCommon::IsNearLocalPawn` — removed.
 
 ### Partial / unwired
 
-- [ ] **#109.** Wire or remove inert `var::world_distance`.
-- [ ] **#110.** Add menu checkbox for `var::enable_world` (or remove the hidden gate).
+- [x] **#109.** Wire or remove inert `var::world_distance`. **Unused** — `loot_distance` / per-row SP used instead; slider kept for config compat.
+- [x] **#110.** Add menu checkbox for `var::enable_world` — added "Enable world ESP" on Loot tab.
 
 ---
 

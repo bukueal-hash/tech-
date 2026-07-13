@@ -100,21 +100,21 @@ void Engine::FinalizeWorldCacheMap(
         const bool espVisible = WorldCategoryEnabled(entry.worldCategory);
         const bool radarVisible = WorldCategoryVisibleOnRadar(filterView);
 
-        // Same tier rules as render: row SP checkbox → loot or SP slider.
-        float maxDrawM = WorldLootPickupMaxDrawMeters(cat, &filterView);
-        if (radarVisible) {
-            const float radarRangeM =
-                var::radar_range > 0.f ? var::radar_range : 100.f;
-            maxDrawM = (std::max)(maxDrawM, radarRangeM);
-        }
+        // ESP and radar keep separate distance budgets — do not let radar_range
+        // inflate ESP Drawing (render culls by loot/SP only; mismatch hid crates).
+        const float espMaxM = WorldLootPickupMaxDrawMeters(cat, &filterView);
+        const float radarMaxM =
+            var::radar_range > 0.f ? var::radar_range : 100.f;
+        const bool inEspRange = entry.Distance <= espMaxM;
+        const bool inRadarRange = radarVisible && entry.Distance <= radarMaxM;
 
-        if (entry.Distance > maxDrawM) {
+        if (!espVisible && !radarVisible) {
             entry.Drawing = false;
             ++it;
             continue;
         }
 
-        if (!espVisible && !radarVisible) {
+        if (!(espVisible && inEspRange) && !inRadarRange) {
             entry.Drawing = false;
             ++it;
             continue;

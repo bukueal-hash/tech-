@@ -552,15 +552,6 @@ void CollectHeldItemActors(uintptr_t pawn, std::unordered_set<uintptr_t>& out)
     }
 }
 
-bool IsNearLocalPawn(const Vector3& worldPos, const Vector3& localPos, float minDistCm)
-{
-    const double dx = worldPos.x - localPos.x;
-    const double dy = worldPos.y - localPos.y;
-    const double dz = worldPos.z - localPos.z;
-    const double distSq = dx * dx + dy * dy + dz * dz;
-    return distSq < static_cast<double>(minDistCm * minDistCm);
-}
-
 bool ScatterReadActorRootPositions(std::vector<CacheRootScatterRow>& rows)
 {
     if (rows.empty())
@@ -632,6 +623,51 @@ void RefreshWorldCacheRetainPositions(std::vector<WorldCacheRetainRow>& rows)
                 rows[i].entry->WorldPos = scatter.worldPos;
         }
     }
+}
+
+void DedupeWorldCacheByRoot(std::unordered_map<uintptr_t, Engine::WorldCacheEntry>& cache)
+{
+    if (cache.size() < 2)
+        return;
+
+    std::unordered_map<uintptr_t, uintptr_t> rootWinner;
+    std::unordered_set<uintptr_t> losers;
+
+    auto prefer = [&](uintptr_t aKey, uintptr_t bKey) -> uintptr_t {
+        const auto aIt = cache.find(aKey);
+        const auto bIt = cache.find(bKey);
+        if (aIt == cache.end())
+            return bKey;
+        if (bIt == cache.end())
+            return aKey;
+        const auto& a = aIt->second;
+        const auto& b = bIt->second;
+        if (a.lootValue != b.lootValue)
+            return (a.lootValue > b.lootValue) ? aKey : bKey;
+        const bool aName = !a.ItemDisplayName.empty();
+        const bool bName = !b.ItemDisplayName.empty();
+        if (aName != bName)
+            return aName ? aKey : bKey;
+        return aKey;
+    };
+
+    for (const auto& [key, entry] : cache) {
+        const uintptr_t root = entry.rootComponent;
+        if (!root)
+            continue;
+        const auto it = rootWinner.find(root);
+        if (it == rootWinner.end()) {
+            rootWinner.emplace(root, key);
+            continue;
+        }
+        const uintptr_t keep = prefer(key, it->second);
+        const uintptr_t drop = (keep == key) ? it->second : key;
+        it->second = keep;
+        losers.insert(drop);
+    }
+
+    for (uintptr_t key : losers)
+        cache.erase(key);
 }
 
 } // namespace WorldScan

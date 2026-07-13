@@ -6,8 +6,6 @@
 bool AssetNamesInit();
 
 std::string LookupByAssetName(const std::string& assetName);
-/** Map id from Bots_Items_Maps (e.g. dam_battlegrounds) -> display name. */
-std::string LookupMapName(const std::string& mapId);
 /** English display from numeric game asset id (asset_index.csv). */
 std::string LookupDisplayByAssetId(int64_t assetId);
 /** Read game asset id from world item actor (ItemDataAsset chain); 0 if unknown. */
@@ -48,11 +46,6 @@ std::string GetActorDataAssetFName(uint64_t actor);
 std::string GetEnemyTypeDataAssetFName(uint64_t actor);
 /** Resolved bot display from constructable enemy data asset pointers. */
 std::string ResolveEnemyAssetBotLabel(uintptr_t actor);
-/** English display: asset tables first, then memory/fname fallbacks. */
-std::string LookupEnglishItemDisplay(
-    uint64_t actor,
-    const std::string& fnameHint,
-    const std::string& memoryHint);
 /** Try display, hover name, fname, and asset tables for items_meta.json hit. */
 bool ResolveItemMetaForActor(
     class Engine& eng,

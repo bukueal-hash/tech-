@@ -329,24 +329,6 @@ static bool MeshHasEncryptedBoneBlock(uintptr_t mesh)
 		&& _mm_cvtsi128_si64(enc830) != 0;
 }
 
-uintptr_t Engine::GetActorBoneMesh(uintptr_t actor)
-{
-	if (!actor)
-		return 0;
-
-	const uintptr_t embark =
-		Memory::read<uintptr_t>(actor + Offsets::EmbarkMesh);
-	const uintptr_t skel =
-		Memory::read<uintptr_t>(actor + Offsets::USkeletalMeshComponent);
-
-	if (embark && IsValidPointer(embark) && MeshHasEncryptedBoneBlock(embark))
-		return embark;
-	if (skel && IsValidPointer(skel) && MeshHasEncryptedBoneBlock(skel))
-		return skel;
-
-	return GetActorSkeletalMesh(actor);
-}
-
 uintptr_t Engine::GetActorSkeletalMesh(uintptr_t actor) const
 {
 	if (!actor)

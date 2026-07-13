@@ -788,6 +788,9 @@ void Engine::CheckWorldTransition(uintptr_t newWorld, uintptr_t newPersistentLev
 void Engine::ClearEspCaches()
 {
 	WorldScan::ClearCachedActorPtrs();
+	WorldScan::ClearItemScannerStaticState();
+	WorldScan::ClearContainerScannerStaticState();
+	WorldScan::ClearRobotScannerStaticState();
 	{
 		std::unique_lock<std::shared_mutex> lk(m_playerCacheMutex);
 		playerCache.clear();

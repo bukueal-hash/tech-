@@ -491,7 +491,6 @@ void ScheduleWorldRebuild(uintptr_t uworld,const Vector3& localPos) {
 		s_rebuilding.store(false,std::memory_order_release);
 	}).detach();
 }
-void Clear() { std::lock_guard lk(g_mutex); delete g_tree; g_tree=nullptr; g_triCount=0; g_lastSmcCount.store(0); }
 std::size_t TriangleCount() { std::lock_guard lk(g_mutex); return g_triCount; }
 std::size_t LastSmcCount() { return g_lastSmcCount.load(std::memory_order_acquire); }
 bool IsRebuilding() { return s_rebuilding.load(std::memory_order_acquire); }

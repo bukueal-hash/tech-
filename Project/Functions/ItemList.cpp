@@ -103,9 +103,6 @@ bool AdmitItemActor(
     if (hasContainerLoot && !fnameIsPickup && !classGroundLoot)
         return false;
 
-    if (!fname.empty() && FnameLooksLikeHarvestableActor(fname))
-        return true;
-
     if (!fname.empty() && FnameAdmitsWorldActor(fname)) {
         if (IsStrictWorldLootFname(fname) && !fnameIsContainer)
             return true;
@@ -215,6 +212,13 @@ static void ClearItemPosMiss(uintptr_t key)
     s_itemPosMisses.erase(key);
 }
 
+static void ClearItemListStaticMaps()
+{
+    s_depletedDeny.clear();
+    s_pickupEvictAfter.clear();
+    s_itemPosMisses.clear();
+}
+
 static bool IsItemAdmissionDenied(uintptr_t key)
 {
     const auto now = std::chrono::steady_clock::now();
@@ -273,6 +277,9 @@ void Engine::ItemList()
     WorldScanContext ctx{};
     if (!GatherWorldScanContext(ctx))
         return;
+
+    const uint64_t genAtStart =
+        m_worldGeneration.load(std::memory_order_acquire);
 
     std::unordered_map<uintptr_t, WorldCacheEntry> localCache;
     {
@@ -442,7 +449,14 @@ void Engine::ItemList()
         if (fname.empty() && !dataAssetFName.empty())
             fname = dataAssetFName;
 
-        std::string displayName = ResolveWorldDisplayLabel(key, labelFname, 0);
+        const std::string fnameLower = ToLowerCopy(fname);
+        // Classify before label resolve so harvestable/category fallbacks fire (#10).
+        WorldItemCategory cat = ClassifyItem(
+            fnameLower, std::string{}, hasLootInteraction,
+            classGroundLoot, classChest, fnameIsPickup, fnameIsContainer);
+
+        std::string displayName = ResolveWorldDisplayLabel(
+            key, labelFname, static_cast<int>(cat));
         if (displayName.empty() || IsJunkWorldEspLabel(displayName)
             || IsGarbledEspLabel(displayName) || !IsPlausibleEspLabel(displayName))
             displayName.clear();
@@ -491,10 +505,8 @@ void Engine::ItemList()
         if (displayName.empty())
             continue;
 
-        const std::string fnameLower = ToLowerCopy(fname);
         const std::string displayLower = ToLowerCopy(displayName);
-
-        const WorldItemCategory cat = ClassifyItem(
+        cat = ClassifyItem(
             fnameLower, displayLower, hasLootInteraction,
             classGroundLoot, classChest, fnameIsPickup, fnameIsContainer);
 
@@ -514,6 +526,8 @@ void Engine::ItemList()
         entry.WorldPos = worldPos;
         ++dbgAdmitted;
     }
+
+    WorldScan::DedupeWorldCacheByRoot(localCache);
 
     std::vector<decltype(localCache)::iterator> retainIters;
     std::vector<uintptr_t> retainRoots;
@@ -582,6 +596,27 @@ void Engine::ItemList()
             it->second.worldCategory = static_cast<uint8_t>(fixed);
         }
 
+        if (IsJunkWorldEspLabel(it->second.ItemDisplayName)
+            || IsGarbledEspLabel(it->second.ItemDisplayName)
+            || it->second.ItemDisplayName.empty()) {
+            const auto cat = static_cast<WorldItemCategory>(it->second.worldCategory);
+            std::string fixed = ResolveWorldDisplayLabel(
+                key, retainFname, static_cast<int>(cat));
+            if (fixed.empty() || IsJunkWorldEspLabel(fixed)
+                || IsGarbledEspLabel(fixed) || !IsPlausibleEspLabel(fixed))
+                fixed.clear();
+            if (fixed.empty()) {
+                const bool fnameIsPickup = FnameLooksLikeDroppedPickup(retainFname)
+                    || FnameLooksLikeDroppedPickup(retainClass);
+                fixed = fnameIsPickup ? "Pickup" : "Item";
+            }
+            fixed = FormatEspDisplayLabel(fixed);
+            if (!fixed.empty()) {
+                it->second.ItemDisplayName = fixed;
+                it->second.ItemType = fixed;
+            }
+        }
+
         retainIters.push_back(it);
         retainRoots.push_back(0);
         ++it;
@@ -632,6 +667,9 @@ void Engine::ItemList()
     }
 
     FinalizeWorldCacheMap(localCache, ctx.camera, ctx.acknowledgedPawn, dbgDrawing);
+
+    if (m_worldGeneration.load(std::memory_order_acquire) != genAtStart)
+        return;
 
     {
         std::unique_lock<std::shared_mutex> lock(m_itemCacheMutex);
@@ -691,3 +729,12 @@ void Engine::ItemList()
             << std::endl;
     }
 }
+
+namespace WorldScan {
+
+void ClearItemScannerStaticState()
+{
+    ClearItemListStaticMaps();
+}
+
+} // namespace WorldScan

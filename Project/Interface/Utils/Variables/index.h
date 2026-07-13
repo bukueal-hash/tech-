@@ -121,6 +121,7 @@ namespace var {
     extern bool show_world_supply_station;
     extern bool show_world_keys;
     extern bool show_world_locker;
+    extern bool show_world_trash;
     extern bool show_world_safe;
     extern bool show_world_buried;
     extern bool show_world_deaddrop;
@@ -148,6 +149,7 @@ namespace var {
     extern float color_world_supply_station[4];
     extern float color_world_keys[4];
     extern float color_world_locker[4];
+    extern float color_world_trash[4];
     extern float color_world_safe[4];
     extern float color_world_buried[4];
     extern float color_world_deaddrop[4];
@@ -196,7 +198,7 @@ inline bool AnyWorldEspEnabled()
         var::show_world_medical || var::show_world_other || var::show_world_probe ||
         var::show_world_vehicles || var::show_world_weapon_case ||
         var::show_world_field_crate || var::show_world_supply_station ||
-        var::show_world_keys || var::show_world_locker ||
+        var::show_world_keys || var::show_world_locker || var::show_world_trash ||
         var::show_world_safe || var::show_world_buried || var::show_world_deaddrop ||
         var::show_world_open_container);
 }

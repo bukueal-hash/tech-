@@ -79,6 +79,7 @@ namespace var {
     bool show_world_supply_station = true;
     bool show_world_keys = true;
     bool show_world_locker = true;
+    bool show_world_trash = true;
     bool show_world_safe = true;
     bool show_world_buried = true;
     bool show_world_deaddrop = true;
@@ -108,6 +109,7 @@ namespace var {
     float color_world_supply_station[4] = { 1.0f, 165.f / 255.f, 0.0f, 1.0f };
     float color_world_keys[4] = { 1.0f, 215.f / 255.f, 0.0f, 1.0f };
     float color_world_locker[4] = { 0.6f, 0.85f, 1.0f, 1.0f };
+    float color_world_trash[4] = { 0.5f, 0.5f, 0.5f, 1.0f };
     float color_world_safe[4] = { 0.85f, 0.75f, 0.2f, 1.0f };
     float color_world_buried[4] = { 0.75f, 0.55f, 0.35f, 1.0f };
     float color_world_deaddrop[4] = { 0.9f, 0.4f, 0.9f, 1.0f };

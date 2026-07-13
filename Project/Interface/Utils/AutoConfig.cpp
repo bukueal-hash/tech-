@@ -163,6 +163,7 @@ struct Snapshot {
     bool show_world_supply_station{};
     bool show_world_keys{};
     bool show_world_locker{};
+    bool show_world_trash{};
     bool show_world_safe{};
     bool show_world_buried{};
     bool show_world_deaddrop{};
@@ -190,6 +191,7 @@ struct Snapshot {
     float color_world_supply_station[4]{};
     float color_world_keys[4]{};
     float color_world_locker[4]{};
+    float color_world_trash[4]{};
     float color_world_safe[4]{};
     float color_world_buried[4]{};
     float color_world_deaddrop[4]{};
@@ -248,6 +250,7 @@ void MigrateWorldColorsFromLoot()
         var::color_world_supply_station,
         var::color_world_keys,
         var::color_world_locker,
+        var::color_world_trash,
         var::color_world_open_container,
         var::color_world_safe,
         var::color_world_buried,
@@ -345,6 +348,7 @@ Snapshot CaptureSnapshot()
     s.show_world_supply_station = var::show_world_supply_station;
     s.show_world_keys = var::show_world_keys;
     s.show_world_locker = var::show_world_locker;
+    s.show_world_trash = var::show_world_trash;
     s.show_world_safe = var::show_world_safe;
     s.show_world_buried = var::show_world_buried;
     s.show_world_deaddrop = var::show_world_deaddrop;
@@ -372,6 +376,7 @@ Snapshot CaptureSnapshot()
     std::memcpy(s.color_world_supply_station, var::color_world_supply_station, sizeof(s.color_world_supply_station));
     std::memcpy(s.color_world_keys, var::color_world_keys, sizeof(s.color_world_keys));
     std::memcpy(s.color_world_locker, var::color_world_locker, sizeof(s.color_world_locker));
+    std::memcpy(s.color_world_trash, var::color_world_trash, sizeof(s.color_world_trash));
     std::memcpy(s.color_world_safe, var::color_world_safe, sizeof(s.color_world_safe));
     std::memcpy(s.color_world_buried, var::color_world_buried, sizeof(s.color_world_buried));
     std::memcpy(s.color_world_deaddrop, var::color_world_deaddrop, sizeof(s.color_world_deaddrop));
@@ -486,6 +491,7 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.show_world_supply_station == b.show_world_supply_station &&
         a.show_world_keys == b.show_world_keys &&
         a.show_world_locker == b.show_world_locker &&
+        a.show_world_trash == b.show_world_trash &&
         a.show_world_safe == b.show_world_safe &&
         a.show_world_buried == b.show_world_buried &&
         a.show_world_deaddrop == b.show_world_deaddrop &&
@@ -513,6 +519,7 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         ColorsEqual(a.color_world_supply_station, b.color_world_supply_station) &&
         ColorsEqual(a.color_world_keys, b.color_world_keys) &&
         ColorsEqual(a.color_world_locker, b.color_world_locker) &&
+        ColorsEqual(a.color_world_trash, b.color_world_trash) &&
         ColorsEqual(a.color_world_safe, b.color_world_safe) &&
         ColorsEqual(a.color_world_buried, b.color_world_buried) &&
         ColorsEqual(a.color_world_deaddrop, b.color_world_deaddrop) &&
@@ -651,6 +658,7 @@ static bool ApplyWorldColorConfigKey(const std::string& key, const std::string& 
         {"color_world_supply_station", var::color_world_supply_station},
         {"color_world_keys", var::color_world_keys},
         {"color_world_locker", var::color_world_locker},
+        {"color_world_trash", var::color_world_trash},
         {"color_world_open_container", var::color_world_open_container},
         {"color_world_safe", var::color_world_safe},
         {"color_world_buried", var::color_world_buried},
@@ -697,6 +705,7 @@ static bool ApplyWorldConfigKey(const std::string& key, const std::string& val)
     if (key == "show_world_supply_station") { var::show_world_supply_station = ParseBool(val, var::show_world_supply_station); return true; }
     if (key == "show_world_keys") { var::show_world_keys = ParseBool(val, var::show_world_keys); return true; }
     if (key == "show_world_locker") { var::show_world_locker = ParseBool(val, var::show_world_locker); return true; }
+    if (key == "show_world_trash") { var::show_world_trash = ParseBool(val, var::show_world_trash); return true; }
     if (key == "show_world_open_container") { var::show_world_open_container = ParseBool(val, var::show_world_open_container); return true; }
     if (key == "show_world_safe") { var::show_world_safe = ParseBool(val, var::show_world_safe); return true; }
     if (key == "show_world_buried") { var::show_world_buried = ParseBool(val, var::show_world_buried); return true; }
@@ -952,6 +961,7 @@ void WriteIni()
     file << "show_world_supply_station=" << (var::show_world_supply_station ? 1 : 0) << '\n';
     file << "show_world_keys=" << (var::show_world_keys ? 1 : 0) << '\n';
     file << "show_world_locker=" << (var::show_world_locker ? 1 : 0) << '\n';
+    file << "show_world_trash=" << (var::show_world_trash ? 1 : 0) << '\n';
     file << "show_world_open_container=" << (var::show_world_open_container ? 1 : 0) << '\n';
     file << "show_world_safe=" << (var::show_world_safe ? 1 : 0) << '\n';
     file << "show_world_buried=" << (var::show_world_buried ? 1 : 0) << '\n';
@@ -981,6 +991,7 @@ void WriteIni()
     WriteColor4(file, "color_world_supply_station", var::color_world_supply_station);
     WriteColor4(file, "color_world_keys", var::color_world_keys);
     WriteColor4(file, "color_world_locker", var::color_world_locker);
+    WriteColor4(file, "color_world_trash", var::color_world_trash);
     WriteColor4(file, "color_world_open_container", var::color_world_open_container);
     WriteColor4(file, "color_world_safe", var::color_world_safe);
     WriteColor4(file, "color_world_buried", var::color_world_buried);

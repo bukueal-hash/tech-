@@ -22,7 +22,7 @@ inline bool AnyContainerEspEnabled()
         var::show_world_crate || var::show_world_furniture || var::show_world_harvestable ||
         var::show_world_industrial || var::show_world_other || var::show_world_probe ||
         var::show_world_vehicles || var::show_world_weapon_case || var::show_world_field_crate ||
-        var::show_world_supply_station || var::show_world_locker ||
+        var::show_world_supply_station || var::show_world_locker || var::show_world_trash ||
         var::show_world_safe || var::show_world_buried || var::show_world_deaddrop ||
         var::show_world_open_container);
 }
@@ -247,6 +247,11 @@ static void ClearContainerPosMiss(uintptr_t key)
     s_containerPosMisses.erase(key);
 }
 
+static void ClearContainerListStaticMaps()
+{
+    s_containerPosMisses.clear();
+}
+
 } // namespace
 
 void Engine::ContainerList()
@@ -262,6 +267,9 @@ void Engine::ContainerList()
     WorldScanContext ctx{};
     if (!GatherWorldScanContext(ctx))
         return;
+
+    const uint64_t genAtStart =
+        m_worldGeneration.load(std::memory_order_acquire);
 
     std::unordered_map<uintptr_t, WorldCacheEntry> localCache;
     {
@@ -448,9 +456,18 @@ void Engine::ContainerList()
         if (!QuickContainerCandidate(
                 maskedType, classChest, actorTypeChest, fname, classFname,
                 hasContainerLoot, hasLootInteraction)) {
-            ++dbgPreSkip;
-            continue;
+            // Chest class / actor-type still qualifies even when fname decrypt
+            // and loot pointers flake (blank ESP while standing on crates).
+            if (!classChest && !actorTypeChest && !fnameIsContainer)
+            {
+                ++dbgPreSkip;
+                continue;
+            }
         }
+
+        if (ContainerLootLooksOpened(key, fname.empty() ? classFname : fname)
+            && !var::show_world_open_container)
+            continue;
 
         const bool looksLikeContainer =
             classChest || actorTypeChest || fnameIsContainer
@@ -628,6 +645,8 @@ void Engine::ContainerList()
     }
     }
 
+    WorldScan::DedupeWorldCacheByRoot(localCache);
+
     std::vector<decltype(localCache)::iterator> retainIters;
     std::vector<uintptr_t> retainRoots;
     retainIters.reserve(localCache.size());
@@ -732,6 +751,9 @@ void Engine::ContainerList()
 
     FinalizeWorldCacheMap(localCache, ctx.camera, ctx.acknowledgedPawn, dbgDrawing);
 
+    if (m_worldGeneration.load(std::memory_order_acquire) != genAtStart)
+        return;
+
     {
         std::unique_lock<std::shared_mutex> lock(m_containerCacheMutex);
         containerCache = std::move(localCache);
@@ -818,3 +840,12 @@ void Engine::ContainerList()
             << std::endl;
     }
 }
+
+namespace WorldScan {
+
+void ClearContainerScannerStaticState()
+{
+    ClearContainerListStaticMaps();
+}
+
+} // namespace WorldScan

@@ -65,13 +65,6 @@ std::string DirectContainerKeywordLabel(
     const std::string& classFname,
     const std::string& dataAssetFname);
 
-/** Ground key pickups (DA_Item_*Key*, keycards) — not piano/skills. */
-bool LooksLikeKeyPickup(
-    Engine& eng,
-    uintptr_t actor,
-    const std::string& fname,
-    const std::string& display);
-
 const char* WorldItemCategoryLabel(WorldItemCategory cat);
 /** Guaranteed ESP label when a container has no specific resolved name. */
 std::string ContainerCategoryFallbackEspLabel(WorldItemCategory cat);
@@ -171,13 +164,11 @@ bool IsGarbledEspLabel(const std::string& label);
 bool FnameLooksLikeEngineSubobjectClass(const std::string& fname);
 /** Reject decrypt junk and non-readable ESP labels. */
 bool IsPlausibleEspLabel(const std::string& label);
-bool WorldCategoryUsesLootDistance(WorldItemCategory cat);
 bool WorldCategoryIsContainerProp(WorldItemCategory cat);
 bool WorldCategoryHasSpConfig(WorldItemCategory cat);
 bool WorldCategoryUsesSpContainerRange(WorldItemCategory cat);
 void SetContainerRangeSp(WorldItemCategory cat, bool useSp);
 float WorldCategoryMaxDrawMeters(WorldItemCategory cat);
-float WorldLootScanRadiusMeters();
 int LootMinRarityMenuToMinTier(int menuIndex);
 float WorldLootPickupMaxDrawMeters(WorldItemCategory cat, const WorldLootFilterView* loot);
 bool WorldLootEntryLooksLikeContainer(const WorldLootFilterView& loot);

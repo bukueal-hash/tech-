@@ -27,6 +27,10 @@ const std::vector<uintptr_t>& CachedActorPtrs();
 
 void ClearCachedActorPtrs();
 
+void ClearItemScannerStaticState();
+void ClearContainerScannerStaticState();
+void ClearRobotScannerStaticState();
+
 void PruneStaleEntries(
     std::unordered_map<uintptr_t, Engine::WorldCacheEntry>& cache,
     const std::unordered_set<uint64_t>& currentSet);
@@ -56,9 +60,6 @@ bool IsHeldEquipmentActor(uintptr_t actor);
  */
 void CollectHeldItemActors(uintptr_t pawn, std::unordered_set<uintptr_t>& out);
 
-/** True when world position is within minDistCm of local player (default 3.5m). */
-bool IsNearLocalPawn(const Vector3& worldPos, const Vector3& localPos, float minDistCm = 350.f);
-
 struct CacheRootScatterRow {
     uintptr_t actorKey = 0;
     uintptr_t root = 0;
@@ -78,5 +79,11 @@ struct WorldCacheRetainRow {
 
 /** Scatter-refresh root + world position for item/container cache retain rows. */
 void RefreshWorldCacheRetainPositions(std::vector<WorldCacheRetainRow>& rows);
+
+/**
+ * Keep one cache entry per rootComponent. Prefer higher lootValue, then
+ * non-empty display name, then the later-scanned actor key.
+ */
+void DedupeWorldCacheByRoot(std::unordered_map<uintptr_t, Engine::WorldCacheEntry>& cache);
 
 } // namespace WorldScan

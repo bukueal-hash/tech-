@@ -758,6 +758,11 @@ static void ClearBotVisualMiss(uintptr_t key)
     s_botVisualMisses.erase(key);
 }
 
+static void ClearRobotListStaticMaps()
+{
+    s_botVisualMisses.clear();
+}
+
 bool HasLiveBotVisual(uintptr_t actor, uintptr_t mesh)
 {
     const uintptr_t root = Memory::read<uintptr_t>(actor + Offsets::RootComponent);
@@ -1255,3 +1260,12 @@ void Engine::RobotList()
             << std::endl;
     }
 }
+
+namespace WorldScan {
+
+void ClearRobotScannerStaticState()
+{
+    ClearRobotListStaticMaps();
+}
+
+} // namespace WorldScan

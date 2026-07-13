@@ -786,62 +786,6 @@ static bool FnameOrDisplayHasKeyToken(const std::string& f, const std::string& d
     return false;
 }
 
-bool LooksLikeKeyPickup(
-    Engine& eng,
-    uintptr_t actor,
-    const std::string& fname,
-    const std::string& display)
-{
-    const std::string f = ToLowerLocal(fname);
-    const std::string d = ToLowerLocal(display);
-
-    if (Contains(f, "piano") || Contains(d, "piano"))
-        return false;
-    if (Contains(f, "characterskill") || Contains(f, "vaultspring") || Contains(d, "vault spring"))
-        return false;
-    if (Contains(f, "safe pocket") || Contains(d, "safe pocket"))
-        return false;
-
-    if (actor) {
-        if (const std::string dataAsset = GetActorDataAssetFName(actor); !dataAsset.empty()) {
-            const std::string da = ToLowerLocal(dataAsset);
-            if (Contains(da, "da_item_keyitem"))
-                return true;
-            if (da.find("key") != std::string::npos
-                && (Contains(da, "da_item_salvage") || Contains(da, "salvage_")))
-                return true;
-            int tier = 0;
-            int value = 0;
-            if (LookupItemMetaByAssetName(dataAsset, tier, value)
-                && FnameOrDisplayHasKeyToken(da, ToLowerLocal(LookupByAssetName(dataAsset))))
-                return true;
-        }
-    }
-
-    if (!fname.empty()) {
-        if (const std::string fromAsset = LookupByAssetName(fname); !fromAsset.empty()) {
-            const std::string al = ToLowerLocal(fromAsset);
-            if (FnameOrDisplayHasKeyToken(f, al))
-                return true;
-        }
-    }
-
-    if (FnameOrDisplayHasKeyToken(f, d))
-        return true;
-
-    if (actor) {
-        int tier = 0;
-        int value = 0;
-        if (ResolveItemMetaForActor(eng, actor, fname, display, tier, value)) {
-            const std::string metaDisplay = !display.empty() ? display : LookupByAssetName(fname);
-            if (FnameOrDisplayHasKeyToken(ToLowerLocal(fname), ToLowerLocal(metaDisplay)))
-                return true;
-        }
-    }
-
-    return false;
-}
-
 const char* WorldItemCategoryLabel(WorldItemCategory cat)
 {
     switch (cat) {
@@ -905,11 +849,6 @@ std::string ContainerCategoryFallbackEspLabel(WorldItemCategory cat)
     case WorldItemCategory::OpenedContainer:    return "Open Container";
     default:                                    return "Container";
     }
-}
-
-bool WorldCategoryUsesLootDistance(WorldItemCategory /*cat*/)
-{
-    return true;
 }
 
 namespace {
@@ -1097,11 +1036,6 @@ float WorldLootPickupMaxDrawMeters(WorldItemCategory cat, const WorldLootFilterV
     return WorldCategoryMaxDrawMeters(cat);
 }
 
-float WorldLootScanRadiusMeters()
-{
-    return (std::max)(var::loot_distance, var::container_distance_sp);
-}
-
 int LootMinRarityMenuToMinTier(int menuIndex)
 {
     if (menuIndex <= 0)
@@ -1138,8 +1072,8 @@ bool LootItemLooksLikePickup(const WorldLootFilterView& loot)
 
 bool PassesLootPickupFilters(const WorldLootFilterView& loot)
 {
-    // Never hide. Value/rarity + SP only choose close vs far draw distance
-    // (see WorldLootPickupMaxDrawMeters). Call sites keep this gate for wiring.
+    // Intentional no-op: never hide pickups. Value/rarity + SP only choose close vs far
+    // draw distance (WorldLootPickupMaxDrawMeters). Call sites keep this gate for wiring (#102).
     (void)loot;
     return true;
 }
@@ -1702,11 +1636,9 @@ bool LootInteractionOwnedByActor(uintptr_t component, uintptr_t actor)
     if (!component || !actor || !Memory::IsValidPtrFast2(component))
         return false;
     // UObject::OuterPrivate @ 0x20 — component must belong to this actor.
+    // Strict: never treat a foreign LootInteraction pointer as owned (inflated admits).
     const uintptr_t outer = Memory::read<uintptr_t>(component + 0x20);
-    if (outer == actor)
-        return true;
-    // Decrypt path when OuterPrivate layout differs or is encrypted.
-    return PointerIsLootInteractionComponent(component);
+    return outer == actor;
 }
 
 bool FnameExcludedFromContainerEsp(const std::string& fnameLower)
@@ -2168,7 +2100,7 @@ bool GroundLootPickupHasStrongSignal(GroundLootPickupSignal sig)
     // After pickup the game often leaves the item DA / asset id on the shell
     // and only clears collision or SpawnItems. Alone, those weaks never hit
     // the old >=2 bar → ESP lingered ~30–40s until destroy. Treat lingering
-    // identity + one physical clear as picked up.
+    // identity + one physical clear as picked up (#85/#87).
     const bool stillId = (sig & S::StillHasAssetId) != S::None;
     if (stillId
         && ((sig & S::NoCollision) != S::None
@@ -2512,7 +2444,7 @@ uint32_t WorldCategoryLabelColor(WorldItemCategory cat)
     case WorldItemCategory::Locker:
         return ColorFromPicker(var::color_world_locker);
     case WorldItemCategory::Trash:
-        return IM_COL32(128, 128, 128, 255);
+        return ColorFromPicker(var::color_world_trash);
     case WorldItemCategory::Safe:
         return ColorFromPicker(var::color_world_safe);
     case WorldItemCategory::Buried:
@@ -2637,7 +2569,7 @@ bool WorldCategoryEnabled(int category)
     case WorldItemCategory::Locker:
         return var::show_world_locker || var::showLoot;
     case WorldItemCategory::Trash:
-        return var::show_world_other || var::showLoot;
+        return var::show_world_trash || var::showLoot;
     case WorldItemCategory::Safe:
         return var::show_world_safe || var::showLoot;
     case WorldItemCategory::Buried:

@@ -983,15 +983,6 @@ std::string LookupByAssetName(const std::string& assetName)
     return {};
 }
 
-std::string LookupMapName(const std::string& mapId)
-{
-    if (mapId.empty())
-        return {};
-    if (auto it = g_mapsById.find(mapId); it != g_mapsById.end())
-        return it->second;
-    return {};
-}
-
 static std::string AssetIdToKey(int64_t assetId)
 {
     return std::to_string(assetId);
@@ -1674,46 +1665,6 @@ bool ResolveItemMetaForActor(
     }
 
     return false;
-}
-
-std::string LookupEnglishItemDisplay(
-    uint64_t actor,
-    const std::string& fnameHint,
-    const std::string& memoryHint)
-{
-    if (actor) {
-        if (const int64_t gameAssetId = TryReadItemGameAssetIdFromActor(actor); gameAssetId != 0) {
-            if (const std::string fromId = LookupDisplayByAssetId(gameAssetId);
-                !fromId.empty() && !IsGenericWorldEspLabel(fromId))
-                return fromId;
-        }
-
-        if (const std::string dataAsset = GetActorDataAssetFName(actor); !dataAsset.empty()) {
-            if (const std::string fromAsset = LookupByAssetName(dataAsset); !fromAsset.empty()
-                && !IsGenericWorldEspLabel(fromAsset))
-                return fromAsset;
-        }
-    }
-
-    if (!fnameHint.empty()) {
-        if (const std::string fromAsset = LookupByAssetName(fnameHint); !fromAsset.empty()
-            && !IsGenericWorldEspLabel(fromAsset))
-            return fromAsset;
-        if (const std::string fromIdx = LookupDisplayByFNameAssetIndex(fnameHint);
-            !fromIdx.empty() && !IsGenericWorldEspLabel(fromIdx))
-            return fromIdx;
-    }
-
-    if (!memoryHint.empty() && !IsGenericWorldEspLabel(memoryHint))
-        return memoryHint;
-
-    if (!fnameHint.empty()) {
-        if (const std::string human = HumanizeActorFName(fnameHint);
-            !human.empty() && !IsGenericWorldEspLabel(human))
-            return human;
-    }
-
-    return {};
 }
 
 std::string LookupDisplayByFNameAssetIndex(const std::string& actorFName)

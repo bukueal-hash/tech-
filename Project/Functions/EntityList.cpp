@@ -330,7 +330,6 @@ void Engine::EntityList()
     int dbgTeamEvict = 0;
     int dbgPsEvict = 0;
     int dbgPosEvict = 0;
-    int dbgDistEvict = 0;
     int dbgDistSkip = 0;
     int dbgBoneMiss = 0;
     int dbgWorldBox = 0;
@@ -354,8 +353,6 @@ void Engine::EntityList()
     std::unordered_set<uint64_t> currentActorSet(
         currentActors.begin(),
         currentActors.end());
-
-    UpdateCamera();
 
     CameraCache cam{};
     {
@@ -485,8 +482,7 @@ void Engine::EntityList()
         const float health = ReadPawnHealthForAdmit(actor);
         if (health < 1.0f) {
             ++dbgHealthSkip;
-            // Soft skip — GS path already admits; secondary path requires some health signal.
-            continue;
+            // Soft: count only — GS path already admits; do not hard-skip (#28).
         }
 
         const uintptr_t root =
@@ -729,7 +725,6 @@ void Engine::EntityList()
                 << " psEvict=" << dbgPsEvict
                 << " posEvict=" << dbgPosEvict
                 << " distSkip=" << dbgDistSkip
-                << " distEvict=" << dbgDistEvict
                 << " boneMiss=" << dbgBoneMiss
                 << " worldBox=" << dbgWorldBox
                 << " ghostEvict=" << dbgGhostEvict

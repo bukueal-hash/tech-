@@ -398,6 +398,11 @@ void DrawArcEspTab()
 
 void DrawArcLootTab()
 {
+    if (ArcMenuLayout::Checkbox("Enable world ESP", &var::enable_world))
+        RequestArcSlowCache();
+    ArcMenuHoverTooltip(
+        "Master switch for item/container scanners and world radar blips. Off = no world cache updates.");
+
     ImGui::Separator();
     ImGui::Text("Loot");
     ArcMenuHoverTooltip("Loot container ESP settings.");
@@ -488,6 +493,7 @@ void DrawArcLootTab()
     ContainerTypeRow("Supply station", &var::show_world_supply_station, var::color_world_supply_station, "##col_w_supply", WorldItemCategory::SupplyCallStation);
     ContainerTypeRow("Keys", &var::show_world_keys, var::color_world_keys, "##col_w_keys", WorldItemCategory::Keys);
     ContainerTypeRow("Locker", &var::show_world_locker, var::color_world_locker, "##col_w_locker", WorldItemCategory::Locker);
+    ContainerTypeRow("Trash", &var::show_world_trash, var::color_world_trash, "##col_w_trash", WorldItemCategory::Trash);
     ContainerTypeRow("Open container", &var::show_world_open_container, var::color_world_open_container, "##col_w_open", WorldItemCategory::OpenedContainer);
     ArcMenuHoverTooltip("Already searched/opened containers. Uses its own color so you can tell at a glance.");
     ContainerTypeRow("Safe", &var::show_world_safe, var::color_world_safe, "##col_w_safe", WorldItemCategory::Safe);
