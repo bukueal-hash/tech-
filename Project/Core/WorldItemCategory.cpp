@@ -1724,6 +1724,10 @@ bool FnameExcludedFromContainerEsp(const std::string& fnameLower)
         "spline",
         "uaid",
         "cuaid",
+        // POI trigger volumes + Slate FWindowStyle class misreads → floating
+        // "F Window Style" ESP with no mesh (debug-5681af runId=names).
+        "pointofinterest",
+        "windowstyle",
     };
     for (const char* token : kBlocked) {
         if (fnameLower.find(token) != std::string::npos)
@@ -1856,9 +1860,23 @@ bool IsJunkWorldEspLabel(const std::string& label)
         "persistent level",
         "online store",
         "health service",
+        "instance",
+        " level instance",
+        "level instance",
+        // Humanized Slate FWindowStyle (POI volume class misread).
+        "window style",
+        "f window style",
+        "f window",
     };
     for (const char* token : kBlocked) {
         if (lower.find(token) != std::string::npos)
+            return true;
+    }
+
+    // Humanized UE Instantiators / Blueprint copies end up as "Foo Instance".
+    if (lower == "instance" || lower.size() >= 9) {
+        if (lower.size() >= 9
+            && lower.compare(lower.size() - 9, 9, " instance") == 0)
             return true;
     }
 

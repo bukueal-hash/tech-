@@ -3,6 +3,8 @@
 #include "../Interface/Utils/Variables/index.h"
 
 #include <chrono>
+#include <cstdio>
+#include <fstream>
 #include <unordered_map>
 #include <vector>
 
@@ -18,9 +20,8 @@ struct PosRefreshKey {
 struct PosRefreshWork {
     PosRefreshKey key{};
     uintptr_t root = 0;
-    uintptr_t mesh = 0;
-    Vector3 rootBuf{};
-    Vector3 meshBuf{};
+    Engine::FVector3d worldBuf{};
+    Vector3 relBuf{};
 };
 
 } // namespace
@@ -30,24 +31,24 @@ void Engine::PositionRefreshPass()
     if (!IsEspRaidActive())
         return;
 
-    std::vector<PosRefreshWork> work;
-    work.reserve(512);
+    const auto t0 = std::chrono::steady_clock::now();
 
-    auto queueEntry = [&](PosRefreshKey::CacheKind kind, uintptr_t key,
-                          uintptr_t root, uintptr_t mesh = 0) {
+    std::vector<PosRefreshWork> work;
+    work.reserve(256);
+
+    auto queueEntry = [&](PosRefreshKey::CacheKind kind, uintptr_t key, uintptr_t root) {
         if (!root || !IsValidPointer(root))
             return;
-        work.push_back({ { kind, key }, root, mesh, {}, {} });
+        work.push_back({ { kind, key }, root, {}, {} });
     };
 
+    // Players + bots only. Containers/items are stationary — WorldPos set at admit.
     if (var::enableesp || var::show_radar) {
         std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
         for (const auto& [key, entry] : playerCache) {
             if (!entry.Drawing)
                 continue;
-            // Do not attach mesh for players — USkeletalMeshComponent@0x428 is CMC;
-            // mesh WorldLocation scatter was overwriting with dead transforms.
-            queueEntry(PosRefreshKey::CacheKind::Player, key, entry.rootComponent, 0);
+            queueEntry(PosRefreshKey::CacheKind::Player, key, entry.rootComponent);
         }
     }
 
@@ -60,36 +61,47 @@ void Engine::PositionRefreshPass()
         }
     }
 
-    if (AnyWorldEspEnabled() || var::show_radar) {
-        {
-            std::shared_lock<std::shared_mutex> lock(m_containerCacheMutex);
-            for (const auto& [key, entry] : containerCache) {
-                if (!entry.Drawing)
-                    continue;
-                queueEntry(PosRefreshKey::CacheKind::Container, key, entry.rootComponent);
-            }
-        }
-        {
-            std::shared_lock<std::shared_mutex> lock(m_itemCacheMutex);
-            for (const auto& [key, entry] : itemCache) {
-                if (!entry.Drawing)
-                    continue;
-                queueEntry(PosRefreshKey::CacheKind::Item, key, entry.rootComponent);
-            }
-        }
-    }
-
     if (work.empty())
         return;
 
-    ScatterSession scatter;
+    // #region agent log
+    {
+        static auto s_lastPosLog = std::chrono::steady_clock::time_point{};
+        const auto nowLog = std::chrono::steady_clock::now();
+        if (s_lastPosLog.time_since_epoch().count() == 0
+            || nowLog - s_lastPosLog >= std::chrono::seconds(2)) {
+            s_lastPosLog = nowLog;
+            int nPlayer = 0, nBot = 0;
+            for (const PosRefreshWork& w : work) {
+                if (w.key.kind == PosRefreshKey::CacheKind::Player)
+                    ++nPlayer;
+                else if (w.key.kind == PosRefreshKey::CacheKind::Robot)
+                    ++nBot;
+            }
+            std::ofstream f("F:/Test/ARCs/debug-5681af.log", std::ios::app);
+            if (f) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"sessionId\":\"5681af\",\"runId\":\"post-fix\",\"hypothesisId\":\"H2\""
+                  << ",\"location\":\"PositionRefreshPass.cpp\",\"message\":\"pos_work\""
+                  << ",\"data\":{\"total\":" << work.size()
+                  << ",\"players\":" << nPlayer
+                  << ",\"bots\":" << nBot
+                  << ",\"world\":0,\"cachedScatter\":1}"
+                  << ",\"timestamp\":" << ms << "}\n";
+            }
+        }
+    }
+    // #endregion
+
+    // Cached scatter (flags=0) — PositionRefresh only. Bones/world stay NOCACHE.
+    ScatterSession scatter(/*cached=*/true);
     if (!scatter.isValid())
         return;
 
     for (PosRefreshWork& item : work) {
-        scatter.prepare(item.root + Offsets::RelativeLocation, item.rootBuf);
-        if (item.mesh && IsValidPointer(item.mesh))
-            scatter.prepare(item.mesh + Offsets::WorldLocation, item.meshBuf);
+        scatter.prepare(item.root + Offsets::WorldLocation, item.worldBuf);
+        scatter.prepare(item.root + Offsets::RelativeLocation, item.relBuf);
     }
     if (!scatter.execute())
         return;
@@ -131,112 +143,57 @@ void Engine::PositionRefreshPass()
         lastVelocityUpdate = static_cast<float>(nowMs);
     };
 
-    for (PosRefreshWork& item : work) {
-        Vector3 pos = item.rootBuf;
-        const Vector3 rootScene = ReadSceneWorldPos(item.root);
-        if (IsPlausibleWorldPos(rootScene))
-            pos = rootScene;
-
-        if (item.mesh && IsValidPointer(item.mesh)) {
-            if (IsPlausibleWorldPos(item.meshBuf))
-                pos = item.meshBuf;
-            else {
-                const Vector3 meshScene = ReadSceneWorldPos(item.mesh);
-                if (IsPlausibleWorldPos(meshScene))
-                    pos = meshScene;
-            }
-        }
-
-        if (!IsPlausibleWorldPos(pos))
-            continue;
-
-        switch (item.key.kind) {
-        case PosRefreshKey::CacheKind::Player: {
-            std::unique_lock<std::shared_mutex> lock(m_playerCacheMutex);
+    // One unique_lock per cache kind — not per entity.
+    {
+        std::unique_lock<std::shared_mutex> lock(m_playerCacheMutex);
+        for (PosRefreshWork& item : work) {
+            if (item.key.kind != PosRefreshKey::CacheKind::Player)
+                continue;
+            Vector3 pos = ToVector3(item.worldBuf);
+            if (!IsPlausibleWorldPos(pos) && IsPlausibleWorldPos(item.relBuf))
+                pos = item.relBuf;
+            if (!IsPlausibleWorldPos(pos))
+                continue;
             auto it = playerCache.find(item.key.key);
             if (it == playerCache.end())
-                break;
-            // Prefer live scene CompToWorld; RelativeLocation freezes on remotes.
-            if (item.root && IsValidPointer(item.root)) {
-                const Vector3 scene = ReadSceneWorldPos(item.root);
-                if (IsPlausibleWorldPos(scene))
-                    pos = scene;
-            }
-            if (!IsPlausibleWorldPos(pos)) {
-                const Vector3 rel = Memory::read<Vector3>(
-                    item.root + Offsets::RelativeLocation);
-                if (IsPlausibleWorldPos(rel))
-                    pos = rel;
-            }
-            if (!IsPlausibleWorldPos(pos)) {
-                constexpr std::ptrdiff_t kStateInterpolator = 0x7c0;
-                constexpr std::ptrdiff_t kReplicatedRootTransform = 0x1f8;
-                constexpr std::ptrdiff_t kReplicatedMovement = 0x150;
-                constexpr std::ptrdiff_t kRepMovLocation = 0x30;
-                constexpr std::ptrdiff_t kACharacterMovement = 0x430;
-                constexpr std::ptrdiff_t kCmcLastUpdateLocation = 0x3e0;
-                const uintptr_t pawn = item.key.key;
-                const uintptr_t interp = Memory::read<uintptr_t>(pawn + kStateInterpolator);
-                if (interp && IsValidPointer(interp)) {
-                    const Vector3 fromInterp =
-                        ToVector3(Memory::read<FVector3d>(interp + kReplicatedRootTransform));
-                    if (IsPlausibleWorldPos(fromInterp))
-                        pos = fromInterp;
-                }
-                if (!IsPlausibleWorldPos(pos)) {
-                    const Vector3 fromRep = ToVector3(Memory::read<FVector3d>(
-                        pawn + kReplicatedMovement + kRepMovLocation));
-                    if (IsPlausibleWorldPos(fromRep)) {
-                        pos = fromRep;
-                    } else {
-                        uintptr_t cmc = Memory::read<uintptr_t>(pawn + Offsets::PioneerCharacterMovement);
-                        if (!cmc || !IsValidPointer(cmc))
-                            cmc = Memory::read<uintptr_t>(pawn + kACharacterMovement);
-                        if (cmc && IsValidPointer(cmc)) {
-                            const Vector3 fromCmc = ToVector3(
-                                Memory::read<FVector3d>(cmc + kCmcLastUpdateLocation));
-                            if (IsPlausibleWorldPos(fromCmc))
-                                pos = fromCmc;
-                        }
-                    }
-                }
-            }
+                continue;
             applyVelocity(
                 it->second.WorldPos,
                 it->second.lastWorldPos,
                 it->second.lastVelocityUpdate,
                 it->second.cachedVelocity,
                 pos);
-            break;
         }
-        case PosRefreshKey::CacheKind::Robot: {
-            std::unique_lock<std::shared_mutex> lock(m_robotCacheMutex);
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(m_robotCacheMutex);
+        for (PosRefreshWork& item : work) {
+            if (item.key.kind != PosRefreshKey::CacheKind::Robot)
+                continue;
+            Vector3 pos = ToVector3(item.worldBuf);
+            if (!IsPlausibleWorldPos(pos) && IsPlausibleWorldPos(item.relBuf))
+                pos = item.relBuf;
+            if (!IsPlausibleWorldPos(pos))
+                continue;
             auto it = robotCache.find(item.key.key);
             if (it == robotCache.end())
-                break;
+                continue;
             applyVelocity(
                 it->second.WorldPos,
                 it->second.lastWorldPos,
                 it->second.lastVelocityUpdate,
                 it->second.cachedVelocity,
                 pos);
-            break;
         }
-        case PosRefreshKey::CacheKind::Container: {
-            std::unique_lock<std::shared_mutex> lock(m_containerCacheMutex);
-            auto it = containerCache.find(item.key.key);
-            if (it != containerCache.end())
-                it->second.WorldPos = pos;
-            break;
-        }
-        case PosRefreshKey::CacheKind::Item: {
-            std::unique_lock<std::shared_mutex> lock(m_itemCacheMutex);
-            auto it = itemCache.find(item.key.key);
-            if (it != itemCache.end())
-                it->second.WorldPos = pos;
-            break;
-        }
-        }
+    }
+
+    const auto posMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (posMs >= 50) {
+        char hitchReason[48];
+        snprintf(hitchReason, sizeof(hitchReason), "hitch_pos_%lldms",
+            static_cast<long long>(posMs));
+        NoteFlicker(hitchReason);
     }
 }
 
@@ -245,10 +202,21 @@ void Engine::BuildEspRenderFrameWorker()
     if (!IsEspRaidActive())
         return;
 
+    const auto t0 = std::chrono::steady_clock::now();
     EspRenderFrame frame{};
     if (!CollectEspRenderFrame(frame))
         return;
 
     std::unique_lock<std::shared_mutex> lock(m_espFrameMutex);
     m_lastEspFrame = std::move(frame);
+    m_lastEspFrameValid.store(m_lastEspFrame.valid, std::memory_order_release);
+
+    const auto frameMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (frameMs >= 50) {
+        char hitchReason[48];
+        snprintf(hitchReason, sizeof(hitchReason), "hitch_frame_%lldms",
+            static_cast<long long>(frameMs));
+        NoteFlicker(hitchReason);
+    }
 }

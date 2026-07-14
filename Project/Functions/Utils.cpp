@@ -818,12 +818,20 @@ bool Engine::ControllerHasValidPcm(uintptr_t pc)
     if (!pc || !Memory::IsValidPtrFast2(pc))
         return false;
 
-    const uintptr_t pcm = Memory::read<uintptr_t>(pc + Offsets::APlayerCameraManager);
+    const uintptr_t pcm =
+        Memory::read_nocache<uintptr_t>(pc + Offsets::APlayerCameraManager);
     if (!pcm || !Memory::IsValidPtrFast2(pcm))
         return false;
 
-    const float fov = Memory::read<float>(pcm + Offsets::DefaultFOV);
-    return fov > 1.f && fov < 179.f;
+    // Either FOV is enough for discovery. Cache retention no longer depends on this
+    // (Update.cpp); requiring it caused pc_drop_fov_gate storms + ~1s DMA hitches.
+    const uintptr_t povBase =
+        pcm + Offsets::ViewTargetTarget + Offsets::ViewTargetPOV;
+    const float povFov =
+        Memory::read_nocache<float>(povBase + Offsets::CameraFOV);
+    const float defFov =
+        Memory::read_nocache<float>(pcm + Offsets::DefaultFOV);
+    return (povFov > 1.f && povFov < 179.f) || (defFov > 1.f && defFov < 179.f);
 }
 
 bool Engine::ResolvePcFromLevelCameraManager(

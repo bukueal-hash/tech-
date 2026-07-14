@@ -60,9 +60,14 @@ inline PersistentScatter g_scatter;
 // Batches multiple DMA reads into one scatter execute.
 class ScatterSession {
 public:
-    ScatterSession() {
-        if (g_mem.IsInitialized())
-            m_handle = g_mem.GetScatterHandle();
+    // Default: NOCACHE (bones / world scan / camera-critical paths).
+    ScatterSession() : ScatterSession(false) {}
+
+    // cached=true → VMM page cache (PositionRefresh only).
+    explicit ScatterSession(bool cached) : m_cached(cached) {
+        if (!g_mem.IsInitialized())
+            return;
+        m_handle = m_cached ? g_mem.GetScatterHandleCached() : g_mem.GetScatterHandle();
     }
 
     ~ScatterSession() { close(); }
@@ -86,11 +91,17 @@ public:
     bool execute() {
         if (!m_handle)
             return false;
-        return g_mem.ExecuteReadScatter(m_handle);
+        return m_cached
+            ? g_mem.ExecuteReadScatterCached(m_handle)
+            : g_mem.ExecuteReadScatter(m_handle);
     }
 
     void clear() {
-        if (m_handle)
+        if (!m_handle)
+            return;
+        if (m_cached)
+            g_mem.ClearScatterHandleCached(m_handle);
+        else
             g_mem.ClearScatterHandle(m_handle);
     }
 
@@ -103,6 +114,7 @@ public:
 
 private:
     void* m_handle = nullptr;
+    bool m_cached = false;
 };
 
 class Memory

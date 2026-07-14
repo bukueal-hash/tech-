@@ -1810,7 +1810,7 @@ static bool IsEspFnameJunkSegment(const std::string& seg)
     const std::string lower = ToLowerCopy(seg);
     static const char* kJunk[] = {
         "wa", "medium", "small", "large", "deployable", "wid", "witem", "w",
-        "default", "dynamic", "lid", "c",
+        "default", "dynamic", "lid", "c", "instance", "inst",
     };
     for (const char* junk : kJunk) {
         if (lower == junk)
@@ -1831,7 +1831,7 @@ static bool IsEspDisplayJunkWord(const std::string& word)
     const std::string lower = ToLowerCopy(word);
     static const char* kJunk[] = {
         "wa", "medium", "small", "large", "deployable", "wid", "witem", "w",
-        "item", "bp", "da", "default", "dynamic", "world",
+        "item", "bp", "da", "default", "dynamic", "world", "instance", "inst",
     };
     for (const char* junk : kJunk) {
         if (lower == junk)

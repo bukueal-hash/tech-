@@ -2,6 +2,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iostream>
 #include <locale>
 #include <codecvt>
 #include <memory>
@@ -26,11 +28,18 @@ static void ApplyVmmCacheTiming(VMM_HANDLE h)
 {
     if (!h)
         return;
+    // Base tick = 100ms.
+    // Ultra-short TTLs (2s/5s) fixed lobby→raid lag but mid-raid logs showed
+    // hitch_pos/frame ~1–1.5s every ~5–7s (= PROCCACHE_TOTAL cadence) from
+    // TLB/process-cache storms. World transition already FullRefresh()'s.
+    // Balance: longer mid-raid TTL; travel remaps via CheckWorldTransition refresh.
     VMMDLL_ConfigSet(h, VMMDLL_OPT_CONFIG_TICK_PERIOD, 100);
-    VMMDLL_ConfigSet(h, VMMDLL_OPT_CONFIG_READCACHE_TICKS, 500);
-    VMMDLL_ConfigSet(h, VMMDLL_OPT_CONFIG_TLBCACHE_TICKS, 2000);
-    VMMDLL_ConfigSet(h, VMMDLL_OPT_CONFIG_PROCCACHE_TICKS_PARTIAL, 500);
-    VMMDLL_ConfigSet(h, VMMDLL_OPT_CONFIG_PROCCACHE_TICKS_TOTAL, 6000);
+    // Mid-raid hitch_pos storms tracked to ~10s TLB/READCACHE expiry + NOCACHE
+    // position scatter. Longer TTLs; travel remaps via soft FullRefresh.
+    VMMDLL_ConfigSet(h, VMMDLL_OPT_CONFIG_READCACHE_TICKS, 600);  // ~60s
+    VMMDLL_ConfigSet(h, VMMDLL_OPT_CONFIG_TLBCACHE_TICKS, 600);   // ~60s
+    VMMDLL_ConfigSet(h, VMMDLL_OPT_CONFIG_PROCCACHE_TICKS_PARTIAL, 100); // ~10s
+    VMMDLL_ConfigSet(h, VMMDLL_OPT_CONFIG_PROCCACHE_TICKS_TOTAL, 200);   // ~20s
 }
 
 // Help CL-1315578 — validate only; Offsets.h unchanged.
@@ -568,5 +577,56 @@ bool PCIMemory::FullRefresh()
 {
     if (!hVMM)
         return false;
-    return VMMDLL_ConfigSet(hVMM, VMMDLL_OPT_REFRESH_ALL, 1) != FALSE;
+
+    // #region agent log
+    const auto t0 = std::chrono::steady_clock::now();
+    // #endregion
+
+    // Cooldown: back-to-back world flaps must not double-flush the VMM bus.
+    static auto s_lastRefresh = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (s_lastRefresh.time_since_epoch().count() != 0
+        && now - s_lastRefresh < std::chrono::seconds(5)) {
+        // #region agent log
+        {
+            std::ofstream f("F:/Test/ARCs/debug-5681af.log", std::ios::app);
+            if (f) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"sessionId\":\"5681af\",\"runId\":\"post-fix\",\"hypothesisId\":\"H3\""
+                  << ",\"location\":\"Memory.cpp:FullRefresh\",\"message\":\"full_refresh\""
+                  << ",\"data\":{\"durMs\":0,\"mode\":\"cooldown_skip\",\"ok\":1}"
+                  << ",\"timestamp\":" << ms << "}\n";
+            }
+        }
+        // #endregion
+        return true;
+    }
+    s_lastRefresh = now;
+
+    // Soft TLB+MEM (not REFRESH_ALL) — REFRESH_ALL blocked Update ~10.9s on load.
+    const BOOL tlb = VMMDLL_ConfigSet(hVMM, VMMDLL_OPT_REFRESH_FREQ_TLB, 1);
+    const BOOL mem = VMMDLL_ConfigSet(hVMM, VMMDLL_OPT_REFRESH_FREQ_MEM, 1);
+    const bool ok = tlb != FALSE && mem != FALSE;
+
+    // #region agent log
+    {
+        const auto msDur = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        std::ofstream f("F:/Test/ARCs/debug-5681af.log", std::ios::app);
+        if (f) {
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            f << "{\"sessionId\":\"5681af\",\"runId\":\"post-fix\",\"hypothesisId\":\"H3\""
+              << ",\"location\":\"Memory.cpp:FullRefresh\",\"message\":\"full_refresh\""
+              << ",\"data\":{\"durMs\":" << msDur
+              << ",\"mode\":\"tlb_mem\",\"ok\":" << (ok ? 1 : 0) << "}"
+              << ",\"timestamp\":" << ms << "}\n";
+        }
+        if (msDur >= 50)
+            std::cout << "[flicker] FullRefresh tlb+mem " << msDur << "ms" << std::endl;
+    }
+    // #endregion
+
+    return ok;
 }

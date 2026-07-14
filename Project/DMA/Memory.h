@@ -71,12 +71,16 @@ public:
     static bool FullRefresh();
 
     static void* GetScatterHandle();
+    /** Scatter that uses VMM page cache (flags=0). Position refresh only. */
+    static void* GetScatterHandleCached();
     static bool RequestReadScatter(void* handle, uintptr_t address, void* buffer, size_t size);
     static bool ExecuteReadScatter(void* handle);
+    static bool ExecuteReadScatterCached(void* handle);
     /** Execute + clear handle (safe to close after). */
     static bool ExecuteReadScatterEx(void* handle);
     /** Call between Prepare/Execute cycles on the same handle (see vmmdll VMMDLL_Scatter_Clear). */
     static void ClearScatterHandle(void* handle);
+    static void ClearScatterHandleCached(void* handle);
     static void CloseScatterHandle(void* handle);
 };
 
@@ -182,6 +186,11 @@ inline void* PCIMemory::GetScatterHandle() {
     return reinterpret_cast<void*>(VMMDLL_Scatter_Initialize(hVMM, processId, VMMDLL_FLAG_NOCACHE));
 }
 
+inline void* PCIMemory::GetScatterHandleCached() {
+    if (!hVMM || !processId) return nullptr;
+    return reinterpret_cast<void*>(VMMDLL_Scatter_Initialize(hVMM, processId, 0));
+}
+
 inline bool PCIMemory::RequestReadScatter(void* handle, uintptr_t address, void* buffer, size_t size) {
     if (!handle || !buffer || size == 0) return false;
     DWORD cbRead = 0;
@@ -203,6 +212,15 @@ inline bool PCIMemory::ExecuteReadScatter(void* handle) {
     return ok == TRUE;
 }
 
+inline bool PCIMemory::ExecuteReadScatterCached(void* handle) {
+    if (!handle || !hVMM || !processId)
+        return false;
+    const auto sh = reinterpret_cast<VMMDLL_SCATTER_HANDLE>(handle);
+    const BOOL ok = VMMDLL_Scatter_ExecuteRead(sh);
+    VMMDLL_Scatter_Clear(sh, processId, 0);
+    return ok == TRUE;
+}
+
 inline bool PCIMemory::ExecuteReadScatterEx(void* handle) {
     return ExecuteReadScatter(handle);
 }
@@ -210,6 +228,11 @@ inline bool PCIMemory::ExecuteReadScatterEx(void* handle) {
 inline void PCIMemory::ClearScatterHandle(void* handle) {
     if (!handle || !hVMM || !processId) return;
     VMMDLL_Scatter_Clear(reinterpret_cast<VMMDLL_SCATTER_HANDLE>(handle), processId, VMMDLL_FLAG_NOCACHE);
+}
+
+inline void PCIMemory::ClearScatterHandleCached(void* handle) {
+    if (!handle || !hVMM || !processId) return;
+    VMMDLL_Scatter_Clear(reinterpret_cast<VMMDLL_SCATTER_HANDLE>(handle), processId, 0);
 }
 
 inline void PCIMemory::CloseScatterHandle(void* handle) {

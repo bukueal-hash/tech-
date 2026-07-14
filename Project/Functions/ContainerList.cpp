@@ -8,8 +8,12 @@
 #include "../Interface/Utils/Variables/index.h"
 
 #include <cctype>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <fstream>
 #include <iostream>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -790,26 +794,57 @@ void Engine::ContainerList()
             const int32_t actorFnameId = GetActorFNameId(actorKey);
             const std::string actorFnameLive = GetActorFNameString(actorKey);
 
-            char dedupeBuf[64]{};
+            char dedupeBuf[160]{};
             if (classPtr)
-                snprintf(dedupeBuf, sizeof(dedupeBuf), "c:%llx",
-                    static_cast<unsigned long long>(classPtr));
+                snprintf(dedupeBuf, sizeof(dedupeBuf), "c:%llx|%s",
+                    static_cast<unsigned long long>(classPtr),
+                    entry.ItemDisplayName.c_str());
             else
-                snprintf(dedupeBuf, sizeof(dedupeBuf), "a:%d", actorFnameId);
+                snprintf(dedupeBuf, sizeof(dedupeBuf), "a:%d|%s",
+                    actorFnameId, entry.ItemDisplayName.c_str());
 
-            if (s_seenContainerClasses.insert(dedupeBuf).second) {
-                std::cout << "[containerName]"
-                    << " actor=" << std::hex << actorKey << std::dec
-                    << " classPtr=" << std::hex << classPtr << std::dec
-                    << " classId=" << classFnameId
-                    << " class=\"" << classFname << "\""
-                    << " actorId=" << actorFnameId
-                    << " actorFname=\"" << actorFnameLive << "\""
-                    << " cachedFname=\"" << entry.ActorName << "\""
-                    << " dataAsset=\"" << GetActorDataAssetFName(actorKey) << "\""
-                    << " label=\"" << entry.ItemDisplayName << "\""
-                    << std::endl;
+            if (!s_seenContainerClasses.insert(dedupeBuf).second)
+                continue;
+
+            std::cout << "[containerName]"
+                << " actor=" << std::hex << actorKey << std::dec
+                << " classPtr=" << std::hex << classPtr << std::dec
+                << " classId=" << classFnameId
+                << " class=\"" << classFname << "\""
+                << " actorId=" << actorFnameId
+                << " actorFname=\"" << actorFnameLive << "\""
+                << " cachedFname=\"" << entry.ActorName << "\""
+                << " dataAsset=\"" << GetActorDataAssetFName(actorKey) << "\""
+                << " label=\"" << entry.ItemDisplayName << "\""
+                << std::endl;
+
+            // #region agent log
+            {
+                static std::mutex s_nameLogMu;
+                std::lock_guard<std::mutex> lk(s_nameLogMu);
+                std::ofstream f("F:/Test/ARCs/debug-5681af.log", std::ios::app);
+                if (f) {
+                    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    auto esc = [](std::string s) {
+                        std::string o;
+                        for (char c : s) {
+                            if (c == '"' || c == '\\') o.push_back('\\');
+                            if (static_cast<unsigned char>(c) >= 32) o.push_back(c);
+                        }
+                        return o;
+                    };
+                    f << "{\"sessionId\":\"5681af\",\"runId\":\"names\",\"hypothesisId\":\"N\""
+                      << ",\"location\":\"ContainerList.cpp:containerName\",\"message\":\"container_label\""
+                      << ",\"data\":{\"fname\":\"" << esc(entry.ActorName)
+                      << "\",\"class\":\"" << esc(classFname)
+                      << "\",\"actorFname\":\"" << esc(actorFnameLive)
+                      << "\",\"dataAsset\":\"" << esc(GetActorDataAssetFName(actorKey))
+                      << "\",\"label\":\"" << esc(entry.ItemDisplayName) << "\"}"
+                      << ",\"timestamp\":" << ms << "}\n";
+                }
             }
+            // #endregion
         }
         std::cout << "[debugContainer] scanned=" << dbgScanned
             << " admitted=" << dbgAdmitted

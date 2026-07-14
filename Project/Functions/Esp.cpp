@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cfloat>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <unordered_set>
 #include <unordered_map>
@@ -738,112 +739,12 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             rootComp = pawnRoot;
     }
 
-    std::vector<EspPosReadTarget> posTargets;
-    posTargets.reserve(out.players.size() + out.world.size() + out.robots.size());
-
-    auto queuePosTarget = [&](
-        EspPosTargetKind kind,
-        size_t index,
-        uintptr_t rootComponent,
-        float distance) {
-        if (!rootComponent || !IsValidPointer(rootComponent))
-            return;
-        posTargets.push_back(
-            EspPosReadTarget{ kind, index, rootComponent, distance, {}, {} });
-    };
-
-    for (size_t i = 0; i < out.players.size(); ++i)
-        queuePosTarget(
-            EspPosTargetKind::Player,
-            i,
-            out.players[i].entry.rootComponent,
-            out.players[i].entry.Distance);
-    for (size_t i = 0; i < out.world.size(); ++i) {
-        uintptr_t scatterRoot = out.world[i].entry.rootComponent;
-        const auto cat = static_cast<WorldItemCategory>(out.world[i].entry.worldCategory);
-        if (IsGroundLootEspCategory(cat)
-            || cat == WorldItemCategory::Items
-            || cat == WorldItemCategory::Harvestable) {
-            if (const uintptr_t lootRoot =
-                    Engine::ResolveLootActorRoot(out.world[i].actorKey, true))
-                scatterRoot = lootRoot;
-        }
-        queuePosTarget(
-            EspPosTargetKind::World,
-            i,
-            scatterRoot,
-            out.world[i].entry.Distance);
-    }
-    for (size_t i = 0; i < out.robots.size(); ++i)
-        queuePosTarget(
-            EspPosTargetKind::Robot,
-            i,
-            out.robots[i].entry.rootComponent,
-            out.robots[i].entry.Distance);
-
-    std::sort(posTargets.begin(), posTargets.end(),
-        [](const EspPosReadTarget& a, const EspPosReadTarget& b) {
-            const auto rank = [](EspPosTargetKind kind) -> int {
-                switch (kind) {
-                case EspPosTargetKind::Player: return 0;
-                case EspPosTargetKind::Robot: return 1;
-                case EspPosTargetKind::World: return 2;
-                default: return 3;
-                }
-            };
-            const int ra = rank(a.kind);
-            const int rb = rank(b.kind);
-            if (ra != rb)
-                return ra < rb;
-            return a.distance < b.distance;
-        });
-
-    if (posTargets.size() > kMaxEspFramePosReads) {
-        // Players reserved (nearest already sorted first within kind), then
-        // robots, then world — nearest-first so close bots/loot are not starved.
-        std::vector<EspPosReadTarget> kept;
-        kept.reserve(kMaxEspFramePosReads);
-
-        size_t playerKept = 0;
-        for (const EspPosReadTarget& t : posTargets) {
-            if (t.kind != EspPosTargetKind::Player)
-                continue;
-            if (playerKept >= kReservedPlayerPosReads)
-                break;
-            kept.push_back(t);
-            ++playerKept;
-        }
-        for (const EspPosReadTarget& t : posTargets) {
-            if (t.kind != EspPosTargetKind::Robot)
-                continue;
-            if (kept.size() >= kMaxEspFramePosReads)
-                break;
-            kept.push_back(t);
-        }
-        for (const EspPosReadTarget& t : posTargets) {
-            if (t.kind != EspPosTargetKind::World)
-                continue;
-            if (kept.size() >= kMaxEspFramePosReads)
-                break;
-            kept.push_back(t);
-        }
-        // If still room and more players beyond the reserve, fill remaining.
-        if (kept.size() < kMaxEspFramePosReads) {
-            size_t seenPlayers = 0;
-            for (const EspPosReadTarget& t : posTargets) {
-                if (t.kind != EspPosTargetKind::Player)
-                    continue;
-                ++seenPlayers;
-                if (seenPlayers <= playerKept)
-                    continue;
-                if (kept.size() >= kMaxEspFramePosReads)
-                    break;
-                kept.push_back(t);
-            }
-        }
-        posTargets = std::move(kept);
-    }
-
+    // Flicker fix (debug-5681af): do NOT re-scatter every entity position here.
+    // PositionRefreshPass (~20ms) already NOCACHE-scatters Drawing roots into the
+    // caches we just copied. A second ~280-actor NOCACHE scatter + serial
+    // ResolveLootActorRoot/ReadSceneWorldPos fallbacks co-timed with hitch_pos
+    // as ~200–1400ms hitch_frame storms every ~10s (VMM TLB expiry).
+    // Camera POV scatter only — keep entry.WorldPos from PositionRefreshPass.
     float povFov = 0.f;
     float defFov = 0.f;
     const float jsonFov = 0.f;
@@ -866,17 +767,31 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
     if (pc && IsValidPointer(pc))
         g_scatter.prepare(pc + Offsets::ControlRotation, ctrlRot);
 
-    for (EspPosReadTarget& target : posTargets) {
-        g_scatter.prepare(
-            target.rootComponent + Offsets::ComponentToWorld + 0x20,
-            target.c2w);
-        g_scatter.prepare(
-            target.rootComponent + Offsets::RelativeLocation,
-            target.relative);
-    }
-
     if (!g_scatter.execute())
         return false;
+
+    // #region agent log
+    {
+        static auto s_lastFrameDmaLog = std::chrono::steady_clock::time_point{};
+        const auto nowLog = std::chrono::steady_clock::now();
+        if (s_lastFrameDmaLog.time_since_epoch().count() == 0
+            || nowLog - s_lastFrameDmaLog >= std::chrono::seconds(2)) {
+            s_lastFrameDmaLog = nowLog;
+            std::ofstream f("F:/Test/ARCs/debug-5681af.log", std::ios::app);
+            if (f) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"sessionId\":\"5681af\",\"runId\":\"post-fix\",\"hypothesisId\":\"H1\""
+                  << ",\"location\":\"Esp.cpp:CollectEspRenderFrame\",\"message\":\"frame_cam_only\""
+                  << ",\"data\":{\"players\":" << out.players.size()
+                  << ",\"bots\":" << out.robots.size()
+                  << ",\"world\":" << out.world.size()
+                  << ",\"entityPosScatter\":0}"
+                  << ",\"timestamp\":" << ms << "}\n";
+            }
+        }
+    }
+    // #endregion
 
     Vector3 pawnPos = Engine::ToVector3(pawnWorld);
     if (!IsPlausibleWorldPos(pawnPos) && rootComp && IsValidPointer(rootComp))
@@ -897,45 +812,6 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             out.camera,
             nullptr))
         return false;
-
-    for (const EspPosReadTarget& target : posTargets) {
-        Vector3 worldPos = ResolveScatterWorldPos(target.c2w, target.relative);
-        if (!IsPlausibleWorldPos(worldPos)
-            && target.rootComponent && IsValidPointer(target.rootComponent))
-            worldPos = Engine::ReadSceneWorldPos(target.rootComponent);
-        if (!IsPlausibleWorldPos(worldPos) && target.kind == EspPosTargetKind::World) {
-            const size_t wi = target.index;
-            if (wi < out.world.size()) {
-                const uintptr_t actorKey = out.world[wi].actorKey;
-                const auto cat = static_cast<WorldItemCategory>(
-                    out.world[wi].entry.worldCategory);
-                const bool preferPickupCollider =
-                    IsGroundLootEspCategory(cat)
-                    || cat == WorldItemCategory::Items
-                    || cat == WorldItemCategory::Harvestable;
-                const uintptr_t resolved = Engine::ResolveLootActorRoot(
-                    actorKey, preferPickupCollider);
-                if (resolved && IsValidPointer(resolved))
-                    worldPos = Engine::ReadSceneWorldPos(resolved);
-            }
-        }
-        if (!IsPlausibleWorldPos(worldPos))
-            continue;
-
-        switch (target.kind) {
-        case EspPosTargetKind::Player:
-            out.players[target.index].entry.WorldPos = worldPos;
-            break;
-        case EspPosTargetKind::World:
-            out.world[target.index].entry.WorldPos = worldPos;
-            break;
-        case EspPosTargetKind::Robot:
-            out.robots[target.index].entry.WorldPos = worldPos;
-            break;
-        default:
-            break;
-        }
-    }
 
     const uint64_t nowMs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1373,12 +1249,16 @@ void Engine::RenderEsp()
         std::shared_lock<std::shared_mutex> lock(m_espFrameMutex);
         frame = m_lastEspFrame;
     }
-    if (!frame.valid)
+    if (!frame.valid) {
+        NoteFlicker("render_skip_frame");
         return;
+    }
 
     Engine::CameraCache renderCam{};
-    if (!ResolveLiveRenderCamera(frame, renderCam))
+    if (!ResolveLiveRenderCamera(frame, renderCam)) {
+        NoteFlicker("render_skip_camera");
         return;
+    }
 
     g_renderQueue.newFrame();
 
