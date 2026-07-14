@@ -1250,13 +1250,11 @@ void Engine::RenderEsp()
         frame = m_lastEspFrame;
     }
     if (!frame.valid) {
-        NoteFlicker("render_skip_frame");
         return;
     }
 
     Engine::CameraCache renderCam{};
     if (!ResolveLiveRenderCamera(frame, renderCam)) {
-        NoteFlicker("render_skip_camera");
         return;
     }
 

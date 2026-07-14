@@ -51,29 +51,6 @@ class Engine {
 public:
     struct WorldCacheEntry;
 
-    /** On-screen / NDJSON flicker diagnostics (ESP blanking). */
-    static constexpr int kFlickerRingSize = 12;
-    struct FlickerEvent {
-        char reason[48]{};
-        int64_t timestampMs = 0;
-        int raidRaw = 0;
-        int espActive = 0;
-        int drawReady = 0;
-        int camOk = 0;
-        int frameValid = 0;
-        int players = 0;
-        int bots = 0;
-        int world = 0;
-        uintptr_t gWorld = 0;
-    };
-    struct FlickerDebugSnapshot {
-        uint32_t total = 0;
-        char lastReason[48]{};
-        int64_t lastAgeMs = -1;
-        int recentCount = 0;
-        FlickerEvent recent[kFlickerRingSize]{};
-    };
-
 private:
     std::atomic<bool> entityStarted{ false };
 
@@ -122,15 +99,6 @@ private:
     void ClearEspCaches();
     /** PC cache, camera, FName/decrypt — same class of reset as process restart for raid transitions. */
     void ResetRaidTransitionState();
-
-    mutable std::mutex m_flickerMutex;
-    FlickerEvent m_flickerRing[kFlickerRingSize]{};
-    int m_flickerWrite = 0;
-    int m_flickerStored = 0;
-    uint32_t m_flickerTotal = 0;
-    char m_flickerLastReason[48]{};
-    std::chrono::steady_clock::time_point m_flickerLastSteady{};
-    std::chrono::steady_clock::time_point m_flickerLastSameSteady{};
 
 public:
     enum class EItemRarity : uint8_t
@@ -458,9 +426,6 @@ public:
     }
     bool IsInRaid() const { return IsEspRaidActive(); }
 
-    void NoteFlicker(const char* reason);
-    void TickFlickerWatch();
-    FlickerDebugSnapshot GetFlickerDebug() const;
     std::atomic<bool> m_lastEspFrameValid{ false };
 
     size_t CountWorldDrawable() const {

@@ -6,11 +6,10 @@
 #include "RobotList.h"
 #include "WorldScanCommon.h"
 
-#include <chrono>
 #include <cmath>
+#include <cctype>
 #include <atomic>
 #include <iostream>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -28,6 +27,22 @@ bool IsWorldEspLabel(const std::string& name)
 bool IsZeroWorldPos(const Vector3& pos)
 {
     return pos.x == 0.0 && pos.y == 0.0 && pos.z == 0.0;
+}
+
+// Mid-raid pollution leaked into bot ESP (log sample ActorName "Camera").
+bool IsBotEspPollutionName(const std::string& s)
+{
+    if (s.empty())
+        return false;
+    std::string lower = s;
+    for (char& c : lower)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return lower.find("camera") != std::string::npos
+        || lower.find("spectator") != std::string::npos
+        || lower.find("playercontroller") != std::string::npos
+        || lower.find("cheatmanager") != std::string::npos
+        || lower.find("debug") != std::string::npos
+        || lower.find("widget") != std::string::npos;
 }
 
 bool IsMislabeledLootName(const std::string& label, const std::string& fname)
@@ -97,7 +112,7 @@ std::string ResolveBotLabelFromFName(const std::string& name)
 
 std::string ResolveBotLabelFromActor(uintptr_t actor, const std::string& fnameHint)
 {
-    // Single chain ‚Äî same as draw/admission.
+    // Single chain ù same as draw/admission.
     return ResolveBotTypeLabel(actor, fnameHint);
 }
 
@@ -270,13 +285,13 @@ bool HasStrongEnemyDataAsset(uintptr_t actor)
 //
 // This is THE single authoritative gate. Every admission pass and every
 // retention pass runs an actor through it, so a bot must independently prove
-// itself twice before it draws. Guarantee: only real ARC enemies survive ‚Äî
+// itself twice before it draws. Guarantee: only real ARC enemies survive ù
 // never the local player, other players, guns, dropped items, boxes or
 // containers. Fuzzy fname/mesh name matches ALONE are never enough; a bot must
 // present real structural proof (an ARC enemy data-asset, the ARC class tag,
 // or a constructable enemy pointer) backed by a resolvable identity.
 // -------------------------------------------------------------------------
-// Skip VerifyBotActor on props/containers ‚Äî full verify on every actor was taking
+// Skip VerifyBotActor on props/containers ù full verify on every actor was taking
 // tens of seconds per pass over the whole level (SyncedThread waits to finish).
 bool QuickBotCandidate(uintptr_t actor)
 {
@@ -316,7 +331,7 @@ bool QuickBotCandidate(uintptr_t actor)
         return false;
     };
 
-    // Cached fname first (cheap). Fresh snitch spawns often miss the cache ‚Äî
+    // Cached fname first (cheap). Fresh snitch spawns often miss the cache ù
     // decrypt once so QuickBot does not skip actors Verify would accept.
     const std::string fnameCached = engine.GetActorFNameStringCached(actor);
     if (fnameLooksLikeBot(fnameCached))
@@ -337,7 +352,7 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
     if (localPawn && actor == localPawn)
         return false;
 
-    // (1) Absolute player negatives ‚Äî veto every positive signal below.
+    // (1) Absolute player negatives ù veto every positive signal below.
     const uint32_t masked =
         ArcActorType::MaskActorTypeId(ArcActorType::ReadActorTypeId(actor));
     if (ArcActorType::IsPlayerClassId(masked))
@@ -351,7 +366,7 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
     if (playerState && engine.IsValidPointer(playerState))
         return false;
 
-    // Arc entry / cargo / caches / socket containers are world ESP ‚Äî never bots,
+    // Arc entry / cargo / caches / socket containers are world ESP ù never bots,
     // even when they carry constructable or enemy-type data assets.
     {
         std::string probe = fname;
@@ -360,6 +375,8 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
         if (probe.empty())
             probe = engine.GetActorFNameString(actor);
         const std::string classFname = engine.GetActorClassFName(actor);
+        if (IsBotEspPollutionName(probe) || IsBotEspPollutionName(classFname))
+            return false;
         if (IsLikelyContainerActor(actor, probe)
             || (!classFname.empty() && IsLikelyContainerActor(actor, classFname))
             || (!probe.empty() && FnameLooksLikeWorldContainer(probe))
@@ -367,18 +384,15 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
             return false;
     }
 
-    // (2) DEFINITIVE proof: constructable enemy/AI pointer on a non-item actor.
-    // Admit on pointer + scene root even when DA fname is not decrypted yet;
-    // ResolveBotDrawLabel fills the real name at draw time.
-    if (HasConstructableEnemyAsset(actor)) {
-        if (HasWorldItemStructure(actor))
-            return false;
+    // (2) DEFINITIVE proof: validated ARC EnemyType data-asset (tech- style).
+    // Bot-exclusive ù DA_EnemyType_* / ResolveEnemyAssetBotLabel. Bare
+    // constructable pointers alone leaked Camera/ghost junk into bot ESP.
+    if (HasStrongEnemyDataAsset(actor))
         return ResolveBotSceneRoot(actor) != 0;
-    }
 
-    // (3) No definitive proof ‚Üí weak candidate. Reject anything that carries
+    // (3) No definitive proof ? weak candidate. Reject anything that carries
     //     gun / item / pickup / container structure. This is what kept your gun,
-    //     ground boxes and containers OUT ‚Äî they never reach the bot cache.
+    //     ground boxes and containers OUT ù they never reach the bot cache.
     if (HasWorldItemStructure(actor))
         return false;
     if (IsLikelyContainerActor(actor, fname))
@@ -393,7 +407,7 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
 
     // (5) Corroborated weak proof: a constructable enemy/AI pointer OR the ARC
     //     class tag, BACKED by a resolvable bot identity. A fuzzy name match with
-    //     no structural signal behind it is rejected ‚Äî that was the leak that
+    //     no structural signal behind it is rejected ù that was the leak that
     //     turned guns/boxes into "bots".
     const bool structuralBotSignal =
         HasConstructableEnemyAsset(actor)
@@ -406,7 +420,7 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
 }
 
 // Internal cache label when struct detection succeeds but fname decrypt fails.
-// Never shown on screen ‚Äî draw uses ResolveBotDrawLabel for a real name.
+// Never shown on screen ù draw uses ResolveBotDrawLabel for a real name.
 
 std::string ResolveStructBotAdmissionLabel(uintptr_t actor, const std::string& fname)
 {
@@ -414,7 +428,7 @@ std::string ResolveStructBotAdmissionLabel(uintptr_t actor, const std::string& f
     if (!label.empty())
         return label;
 
-    // Identity decrypt failed ‚Äî still admit struct bots for boxes; draw resolves name.
+    // Identity decrypt failed ù still admit struct bots for boxes; draw resolves name.
     if (HasVerifiedEnemyAsset(actor, fname)
         || ActorHasKnownBotIdentity(actor, fname)
         || ArcActorType::IsAnyBotActor(actor)
@@ -486,24 +500,39 @@ Vector3 ReadComponentWorldPos(uintptr_t component)
     return Engine::ReadSceneWorldPos(component);
 }
 
+// Live bot tracking ù mirror EntityList ResolvePlayerWorldPos (NOCACHE).
+// Cached Memory::read / RelativeLocation froze ESP boxes at the spawn footprint.
+Vector3 ReadBotSceneWorldPosLive(uintptr_t component)
+{
+    if (!component || !engine.IsValidPointer(component))
+        return {};
+    const Engine::FVector3d world =
+        Memory::read_nocache<Engine::FVector3d>(component + Offsets::WorldLocation);
+    const Vector3 w = Engine::ToVector3(world);
+    if (IsPlausibleWorldPos(w))
+        return w;
+    return {};
+}
+
 Vector3 ResolveBotWorldPos(uintptr_t actor, uintptr_t root, uintptr_t mesh)
 {
     if (root) {
-        const Vector3 fromRoot = ReadComponentWorldPos(root);
-        if (!IsZeroWorldPos(fromRoot))
+        const Vector3 fromRoot = ReadBotSceneWorldPosLive(root);
+        if (IsPlausibleWorldPos(fromRoot))
             return fromRoot;
     }
 
     if (mesh) {
-        const Vector3 fromMesh = ReadComponentWorldPos(mesh);
-        if (!IsZeroWorldPos(fromMesh))
+        const Vector3 fromMesh = ReadBotSceneWorldPosLive(mesh);
+        if (IsPlausibleWorldPos(fromMesh))
             return fromMesh;
     }
 
-    const uintptr_t embarkMesh = Memory::read<uintptr_t>(actor + Offsets::EmbarkMesh);
-    if (embarkMesh && embarkMesh != mesh) {
-        const Vector3 fromEmbark = ReadComponentWorldPos(embarkMesh);
-        if (!IsZeroWorldPos(fromEmbark))
+    const uintptr_t embarkMesh =
+        Memory::read_nocache<uintptr_t>(actor + Offsets::EmbarkMesh);
+    if (embarkMesh && embarkMesh != mesh && engine.IsValidPointer(embarkMesh)) {
+        const Vector3 fromEmbark = ReadBotSceneWorldPosLive(embarkMesh);
+        if (IsPlausibleWorldPos(fromEmbark))
             return fromEmbark;
     }
 
@@ -583,21 +612,22 @@ void PopulateBotPartCache(Engine::WorldCacheEntry& actor, uintptr_t key)
 
     if (valid > 0) {
         const Vector3 meshCenter = actor.Mesh ? ReadComponentWorldPos(actor.Mesh) : Vector3{};
-        if (IsPlausibleWorldPos(meshCenter)) {
+        if (IsPlausibleWorldPos(meshCenter))
             actor.CenterWorldPos = meshCenter;
-            actor.WorldPos = meshCenter;
-        } else {
+        else {
             const float inv = 1.f / static_cast<float>(valid);
             actor.CenterWorldPos = Vector3{ sum.x * inv, sum.y * inv, sum.z * inv };
-            actor.WorldPos = actor.CenterWorldPos;
         }
-        return;
-    }
-
-    actor.WorldPos = ResolveBotWorldPos(key, actor.rootComponent, actor.Mesh);
-    actor.CenterWorldPos = actor.WorldPos;
-    if (!IsZeroWorldPos(actor.WorldPos) && actor.BotPartCount < Engine::WorldCacheEntry::kMaxBotParts) {
-        actor.BotPartPos[actor.BotPartCount++] = actor.WorldPos;
+        // Do NOT write mesh CTW into WorldPos. Scene-root refresh + PositionRefresh
+        // own live tracking; mesh often freezes at the initial footprint.
+        if (!IsPlausibleWorldPos(actor.WorldPos))
+            actor.WorldPos = actor.CenterWorldPos;
+    } else {
+        actor.WorldPos = ResolveBotWorldPos(key, actor.rootComponent, actor.Mesh);
+        actor.CenterWorldPos = actor.WorldPos;
+        if (!IsZeroWorldPos(actor.WorldPos) && actor.BotPartCount < Engine::WorldCacheEntry::kMaxBotParts) {
+            actor.BotPartPos[actor.BotPartCount++] = actor.WorldPos;
+        }
     }
 
     actor.hasBotHeadWorldPos = false;
@@ -759,10 +789,10 @@ static void ClearRobotListStaticMaps()
 
 bool HasLiveBotVisual(uintptr_t actor, uintptr_t mesh)
 {
-    const uintptr_t root = Memory::read<uintptr_t>(actor + Offsets::RootComponent);
-    if (IsPlausibleWorldPos(ResolveBotWorldPos(actor, root, mesh)))
-        return true;
-
+    // Prefer mesh / embark CTW when readable. Do NOT treat raw actor WorldPos
+    // alone as live (stale ghost transforms). Debug (c190fb): Wasp admitted with
+    // visRootOk=1 visMeshBad=1 and drawing=0 for entire cache ù ARC bot mesh
+    // ComponentToWorld is often unreadable while scene root stays valid.
     if (ComponentHasPlausibleWorldPos(mesh))
         return true;
 
@@ -787,6 +817,12 @@ bool HasLiveBotVisual(uintptr_t actor, uintptr_t mesh)
         }
     }
 
+    // Scene root CTW as live proof after Verify (mesh CTW often unreadable).
+    const uintptr_t root = ResolveBotSceneRoot(actor);
+    if (root && root != mesh && root != embarkMesh
+        && ComponentHasPlausibleWorldPos(root))
+        return true;
+
     return false;
 }
 
@@ -807,7 +843,7 @@ uint8_t ReadBotBrokenFlag(uintptr_t actor)
     if (broken == 1)
         return 1;
 
-    // Do not treat Health‚â§0 as dead here ‚Äî spawn frames often read 0 HP and
+    // Do not treat Health?0 as dead here ù spawn frames often read 0 HP and
     // that blocked snitch admits until the next healthy admission window.
     return 0;
 }
@@ -834,7 +870,7 @@ std::string FinalizeBotTypeLabel(const std::string& label, const std::string& fn
 
 std::string ResolveBotTypeLabel(uintptr_t actor, const std::string& fname)
 {
-    // Single ordered chain: fname ‚Üí class ‚Üí enemy DA ‚Üí mesh ‚Üí embark ‚Üí husk.
+    // Single ordered chain: fname ? class ? enemy DA ? mesh ? embark ? husk.
     auto tryName = [&](const std::string& name) -> std::string {
         if (name.empty())
             return {};
@@ -915,7 +951,7 @@ std::string ResolveBotDrawLabel(
             return hit;
     }
 
-    // Bot-only fallbacks when FName decrypt flakes ‚Äî do not use item/world naming.
+    // Bot-only fallbacks when FName decrypt flakes ù do not use item/world naming.
     auto tryToken = [&](const std::string& name) -> std::string {
         if (name.empty())
             return {};
@@ -992,7 +1028,7 @@ void Engine::RobotList()
                 localPos = rootPos;
         }
     }
-    // LOS mesh rebuild is owned by Update ‚Äî calling it every RobotList tick
+    // LOS mesh rebuild is owned by Update ù calling it every RobotList tick
     // kept VisCheck rebuilding=1 with smc thousands (overlay lag).
 
     const float maxDistM = var::bot_esp_distance > 0.f ? var::bot_esp_distance : var::kMaxDistanceSliderM;
@@ -1041,7 +1077,7 @@ void Engine::RobotList()
         if (fname.empty())
             fname = engine.GetActorFNameString(actor);
 
-        // CHECK #1 ‚Äî authoritative verification at admission. Only actors that
+        // CHECK #1 ù authoritative verification at admission. Only actors that
         // prove they are ARC bots (and not players/guns/items/containers) pass.
         if (!VerifyBotActor(actor, sAcknowledgedPawn, fname)) {
             ++dbgStructHit;
@@ -1091,16 +1127,17 @@ void Engine::RobotList()
     }
     }
 
-    // ComponentToWorld only ‚Äî RelativeLocation is local-space and looked
-    // "plausible" as WorldPos (console: distSkip=130 maxDist=188, drawing=6).
+    // ComponentToWorld / WorldLocation via NOCACHE ù not RelativeLocation.
     int dbgScenePosOk = 0;
     int dbgScenePosFail = 0;
     for (auto it = localCache.begin(); it != localCache.end(); ++it) {
         it->second.rootComponent = ResolveBotSceneRoot(it->first);
         if (!it->second.rootComponent)
             continue;
-        const Vector3 scene =
-            Engine::ReadSceneWorldPos(it->second.rootComponent);
+        Vector3 scene = ReadBotSceneWorldPosLive(it->second.rootComponent);
+        if (!IsPlausibleWorldPos(scene))
+            scene = ResolveBotWorldPos(
+                it->first, it->second.rootComponent, it->second.Mesh);
         if (IsPlausibleWorldPos(scene)) {
             it->second.WorldPos = scene;
             ++dbgScenePosOk;
@@ -1118,6 +1155,12 @@ void Engine::RobotList()
         if (fname.empty())
             fname = engine.GetActorFNameString(key);
 
+        if (IsBotEspPollutionName(fname) || IsBotEspPollutionName(actor.ActorName)) {
+            ClearBotVisualMiss(key);
+            it = localCache.erase(it);
+            continue;
+        }
+
         if (actor.ActorName.empty()
             || actor.ActorName == kBotStructAdmissionToken
             || !IsAcceptedBotEspLabel(engine, actor.ActorName, fname)) {
@@ -1127,8 +1170,15 @@ void Engine::RobotList()
                 actor.ActorName = resolved;
         }
 
-        // CHECK #2 ‚Äî cheap retain gate (admission already ran full VerifyBotActor).
-        if (!StillLooksLikeBot(key, sAcknowledgedPawn, actor.category, localPos)) {
+        if (IsBotEspPollutionName(actor.ActorName)) {
+            ClearBotVisualMiss(key);
+            it = localCache.erase(it);
+            continue;
+        }
+
+        // CHECK #2 ù re-verify every cached bot each pass (tech- balance):
+        // impostors (Camera/ghosts) that fail strong/weak proof are dropped.
+        if (!VerifyBotActor(key, sAcknowledgedPawn, fname)) {
             ClearBotVisualMiss(key);
             it = localCache.erase(it);
             continue;
@@ -1185,7 +1235,7 @@ void Engine::RobotList()
         PopulateBotPartCache(actor, key);
 
         // Destroyed bots can linger in the actor list with a stale root transform.
-        // Do not rescue with WorldPos alone ‚Äî that kept ghosts Drawing at old spots.
+        // Do not rescue with WorldPos alone ù that kept ghosts Drawing at old spots.
         if (!broken) {
             bool visualOk = HasLiveBotVisual(key, actor.Mesh);
             if (!visualOk) {

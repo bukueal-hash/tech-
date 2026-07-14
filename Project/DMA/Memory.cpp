@@ -623,8 +623,6 @@ bool PCIMemory::FullRefresh()
               << ",\"mode\":\"tlb_mem\",\"ok\":" << (ok ? 1 : 0) << "}"
               << ",\"timestamp\":" << ms << "}\n";
         }
-        if (msDur >= 50)
-            std::cout << "[flicker] FullRefresh tlb+mem " << msDur << "ms" << std::endl;
     }
     // #endregion
 

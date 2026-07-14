@@ -379,13 +379,11 @@ uintptr_t Engine::ResolveBestGWorld(uint64_t base)
 }
 
 void Engine::Update() {
-	const auto updateT0 = std::chrono::steady_clock::now();
 	const uint64_t base = Memory::getBaseAddress();
 	const uintptr_t tGWorld = ResolveBestGWorld(base);
 	if (!tGWorld) {
 		HandleWorldLost();
 		TickRaidGate();
-		TickFlickerWatch();
 		return;
 	}
 
@@ -464,7 +462,6 @@ void Engine::Update() {
 				s_cachedPC = 0;
 				s_cachedPawn = 0;
 				s_cacheFailStreak = 0;
-				NoteFlicker("pc_drop_pos_magSq");
 			}
 		} else if (s_cachedPC || s_cachedPawn) {
 			cacheInvalidateReason = "pair_incomplete";
@@ -474,7 +471,6 @@ void Engine::Update() {
 				s_cachedPC = 0;
 				s_cachedPawn = 0;
 				s_cacheFailStreak = 0;
-				NoteFlicker("pc_drop_pair");
 			}
 		}
 
@@ -727,25 +723,15 @@ void Engine::Update() {
 
 	TickRaidGate();
 	TickEspCacheReadiness();
-	TickFlickerWatch();
 
 	// Do NOT clear s_cachedPC every hub tick. That forced ResolvePcFromLevelCameraManager
-	// over the menu actor list every Update → hitch_update 50–400ms storms and
-	// orange FREEZE banners while waiting in MainMenu (debug-5681af hub_world).
+	// over the menu actor list every Update and caused multi-hundred-ms DMA stalls
+	// while waiting in MainMenu.
 	// Cache is already reset on world_change / raid_left / ResetRaidTransitionState.
 
 	if (IsEspRaidActive()
 		&& tPlayerController && tAcknowledgedPawn && tRootComponent) {
 		entityStarted.store(true, std::memory_order_release);
-	}
-
-	const auto updateMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-		std::chrono::steady_clock::now() - updateT0).count();
-	if (updateMs >= 50 && IsEspRaidActive()) {
-		char hitchReason[48];
-		snprintf(hitchReason, sizeof(hitchReason), "hitch_update_%lldms",
-			static_cast<long long>(updateMs));
-		NoteFlicker(hitchReason);
 	}
 }
 
@@ -886,7 +872,6 @@ void Engine::HandleWorldLost()
 	ResetRaidTransitionState();
 	ClearEspCaches();
 	std::cout << "[raid] world_lost" << std::endl;
-	NoteFlicker("world_lost");
 	// #region agent log
 	RaidDbgLog("world_lost", "{}");
 	// #endregion
@@ -903,7 +888,6 @@ void Engine::CheckWorldTransition(uintptr_t newWorld, uintptr_t newPersistentLev
 
 	ResetRaidTransitionState();
 	ClearEspCaches();
-	NoteFlicker("world_change");
 
 	m_lastWorldPtr = newWorld;
 	m_lastPersistentLevel = newPersistentLevel;
@@ -983,7 +967,6 @@ void Engine::TickEspCacheReadiness()
 			<< " bots=" << bots
 			<< " world=" << world
 			<< std::endl;
-		NoteFlicker("caches_ready");
 		// #region agent log
 		{
 			std::ostringstream d;
@@ -1011,7 +994,6 @@ void Engine::TickEspCacheReadiness()
 		<< " bots=" << bots
 		<< " world=" << world
 		<< std::endl;
-	NoteFlicker("caches_ready_soft");
 	// #region agent log
 	{
 		std::ostringstream d;
@@ -1129,7 +1111,6 @@ void Engine::TickRaidGate()
 		ResetRaidTransitionState();
 		ClearEspCaches();
 		std::cout << "[raid] left" << std::endl;
-		NoteFlicker("raid_left");
 		// #region agent log
 		{
 			std::ostringstream d;
@@ -1193,7 +1174,6 @@ void Engine::TickRaidGate()
 	m_espRaidActive.store(true, std::memory_order_release);
 	m_worldGeneration.fetch_add(1, std::memory_order_release);
 	std::cout << "[raid] entered players=" << partyCount << std::endl;
-	NoteFlicker("raid_entered");
 	// #region agent log
 	{
 		std::ostringstream d;
@@ -1203,184 +1183,4 @@ void Engine::TickRaidGate()
 		RaidDbgLog("entered", d.str());
 	}
 	// #endregion
-}
-
-void Engine::NoteFlicker(const char* reason)
-{
-	if (!reason || !reason[0])
-		return;
-
-	const auto nowSteady = std::chrono::steady_clock::now();
-	{
-		std::lock_guard<std::mutex> lock(m_flickerMutex);
-		if (m_flickerLastReason[0]
-			&& std::strncmp(m_flickerLastReason, reason, sizeof(m_flickerLastReason)) == 0
-			&& m_flickerLastSameSteady.time_since_epoch().count() != 0
-			&& nowSteady - m_flickerLastSameSteady < std::chrono::milliseconds(400))
-			return;
-		strncpy_s(m_flickerLastReason, sizeof(m_flickerLastReason), reason, _TRUNCATE);
-		m_flickerLastSameSteady = nowSteady;
-		m_flickerLastSteady = nowSteady;
-	}
-
-	FlickerEvent ev{};
-	strncpy_s(ev.reason, sizeof(ev.reason), reason, _TRUNCATE);
-	ev.timestampMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-		std::chrono::system_clock::now().time_since_epoch()).count();
-	ev.raidRaw = m_raidRaw.load(std::memory_order_acquire) ? 1 : 0;
-	ev.espActive = m_espRaidActive.load(std::memory_order_acquire) ? 1 : 0;
-	ev.drawReady = m_espDrawReady.load(std::memory_order_acquire) ? 1 : 0;
-	ev.frameValid = m_lastEspFrameValid.load(std::memory_order_acquire) ? 1 : 0;
-	{
-		CameraCache cam{};
-		{
-			std::shared_lock<std::shared_mutex> lock(m_cameraMutex);
-			cam = g_Camera;
-		}
-		ev.camOk = (IsUsableCameraFov(cam.FOV) && IsPlausibleWorldPos(cam.Location)) ? 1 : 0;
-	}
-	ev.players = static_cast<int>(PlayerCacheCount());
-	ev.bots = static_cast<int>(RobotCacheCount());
-	ev.world = static_cast<int>(WorldCacheCount());
-	{
-		std::shared_lock<std::shared_mutex> lock(m_stateMutex);
-		ev.gWorld = GWorld;
-	}
-
-	{
-		std::lock_guard<std::mutex> lock(m_flickerMutex);
-		m_flickerRing[m_flickerWrite % kFlickerRingSize] = ev;
-		m_flickerWrite = (m_flickerWrite + 1) % kFlickerRingSize;
-		if (m_flickerStored < kFlickerRingSize)
-			++m_flickerStored;
-		++m_flickerTotal;
-	}
-
-	std::cout << "[flicker] " << reason
-		<< " raw=" << ev.raidRaw
-		<< " esp=" << ev.espActive
-		<< " draw=" << ev.drawReady
-		<< " cam=" << ev.camOk
-		<< " frame=" << ev.frameValid
-		<< " p=" << ev.players
-		<< " b=" << ev.bots
-		<< " w=" << ev.world
-		<< std::endl;
-
-	// #region agent log
-	{
-		static std::mutex s_logMu;
-		std::lock_guard<std::mutex> lock(s_logMu);
-		std::ofstream f("F:/Test/ARCs/debug-5681af.log", std::ios::app);
-		if (f) {
-			f << "{\"sessionId\":\"5681af\",\"runId\":\"flicker\",\"hypothesisId\":\"F\""
-			  << ",\"location\":\"Update.cpp:NoteFlicker\",\"message\":\"" << reason
-			  << "\",\"data\":{\"raw\":" << ev.raidRaw
-			  << ",\"esp\":" << ev.espActive
-			  << ",\"draw\":" << ev.drawReady
-			  << ",\"cam\":" << ev.camOk
-			  << ",\"frame\":" << ev.frameValid
-			  << ",\"players\":" << ev.players
-			  << ",\"bots\":" << ev.bots
-			  << ",\"world\":" << ev.world
-			  << ",\"gw\":\"" << std::hex << ev.gWorld << std::dec << "\"}"
-			  << ",\"timestamp\":" << ev.timestampMs << "}\n";
-		}
-	}
-	// #endregion
-}
-
-void Engine::TickFlickerWatch()
-{
-	static bool s_init = false;
-	static bool s_raw = false;
-	static bool s_active = false;
-	static bool s_draw = false;
-	static bool s_camOk = false;
-	static bool s_frameOk = false;
-	static size_t s_players = 0;
-	static size_t s_bots = 0;
-	static size_t s_world = 0;
-
-	const bool raw = m_raidRaw.load(std::memory_order_acquire);
-	const bool active = m_espRaidActive.load(std::memory_order_acquire);
-	const bool draw = m_espDrawReady.load(std::memory_order_acquire);
-	const bool frameOk = m_lastEspFrameValid.load(std::memory_order_acquire);
-	bool camOk = false;
-	{
-		CameraCache cam{};
-		{
-			std::shared_lock<std::shared_mutex> lock(m_cameraMutex);
-			cam = g_Camera;
-		}
-		camOk = IsUsableCameraFov(cam.FOV) && IsPlausibleWorldPos(cam.Location);
-	}
-	const size_t players = PlayerCacheCount();
-	const size_t bots = RobotCacheCount();
-	const size_t world = WorldCacheCount();
-
-	if (!s_init) {
-		s_init = true;
-		s_raw = raw;
-		s_active = active;
-		s_draw = draw;
-		s_camOk = camOk;
-		s_frameOk = frameOk;
-		s_players = players;
-		s_bots = bots;
-		s_world = world;
-		return;
-	}
-
-	if (raw != s_raw)
-		NoteFlicker(raw ? "edge_raid_raw_on" : "edge_raid_raw_off");
-	if (active != s_active)
-		NoteFlicker(active ? "edge_esp_raid_on" : "edge_esp_raid_off");
-	if (draw != s_draw)
-		NoteFlicker(draw ? "edge_draw_ready_on" : "edge_draw_ready_off");
-	if (active && s_camOk && !camOk)
-		NoteFlicker("camera_bad");
-	if (active && !s_camOk && camOk)
-		NoteFlicker("camera_recovered");
-	if (active && s_frameOk && !frameOk)
-		NoteFlicker("frame_invalid");
-	if (active && !s_frameOk && frameOk)
-		NoteFlicker("frame_recovered");
-	if (active && s_players > 0 && players == 0)
-		NoteFlicker("players_empty");
-	if (active && s_bots > 0 && bots == 0)
-		NoteFlicker("bots_empty");
-	if (active && s_world > 0 && world == 0)
-		NoteFlicker("world_empty");
-
-	s_raw = raw;
-	s_active = active;
-	s_draw = draw;
-	s_camOk = camOk;
-	s_frameOk = frameOk;
-	s_players = players;
-	s_bots = bots;
-	s_world = world;
-}
-
-Engine::FlickerDebugSnapshot Engine::GetFlickerDebug() const
-{
-	FlickerDebugSnapshot out{};
-	const auto nowSteady = std::chrono::steady_clock::now();
-	std::lock_guard<std::mutex> lock(m_flickerMutex);
-	out.total = m_flickerTotal;
-	if (m_flickerLastReason[0]) {
-		strncpy_s(out.lastReason, sizeof(out.lastReason), m_flickerLastReason, _TRUNCATE);
-		out.lastAgeMs = m_flickerLastSteady.time_since_epoch().count() == 0
-			? -1
-			: std::chrono::duration_cast<std::chrono::milliseconds>(
-				nowSteady - m_flickerLastSteady).count();
-	}
-	out.recentCount = m_flickerStored;
-	const int n = m_flickerStored;
-	for (int i = 0; i < n; ++i) {
-		const int idx = (m_flickerWrite - n + i + kFlickerRingSize) % kFlickerRingSize;
-		out.recent[i] = m_flickerRing[idx];
-	}
-	return out;
 }

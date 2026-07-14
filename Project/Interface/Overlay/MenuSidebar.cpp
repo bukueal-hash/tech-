@@ -792,20 +792,7 @@ void DrawArcDebugTab()
     ImGui::Text("Debug overlay");
     ArcMenuLayout::Checkbox("Show offset validation", &var::show_debug_overlay);
     ArcMenuHoverTooltip(
-        "Pointer chain + flicker banner. Close menu to see overlay. "
-        "When ESP blanks, look for red FLICKER banner (cause name).");
-    {
-        const Engine::FlickerDebugSnapshot flick = engine.GetFlickerDebug();
-        ImGui::Text("Flicker events: %u", flick.total);
-        if (flick.lastReason[0]) {
-            ImGui::TextColored(ImVec4(1.f, 0.85f, 0.3f, 1.f),
-                "Last: %s (%lld ms ago)",
-                flick.lastReason,
-                static_cast<long long>(flick.lastAgeMs));
-        } else {
-            ImGui::TextDisabled("Last: (none yet)");
-        }
-    }
+        "Pointer chain status. Close menu to see overlay.");
 }
 
 void DrawArcHelpTab()

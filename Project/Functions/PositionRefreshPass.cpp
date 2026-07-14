@@ -3,7 +3,6 @@
 #include "../Interface/Utils/Variables/index.h"
 
 #include <chrono>
-#include <cstdio>
 #include <fstream>
 #include <unordered_map>
 #include <vector>
@@ -30,8 +29,6 @@ void Engine::PositionRefreshPass()
 {
     if (!IsEspRaidActive())
         return;
-
-    const auto t0 = std::chrono::steady_clock::now();
 
     std::vector<PosRefreshWork> work;
     work.reserve(256);
@@ -87,15 +84,16 @@ void Engine::PositionRefreshPass()
                   << ",\"data\":{\"total\":" << work.size()
                   << ",\"players\":" << nPlayer
                   << ",\"bots\":" << nBot
-                  << ",\"world\":0,\"cachedScatter\":1}"
+                  << ",\"world\":0,\"cachedScatter\":0}"
                   << ",\"timestamp\":" << ms << "}\n";
             }
         }
     }
     // #endregion
 
-    // Cached scatter (flags=0) — PositionRefresh only. Bones/world stay NOCACHE.
-    ScatterSession scatter(/*cached=*/true);
+    // NOCACHE — cached VMM pages froze bot WorldPos (boxes stuck at spawn footprint).
+    // Same class of bug EntityList fixed for players with read_nocache.
+    ScatterSession scatter(/*cached=*/false);
     if (!scatter.isValid())
         return;
 
@@ -171,29 +169,46 @@ void Engine::PositionRefreshPass()
             if (item.key.kind != PosRefreshKey::CacheKind::Robot)
                 continue;
             Vector3 pos = ToVector3(item.worldBuf);
-            if (!IsPlausibleWorldPos(pos) && IsPlausibleWorldPos(item.relBuf))
-                pos = item.relBuf;
+            // Bots: never use RelativeLocation as live WorldPos (freezes remotes).
             if (!IsPlausibleWorldPos(pos))
                 continue;
             auto it = robotCache.find(item.key.key);
             if (it == robotCache.end())
                 continue;
+            const Vector3 oldPos = it->second.WorldPos;
             applyVelocity(
                 it->second.WorldPos,
                 it->second.lastWorldPos,
                 it->second.lastVelocityUpdate,
                 it->second.cachedVelocity,
                 pos);
+            // Keep part/aim helpers glued to the live root so boxes cannot stay
+            // planted on stale mesh CTW after WorldPos moves.
+            const Vector3 d{
+                it->second.WorldPos.x - oldPos.x,
+                it->second.WorldPos.y - oldPos.y,
+                it->second.WorldPos.z - oldPos.z};
+            if (d.x != 0.0 || d.y != 0.0 || d.z != 0.0) {
+                if (IsPlausibleWorldPos(it->second.CenterWorldPos)) {
+                    it->second.CenterWorldPos.x += d.x;
+                    it->second.CenterWorldPos.y += d.y;
+                    it->second.CenterWorldPos.z += d.z;
+                }
+                if (it->second.hasBotHeadWorldPos
+                    && IsPlausibleWorldPos(it->second.BotHeadWorldPos)) {
+                    it->second.BotHeadWorldPos.x += d.x;
+                    it->second.BotHeadWorldPos.y += d.y;
+                    it->second.BotHeadWorldPos.z += d.z;
+                }
+                for (int i = 0; i < it->second.BotPartCount; ++i) {
+                    if (!IsPlausibleWorldPos(it->second.BotPartPos[i]))
+                        continue;
+                    it->second.BotPartPos[i].x += d.x;
+                    it->second.BotPartPos[i].y += d.y;
+                    it->second.BotPartPos[i].z += d.z;
+                }
+            }
         }
-    }
-
-    const auto posMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - t0).count();
-    if (posMs >= 50) {
-        char hitchReason[48];
-        snprintf(hitchReason, sizeof(hitchReason), "hitch_pos_%lldms",
-            static_cast<long long>(posMs));
-        NoteFlicker(hitchReason);
     }
 }
 
@@ -202,7 +217,6 @@ void Engine::BuildEspRenderFrameWorker()
     if (!IsEspRaidActive())
         return;
 
-    const auto t0 = std::chrono::steady_clock::now();
     EspRenderFrame frame{};
     if (!CollectEspRenderFrame(frame))
         return;
@@ -210,13 +224,4 @@ void Engine::BuildEspRenderFrameWorker()
     std::unique_lock<std::shared_mutex> lock(m_espFrameMutex);
     m_lastEspFrame = std::move(frame);
     m_lastEspFrameValid.store(m_lastEspFrame.valid, std::memory_order_release);
-
-    const auto frameMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - t0).count();
-    if (frameMs >= 50) {
-        char hitchReason[48];
-        snprintf(hitchReason, sizeof(hitchReason), "hitch_frame_%lldms",
-            static_cast<long long>(frameMs));
-        NoteFlicker(hitchReason);
-    }
 }

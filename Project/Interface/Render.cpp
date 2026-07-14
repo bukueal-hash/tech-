@@ -58,31 +58,6 @@ void Render(HWND hwnd)
     if (var::show_debug_overlay && !showmenu) {
         DrawDebugOffsetValidation(engine);
         engine.PrintVisCheckDebugConsole();
-
-        // Top-center flicker flash banner + last events (readable when ESP blanks).
-        const Engine::FlickerDebugSnapshot flick = engine.GetFlickerDebug();
-        ImDrawList* fdl = ImGui::GetForegroundDrawList();
-        ImFont* font = ImGui::GetFont();
-        const ImVec2 ds = ImGui::GetIO().DisplaySize;
-        if (flick.lastReason[0] && flick.lastAgeMs >= 0 && flick.lastAgeMs < 5000
-            && engine.IsEspRaidActive()) {
-            const bool isHitch = std::strncmp(flick.lastReason, "hitch_", 6) == 0
-                || std::strncmp(flick.lastReason, "pc_drop", 7) == 0;
-            char banner[160];
-            snprintf(banner, sizeof(banner), "%s: %s  (%lld ms ago)  total=%u",
-                isHitch ? "FREEZE/HITCH" : "FLICKER",
-                flick.lastReason,
-                static_cast<long long>(flick.lastAgeMs),
-                flick.total);
-            const ImVec2 sz = font->CalcTextSizeA(22.f, FLT_MAX, 0.f, banner);
-            const float bx = (ds.x - sz.x) * 0.5f;
-            const float by = 8.f;
-            fdl->AddRectFilled(
-                ImVec2(bx - 10.f, by - 4.f),
-                ImVec2(bx + sz.x + 10.f, by + sz.y + 6.f),
-                isHitch ? IM_COL32(200, 80, 0, 230) : IM_COL32(180, 20, 20, 230));
-            fdl->AddText(font, 22.f, ImVec2(bx, by), IM_COL32(255, 255, 80, 255), banner);
-        }
     }
 
     if (requestExit) {
@@ -239,24 +214,6 @@ static void DrawDebugOffsetValidation(Engine& eng)
         }
         ok = IsUsableCameraFov(cam.FOV);
         drawRow(xPos, row++, "CameraRead", ok, "FOV:%.1f", cam.FOV);
-
-        const Engine::FlickerDebugSnapshot flick = eng.GetFlickerDebug();
-        ok = flick.lastAgeMs < 0 || flick.lastAgeMs > 2000;
-        drawRow(xPos, row++, "FlickerN", flick.total == 0, "%u", flick.total);
-        if (flick.lastReason[0]) {
-            drawRow(xPos, row++, "FlickerLast", ok, "%s", flick.lastReason);
-            drawRow(xPos, row++, "FlickerAge", ok, "%lldms",
-                static_cast<long long>(flick.lastAgeMs));
-        }
-        // Show up to 3 newest events (newest last in list).
-        const int showN = flick.recentCount < 3 ? flick.recentCount : 3;
-        for (int i = 0; i < showN; ++i) {
-            const int idx = flick.recentCount - showN + i;
-            const Engine::FlickerEvent& e = flick.recent[idx];
-            char tag[32];
-            snprintf(tag, sizeof(tag), "Flick#%d", i + 1);
-            drawRow(xPos, row++, tag, true, "%s", e.reason);
-        }
     }
 
     {

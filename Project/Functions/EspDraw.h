@@ -29,35 +29,49 @@ inline bool ResolveBotHeadFeetWorld(
     Vector3& headWorld,
     Vector3& feetWorld)
 {
+    // Live pawn motion comes through WorldPos (scene root + PositionRefresh).
+    // BotPartPos is filled from mesh/child CTW in PopulateBotPartCache; those
+    // transforms often stay at the spawn footprint while the root moves — so
+    // preferring parts planted the ESP box and left it behind the body.
+    if (!IsPlausibleWorldPos(robot.WorldPos))
+        return false;
+
+    constexpr float kHalfHeightCm = 90.f;
+    float halfH = kHalfHeightCm;
+
     if (robot.BotPartCount > 0) {
         float minZ = FLT_MAX;
         float maxZ = -FLT_MAX;
-        double sumX = 0.0;
-        double sumY = 0.0;
         int count = 0;
-
         for (int i = 0; i < robot.BotPartCount; ++i) {
             const Vector3& part = robot.BotPartPos[i];
             if (!IsPlausibleWorldPos(part))
                 continue;
-
+            // Reject frozen mesh parts that drifted away from live WorldPos.
+            const double dx = part.x - robot.WorldPos.x;
+            const double dy = part.y - robot.WorldPos.y;
+            if ((dx * dx + dy * dy) > (250.0 * 250.0))
+                continue;
             const float z = static_cast<float>(part.z);
             minZ = (std::min)(minZ, z);
             maxZ = (std::max)(maxZ, z);
-            sumX += part.x;
-            sumY += part.y;
             ++count;
         }
-
         if (count > 0 && maxZ > minZ + 5.f) {
-            const double inv = 1.0 / static_cast<double>(count);
-            headWorld = Vector3{ sumX * inv, sumY * inv, static_cast<double>(maxZ) };
-            feetWorld = Vector3{ sumX * inv, sumY * inv, static_cast<double>(minZ) };
-            return true;
+            const float span = maxZ - minZ;
+            halfH = span * 0.5f;
+            if (halfH < 40.f)
+                halfH = 40.f;
+            if (halfH > 250.f)
+                halfH = 250.f;
         }
     }
 
-    return ResolveBotHeadFeetWorld(robot.WorldPos, headWorld, feetWorld);
+    headWorld = robot.WorldPos;
+    feetWorld = robot.WorldPos;
+    headWorld.z += halfH;
+    feetWorld.z -= halfH;
+    return true;
 }
 
 inline bool ResolvePlayerHeadFeetWorld(

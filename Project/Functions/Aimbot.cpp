@@ -10,6 +10,7 @@
 #include "../Interface/Utils/Variables/index.h"
 #include "../ThirdParty/ImGui/imgui.h"
 #include <iostream>
+#include <fstream>
 #include <random>
 #include <chrono>
 #include <cmath>
@@ -112,9 +113,15 @@ static bool ResolveAimBoneWorld(
     Vector3& outWorld)
 {
     auto fallbackTorso = [&]() -> bool {
-        if (TryBoneWorld(bones, UniBone::Head, outWorld))
+        if (TryBoneWorld(bones, UniBone::Chest, outWorld))
+            return true;
+        if (TryBoneWorld(bones, UniBone::Spine3, outWorld))
+            return true;
+        if (TryBoneWorld(bones, UniBone::Pelvis, outWorld))
             return true;
         if (TryBoneWorld(bones, UniBone::Neck, outWorld))
+            return true;
+        if (TryBoneWorld(bones, UniBone::Head, outWorld))
             return true;
         return false;
     };
@@ -190,8 +197,7 @@ static bool ResolveAimBoneWorld(
     return fallbackTorso();
 }
 
-/** Acquisition snap: Head when far / new lock; menu bone (Closest etc.) when close. */
-static constexpr float kPlayerAimSnapPx = 48.f;
+/** Soft fasten onto torso — no head acquisition snap (ban-risk / flips off body). */
 static uint64_t g_playerAimLockedKey = 0;
 static bool g_playerAimClosePhase = false;
 
@@ -206,8 +212,8 @@ static float NormalizeYawDelta(float degrees)
 
 static float CameraRotDeltaDeg(const Vector3& a, const Vector3& b)
 {
-    const float dp = std::abs(a.x - b.x);
-    const float dy = std::abs(NormalizeYawDelta(a.y - b.y));
+    const float dp = std::abs(static_cast<float>(a.x - b.x));
+    const float dy = std::abs(NormalizeYawDelta(static_cast<float>(a.y - b.y)));
     return std::sqrt(dp * dp + dy * dy);
 }
 
@@ -221,35 +227,111 @@ static bool ResolvePlayerAimBoneWorldTwoPhase(
     const Engine::CameraCache& cam,
     Vector3& outWorld)
 {
-    Vector3 headWorld{};
-    const bool haveHead = TryBoneWorld(bones, UniBone::Head, headWorld)
-        || TryBoneWorld(bones, UniBone::Neck, headWorld);
-
-    const bool lockedOnThis = (g_playerAimLockedKey != 0 && key == g_playerAimLockedKey);
-    if (!lockedOnThis)
-        g_playerAimClosePhase = false;
-
-    if (haveHead) {
-        Vector3 headScreen{};
-        float headErr = FLT_MAX;
-        if (eng.ProjectWorldLocationToScreen(headWorld, headScreen, cam)) {
-            const float dx = static_cast<float>(headScreen.x - screenCenter.x);
-            const float dy = static_cast<float>(headScreen.y - screenCenter.y);
-            headErr = std::sqrt(dx * dx + dy * dy);
-        }
-
-        // New lock or still far from head → fast Head snap. Once close, stay on menu
-        // bone until unlock — avoids head/chest flip when reload shakes the view.
-        if (!lockedOnThis || (!g_playerAimClosePhase && headErr > kPlayerAimSnapPx)) {
-            outWorld = headWorld;
-            return true;
-        }
-        if (!g_playerAimClosePhase && headErr <= kPlayerAimSnapPx)
-            g_playerAimClosePhase = true;
-    }
-
+    (void)g_playerAimLockedKey;
+    g_playerAimClosePhase = false;
     return ResolveAimBoneWorld(
         eng, bones, key, currentTime, screenCenter, fovRadius, cam, outWorld);
+}
+
+/** Projected body soft-zone: crosshair inside = on-target (shoot-around); outside = fasten. */
+struct SoftBodyScreenZone {
+    bool valid = false;
+    float cx = 0.f;
+    float cy = 0.f;
+    float halfW = 0.f;
+    float halfH = 0.f;
+};
+
+static bool CrosshairInSoftBodyZone(
+    const Vector3& screenCenter,
+    const SoftBodyScreenZone& z)
+{
+    if (!z.valid || z.halfW < 4.f || z.halfH < 8.f)
+        return false;
+    const float dx = std::abs(static_cast<float>(screenCenter.x) - z.cx);
+    const float dy = std::abs(static_cast<float>(screenCenter.y) - z.cy);
+    return dx <= z.halfW && dy <= z.halfH;
+}
+
+static SoftBodyScreenZone BuildPlayerSoftBodyZone(
+    Engine& eng,
+    const BoneData& bones,
+    const Vector3& worldFallback,
+    const Engine::CameraCache& cam)
+{
+    SoftBodyScreenZone z{};
+    Vector3 headW{};
+    Vector3 feetW{};
+    bool headOk = TryBoneWorld(bones, UniBone::Head, headW)
+        || TryBoneWorld(bones, UniBone::Neck, headW);
+    bool feetOk = TryBoneWorld(bones, UniBone::FootL, feetW)
+        || TryBoneWorld(bones, UniBone::FootR, feetW)
+        || TryBoneWorld(bones, UniBone::Pelvis, feetW);
+    if (!headOk && IsPlausibleWorldPos(worldFallback)) {
+        headW = worldFallback;
+        headW.z += 90.0;
+        headOk = true;
+    }
+    if (!feetOk && IsPlausibleWorldPos(worldFallback)) {
+        feetW = worldFallback;
+        feetW.z -= 90.0;
+        feetOk = true;
+    }
+    if (!headOk || !feetOk)
+        return z;
+
+    Vector3 headS{};
+    Vector3 feetS{};
+    if (!eng.ProjectWorldLocationToScreen(headW, headS, cam)
+        || !eng.ProjectWorldLocationToScreen(feetW, feetS, cam))
+        return z;
+
+    const float top = static_cast<float>((std::min)(headS.y, feetS.y));
+    const float bot = static_cast<float>((std::max)(headS.y, feetS.y));
+    const float midX = static_cast<float>((headS.x + feetS.x) * 0.5);
+    const float h = bot - top;
+    if (h < 16.f)
+        return z;
+
+    z.valid = true;
+    z.cx = midX;
+    z.cy = (top + bot) * 0.5f;
+    z.halfH = h * 0.55f;
+    z.halfW = h * 0.28f;
+    if (z.halfW < 18.f)
+        z.halfW = 18.f;
+    return z;
+}
+
+static SoftBodyScreenZone BuildRobotSoftBodyZone(
+    Engine& eng,
+    const Engine::WorldCacheEntry& robot,
+    const Engine::CameraCache& cam)
+{
+    SoftBodyScreenZone z{};
+    Vector3 headW{};
+    Vector3 feetW{};
+    if (!EspDraw::ResolveBotHeadFeetWorld(robot, headW, feetW))
+        return z;
+    Vector3 headS{};
+    Vector3 feetS{};
+    if (!eng.ProjectWorldLocationToScreen(headW, headS, cam)
+        || !eng.ProjectWorldLocationToScreen(feetW, feetS, cam))
+        return z;
+    const float top = static_cast<float>((std::min)(headS.y, feetS.y));
+    const float bot = static_cast<float>((std::max)(headS.y, feetS.y));
+    const float midX = static_cast<float>((headS.x + feetS.x) * 0.5);
+    const float h = bot - top;
+    if (h < 12.f)
+        return z;
+    z.valid = true;
+    z.cx = midX;
+    z.cy = (top + bot) * 0.5f;
+    z.halfH = h * 0.55f;
+    z.halfW = h * 0.32f;
+    if (z.halfW < 14.f)
+        z.halfW = 14.f;
+    return z;
 }
 
 static float ScoreAimTarget(
@@ -527,6 +609,31 @@ static void ExtrapolateRobotWorldPosToNow(Engine::WorldCacheEntry& entry)
     }
 }
 
+// Lead aim bones to "now" using PositionRefresh velocity — GetActorVelocity was
+// ~0 in aim_lock_track (velMag=1) so predict never caught strafing players while
+// ESP WorldPos already extrapolated ahead of uneqtrapolated bones.
+static void ExtrapolatePlayerAimWorldToNow(
+    Vector3& worldPos,
+    const Vector3& cachedVelocity,
+    float lastVelocityUpdate)
+{
+    if (!IsPlausibleWorldPos(worldPos) || lastVelocityUpdate <= 0.f)
+        return;
+    const uint64_t nowMs = NowMs();
+    const float dtSec =
+        (nowMs - static_cast<uint64_t>(lastVelocityUpdate)) * 0.001f;
+    if (dtSec <= 0.f || dtSec > 0.20f)
+        return;
+    worldPos.x += cachedVelocity.x * dtSec;
+    worldPos.y += cachedVelocity.y * dtSec;
+    worldPos.z += cachedVelocity.z * dtSec;
+}
+
+static float VelocityMag(const Vector3& v)
+{
+    return static_cast<float>(std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z));
+}
+
 static float RobotWorldAgeMs(const Engine::WorldCacheEntry& entry)
 {
     if (entry.lastVelocityUpdate <= 0.f)
@@ -638,6 +745,17 @@ void Engine::AimAssistPlayer(
             worldPos.z += 160.0;
         }
 
+        // Match ESP PositionRefresh lead so bones aren't left behind moving pawns.
+        ExtrapolatePlayerAimWorldToNow(
+            worldPos, actor.cachedVelocity, actor.lastVelocityUpdate);
+
+        Vector3 velocity = actor.cachedVelocity;
+        if (VelocityMag(velocity) < 5.f) {
+            const Vector3 dmaVel = GetActorVelocity(actor.APawn);
+            if (VelocityMag(dmaVel) > VelocityMag(velocity))
+                velocity = dmaVel;
+        }
+
         if (var::predict)
         {
             Vector3 camLocation{};
@@ -645,7 +763,6 @@ void Engine::AimAssistPlayer(
                 std::shared_lock<std::shared_mutex> camLock(m_cameraMutex);
                 camLocation = g_Camera.Location;
             }
-            const Vector3 velocity = GetActorVelocity(actor.APawn);
             worldPos = PredictPosition(worldPos, velocity, camLocation, bulletSpeed, 3);
         }
 
@@ -781,14 +898,17 @@ void Engine::AimAssistRobot(
 namespace {
 
 constexpr int kKmAimChunkPx = 512;
-constexpr float kMaxAimStepFraction = 1.0f;
+// Soft fasten (not ban-risk hard snap): enough mouse budget to reach body, capped.
+constexpr float kMaxAimStepFraction = 1.85f;
 constexpr float kHumanizerSkipDistPx = 40.f;
 /** Per-tick view rotation jump — reload / flinch; don't fight the animation. */
 constexpr float kAimViewShakeSuppressDeg = 1.35f;
 /** ESP-frame camera only when live view is stable (avoids stale-cam jitter). */
 constexpr float kAimEspFrameCamMaxDriftDeg = 0.65f;
+/** When crosshair is already on the model, keep tracking tiny (shoot-around). */
+constexpr float kOnBodyPullScale = 0.12f;
 
-float SendKmAimDelta(float dx, float dy, float* outGain = nullptr)
+float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain = nullptr)
 {
     const float dist = hypotf(dx, dy);
     if (dist <= var::aim_deadzone_px)
@@ -803,27 +923,36 @@ float SendKmAimDelta(float dx, float dy, float* outGain = nullptr)
         sens = 0.25f;
 
     float gain = (speed / 10.f) / (smooth * sens);
-    if (gain < 0.05f)
-        gain = 0.05f;
-    if (gain > 8.f)
-        gain = 8.f;
+    if (gain < 0.06f)
+        gain = 0.06f;
+    if (gain > 10.f)
+        gain = 10.f;
 
-    // Extra pull when lagging behind a moving target (large pixel error).
-    if (dist > 24.f)
-        gain *= 1.f + (std::min)(dist, 160.f) / 160.f;
+    // Progressive fasten while off-body — not a teleport.
+    if (dist > 20.f)
+        gain *= 1.05f + (std::min)(dist, 220.f) / 220.f;
 
     if (var::aim_algorithm == AimAlgorithm::Accelerated) {
-        const float norm = (std::min)(dist / 120.f, 1.f);
-        gain *= (0.5f + 0.5f * norm * norm);
+        const float norm = (std::min)(dist / 100.f, 1.f);
+        gain *= (0.8f + 0.45f * norm * norm);
     }
+
+    if (pullScale < 0.f)
+        pullScale = 0.f;
+    if (pullScale > 1.f)
+        pullScale = 1.f;
+    gain *= pullScale;
 
     if (outGain)
         *outGain = gain;
 
+    if (gain < 0.01f)
+        return gain;
+
     int remX = static_cast<int>(std::round(dx * gain));
     int remY = static_cast<int>(std::round(dy * gain));
 
-    const float maxStep = dist * kMaxAimStepFraction;
+    const float maxStep = dist * kMaxAimStepFraction * (std::max)(pullScale, 0.15f);
     if (maxStep > 0.5f) {
         const float mag = hypotf(static_cast<float>(remX), static_cast<float>(remY));
         if (mag > maxStep) {
@@ -833,7 +962,7 @@ float SendKmAimDelta(float dx, float dy, float* outGain = nullptr)
         }
     }
 
-    if (remX == 0 && remY == 0 && dist > 0.5f) {
+    if (remX == 0 && remY == 0 && dist > 0.5f && pullScale > 0.05f) {
         remX = (dx > 0.f) ? 1 : ((dx < 0.f) ? -1 : 0);
         remY = (dy > 0.f) ? 1 : ((dy < 0.f) ? -1 : 0);
     }
@@ -869,8 +998,69 @@ struct AimDebugSnapshot {
     uint8_t posSrc = 0;
     float worldAgeMs = 0.f;
     int grace = 0;
+    // #region agent log
+    int lockedInCand = -1;
+    int isRobot = -1;
+    float distPx = -1.f;
+    float velMag = -1.f;
+    float stickyFov = -1.f;
+    int dropReason = 0; // 0 none, 1 notInCand, 2 graceExpire, 3 noBest, 4 kmbox
+    int onBody = -1;    // 1 crosshair in soft body zone
+    int zoneOk = 0;
+    float pullScale = 1.f;
+    float bodyEdge = -1.f; // 0 center .. 1 edge of soft zone
+    // #endregion
 };
 static AimDebugSnapshot s_aimDbg;
+
+// #region agent log
+static void WriteAimTrackNdjson(const AimDebugSnapshot& d, bool suppress)
+{
+    static auto s_last = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    // Always emit on drop; otherwise throttle.
+    const bool force = d.dropReason != 0;
+    if (!force
+        && s_last.time_since_epoch().count() != 0
+        && now - s_last < std::chrono::milliseconds(250))
+        return;
+    s_last = now;
+    std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+    if (!f)
+        return;
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    f << "{\"sessionId\":\"c190fb\",\"runId\":\"soft-body\",\"hypothesisId\":\"G\""
+      << ",\"location\":\"Aimbot.cpp:AimAssistence\",\"message\":\"aim_lock_track\""
+      << ",\"data\":{\"candidates\":" << d.candidates
+      << ",\"locked\":" << d.locked
+      << ",\"inCand\":" << d.lockedInCand
+      << ",\"dx\":" << d.lastDx
+      << ",\"dy\":" << d.lastDy
+      << ",\"distPx\":" << d.distPx
+      << ",\"gain\":" << d.lastGain
+      << ",\"kmbox\":" << d.kmbox
+      << ",\"grace\":" << d.grace
+      << ",\"drop\":" << d.dropReason
+      << ",\"isRobot\":" << d.isRobot
+      << ",\"velMag\":" << d.velMag
+      << ",\"worldAgeMs\":" << d.worldAgeMs
+      << ",\"posSrc\":" << static_cast<int>(d.posSrc)
+      << ",\"sticky\":" << (var::sticky_target_lock ? 1 : 0)
+      << ",\"stickyFovPx\":" << d.stickyFov
+      << ",\"predict\":" << (var::predict ? 1 : 0)
+      << ",\"smooth\":" << var::smoothness
+      << ",\"hwSpeed\":" << var::aim_hardware_speed
+      << ",\"fovDeg\":" << var::aimbot_fov
+      << ",\"graceMs\":" << var::aim_loss_of_sight_grace_ms
+      << ",\"suppress\":" << (suppress ? 1 : 0)
+      << ",\"onBody\":" << d.onBody
+      << ",\"zoneOk\":" << d.zoneOk
+      << ",\"pullScale\":" << d.pullScale
+      << ",\"bodyEdge\":" << d.bodyEdge
+      << "},\"timestamp\":" << ms << "}\n";
+}
+// #endregion
 
 } // namespace
 
@@ -1045,6 +1235,10 @@ void Engine::AimAssistence()
     g_aimStickyKey = 0;
     g_aimStickyExtraFovPx = 0.f;
 
+    // #region agent log
+    s_aimDbg.candidates = static_cast<int>(allTargets.size());
+    // #endregion
+
     if (lockedTarget != 0) {
         bool lockedInCandidates = false;
         for (const AimTarget& target : allTargets) {
@@ -1061,12 +1255,25 @@ void Engine::AimAssistence()
                         it != robotCache.end())
                         s_graceVelocity = it->second.cachedVelocity;
                 } else {
-                    s_graceVelocity = GetActorVelocity(static_cast<uintptr_t>(target.entityKey));
+                    std::shared_lock<std::shared_mutex> plock(m_playerCacheMutex);
+                    if (const auto it = playerCache.find(static_cast<uintptr_t>(target.entityKey));
+                        it != playerCache.end()
+                        && VelocityMag(it->second.cachedVelocity) >= 5.f)
+                        s_graceVelocity = it->second.cachedVelocity;
+                    else
+                        s_graceVelocity = GetActorVelocity(
+                            static_cast<uintptr_t>(target.entityKey));
                 }
                 break;
             }
         }
+        // #region agent log
+        s_aimDbg.lockedInCand = lockedInCandidates ? 1 : 0;
+        // #endregion
         if (!lockedInCandidates) {
+            // #region agent log
+            s_aimDbg.dropReason = 1;
+            // #endregion
             if (var::aim_loss_of_sight_grace_enabled
                 && var::aim_loss_of_sight_grace_ms > 0
                 && s_graceTarget.entityKey == lockedTarget) {
@@ -1107,6 +1314,10 @@ void Engine::AimAssistence()
                     s_graceStampMs = 0;
                     s_aimDbg.locked = 0;
                     s_aimDbg.grace = 0;
+                    // #region agent log
+                    s_aimDbg.dropReason = 2;
+                    WriteAimTrackNdjson(s_aimDbg, suppressAimOutput);
+                    // #endregion
                     return;
                 }
             } else {
@@ -1117,6 +1328,10 @@ void Engine::AimAssistence()
                 s_graceVelocity = {};
                 s_graceStampMs = 0;
                 s_aimDbg.locked = 0;
+                // #region agent log
+                s_aimDbg.dropReason = 1;
+                WriteAimTrackNdjson(s_aimDbg, suppressAimOutput);
+                // #endregion
                 return;
             }
         }
@@ -1149,10 +1364,26 @@ void Engine::AimAssistence()
         humanizer.Reset();
         s_graceActive = false;
         s_aimDbg.locked = 0;
+        // #region agent log
+        s_aimDbg.dropReason = 3;
+        WriteAimTrackNdjson(s_aimDbg, suppressAimOutput);
+        // #endregion
         return;
     }
 
     s_aimDbg.candidates = static_cast<int>(allTargets.size());
+    // #region agent log
+    s_aimDbg.isRobot = bestTarget->isRobot ? 1 : 0;
+    s_aimDbg.distPx = bestTarget->distToCenter;
+    {
+        const Vector3& v = s_graceVelocity;
+        s_aimDbg.velMag = static_cast<float>(
+            std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z));
+    }
+    s_aimDbg.stickyFov = fovRadius + (var::sticky_target_lock
+        ? (std::max)(0.f, var::aim_sticky_fov_bias_px)
+        : 0.f);
+    // #endregion
 
     if (bestTarget->worldPos.x == 0.0 && bestTarget->worldPos.y == 0.0 && bestTarget->worldPos.z == 0.0)
         return;
@@ -1205,6 +1436,10 @@ void Engine::AimAssistence()
             previousTarget = 0;
             humanizer.Reset();
             s_graceActive = false;
+            // #region agent log
+            s_aimDbg.dropReason = 4;
+            WriteAimTrackNdjson(s_aimDbg, suppressAimOutput);
+            // #endregion
         }
         return;
     }
@@ -1215,12 +1450,63 @@ void Engine::AimAssistence()
     float dx = static_cast<float>(bestTarget->aimPos.x - screenCenter.x);
     float dy = static_cast<float>(bestTarget->aimPos.y - screenCenter.y);
 
+    // Soft body zone: fasten from outside; free shoot-around once crosshair is on model.
+    SoftBodyScreenZone bodyZone{};
+    float pullScale = 1.f;
+    int onBody = 0;
+    float bodyEdge = -1.f;
+    if (!bestTarget->isRobot) {
+        std::shared_lock<std::shared_mutex> plock(m_playerCacheMutex);
+        if (const auto it = playerCache.find(static_cast<uintptr_t>(bestTarget->entityKey));
+            it != playerCache.end()) {
+            bodyZone = BuildPlayerSoftBodyZone(
+                *this, it->second.boneData, it->second.WorldPos, aimProjCam);
+        }
+    } else {
+        std::shared_lock<std::shared_mutex> rlock(m_robotCacheMutex);
+        if (const auto it = robotCache.find(static_cast<uintptr_t>(bestTarget->entityKey));
+            it != robotCache.end()) {
+            bodyZone = BuildRobotSoftBodyZone(*this, it->second, aimProjCam);
+        }
+    }
+
+    if (bodyZone.valid && CrosshairInSoftBodyZone(screenCenter, bodyZone)) {
+        onBody = 1;
+        const float ox = std::abs(static_cast<float>(screenCenter.x) - bodyZone.cx)
+            / (std::max)(bodyZone.halfW, 1.f);
+        const float oy = std::abs(static_cast<float>(screenCenter.y) - bodyZone.cy)
+            / (std::max)(bodyZone.halfH, 1.f);
+        bodyEdge = (std::max)(ox, oy);
+        if (bodyEdge < 0.72f) {
+            // On model — do not magnet to one bone; allow shoot-around.
+            pullScale = kOnBodyPullScale;
+            dx = 0.f;
+            dy = 0.f;
+        } else {
+            // Near silhouette edge — soft inward retention so lock doesn't fall off.
+            dx = bodyZone.cx - static_cast<float>(screenCenter.x);
+            dy = bodyZone.cy - static_cast<float>(screenCenter.y);
+            pullScale = 0.30f;
+        }
+    }
+
     s_aimDbg.lastDx = dx;
     s_aimDbg.lastDy = dy;
     s_aimDbg.posSrc = bestTarget->aimPosSrc;
     s_aimDbg.worldAgeMs = bestTarget->aimWorldAgeMs;
+    // #region agent log
+    s_aimDbg.onBody = onBody;
+    s_aimDbg.zoneOk = bodyZone.valid ? 1 : 0;
+    s_aimDbg.pullScale = pullScale;
+    s_aimDbg.bodyEdge = bodyEdge;
+    s_aimDbg.distPx = hypotf(
+        static_cast<float>(bestTarget->aimPos.x - screenCenter.x),
+        static_cast<float>(bestTarget->aimPos.y - screenCenter.y));
+    // #endregion
 
-    if (var::humanizer && !bestTarget->isRobot && hypotf(dx, dy) >= kHumanizerSkipDistPx) {
+    if (var::humanizer && !bestTarget->isRobot
+        && pullScale > 0.5f
+        && hypotf(dx, dy) >= kHumanizerSkipDistPx) {
         const float movePx = hypotf(dx, dy);
         double jitterX = 0.0;
         double jitterY = 0.0;
@@ -1234,14 +1520,17 @@ void Engine::AimAssistence()
 
     // Reload / flinch moves the view — skip hardware pull for this tick (keep lock).
     if (!suppressAimOutput)
-        s_aimDbg.lastGain = SendKmAimDelta(dx, dy, &s_aimDbg.lastGain);
+        s_aimDbg.lastGain = SendKmAimDelta(dx, dy, pullScale, &s_aimDbg.lastGain);
 
     // Triggerbot: fire when locked and within deadzone (or very close), if hardware
     // can report physical buttons and user isn't already holding LMB.
     if (var::enable_triggerbot && g_kmbox.FiringProxyAvailable()) {
         const float onTargetPx = (std::max)(var::aim_deadzone_px, 4.f);
-        const float distPx = hypotf(dx, dy);
-        if (distPx <= onTargetPx && !g_kmbox.IsPhysicalLeftDown()) {
+        const float distPx = hypotf(
+            static_cast<float>(bestTarget->aimPos.x - screenCenter.x),
+            static_cast<float>(bestTarget->aimPos.y - screenCenter.y));
+        const bool onBodyFire = onBody != 0;
+        if ((distPx <= onTargetPx || onBodyFire) && !g_kmbox.IsPhysicalLeftDown()) {
             static auto s_lastTriggerClick = std::chrono::steady_clock::time_point{};
             const auto nowTp = std::chrono::steady_clock::now();
             if (s_lastTriggerClick.time_since_epoch().count() == 0
@@ -1269,6 +1558,15 @@ void Engine::AimAssistence()
                 << " gain=" << s_aimDbg.lastGain
                 << " kmbox=" << s_aimDbg.kmbox
                 << " grace=" << s_aimDbg.grace
+                << " inCand=" << s_aimDbg.lockedInCand
+                << " robot=" << s_aimDbg.isRobot
+                << " distPx=" << s_aimDbg.distPx
+                << " vel=" << s_aimDbg.velMag
+                << " drop=" << s_aimDbg.dropReason
+                << " onBody=" << s_aimDbg.onBody
+                << " pull=" << s_aimDbg.pullScale
+                << " edge=" << s_aimDbg.bodyEdge
+                << " zone=" << s_aimDbg.zoneOk
                 << " viewShakeDeg=" << viewShakeDeg
                 << " suppress=" << (suppressAimOutput ? 1 : 0)
                 << " src=" << srcTag
@@ -1278,4 +1576,8 @@ void Engine::AimAssistence()
                 << std::endl;
         }
     }
+
+    // #region agent log
+    WriteAimTrackNdjson(s_aimDbg, suppressAimOutput);
+    // #endregion
 }
