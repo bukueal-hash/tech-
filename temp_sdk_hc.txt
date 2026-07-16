@@ -1,0 +1,4 @@
+146843:// Class /Script/Angelscript.ActorHealthComponent
+222065:// Class /Script/Angelscript.HealthComponent
+222173:// Class /Script/Angelscript.HealthComponentInterface
+266443:// Class /Script/Angelscript.PioneerActorHealthComponentAttributeSet

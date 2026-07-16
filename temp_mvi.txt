@@ -1,0 +1,28 @@
+171165:void BlueprintUpdateCameraShake(MinimalViewInfo POV, MinimalViewInfo ModifiedPOV, float DeltaTime, float Alpha); // 4 params
+211595:void BlueprintUpdateCameraShake(MinimalViewInfo POV, MinimalViewInfo ModifiedPOV, float DeltaTime, float Alpha); // 4 params
+212016:void BlueprintUpdateCameraShake(MinimalViewInfo POV, MinimalViewInfo ModifiedPOV, float DeltaTime, float Alpha); // 4 params
+371304:constexpr uint32_t ModifiedPOV                              = 0x830;  // MinimalViewInfo // size=0x820
+371305:constexpr uint32_t POV                                      = 0x10;  // MinimalViewInfo // size=0x820
+397289:constexpr uint32_t ReturnValue                              = 0x10;  // MinimalViewInfo // size=0x820
+397313:constexpr uint32_t DesiredView                              = 0x10;  // MinimalViewInfo // size=0x820
+420569:constexpr uint32_t DesiredView                              = 0x0;  // MinimalViewInfo // size=0x820
+556370:constexpr uint32_t MinimalViewInfo                          = 0x0;  // MinimalViewInfo // size=0x820
+556517:constexpr uint32_t POV                                      = 0x10;  // MinimalViewInfo // size=0x820
+556565:void GetCameraView(MinimalViewInfo DesiredView, float DeltaTime); // 2 params
+556744:constexpr uint32_t POV                                      = 0x10;  // MinimalViewInfo // size=0x820
+556874:constexpr uint32_t POV                                      = 0x10;  // MinimalViewInfo // size=0x820
+565054:void GetViewProjectionMatrix(MinimalViewInfo DesiredView, Matrix ViewMatrix, Matrix ProjectionMatrix, Matrix ViewProjectionMatrix); // 4 params
+572135:Matrix CalculateProjectionMatrix(MinimalViewInfo MinimalViewInfo); // 1 params
+582728:// Struct /Script/Engine.MinimalViewInfo
+582731:namespace MinimalViewInfo {
+582747:} // namespace MinimalViewInfo  // size=0x820
+600737:constexpr uint32_t POV                                      = 0x10;  // MinimalViewInfo // size=0x820
+613651:void BlueprintUpdateCameraShake(MinimalViewInfo POV, MinimalViewInfo ModifiedPOV, float DeltaTime, float Alpha); // 4 params
+708935:constexpr uint32_t ReturnValue                              = 0x10;  // MinimalViewInfo // size=0x820
+708987:MinimalViewInfo GetCameraCachePOV(PlayerController* PlayerController); // 1 params
+708989:MinimalViewInfo GetLastFrameCameraCachePOV(PlayerController* PlayerController); // 1 params
+745848:void MinimalViewInfo(PostProcessSettings PostProcessSettings, Vector2D OffCenterProjectionOffset, Vector Location, Rotator Rotation, float FOV, float DesiredFOV, float OrthoWidth, float OrthoNearClipPlane, float OrthoFarClipPlane, float PerspectiveNearClipPlane, float AspectRatio, bool bConstrainAspectRatio, bool bUseFieldOfViewForLOD, ECameraProjectionMode ProjectionMode, float PostProcessBlendWeight); // f params
+746148:void CameraCacheEntry(MinimalViewInfo POV, float Timestamp); // 2 params
+746150:void TViewTarget(Actor* Target, MinimalViewInfo POV, PlayerState* PlayerState); // 3 params
+746648:void CameraShakeUpdateParams(MinimalViewInfo POV, float DeltaTime, float ShakeScale, float DynamicScale); // 4 params
+746650:void CameraShakeScrubParams(MinimalViewInfo POV, float AbsoluteTime, float ShakeScale, float DynamicScale); // 4 params
