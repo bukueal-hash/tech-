@@ -225,6 +225,9 @@ static bool LooksLikeStrictHubWorld(uintptr_t world, uintptr_t level)
 	static const char* kStrictHubTokens[] = {
 		"sprocket", "mainmenu", "frontend", "front_end",
 		"lobby", "loadout", "hideout", "menuworld", "bilguun",
+		// Post-raid score screen (log: world "EndofRound"). Not listing it kept
+		// raidRaw true on the stay path until the world pointer changed.
+		"endofround",
 	};
 	return FNameTokensMatch(world, level, kStrictHubTokens,
 		static_cast<int>(sizeof(kStrictHubTokens) / sizeof(kStrictHubTokens[0])));
@@ -341,6 +344,7 @@ static const char* MatchHubToken(uintptr_t world, uintptr_t level)
 	static const char* kTokens[] = {
 		"sprocket", "mainmenu", "frontend", "front_end",
 		"lobby", "loadout", "hideout", "menuworld", "bilguun",
+		"endofround",
 	};
 	for (const char* tok : kTokens) {
 		if (ObjectFNameContains(world, tok) || ObjectFNameContains(level, tok))
@@ -779,6 +783,11 @@ bool Engine::IsInRaidRaw() const
 		if (LooksLikeStrictHubWorld(sGWorld, sPersistentLevel))
 			return false;
 		if (sAcknowledgedPawn && PawnLooksLikeHubCharacter(sAcknowledgedPawn))
+			return false;
+		// Menu with undecryptable hub FName kept raid "on" forever: local pawn
+		// gone AND GameState player array drained to <=1 means we left the
+		// match server. Brief DMA flakes are absorbed by kRaidRawFalseGraceMs.
+		if (!sAcknowledgedPawn && CountGameStatePlayerArray() <= 1)
 			return false;
 		return true;
 	}

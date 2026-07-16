@@ -61,6 +61,17 @@ bool FnameLooksLikeNonWorldEspActor(const std::string& fname)
         || lower.find("boxcomponent") != std::string::npos
         || lower.find("capsulecomponent") != std::string::npos)
         return true;
+    // Niagara / VFX / GameplayCue effects (e.g. NS_VisionCone_Peppermint, the
+    // Queen's sight-cone effect) are visual FX actors, never floor loot.
+    if (lower.rfind("ns_", 0) == 0
+        || lower.find("niagara") != std::string::npos
+        || lower.find("visioncone") != std::string::npos
+        || lower.find("vision_cone") != std::string::npos
+        || lower.rfind("gc_", 0) == 0
+        || lower.find("gameplaycue") != std::string::npos
+        || lower.find("_vfx") != std::string::npos
+        || lower.find("vfx_") != std::string::npos)
+        return true;
     // Log proof: DDGIVolume→"Double Property", IndoorsVolume→"Door",
     // WaterProcessingBuilding→item ESP. These are not floor loot.
     static const char* kJunkWorld[] = {

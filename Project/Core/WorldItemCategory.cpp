@@ -1879,6 +1879,11 @@ bool IsJunkWorldEspLabel(const std::string& label)
         "window style",
         "f window style",
         "f window",
+        // Niagara / VFX / GameplayCue effects humanized into loot labels
+        // (e.g. "NS Vision Cone Peppermint" = Queen sight-cone effect).
+        "vision cone",
+        "niagara",
+        "gameplay cue",
     };
     for (const char* token : kBlocked) {
         if (lower.find(token) != std::string::npos)
@@ -2137,30 +2142,30 @@ ContainerOpenSignal ProbeContainerOpenSignals(uintptr_t actor, const std::string
     if (FnameExcludedFromContainerEsp(fnameLower))
         return ContainerOpenSignal::None;
 
-    // Fast path: directly read bHasBeenOpened from the LootInteractionComponent
-    // pointer.  We skip the class-name gate (which fails on DMA reads) but
-    // validate via UObject::OuterPrivate (offset 0x20 in this engine's layout)
-    // — it must point back to the owning actor so we know the pointer is real.
-    // SDK: LootContainerSingle::LootInteraction@0xB58,
-    //      LootInteractionComponent::bHasBeenOpened@0x870 mask=0x1.
-    {
-        const uintptr_t lootCompDirect =
-            Memory::read<uintptr_t>(actor + static_cast<uint64_t>(Offsets::LootInteractionComponent));
-        if (lootCompDirect && Memory::IsValidPtrFast2(lootCompDirect)) {
-            const uintptr_t outer = Memory::read<uintptr_t>(lootCompDirect + 0x20);
-            if (outer == actor) {
-                const uint8_t openedByte = Memory::read<uint8_t>(
-                    lootCompDirect + static_cast<uint64_t>(Offsets::LootInteraction_Searched));
-                if (openedByte & 0x1)
-                    return ContainerOpenSignal::LootSearched;
-            }
-        }
-    }
+    // Help SDK: LootContainerSingle::LootInteraction@0xB58,
+    // LootInteractionComponent::bHasBeenOpened@0x870 mask=0x1.
+    // Pointers read FROM the actor's own fields are already owned — do not
+    // require OuterPrivate@0x20 (that gate silently blocked opens for minutes
+    // while the shell stayed labeled as a closed crate).
+    auto fieldLiOpened = [](uintptr_t li) -> bool {
+        if (!li || !Memory::IsValidPtrFast2(li))
+            return false;
+        const uint8_t openedByte = Memory::read<uint8_t>(
+            li + static_cast<uint64_t>(Offsets::LootInteraction_Searched));
+        return (openedByte & 0x1) != 0;
+    };
+    if (fieldLiOpened(Memory::read<uintptr_t>(
+            actor + static_cast<uint64_t>(Offsets::LootInteractionComponent)))
+        || fieldLiOpened(Memory::read<uintptr_t>(
+            actor + static_cast<uint64_t>(Offsets::LootInteraction_Container)))
+        || fieldLiOpened(Memory::read<uintptr_t>(
+            actor + static_cast<uint64_t>(Offsets::SimpleLootActivity_LootInteraction))))
+        return ContainerOpenSignal::LootSearched;
 
     if (SalvageChosenMeshLooksOpened(actor, fnameLower))
         return ContainerOpenSignal::SalvageMesh;
 
-    // Do not use ItemContainer OpenTime (false DynamicLootType opens).
+    // Do not use ItemContainer OpenTime (SDK types it as FName; float reads FPed).
 
     std::vector<uintptr_t> lootPointers;
     CollectLootInteractionPointers(actor, fnameLower, lootPointers);
@@ -2207,6 +2212,25 @@ GroundLootPickupSignal ProbeGroundLootPickupSignals(
 
     if (ActorLooksHiddenOrDestroyed(actor))
         sig = sig | GroundLootPickupSignal::HiddenOrDestroyed;
+
+    // After pickup the actor shell often stays for 1–2 minutes before GC, but
+    // RootComponent / RootCollider flip bHiddenInGame immediately (syringe case).
+    {
+        auto sceneHiddenInGame = [](uintptr_t comp) -> bool {
+            if (!comp || !Memory::IsValidPtrFast2(comp))
+                return false;
+            const uint8_t flags = Memory::read<uint8_t>(
+                comp + static_cast<uint64_t>(Offsets::Scene_bHiddenInGameByte));
+            return (flags & Offsets::Scene_bHiddenInGameMask) != 0;
+        };
+        const uintptr_t root =
+            Memory::read<uintptr_t>(actor + static_cast<uint64_t>(Offsets::RootComponent));
+        const uintptr_t collider =
+            Memory::read<uintptr_t>(
+                actor + static_cast<uint64_t>(Offsets::Pickup_RootCollider));
+        if (sceneHiddenInGame(root) || sceneHiddenInGame(collider))
+            sig = sig | GroundLootPickupSignal::HiddenOrDestroyed;
+    }
 
     std::string fname = fnameHint;
     if (fname.empty())
@@ -2306,8 +2330,10 @@ bool WorldLootCacheEntryDepleted(
         return true;
 
     if (WorldCategoryIsContainerProp(cat) || cat == WorldItemCategory::OpenedContainer) {
-        if (ContainerLootLooksOpened(actor, fnameHint))
-            return true;
+        // Opened ≠ depleted. Erasing here removed crates from cache so they never
+        // remapped to menu "Open Container" and kept showing closed for minutes.
+        (void)fnameHint;
+        return false;
     }
 
     if (cat == WorldItemCategory::DroppedPickup

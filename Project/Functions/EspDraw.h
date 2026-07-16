@@ -148,20 +148,70 @@ inline bool WorldToScreenBox(
 {
     Vector3 headScr{};
     Vector3 feetScr{};
-    if (!eng.ProjectWorldLocationToScreen(headWorld, headScr, cam))
-        return false;
-    if (!eng.ProjectWorldLocationToScreen(feetWorld, feetScr, cam))
-        return false;
+    const bool headOk = eng.ProjectWorldLocationToScreen(headWorld, headScr, cam);
+    const bool feetOk = eng.ProjectWorldLocationToScreen(feetWorld, feetScr, cam);
+
+    if (!headOk || !feetOk) {
+        // Close flying bots (Firefly/Wasp overhead, sky-drop Snitch): one end
+        // of the head-feet segment lands behind the near plane or outside the
+        // projection bounds while the body is centered on screen. Requiring
+        // BOTH endpoints dropped the whole box (c190fb near_bot_w2s_fail at
+        // 7-11m). Rebuild from the center point with a distance-scaled height.
+        const Vector3 centerWorld{
+            (headWorld.x + feetWorld.x) * 0.5,
+            (headWorld.y + feetWorld.y) * 0.5,
+            (headWorld.z + feetWorld.z) * 0.5};
+        Vector3 centerScr{};
+        if (!eng.ProjectWorldLocationToScreen(centerWorld, centerScr, cam))
+            return false;
+
+        const double dx = centerWorld.x - cam.Location.x;
+        const double dy = centerWorld.y - cam.Location.y;
+        const double dz = centerWorld.z - cam.Location.z;
+        const double distCm = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+        float halfPx = 14.f;
+        if (distCm > 1.0 && cam.FOV > 1.f && cam.FOV < 179.f) {
+            constexpr double kPi = 3.14159265358979323846;
+            const double tanHalfFov =
+                std::tan(static_cast<double>(cam.FOV) * kPi / 360.0);
+            if (tanHalfFov > 0.001) {
+                const double worldH = std::fabs(headWorld.z - feetWorld.z);
+                const double scale =
+                    (static_cast<double>(ImGui::GetIO().DisplaySize.y) * 0.5)
+                    / tanHalfFov;
+                const double hPx = worldH * scale / distCm;
+                halfPx = static_cast<float>(
+                    (std::min)((std::max)(hPx * 0.5, 12.0), 400.0));
+            }
+        }
+        head = ImVec2(
+            static_cast<float>(centerScr.x),
+            static_cast<float>(centerScr.y) - halfPx);
+        feet = ImVec2(
+            static_cast<float>(centerScr.x),
+            static_cast<float>(centerScr.y) + halfPx);
+        return std::isfinite(head.x) && std::isfinite(head.y)
+            && std::isfinite(feet.x) && std::isfinite(feet.y);
+    }
 
     if (feetScr.y < headScr.y)
         std::swap(headScr, feetScr);
 
     const float height = static_cast<float>(feetScr.y - headScr.y);
-    if (height < 2.f)
-        return false;
-
-    head = ImVec2(static_cast<float>(headScr.x), static_cast<float>(headScr.y));
-    feet = ImVec2(static_cast<float>(feetScr.x), static_cast<float>(feetScr.y));
+    // Looking nearly along the vertical axis (Snitch sky-drops / overhead
+    // Wasps) collapses head/feet to ~1 screen pixel. Old height<2 reject
+    // dropped ESP while aim still tracked the same actor (c190fb W2S log).
+    if (height < 2.f) {
+        constexpr float kMinBoxPx = 28.f;
+        const float midX = static_cast<float>((headScr.x + feetScr.x) * 0.5);
+        const float midY = static_cast<float>((headScr.y + feetScr.y) * 0.5);
+        head = ImVec2(midX, midY - kMinBoxPx * 0.5f);
+        feet = ImVec2(midX, midY + kMinBoxPx * 0.5f);
+    } else {
+        head = ImVec2(static_cast<float>(headScr.x), static_cast<float>(headScr.y));
+        feet = ImVec2(static_cast<float>(feetScr.x), static_cast<float>(feetScr.y));
+    }
     return std::isfinite(head.x) && std::isfinite(head.y)
         && std::isfinite(feet.x) && std::isfinite(feet.y);
 }
