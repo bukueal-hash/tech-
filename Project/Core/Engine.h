@@ -13,7 +13,9 @@
 #include <d3d9.h>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <unordered_set>
+#include <vector>
 #include "../ThirdParty/ImGui/imgui.h"
 #include "../Interface/Utils/Threads/SyncedThread.h"
 #include "../Interface/Utils/Variables/index.h"
@@ -50,6 +52,31 @@ inline bool IsPlausibleWorldPos(const Vector3& p)
 class Engine {
 public:
     struct WorldCacheEntry;
+
+    // FStowedWeaponInfo — 0x40 bytes per stowed weapon slot in InventoryComponent
+#pragma pack(push, 1)
+    struct StowedWeaponInfo {
+        uint64_t Item = 0;              // +0x00 ItemBase*
+        uint64_t ItemDataAsset = 0;     // +0x08 ItemDataAsset*
+        uint64_t StowedActor = 0;       // +0x10 StowedWeaponActor*
+        uint64_t WeaponVisual = 0;      // +0x18 WeaponVisualsDataAsset*
+        uint64_t QualityVisual = 0;     // +0x20 WeaponQualityVisualizationAsset*
+        uint64_t WeaponVisualMods = 0;  // +0x28 FArrayProperty (ptr)
+        int32_t  WeaponQuality = 0;     // +0x38 int32 (0-3 = I-IV)
+        uint8_t  bShouldBeStowed = 0;   // +0x3C
+        uint8_t  bSlotHidden = 0;       // +0x3D
+        uint8_t  bUsePrimary = 0;       // +0x3E
+        uint8_t  WantedSlot = 0;        // +0x3F
+    };
+#pragma pack(pop)
+
+    /** Try plaintext then decrypt_object_ptr for InventoryComponent chain. */
+    static uintptr_t ResolveInventoryPtr(uintptr_t raw);
+    /** Read stowed weapon info, equipped weapon, armor from a player's inventory. */
+    void ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int& outWeaponQuality,
+        std::string& outStowed0, int& outStowedQ0,
+        std::string& outStowed1, int& outStowedQ1,
+        float& outArmorPlates, float& outArmorPerPlate);
 
 private:
     std::atomic<bool> entityStarted{ false };
@@ -129,6 +156,15 @@ public:
     void RobotList();
     void ContainerList();
     void ItemList();
+    void UserConfirmGroundItemPicked(uintptr_t key);
+    struct GroundPickupHudRow {
+        uintptr_t key = 0;
+        std::string name;
+        float distM = -1.f;
+        uint8_t worldCategory = 0;
+        std::string fname;
+    };
+    void CollectDrawingGroundPickups(std::vector<GroundPickupHudRow>& out) const;
 
     struct WorldScanContext {
         uintptr_t gWorld = 0;
@@ -371,13 +407,19 @@ public: // PlayerCache
         uintptr_t boneArray = 0;
         uintptr_t boneMesh = 0;
 
-        std::string weaponName;
-        int weaponQuality = -1;
-
         Vector3 cachedVelocity = { 0, 0, 0 };
         float lastVelocityUpdate = 0.0f;
         Vector3 lastWorldPos = { 0, 0, 0 };
 
+        // Weapon system from InventoryComponent
+        std::string weaponName;
+        int weaponQuality = -1;
+        std::string stowedWeapon0;
+        int stowedQuality0 = -1;
+        std::string stowedWeapon1;
+        int stowedQuality1 = -1;
+        float armorPlates = 0.f;
+        float armorPerPlate = 0.f;
         uintptr_t lastWeaponPtr = 0;
 
         PlayerCacheEntry() {};
@@ -960,16 +1002,16 @@ public:
 
     double get_armor(uintptr_t actor)
     {
-        return ReadPlayerStatWithHealthFallback(
-            actor, Offsets::PlayerState_Armor, Offsets::Shield);
+        if (!actor)
+            return 0.0;
+        return ReadHealthComponentStat(actor, Offsets::Shield);
     }
 
     double get_maxarmor(uintptr_t actor)
     {
         if (!actor)
             return 0.0;
-        // PS+0x548 collides with PlayerStatus — use HealthComponent only.
-        return ReadHealthComponentStat(actor, Offsets::Shield + 0x8);
+        return ReadHealthComponentStat(actor, Offsets::ShieldMax);
     }
 
     struct PlayerHealthInfo {

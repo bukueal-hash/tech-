@@ -474,6 +474,23 @@ void Engine::Update() {
 			}
 		}
 
+		// Prefer PCM FName → PCOwner@0x420 → AckPawn (help/esp.txt Step 4–5).
+		// LocalPlayer/GI→LP may be encrypted — never gate identity on LP.
+		if (!tPlayerController && tPersistentLevel && tActors) {
+			uintptr_t pcmPc = 0;
+			uintptr_t pcmPawn = 0;
+			uintptr_t pcmDummy = 0;
+			if (Engine::ResolvePcFromLevelCameraManager(
+				tPersistentLevel, tActors, pcmPc, pcmPawn, pcmDummy)) {
+				tPlayerController = s_cachedPC = pcmPc;
+				tAcknowledgedPawn = s_cachedPawn = pcmPawn;
+				pcPath = "cam_mgr";
+				dbgPcmPtr = pcmDummy;
+				if (dbgPcmPtr && Memory::IsValidPtrFast2(dbgPcmPtr))
+					dbgPcmFov = Memory::read<float>(dbgPcmPtr + Offsets::DefaultFOV);
+			}
+		}
+
 		if (!tPlayerController && tPersistentLevel && tActors && actorCount > 0) {
 			uintptr_t scannedPc = 0;
 			uintptr_t scannedPawn = 0;
@@ -484,21 +501,6 @@ void Engine::Update() {
 				tAcknowledgedPawn = s_cachedPawn = scannedPawn;
 				pcPath = "actor_scan";
 			}
-		}
-	}
-
-	if (!tPlayerController && tPersistentLevel && tActors) {
-		uintptr_t pcmPc = 0;
-		uintptr_t pcmPawn = 0;
-		uintptr_t pcmDummy = 0;
-		if (Engine::ResolvePcFromLevelCameraManager(
-			tPersistentLevel, tActors, pcmPc, pcmPawn, pcmDummy)) {
-			tPlayerController = s_cachedPC = pcmPc;
-			tAcknowledgedPawn = s_cachedPawn = pcmPawn;
-			pcPath = "cam_mgr";
-			dbgPcmPtr = pcmDummy;
-			if (dbgPcmPtr && Memory::IsValidPtrFast2(dbgPcmPtr))
-				dbgPcmFov = Memory::read<float>(dbgPcmPtr + Offsets::DefaultFOV);
 		}
 	}
 
@@ -518,7 +520,8 @@ void Engine::Update() {
 			tPlayerState = 0;
 	}
 
-	// LP from GameInstance — validated; slot scan must match known PC (avoids 0xFF.. garbage).
+	// LP resolution is best-effort only (encrypted GI→LP is non-fatal).
+	// Camera / self identity already comes from PCM→PCOwner→AckPawn above.
 	if (tGameInstance) {
 		uintptr_t giLp = 0;
 		uintptr_t giPcDummy = 0;
@@ -581,29 +584,41 @@ void Engine::Update() {
 		s_cachedLocalPlayer = tLocalPlayer;
 
 	uintptr_t tPCM = 0;
-	if (tPlayerController) {
+	// Publish level/actors early so GetCameraManagerFromActors can FName-scan
+	// even when PC is still missing (LP=0 must not block camera).
+	{
 		std::unique_lock<std::shared_mutex> stateLock(m_stateMutex);
-		PlayerController = tPlayerController;
-		AcknowledgedPawn = tAcknowledgedPawn;
-		RootComponent = tRootComponent;
-		PlayerState = tPlayerState;
+		if (tPlayerController)
+			PlayerController = tPlayerController;
+		if (tAcknowledgedPawn)
+			AcknowledgedPawn = tAcknowledgedPawn;
+		if (tRootComponent)
+			RootComponent = tRootComponent;
+		if (tPlayerState)
+			PlayerState = tPlayerState;
 		PersistentLevel = tPersistentLevel;
 		Actors = tActors;
-		stateLock.unlock();
+	}
 
-		tPCM = GetCameraManagerFromActors();
-		if (!tPCM)
-			tPCM = Memory::read<uintptr_t>(tPlayerController + Offsets::APlayerCameraManager);
-		if (!tPCM && tPersistentLevel && tActors) {
-			uintptr_t pcmPc = tPlayerController;
-			uintptr_t pcmPawn = tAcknowledgedPawn;
-			if (Engine::ResolvePcFromLevelCameraManager(
-				tPersistentLevel, tActors, pcmPc, pcmPawn, tPCM)) {
-				tPlayerController = pcmPc;
-				tAcknowledgedPawn = pcmPawn;
-				s_cachedPC = pcmPc;
-				s_cachedPawn = pcmPawn;
-			}
+	tPCM = GetCameraManagerFromActors();
+	if (!tPCM && tPlayerController)
+		tPCM = Memory::read<uintptr_t>(tPlayerController + Offsets::APlayerCameraManager);
+	if ((!tPCM || !tPlayerController) && tPersistentLevel && tActors) {
+		uintptr_t pcmPc = tPlayerController;
+		uintptr_t pcmPawn = tAcknowledgedPawn;
+		uintptr_t foundPcm = tPCM;
+		if (Engine::ResolvePcFromLevelCameraManager(
+			tPersistentLevel, tActors, pcmPc, pcmPawn, foundPcm)) {
+			tPCM = foundPcm;
+			tPlayerController = pcmPc;
+			tAcknowledgedPawn = pcmPawn;
+			s_cachedPC = pcmPc;
+			s_cachedPawn = pcmPawn;
+			if (std::strcmp(pcPath, "none") == 0 || std::strcmp(pcPath, "retain") == 0)
+				pcPath = "cam_mgr";
+			if (!tRootComponent && tAcknowledgedPawn)
+				tRootComponent = Memory::read<uintptr_t>(
+					tAcknowledgedPawn + Offsets::RootComponent);
 		}
 	}
 
@@ -718,7 +733,9 @@ void Engine::Update() {
 		}
 	}
 
-	if (tPlayerController && IsEspRaidActive())
+	// Camera refresh does not require LocalPlayer. Prefer PCM ViewTarget POV
+	// (0x4B0+0x10); ResolvePcFromLevelCameraManager recovers PC if needed.
+	if (IsEspRaidActive() && (tPlayerController || tPCM || (tPersistentLevel && tActors)))
 		RefreshCameraFromViewTarget();
 
 	TickRaidGate();

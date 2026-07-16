@@ -899,7 +899,7 @@ namespace {
 
 constexpr int kKmAimChunkPx = 512;
 // Soft fasten (not ban-risk hard snap): enough mouse budget to reach body, capped.
-constexpr float kMaxAimStepFraction = 1.85f;
+constexpr float kMaxAimStepFraction = 1.50f;
 constexpr float kHumanizerSkipDistPx = 40.f;
 /** Per-tick view rotation jump — reload / flinch; don't fight the animation. */
 constexpr float kAimViewShakeSuppressDeg = 1.35f;

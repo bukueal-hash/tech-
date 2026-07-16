@@ -7,6 +7,7 @@
 
 #include <iostream>
 #include <chrono>
+#include <fstream>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -307,25 +308,16 @@ void Engine::EntityList()
 
     const uint64_t gen = m_worldGeneration.load(std::memory_order_acquire);
 
-    const int actor_count =
-        Memory::read<int>(sPersistentLevel + Offsets::ActorsCount);
-
-    if (sActors == 0 || actor_count <= 0 || actor_count > 10000) {
+    // help/esp.txt: walk all UWorld::Levels — PersistentLevel alone misses
+    // streamed remotes (gsPawnMiss). Same union bots/items already use.
+    std::vector<uint64_t> currentActors;
+    WorldScan::CollectLevelActors(sGWorld, sPersistentLevel, currentActors);
+    if (currentActors.empty()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         return;
     }
 
-    std::vector<uint64_t> currentActors(static_cast<size_t>(actor_count));
-    if (!Memory::ReadRaw(
-            sActors,
-            currentActors.data(),
-            static_cast<size_t>(actor_count) * sizeof(uint64_t)))
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        return;
-    }
-
-    int dbgScanned = actor_count;
+    int dbgScanned = static_cast<int>(currentActors.size());
     int dbgAdmitted = 0;
     int dbgPreAdmit = 0;
     int dbgDrawing = 0;
@@ -416,7 +408,7 @@ void Engine::EntityList()
                 ++dbgFwdMismatch;
         } else {
             ++dbgGsPawnMiss;
-            continue; // need actor in this level's list for cache key / prune
+            continue; // need pawn in all-Levels actor union for cache key / prune
         }
 
         if (localCache.contains(backPawn))
@@ -483,12 +475,11 @@ void Engine::EntityList()
             continue;
         }
 
-        // When GameState PlayerArray is healthy, do not admit stray PS pawns —
-        // that inflated preAdmit/cache (~15) vs ~6 remotes (ghost boxes).
-        if (!gsPlayerStates.empty() && !gsPlayerStates.contains(playerState)) {
-            ++dbgGsEvict;
-            continue;
-        }
+        // Do NOT gate secondary admit on gsPlayerStates membership.
+        // Stale/wrong PlayerArray allowlists were zeroing PlayerCache (gsEvict)
+        // even when pawn→PS chase succeeded — keep gsArray diagnostic-only.
+        if (!gsPlayerStates.empty() && !gsPlayerStates.contains(playerState))
+            ++dbgGsEvict; // count only — still admit
 
         const float health = ReadPawnHealthForAdmit(actor);
         if (health < 1.0f) {
@@ -608,11 +599,9 @@ void Engine::EntityList()
             continue;
         }
 
-        if (!gsPlayerStates.empty() && !gsPlayerStates.contains(playerState)) {
+        // Diagnostic only — do not prune on GS allowlist (see admit path).
+        if (!gsPlayerStates.empty() && !gsPlayerStates.contains(playerState))
             ++dbgGsEvict;
-            it = localCache.erase(it);
-            continue;
-        }
 
         actor.actorState = playerState;
         actor.bIsDeathVerge = false;
@@ -652,35 +641,20 @@ void Engine::EntityList()
         actor.shield = static_cast<float>(get_armor(key));
         actor.maxshield = static_cast<float>(get_maxarmor(key));
 
-        const uintptr_t currentHeld = WorldScan::ResolvePreferredHeldItemActor(key);
-        std::string heldFName;
-        if (currentHeld) {
-            heldFName = GetActorFNameStringCached(currentHeld);
-            if (heldFName.empty())
-                heldFName = GetActorFNameString(currentHeld);
-        }
-
-        std::string heldLabel;
-        if (currentHeld && !heldFName.empty())
-            heldLabel = GetWeaponName(heldFName);
-        if (heldLabel.empty() && !heldFName.empty())
-            heldLabel = HumanizeActorFName(heldFName);
-        actor.weaponName = heldLabel.empty() ? (currentHeld ? "Item" : "Unarmed") : heldLabel;
-
-        // Firearm tier only — consumables/nades stay neutral-colored in ESP.
-        int quality = -1;
-        if (currentHeld) {
-            std::string lower = heldFName;
-            for (char& c : lower)
-                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (lower.find("weaponactor") != std::string::npos
-                || lower.find("bp_weapon") != std::string::npos) {
-                quality = GetWeaponQualityFromActor(currentHeld);
-                if (quality < 0 || quality > 4)
-                    quality = GetWeaponQuality(key);
-            }
-        }
-        actor.weaponQuality = (quality >= 0 && quality <= 4) ? (quality + 1) : -1;
+        // Read weapon system from InventoryComponent (stowed slots + equipped + armor)
+        std::string invWeapon, invStowed0, invStowed1;
+        int invWq = -1, invSq0 = -1, invSq1 = -1;
+        float invArmorPlates = 0.f, invArmorPerPlate = 0.f;
+        ReadPlayerInventory(key, invWeapon, invWq, invStowed0, invSq0, invStowed1, invSq1,
+            invArmorPlates, invArmorPerPlate);
+        actor.weaponName = invWeapon.empty() ? "Unarmed" : invWeapon;
+        actor.weaponQuality = invWq;
+        actor.stowedWeapon0 = invStowed0;
+        actor.stowedQuality0 = invSq0;
+        actor.stowedWeapon1 = invStowed1;
+        actor.stowedQuality1 = invSq1;
+        actor.armorPlates = invArmorPlates;
+        actor.armorPerPlate = invArmorPerPlate;
 
         GetBones(actor);
 
@@ -757,6 +731,45 @@ void Engine::EntityList()
         std::unique_lock<std::shared_mutex> lock(m_playerCacheMutex);
         playerCache = std::move(localCache);
     }
+
+    // #region agent log
+    {
+        static auto s_lastPlayerLog = std::chrono::steady_clock::time_point{};
+        const auto nowLog = std::chrono::steady_clock::now();
+        if (s_lastPlayerLog.time_since_epoch().count() == 0
+            || nowLog - s_lastPlayerLog >= std::chrono::seconds(1)) {
+            s_lastPlayerLog = nowLog;
+            size_t cacheN = 0;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
+                cacheN = playerCache.size();
+            }
+            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+            if (f) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"sessionId\":\"c190fb\",\"runId\":\"player-gs-gate\",\"hypothesisId\":\"H2\""
+                  << ",\"location\":\"EntityList.cpp:EntityList\",\"message\":\"player_admit\""
+                  << ",\"data\":{\"scanned\":" << dbgScanned
+                  << ",\"admitted\":" << dbgAdmitted
+                  << ",\"preAdmit\":" << dbgPreAdmit
+                  << ",\"cache\":" << cacheN
+                  << ",\"drawing\":" << dbgDrawing
+                  << ",\"gsArray\":" << dbgGsArray
+                  << ",\"gsEvict\":" << dbgGsEvict
+                  << ",\"gsPawnHit\":" << dbgGsPawnHit
+                  << ",\"gsPawnMiss\":" << dbgGsPawnMiss
+                  << ",\"gsPawnNull\":" << dbgGsPawnNull
+                  << ",\"psSkip\":" << dbgPsSkip
+                  << ",\"posEvict\":" << dbgPosEvict
+                  << ",\"ghostEvict\":" << dbgGhostEvict
+                  << ",\"actorTypeAdmit\":" << dbgActorTypeAdmit
+                  << ",\"lpGate\":0}"
+                  << ",\"timestamp\":" << ms << "}\n";
+            }
+        }
+    }
+    // #endregion
 
     if (var::show_debug_overlay) {
         static IntervalTimer playerDebugTimer(500);

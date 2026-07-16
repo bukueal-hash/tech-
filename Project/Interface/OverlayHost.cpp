@@ -37,13 +37,13 @@ bool QueryMonitorBounds(int index, int* outX, int* outY, int* outW, int* outH)
 
 } // namespace
 
-void ApplyOverlayMode(HWND hwnd, bool menuVisible)
+void ApplyOverlayMode(HWND hwnd, bool interactive)
 {
     if (!hwnd)
         return;
 
     static bool s_initialized = false;
-    static bool s_lastMenuVisible = false;
+    static bool s_lastInteractive = false;
     static bool s_hasApplied = false;
 
     if (!s_initialized) {
@@ -53,15 +53,15 @@ void ApplyOverlayMode(HWND hwnd, bool menuVisible)
         s_initialized = true;
     }
 
-    if (s_hasApplied && menuVisible == s_lastMenuVisible)
+    if (s_hasApplied && interactive == s_lastInteractive)
         return;
 
     s_hasApplied = true;
-    s_lastMenuVisible = menuVisible;
+    s_lastInteractive = interactive;
 
     LONG style = GetWindowLong(hwnd, GWL_EXSTYLE);
     style |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TOPMOST;
-    if (menuVisible)
+    if (interactive)
         style &= ~WS_EX_TRANSPARENT;
     else
         style |= WS_EX_TRANSPARENT;

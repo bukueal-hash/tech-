@@ -7,13 +7,17 @@
 #include "../Interface/Utils/Variables/index.h"
 #include "../ThirdParty/ImGui/imgui.h"
 
+#include <Windows.h>
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 extern Engine engine;
@@ -1511,6 +1515,7 @@ bool DisplayLooksLikeWorldContainer(const std::string& displayLower)
         "fruit basket", "safe", "vault", "dead drop", "buried",
         "socket container", "weapons rack", "weapon rack", "security camera",
         "barricade", "arc husk",
+        "probe crashed", "crashed arc probe", "arc probe",
     };
     for (const char* token : kTokens) {
         if (Contains(displayLower, token))
@@ -1852,6 +1857,7 @@ bool IsJunkWorldEspLabel(const std::string& label)
         "soft object property",
         "fproperty",
         "uproperty",
+        "double property",
         "ddgi",
         "point of interest",
         "poi volume",
@@ -2258,9 +2264,31 @@ bool GroundLootLooksPickedUp(uintptr_t actor, const std::string& fnameHint)
     return GroundLootPickupHasStrongSignal(sig);
 }
 
+namespace {
+std::mutex g_pickupGoneMu;
+std::unordered_set<uintptr_t> g_pickupGoneSticky;
+} // namespace
+
 void ClearGroundLootPickupStickyState()
 {
-    // Retained for raid-reset callers; sticky pickup state removed (tech- path).
+    std::lock_guard<std::mutex> lock(g_pickupGoneMu);
+    g_pickupGoneSticky.clear();
+}
+
+void MarkGroundPickupGoneSticky(uintptr_t actor)
+{
+    if (!actor)
+        return;
+    std::lock_guard<std::mutex> lock(g_pickupGoneMu);
+    g_pickupGoneSticky.insert(actor);
+}
+
+bool IsGroundPickupGoneSticky(uintptr_t actor)
+{
+    if (!actor)
+        return false;
+    std::lock_guard<std::mutex> lock(g_pickupGoneMu);
+    return g_pickupGoneSticky.contains(actor);
 }
 
 bool WorldLootCacheEntryDepleted(

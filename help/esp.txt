@@ -1,0 +1,810 @@
+[GUIDE] External ESP — Correct Chain From UWorld to Drawing (CL-1315578+)
+ 
+I see a lot of people struggling with the same issues: encrypted pointers, broken FName,
+camera Location/Rotation returning garbage. Most of these problems come from doing things
+in the wrong order or using stale offsets. Here is the correct approach, step by step.
+ 
+ 
+═══════════════════════════════════════════════════════════════════════
+STEP 0: GET YOUR FName RESOLVE WORKING — THIS IS NON-NEGOTIABLE
+═══════════════════════════════════════════════════════════════════════
+ 
+If your FName returns empty strings, STOP. Do not try to hack around it by scanning for
+FOV values or guessing actors by vtable. You WILL find the wrong actor and waste days
+debugging phantom offsets that aren't actually wrong — your base pointer is wrong.
+ 
+FName in this game is fully encrypted. Here is the FULL decryption pipeline for CL-1315578.
+The constants change every patch — you will need to RE-scan for them after updates.
+ 
+---------- 0a) Constants & RVAs (CL-1315578) ----------
+ 
+ 
+	
+Code:
+	
+// Pool RVAs (relative to game module base)
+constexpr uint64_t RVA_GNAMEPOOL  = 0xE4F2A00;   // GNamePool base
+constexpr uint64_t RVA_KEYTABLE   = 0xE4318DC;   // 64 x uint16_t string decrypt key table
+constexpr uint64_t RVA_BLOCK_MASK = 0xB523C50;    // uint64_t, XOR mask for block decrypt
+// Slot hash constants (FNV-1a variant — look for ROL32/0x01000193 patterns in IDA)
+constexpr uint32_t HASH_PRIME    = 0x01000193;
+constexpr uint32_t SLOT_HASH_ADD = 0xF3D8DA36;
+constexpr int HASH_ROL1 = 21, HASH_ROL2 = 13, HASH_ROL3 = 21, HASH_ROL4 = 13;
+// Block hash constants
+constexpr uint32_t BLOCK_HASH_ADD = 0xD5AF8E52;
+// FNV chaining constants
+constexpr uint64_t FNV_PRIME = 0x100000001B3;
+constexpr uint64_t FNV_ADD   = 0x10F3A73711CE0312;
+// Chunk layout within GNamePool
+constexpr uint64_t CHUNK_HASH_SEED  = 0x2F90;     // offset of hash seed in chunk
+constexpr uint64_t CHUNK_BLOCK_BASE = 0x2FA0;     // offset of block array in chunk
+// String decrypt PRNG constants (MUL/ADD linear congruential)
+constexpr uint32_t STRING_BIAS_NARROW = 0xFFFFA7B4;
+constexpr uint32_t STRING_BIAS_WIDE   = 0x0000A7B4;
+constexpr uint32_t STRING_MUL         = 0x6DDC5690;
+constexpr uint32_t STRING_ADD         = 0x5EBF2255;
+constexpr uint32_t STRING_ODD_MUL     = 0xFFFF584C;
+constexpr uint32_t STRING_ODD_ADD     = 0xF629;
+// UObject slot layout
+constexpr int SLOT_BASE_OFF = 0x20;   // first slot starts at ObjBase + 0x20
+constexpr int SLOT_STRIDE   = 0x20;   // each slot is 0x20 bytes apart
+ 
+ 
+---------- 0b) Runtime State & Initialization ----------
+ 
+ 
+	
+Code:
+	
+struct FNameState {
+    uint16_t keyTable[64] = {};
+    uint64_t blockMask    = 0;
+    uint64_t gnamePoolRva = 0;
+    bool     initialized  = false;
+};
+static FNameState g_fname;
+bool InitFName(uint64_t gameBase) {
+    if (g_fname.initialized) return true;
+    g_fname.gnamePoolRva = RVA_GNAMEPOOL;
+    // Load the 64-entry key table (128 bytes of uint16_t)
+    uint8_t ktBuf[128] = {};
+    if (!ReadMemory(gameBase + RVA_KEYTABLE, ktBuf, 128)) return false;
+    for (int i = 0; i < 64; i++)
+        memcpy(&g_fname.keyTable[i], ktBuf + i * 2, 2);
+    // Count non-zero entries — if too few, the RVA is stale
+    int nonZero = 0;
+    for (int i = 0; i < 64; i++) nonZero += (g_fname.keyTable[i] != 0);
+    if (nonZero < 8) return false;  // key table not loaded properly
+    // Load block XOR mask
+    if (!ReadMemory(gameBase + RVA_BLOCK_MASK, &g_fname.blockMask, 8)) return false;
+    g_fname.initialized = true;
+    return true;
+}
+ 
+ 
+---------- 0c) Helper: Pshuflw64 (scalar emulation of x86 PSHUFLW) ----------
+ 
+The game's FName code uses SIMD shuffles extensively. This is the scalar equivalent:
+ 
+ 
+	
+Code:
+	
+// Emulates x86 PSHUFLW on a 64-bit value.
+// Shuffles all 4 x 16-bit words according to the immediate byte.
+// Each 2-bit field in Imm selects which source word goes to that position.
+uint64_t Pshuflw64(uint64_t X, int Imm) {
+    uint16_t W[4];
+    W[0] = (uint16_t)(X);
+    W[1] = (uint16_t)(X >> 16);
+    W[2] = (uint16_t)(X >> 32);
+    W[3] = (uint16_t)(X >> 48);
+    return (uint64_t)W[(Imm >> 0) & 3]
+         | ((uint64_t)W[(Imm >> 2) & 3] << 16)
+         | ((uint64_t)W[(Imm >> 4) & 3] << 32)
+         | ((uint64_t)W[(Imm >> 6) & 3] << 48);
+}
+// Standard bit rotations — you probably have these already
+uint32_t rotl32(uint32_t v, int s) { s &= 31; return (v << s) | (v >> (32 - s)); }
+uint64_t rotl64(uint64_t v, int s) { s &= 63; return (v << s) | (v >> (64 - s)); }
+ 
+ 
+---------- 0d) Step 1: Determine which UObject slot holds the FName ----------
+ 
+Each UObject has 4 encrypted slots at ObjBase + 0x20, spaced 0x20 apart.
+Which slot holds the name (vs class, outer, etc.) is derived from a hash of
+the object's own address. This prevents simple offset-based reading.
+ 
+ 
+	
+Code:
+	
+// Hash the object pointer to determine its name slot index (0-3)
+uint8_t ObjSlotMixByte(uint64_t ObjPtr) {
+    uint64_t P  = ObjPtr + 0x10;
+    uint32_t Lo = (uint32_t)(P & 0xFFFFFFFF);
+    uint32_t Hi = (uint32_t)(P >> 32);
+    uint32_t A = HASH_PRIME * rotl32(Lo, HASH_ROL1) + SLOT_HASH_ADD;
+    uint32_t B = HASH_PRIME * rotl32(A, HASH_ROL2)  + Hi + SLOT_HASH_ADD;
+    uint32_t C = HASH_PRIME * rotl32(B, HASH_ROL3)  + SLOT_HASH_ADD;
+    uint32_t V = HASH_PRIME * rotl32(C, HASH_ROL4)  + SLOT_HASH_ADD;
+    return (uint8_t)(V ^ (V >> 16));
+}
+// Name slot: XOR with 2 then mask to 0-3
+uint32_t GetNameSlot(uint64_t ObjPtr) {
+    return ((uint32_t)ObjSlotMixByte(ObjPtr) & 3) ^ 2;
+}
+// Class slot: just mask to 0-3 (no XOR)
+uint32_t GetClassSlot(uint64_t ObjPtr) {
+    return (uint32_t)ObjSlotMixByte(ObjPtr) & 3;
+}
+ 
+ 
+---------- 0e) Step 2: Read and decrypt the slot → ComparisonIndex ----------
+ 
+ 
+	
+Code:
+	
+// Read the raw 8 bytes from the computed slot
+uint64_t ReadSlotRaw(uint64_t ObjBase, uint32_t Slot) {
+    uint64_t addr = ObjBase + SLOT_BASE_OFF + (uint64_t)Slot * SLOT_STRIDE;
+    return Read<uint64_t>(addr);
+}
+// Decrypt the name slot to extract ComparisonIndex (CI) and Number
+// Returns packed: low 32 bits = CI, high 32 bits = Number
+uint64_t DecryptNameSlot(uint64_t Raw) {
+    uint64_t V = rotl64(Raw, 29);
+    V = Pshuflw64(V, 0x39);
+    uint32_t CI     = rotl32((uint32_t)(V >> 32), 5);
+    uint32_t Number = (uint32_t)V;
+    return (uint64_t)CI | ((uint64_t)Number << 32);
+}
+// Decrypt the class slot (different decrypt — no ROL32 on CI)
+uint64_t DecryptClassSlot(uint64_t Raw) {
+    uint64_t V = rotl64(Raw, 29);
+    V = Pshuflw64(V, 0x39);
+    return V;  // low bits are the class object pointer (needs validation)
+}
+// Convenience: get ComparisonIndex from an actor
+int32_t GetFNameCI(uint64_t actor) {
+    uint32_t slot = GetNameSlot(actor);
+    uint64_t raw  = ReadSlotRaw(actor, slot);
+    if (!raw) return 0;
+    uint64_t decrypted = DecryptNameSlot(raw);
+    return (int32_t)(decrypted & 0xFFFFFFFF);
+}
+ 
+ 
+---------- 0f) Step 3: ComparisonIndex → FNameEntry pointer ----------
+ 
+This is the core of the name pool lookup. The CI is transformed into a seed,
+which locates a chunk in the pool, then two encrypted blocks are read and
+combined via FNV hashing to produce the final name pointer.
+ 
+ 
+	
+Code:
+	
+// Compute the "seed" from ComparisonIndex
+uint64_t ComputeNameSeed(int32_t CI) {
+    uint64_t X = (uint64_t)(uint32_t)CI;
+    uint64_t T = (X << 16) >> 50;
+    X = Pshuflw64((X << 30) | T, 0x72);
+    X = Pshuflw64(X, 0x8C);
+    X = (X >> 14) << 14;
+    X = Pshuflw64(X, 0x72);
+    return X;
+}
+// Resolve CI to FNameEntry pointer in memory
+uint64_t ResolveNamePtr(int32_t CI, uint64_t gameBase) {
+    if (CI <= 0) return 0;
+    uint64_t Seed = ComputeNameSeed(CI);
+    // Extract nameOff and chunk address from seed
+    uint32_t Eax = (uint32_t)(Pshuflw64(Seed, 0x8C) >> 30);
+    uint16_t NameOff = (uint16_t)Eax;
+    uint64_t ChunkAddr = gameBase + g_fname.gnamePoolRva
+                       + ((uint64_t)(Eax >> 8) & 0xFFFF00ULL);
+    // Hash the chunk address to find block indices (0-7)
+    uint64_t HashAddr = ChunkAddr + CHUNK_HASH_SEED;
+    uint32_t HLo = rotl32((uint32_t)HashAddr, 17);
+    uint32_t HHi = (uint32_t)(HashAddr >> 32);
+    uint32_t A = HASH_PRIME * HLo + BLOCK_HASH_ADD;
+    uint32_t B = HASH_PRIME * rotl32(A, 13) + HHi + BLOCK_HASH_ADD;
+    uint32_t C = HASH_PRIME * rotl32(B, 17) + BLOCK_HASH_ADD;
+    uint32_t D = HASH_PRIME * rotl32(C, 13) + BLOCK_HASH_ADD;
+    uint32_t Mix = D ^ (D >> 16);
+    uint64_t BIdx1 = (uint64_t)(Mix & 7);
+    uint64_t BIdx2 = (uint64_t)((Mix + 1) & 7);
+    // Read two encrypted blocks from the chunk
+    uint64_t B1Addr = ChunkAddr + CHUNK_BLOCK_BASE + 32 * BIdx1;
+    uint64_t B2Addr = ChunkAddr + CHUNK_BLOCK_BASE + 32 * BIdx2;
+    uint64_t B1Raw = Read<uint64_t>(B1Addr);
+    uint64_t B2Raw = Read<uint64_t>(B2Addr);
+    if (!B1Raw || !B2Raw) return 0;
+    // Decrypt each block: ROL64(13) → PSHUFLW(0x93) → XOR(blockMask)
+    auto DecryptBlock = [](uint64_t Raw) -> uint64_t {
+        uint64_t B = rotl64(Raw, 13);
+        B = Pshuflw64(B, 0x93);
+        return B ^ g_fname.blockMask;
+    };
+    uint64_t V13 = DecryptBlock(B1Raw);
+    uint64_t V15 = DecryptBlock(B2Raw);
+    // FNV chain to produce final pointer
+    uint64_t Fv1 = FNV_PRIME * rotl64(V13, 37) + FNV_ADD;
+    uint64_t Fv2 = FNV_PRIME * rotl64(Fv1, 40) + FNV_ADD;
+    uint64_t NamePtr = (Fv2 ^ V15) + V13 + 2ULL * NameOff;
+    return NamePtr;
+}
+ 
+ 
+---------- 0g) Step 4: FNameEntry → decrypted string ----------
+ 
+The FNameEntry has a 2-byte header followed by encrypted string data.
+Header layout: length = header >> 6, isWide = (header & 0x20) != 0.
+The string bytes are XOR'd with values from the key table using a
+MUL/ADD PRNG. Even and odd characters use different index formulas.
+ 
+ 
+	
+Code:
+	
+std::string DecryptNameString(uint64_t NameEntryPtr) {
+    if (!NameEntryPtr) return "";
+    // Read 2-byte header
+    uint16_t Header = Read<uint16_t>(NameEntryPtr);
+    if (!Header) return "";
+    int  Length = (int)(Header >> 6);
+    bool IsWide = (Header & 0x20) != 0;
+    if (Length <= 0 || Length > 256) return "";
+    if (!IsWide) {
+        // ---- Narrow string (ASCII, 1 byte per char) ----
+        uint8_t Bytes[256] = {};
+        ReadMemory(NameEntryPtr + 2, Bytes, Length);
+        uint32_t Eax = (uint32_t)Length + STRING_BIAS_NARROW;
+        int N = Length & ~1;  // process pairs
+        for (int K = 0; 2 * K < N; K++) {
+            // Even index: keyTable[Eax & 0x3F] >> 3
+            Bytes[2 * K]     ^= (uint8_t)(g_fname.keyTable[Eax & 0x3F] >> 3);
+            // Odd index: keyTable[(Eax * ODD_MUL + ODD_ADD) & 0x3D] >> 3
+            Bytes[2 * K + 1] ^= (uint8_t)(g_fname.keyTable[(Eax * STRING_ODD_MUL + STRING_ODD_ADD) & 0x3D] >> 3);
+            // Advance PRNG
+            Eax = Eax * STRING_MUL + STRING_ADD;
+        }
+        // Handle trailing odd byte
+        if ((Length & 1) != 0)
+            Bytes[Length - 1] ^= (uint8_t)(g_fname.keyTable[Eax & 0x3F] >> 3);
+        std::string Out;
+        for (int j = 0; j < Length; j++) {
+            uint8_t ch = Bytes[j];
+            if (!ch) break;
+            Out += (ch >= 32 && ch <= 126) ? (char)ch : '?';
+        }
+        return Out;
+    }
+    else {
+        // ---- Wide string (UTF-16, 2 bytes per char) ----
+        uint16_t Wides[256] = {};
+        ReadMemory(NameEntryPtr + 2, Wides, Length * 2);
+        uint32_t Eax = (uint32_t)Length + STRING_BIAS_WIDE;
+        int N = Length & ~1;
+        for (int K = 0; 2 * K < N; K++) {
+            Wides[2 * K]     ^= g_fname.keyTable[Eax & 0x3F];
+            Wides[2 * K + 1] ^= g_fname.keyTable[(Eax * STRING_ODD_MUL + STRING_ODD_ADD) & 0x3D];
+            Eax = Eax * STRING_MUL + STRING_ADD;
+        }
+        if ((Length & 1) != 0)
+            Wides[Length - 1] ^= g_fname.keyTable[Eax & 0x3F];
+        std::string Out;
+        for (int j = 0; j < Length; j++) {
+            uint16_t ch = Wides[j];
+            if (!ch) break;
+            Out += (ch >= 32 && ch <= 126) ? (char)ch : '?';
+        }
+        return Out;
+    }
+}
+ 
+ 
+---------- 0h) Public API: GetActorFNameString / GetObjectClassName ----------
+ 
+ 
+	
+Code:
+	
+// Cache resolved names by ComparisonIndex to avoid re-decrypting
+std::unordered_map<int32_t, std::string> g_name_cache;
+std::string CachedResolve(int32_t CI, uint64_t gameBase) {
+    if (CI <= 0) return "";
+    auto it = g_name_cache.find(CI);
+    if (it != g_name_cache.end()) return it->second;
+    uint64_t ptr = ResolveNamePtr(CI, gameBase);
+    if (!ptr) return "";
+    std::string str = DecryptNameString(ptr);
+    if (str.empty()) return "";
+    g_name_cache[CI] = str;
+    return str;
+}
+// Get the instance name of an actor (e.g. "PlayerCameraManager_0")
+std::string GetActorFNameString(uint64_t actor, uint64_t gameBase) {
+    if (!actor || !InitFName(gameBase)) return "";
+    int32_t CI = GetFNameCI(actor);
+    if (CI > 0) {
+        std::string s = CachedResolve(CI, gameBase);
+        if (!s.empty()) return s;
+    }
+    // Fallback: try reading raw CI at ObjBase+0x18 (some UE versions)
+    int32_t rawCI = Read<int32_t>(actor + 0x18);
+    if (rawCI > 1 && rawCI < 0x2000000) {
+        std::string s = CachedResolve(rawCI, gameBase);
+        if (!s.empty()) return s;
+    }
+    return "";
+}
+// Get the CLASS name of an actor (e.g. "BP_PioneerCharacter_C")
+// This reads ClassPrivate from the class slot, then resolves that object's FName
+std::string GetObjectClassName(uint64_t actor, uint64_t gameBase) {
+    if (!actor || !InitFName(gameBase)) return "";
+    uint32_t slot = GetClassSlot(actor);
+    uint64_t raw  = ReadSlotRaw(actor, slot);
+    if (!raw) return "";
+    uint64_t classPtr = DecryptClassSlot(raw);
+    // Validate pointer range
+    if (classPtr < 0x10000 || classPtr >= 0x800000000000) return "";
+    // ClassPrivate is itself a UObject — resolve ITS FName
+    return GetActorFNameString(classPtr, gameBase);
+}
+ 
+ 
+---------- 0i) Usage Example ----------
+ 
+ 
+	
+Code:
+	
+uint64_t gameBase = GetModuleBase("ARC-WinGDK-Shipping.exe");
+if (!InitFName(gameBase)) {
+    printf("FName init failed — check RVAs\n");
+    return;
+}
+// For any actor pointer:
+std::string className = GetObjectClassName(actor, gameBase);
+std::string instName  = GetActorFNameString(actor, gameBase);
+printf("Class: %s  Instance: %s\n", className.c_str(), instName.c_str());
+// Output: "Class: PlayerCameraManager  Instance: PlayerCameraManager_0"
+// Output: "Class: BP_PioneerCharacter_C  Instance: BP_PioneerCharacter_C_0"
+// Output: "Class: Pickup_C  Instance: Pickup_230"
+ 
+ 
+═══════════════════════════════════════════════════════════════════════
+STEP 1: READ UWorld
+═══════════════════════════════════════════════════════════════════════
+ 
+UWorld is at a fixed RVA from the game module base. Single pointer read.
+ 
+ 
+	
+Code:
+	
+constexpr uint64_t UWORLD_RVA = 0xE91A288;
+uintptr_t gameBase = GetModuleBase("ARC-WinGDK-Shipping.exe");
+uintptr_t pUWorld  = Read<uintptr_t>(gameBase + UWORLD_RVA);
+if (!IsValidPtr(pUWorld)) {
+    // Game not fully loaded yet, or RVA is stale
+    return;
+}
+ 
+ 
+═══════════════════════════════════════════════════════════════════════
+STEP 2: READ THE ACTOR ARRAY — FROM ALL LEVELS, NOT JUST PERSISTENT
+═══════════════════════════════════════════════════════════════════════
+ 
+Many people only read PersistentLevel->Actors. This misses streamed/sub-levels.
+You want to walk ALL loaded levels.
+ 
+UWorld offsets (CL-1315578 — these shifted significantly from earlier patches):
+ 
+ 
+	
+Code:
+	
+// UWorld offsets — NOT the same as older patches!
+constexpr uint32_t UW_PERSISTENT_LEVEL  = 0x158;   // was 0x110 in CL-1299607!
+constexpr uint32_t UW_LEVELS            = 0x4A0;   // TArray<ULevel*>, was 0x368
+constexpr uint32_t UW_LEVEL_COLLECTIONS = 0x370;   // was 0x210
+// ULevel offsets (stable across recent patches):
+constexpr uint32_t LVL_ACTORS       = 0x108;   // TArray<AActor*>.Data
+constexpr uint32_t LVL_ACTOR_COUNT  = 0x110;   // TArray<AActor*>.Num
+constexpr uint32_t LVL_OWNING_WORLD = 0x130;
+ 
+Read actors from ALL levels:
+ 
+ 
+	
+Code:
+	
+// UWorld->Levels TArray (catches everything including streamed levels)
+uintptr_t levelsData  = Read<uintptr_t>(pUWorld + 0x4A0);      // Levels.Data
+int       levelsCount = Read<int32_t>(pUWorld + 0x4A0 + 0x08);  // Levels.Num
+struct ActorEntry { uintptr_t addr; uintptr_t level; };
+std::vector<ActorEntry> allActors;
+for (int lvl = 0; lvl < levelsCount && lvl < 64; lvl++) {
+    uintptr_t level = Read<uintptr_t>(levelsData + lvl * 8);
+    if (!IsValidPtr(level)) continue;
+    uintptr_t actorsData  = Read<uintptr_t>(level + 0x108);
+    int       actorsCount = Read<int32_t>(level + 0x110);
+    if (!IsValidPtr(actorsData) || actorsCount <= 0 || actorsCount > 50000)
+        continue;
+    for (int i = 0; i < actorsCount; i++) {
+        uintptr_t actor = Read<uintptr_t>(actorsData + i * 8);
+        if (!IsValidPtr(actor)) continue;
+        allActors.push_back({ actor, level });
+    }
+}
+// Simpler alternative: just PersistentLevel (fewer actors, misses streamed)
+// uintptr_t persistentLevel = Read<uintptr_t>(pUWorld + 0x158);
+// uintptr_t actorsData      = Read<uintptr_t>(persistentLevel + 0x108);
+// int       actorsCount     = Read<int32_t>(persistentLevel + 0x110);
+ 
+ 
+═══════════════════════════════════════════════════════════════════════
+STEP 3: CLASSIFY ACTORS BY FName — CACHE WHAT YOU NEED
+═══════════════════════════════════════════════════════════════════════
+ 
+This is where FName pays off. Iterate all actors, resolve the class name, classify:
+ 
+ 
+	
+Code:
+	
+uintptr_t myPlayerCameraManager = 0;
+std::vector<uintptr_t> playerActors;
+std::vector<uintptr_t> botActors;
+std::vector<uintptr_t> pickupActors;
+std::vector<uintptr_t> containerActors;
+for (auto& entry : allActors) {
+    uintptr_t actor = entry.addr;
+    // Resolve the class name via FName
+    std::string className = GetObjectClassName(actor, gameBase);
+    if (className.empty())
+        className = GetActorFNameString(actor, gameBase);
+    // Strip World Partition suffixes:
+    //   "BP_PioneerCharacter_C_UAID_C87F..." → "BP_PioneerCharacter_C"
+    //   "Pickup_230_8dcfce4758e17c9e"         → "Pickup_230"
+    // (strip trailing _<16 hex chars> and _UAID_<hex>_<digits> patterns)
+    className = NormalizeClassName(className);
+    // === CAMERA ===
+    if (className.find("PlayerCameraManager") != std::string::npos ||
+        className.find("CameraManager")       != std::string::npos) {
+        // IMPORTANT: verify this camera belongs to YOUR player!
+        // There can be multiple CameraManagers (lobby, cinematic, spectator).
+        // Check Owner field — your cam's owner is your PlayerController:
+        uintptr_t owner = Read<uintptr_t>(actor + 0x1C0);  // AActor::Owner
+        // Also validate it has a sane FOV and non-zero location:
+        float fov = Read<float>(actor + 0x510);
+        double locX = Read<double>(actor + 0x4C0);
+        if (fov > 1.0f && fov < 170.0f && (std::abs(locX) > 100.0 || !IsValidPtr(myPlayerCameraManager))) {
+            myPlayerCameraManager = actor;
+        }
+    }
+    // === PLAYERS ===
+    else if (className.find("BP_PioneerCharacter_C") != std::string::npos) {
+        playerActors.push_back(actor);
+    }
+    // === BOTS / ENEMIES ===
+    else if (className.find("NuConstructable")  != std::string::npos ||
+             className.find("Harvester")        != std::string::npos ||
+             className.find("BP_AICharacter")   != std::string::npos ||
+             className.find("HumanoidDummy")    != std::string::npos) {
+        botActors.push_back(actor);
+    }
+    // === PICKUPS ===
+    else if (className.find("Pickup") != std::string::npos) {
+        pickupActors.push_back(actor);
+    }
+    // === CONTAINERS ===
+    else if (className.find("LootContainer") != std::string::npos ||
+             className.find("ItemContainer") != std::string::npos) {
+        containerActors.push_back(actor);
+    }
+}
+ 
+ 
+═══════════════════════════════════════════════════════════════════════
+STEP 4: GET YOUR PlayerCameraManager — FName SCAN IS THE ONLY WAY
+═══════════════════════════════════════════════════════════════════════
+ 
+Forget the traditional UWorld → GameInstance → LocalPlayers → PlayerController
+→ PlayerCameraManager chain. The GameInstance pointer (UWorld + 0x4D8) is
+TObjectPtr-encrypted with SIMD instructions (XOR + ROL64 + PSHUFLW + PSHUFB),
+and the decryption keys rotate every patch. Nobody has a stable decrypt for it.
+Every TObjectPtr in that chain is encrypted the same way — LocalPlayer,
+PlayerController, CameraManager — so even if you crack GameInstance, the next
+link breaks.
+ 
+The ONLY reliable method is the FName actor scan from Step 3. You already did
+the work — you walked every actor and resolved its class name. The camera
+manager is just the actor whose class name is "PlayerCameraManager".
+ 
+ 
+	
+Code:
+	
+uintptr_t cameraManager = myPlayerCameraManager;  // from Step 3
+if (!IsValidPtr(cameraManager)) {
+    // FName scan found nothing — your FName decrypt is broken. Fix that first.
+    printf("ERROR: No PlayerCameraManager found. Fix your FName.\n");
+    return;
+}
+ 
+!!!! DO NOT scan for the camera by reading FOV values from random actors !!!!
+You WILL find the wrong actor. Many actors have float fields that happen to
+sit between 60-120. If your FName doesn't work yet, fix FName first — do not
+try to work around it.
+ 
+ 
+═══════════════════════════════════════════════════════════════════════
+STEP 5: READ CAMERA DATA — Location, Rotation, FOV
+═══════════════════════════════════════════════════════════════════════
+ 
+This is where the OP was stuck. Here is the CORRECT layout:
+ 
+ 
+	
+Code:
+	
+// APlayerCameraManager memory layout (CL-1315578):
+//
+//   +0x0420  PCOwner (APlayerController*)    — live verified
+//   +0x0430  DefaultFOV (float, = 90.0)     — live verified
+//   +0x04B0  FTViewTarget CameraCacheEntry   — was 0x4A0 in older patches!
+//              +0x00  Target (AActor*, your pawn)
+//              +0x08  (padding)
+//              +0x10  FMinimalViewInfo POV:
+//                       +0x00  Location.X (double)     ← READ AS DOUBLE!
+//                       +0x08  Location.Y (double)
+//                       +0x10  Location.Z (double)
+//                       +0x18  (8 bytes padding)
+//                       +0x20  Rotation.Pitch (double, degrees)
+//                       +0x28  Rotation.Yaw   (double, degrees)
+//                       +0x30  Rotation.Roll  (double, degrees)
+//                       +0x38  (8 bytes padding)
+//                       +0x40  FOV (float)              ← this one IS float
+// Absolute offsets from CameraManager actor base:
+constexpr uint32_t CAM_VIEW_TARGET = 0x4B0;   // NOT 0x4A0!
+constexpr uint32_t CAM_POV         = 0x4C0;   // ViewTarget + 0x10
+constexpr uint32_t CAM_LOCATION    = 0x4C0;   // POV + 0x00, 3x double
+constexpr uint32_t CAM_ROTATION    = 0x4E8;   // POV + 0x28, 3x double
+constexpr uint32_t CAM_FOV         = 0x510;   // POV + 0x50, float
+ 
+Reading the camera:
+ 
+ 
+	
+Code:
+	
+struct CameraData {
+    double locX, locY, locZ;     // world position in centimeters (UE units)
+    double pitch, yaw, roll;     // rotation in degrees
+    float  fov;                  // horizontal FOV
+};
+CameraData ReadCamera(uintptr_t cameraManager) {
+    CameraData cam = {};
+    // Read Location — THREE DOUBLES, not floats!
+    // UE5 uses Large World Coordinates = FVector is 3x double (24 bytes)
+    cam.locX = Read<double>(cameraManager + 0x4C0);
+    cam.locY = Read<double>(cameraManager + 0x4C8);
+    cam.locZ = Read<double>(cameraManager + 0x4D0);
+    // Read Rotation — also THREE DOUBLES (Pitch/Yaw/Roll in degrees)
+    cam.pitch = Read<double>(cameraManager + 0x4E8);
+    cam.yaw   = Read<double>(cameraManager + 0x4F0);
+    cam.roll  = Read<double>(cameraManager + 0x4F8);
+    // Read FOV — this one IS a float
+    cam.fov = Read<float>(cameraManager + 0x510);
+    return cam;
+}
+ 
+COMMON MISTAKES that give you garbage camera data:
+  1. Reading Location as float instead of double — UE5 LWC is ALWAYS doubles.
+     If you Read<float> at the right address, the first 4 bytes of a double
+     like 80000.0 will decode as ~83. That's your "83" mystery value.
+  2. Using CameraCachePrivate = 0x4A0 — it shifted to 0x4B0 (ViewTarget +0x10)
+  3. Wrong FMinimalViewInfo layout — there's 8 bytes padding between Location
+     and Rotation (Location ends at POV+0x18, Rotation starts at POV+0x28)
+  4. Finding camera by FOV scan instead of FName — wrong actor entirely
+ 
+ 
+═══════════════════════════════════════════════════════════════════════
+STEP 6: READ ACTOR POSITIONS
+═══════════════════════════════════════════════════════════════════════
+ 
+For any actor, position comes from RootComponent → ComponentToWorld.Translation:
+ 
+ 
+	
+Code:
+	
+// AActor offsets (CL-1315578):
+constexpr uint32_t ACTOR_ROOT_COMPONENT = 0x218;  // NOT 0x220!
+// USceneComponent offsets (CL-1315578):
+constexpr uint32_t SC_RELATIVE_LOCATION  = 0x218;  // FVector (3 doubles)
+constexpr uint32_t SC_COMPONENT_TO_WORLD = 0x330;  // FTransform
+constexpr uint32_t SC_WORLD_LOCATION     = 0x350;  // C2W + 0x20 = Translation
+struct FVector { double X, Y, Z; };  // UE5 LWC — DOUBLES!
+FVector GetActorWorldPosition(uintptr_t actor) {
+    uintptr_t rootComp = Read<uintptr_t>(actor + 0x218);
+    if (!IsValidPtr(rootComp)) return {0, 0, 0};
+    // Read world location from ComponentToWorld translation
+    FVector pos;
+    pos.X = Read<double>(rootComp + 0x350);
+    pos.Y = Read<double>(rootComp + 0x358);
+    pos.Z = Read<double>(rootComp + 0x360);
+    return pos;  // in centimeters
+}
+float DistanceMetres(FVector actorPos, CameraData cam) {
+    double dx = actorPos.X - cam.locX;
+    double dy = actorPos.Y - cam.locY;
+    double dz = actorPos.Z - cam.locZ;
+    return (float)(sqrt(dx*dx + dy*dy + dz*dz) / 100.0);  // cm → m
+}
+ 
+ 
+═══════════════════════════════════════════════════════════════════════
+STEP 7: WORLD TO SCREEN PROJECTION
+═══════════════════════════════════════════════════════════════════════
+ 
+Standard 3D→2D projection using camera Location, Rotation, FOV:
+ 
+ 
+	
+Code:
+	
+#define DEG2RAD(x) ((x) * 3.14159265358979323846 / 180.0)
+struct Vec2 { float X, Y; };
+Vec2 WorldToScreen(FVector worldPos, CameraData cam, float screenW, float screenH) {
+    double dx = worldPos.X - cam.locX;
+    double dy = worldPos.Y - cam.locY;
+    double dz = worldPos.Z - cam.locZ;
+    double sp = sin(DEG2RAD(cam.pitch)), cp = cos(DEG2RAD(cam.pitch));
+    double sy = sin(DEG2RAD(cam.yaw)),   cy = cos(DEG2RAD(cam.yaw));
+    double sr = sin(DEG2RAD(cam.roll)),  cr = cos(DEG2RAD(cam.roll));
+    // Camera axes: Forward (X), Right (Y), Up (Z)
+    FVector axisX = { cy * cp, sy * cp, sp };
+    FVector axisY = { cy * sp * sr - sy * cr, sy * sp * sr + cy * cr, -cp * sr };
+    FVector axisZ = { -(cy * sp * cr + sy * sr), cy * sr - sy * sp * cr, cp * cr };
+    double camX = dx * axisY.X + dy * axisY.Y + dz * axisY.Z;  // right
+    double camY = dx * axisZ.X + dy * axisZ.Y + dz * axisZ.Z;  // up
+    double camZ = dx * axisX.X + dy * axisX.Y + dz * axisX.Z;  // forward
+    if (camZ < 1.0) return { -10000.0f, -10000.0f };  // behind camera
+    double centerX = screenW * 0.5;
+    double centerY = screenH * 0.5;
+    double aspect  = (double)screenW / (double)screenH;
+    double tanHalfFov = tan(DEG2RAD(cam.fov) * 0.5);
+    float sx = (float)(centerX + (camX / (camZ * tanHalfFov * aspect)) * centerX);
+    float sy = (float)(centerY - (camY / (camZ * tanHalfFov))          * centerY);
+    return { sx, sy };
+}
+ 
+ 
+═══════════════════════════════════════════════════════════════════════
+STEP 8: DRAW ESP
+═══════════════════════════════════════════════════════════════════════
+ 
+ 
+	
+Code:
+	
+void DrawESP(CameraData cam, float screenW, float screenH) {
+    for (uintptr_t actor : playerActors) {
+        FVector pos = GetActorWorldPosition(actor);
+        if (pos.X == 0 && pos.Y == 0 && pos.Z == 0) continue;
+        float dist = DistanceMetres(pos, cam);
+        if (dist > 500.0f) continue;
+        // Project feet and head (capsule half-height ~90cm)
+        Vec2 bottom = WorldToScreen({pos.X, pos.Y, pos.Z - 90.0}, cam, screenW, screenH);
+        Vec2 top    = WorldToScreen({pos.X, pos.Y, pos.Z + 90.0}, cam, screenW, screenH);
+        if (bottom.X < -9000 || top.X < -9000) continue;  // off screen
+        float boxH = abs(bottom.Y - top.Y);
+        float boxW = boxH * 0.4f;
+        float boxX = top.X - boxW / 2.0f;
+        float boxY = top.Y;
+        // Read health
+        uintptr_t healthComp = Read<uintptr_t>(actor + 0xDC8);  // HealthComponent
+        double hp    = 100.0;
+        double maxHp = 100.0;
+        if (IsValidPtr(healthComp)) {
+            hp    = Read<double>(healthComp + 0x668);  // CurrentHealth
+            maxHp = Read<double>(healthComp + 0x308);  // MaxHealth
+        }
+        // Draw
+        DrawRect(boxX, boxY, boxW, boxH, COLOR_RED);
+        DrawText(top.X, top.Y - 14, Format("%.0fm", dist));
+        DrawHealthBar(boxX - 4, boxY, 2, boxH, hp / maxHp);
+    }
+}
+ 
+ 
+═══════════════════════════════════════════════════════════════════════
+COMMON OFFSET TABLE (CL-1315578 / 2026-07-09)
+═══════════════════════════════════════════════════════════════════════
+ 
+ 
+	
+Code:
+	
+                          OP's OFFSET    CORRECT       NOTES
+UWorld RVA               0xE91A288      0xE91A288     OK
+PersistentLevel          0x130          0x158         WRONG — shifted!
+Actors.Data              0x108          0x108         OK (on ULevel, not UWorld)
+Actors.Num               0x110          0x110         OK
+AcknowledgedPawn         0x3E0          0x3E0         OK
+RootComponent            0x220          0x218         WRONG — off by 8
+PlayerState              0x3C0          0x3C0         OK (Pawn::PlayerState)
+CharacterMesh            0x428          0x428         OK
+HealthComponent          0xD20          0xDC8         WRONG
+RelativeLocation         0x290          0x218         WRONG
+ComponentToWorld         0x3A0          0x330         WRONG
+ComponentVelocity        0x248          0x260         WRONG
+Camera (from PlayerCameraManager actor, found via FName scan):
+ViewTarget               0x4A0          0x4B0         WRONG — shifted +0x10
+POV (FMinimalViewInfo)   ???            0x4C0         ViewTarget + 0x10
+Location                 ???            0x4C0         3x DOUBLE (not float!)
+Rotation                 ???            0x4E8         3x DOUBLE (degrees)
+FOV                      0x510          0x510         OK (float)
+Health (from HealthComponent pointer):
+CurrentHealth            ???            HC+0x668      double
+MaxHealth                ???            HC+0x308      double
+PlayerController chain (ALL ENCRYPTED — do NOT use):
+GameInstance             0x2D0          0x4D8         encrypted TObjectPtr
+LocalPlayers             0xF0           0x120         encrypted
+PlayerController         0x98           0x0A0         encrypted
+PlayerCameraManager      0xC30          0x4E0         encrypted
+ 
+ 
+═══════════════════════════════════════════════════════════════════════
+WHY YOUR CURRENT APPROACH FAILS — SPECIFIC ANSWERS
+═══════════════════════════════════════════════════════════════════════
+ 
+Q: "Where is camera Location/Rotation stored?"
+A: CameraManager + 0x4C0 (Location, 3 doubles) and + 0x4E8 (Rotation, 3 doubles).
+   ViewTarget shifted from 0x4A0 to 0x4B0. Your FOV at +0x510 works because
+   0x4B0 + 0x10 + 0x50 = 0x510. But Location is at POV + 0x00 and Rotation at
+   POV + 0x28. They are DOUBLES, not floats.
+ 
+Q: "Is there a way to get the camera WITHOUT PlayerController chain?"
+A: Yes — the FName scan above. Walk all level actors, resolve each class name,
+   find "PlayerCameraManager". This is the primary method, not a fallback.
+   The encrypted pointer chain is unusable without TObjectPtr decryption.
+ 
+Q: "How are YOU getting the view matrix currently?"
+A: FName scan all level actors for "PlayerCameraManager" class name. That gives
+   us the actor pointer directly. Then read Location/Rotation/FOV at the offsets
+   above. The FName scan has NEVER failed across patches — struct offsets shift,
+   but the actor always exists and always has that class name.
+ 
+Q: "Why does Location at POV+0x10 give 83?"
+A: You're reading a double as a float. The first 4 bytes of a double that
+   represents ~80000.0 will decode as ~83 when interpreted as float32.
+   Use Read<double> instead of Read<float>.
+ 
+ 
+═══════════════════════════════════════════════════════════════════════
+TL;DR CHECKLIST
+═══════════════════════════════════════════════════════════════════════
+ 
+[ ] FName decrypt working (full pipeline above — returns real class names)
+[ ] UWorld at GameBase + 0xE91A288
+[ ] PersistentLevel at UWorld + 0x158 (NOT 0x130)
+[ ] Actors at Level + 0x108 / 0x110
+[ ] Walk ALL Levels (UWorld + 0x4A0 TArray), not just PersistentLevel
+[ ] Classify actors by FName, cache by type
+[ ] Find "PlayerCameraManager" by FName class scan
+[ ] Read Location at CamMgr + 0x4C0 as 3x DOUBLE
+[ ] Read Rotation at CamMgr + 0x4E8 as 3x DOUBLE (degrees)
+[ ] Read FOV at CamMgr + 0x510 as float
+[ ] Actor position: actor + 0x218 → RootComp, then RC + 0x350 as 3x DOUBLE
+[ ] WorldToScreen with proper rotation matrix
+[ ] Health at actor + 0xDC8 → HC, then HC + 0x668 / HC + 0x308
+ 
+Good luck. FName is the hardest part. But once it works, everything else is
+just offset tables and Read<double>.

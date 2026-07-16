@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <algorithm>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -60,6 +61,24 @@ bool FnameLooksLikeNonWorldEspActor(const std::string& fname)
         || lower.find("boxcomponent") != std::string::npos
         || lower.find("capsulecomponent") != std::string::npos)
         return true;
+    // Log proof: DDGIVolume→"Double Property", IndoorsVolume→"Door",
+    // WaterProcessingBuilding→item ESP. These are not floor loot.
+    static const char* kJunkWorld[] = {
+        "ddgivolume", "ddgi", "ambiencevolume", "indoorsvolume", "outdoorsvolume",
+        "blockingvolume", "runtimevirtualtexture", "levelbounds",
+        "waterprocessing", "processingbuilding", "embarkworldsettings",
+        "pioneerswatersystem", "pioneerwatersystem", "defaultambience",
+    };
+    for (const char* token : kJunkWorld) {
+        if (lower.find(token) != std::string::npos)
+            return true;
+    }
+    if (lower.size() >= 6
+        && lower.compare(lower.size() - 6, 6, "volume") == 0)
+        return true;
+    if (lower.size() >= 8
+        && lower.compare(lower.size() - 8, 8, "building") == 0)
+        return true;
     return false;
 }
 
@@ -81,50 +100,33 @@ bool AdmitItemActor(
     if (!dataAssetFName.empty() && FnameLooksLikeHarvestableActor(dataAssetFName))
         return true;
 
+    // Soft admit paths below used to swallow volumes/buildings when +0x488/
+    // asset-id looked populated (Door@IndoorsVolume, WaterProcessingBuilding).
+    if ((!fname.empty() && FnameLooksLikeNonWorldEspActor(fname))
+        || (!dataAssetFName.empty() && FnameLooksLikeNonWorldEspActor(dataAssetFName)))
+        return false;
+
     if (classChest || fnameIsContainer)
+        return false;
+    // Probe wrecks are containers (WorldItemCategory::Probe). Keep them out of
+    // the ground-loot scanner so F6 / liveNear only tracks BP_PickupBase drops.
+    if ((!fname.empty() && FnameLooksLikeWorldContainer(fname))
+        || (!dataAssetFName.empty() && FnameLooksLikeWorldContainer(dataAssetFName)))
         return false;
     if (!fname.empty() && IsSalvageContainerActor(fname, key))
         return false;
     if (!fname.empty() && IsRealSocketSalvageContainer(fname, key))
         return false;
-    if (!fname.empty() && FnameLooksLikeWorldContainer(fname))
-        return false;
 
     if (classGroundLoot || fnameIsPickup)
         return true;
 
-    if (TryReadItemGameAssetIdFromActor(key) != 0)
-        return true;
-
-    if (!dataAssetFName.empty()) {
-        if (FnameLooksLikeWorldContainer(dataAssetFName))
-            return false;
-        if (FnameLooksLikeDroppedPickup(dataAssetFName))
-            return true;
-        if (!LookupByAssetName(dataAssetFName).empty())
-            return true;
-    }
-
-    if (hasItemDataAsset && !fnameIsContainer && !classChest)
-        return true;
-
-    // Container-route actors use LootInteraction_Container (+0xBB8), not ground loot.
-    if (hasContainerLoot && !fnameIsPickup && !classGroundLoot)
-        return false;
-
-    if (!fname.empty() && FnameAdmitsWorldActor(fname)) {
-        if (IsStrictWorldLootFname(fname) && !fnameIsContainer)
-            return true;
-        if (FnameLooksLikeHarvestableActor(fname))
-            return true;
-    }
-
-    if (!fname.empty() && !LookupByAssetName(fname).empty()
-        && !FnameLooksLikeWorldContainer(fname))
-        return true;
-
+    // Only pickup/harvestable/class signals admit. Do not use loose ItemDataAsset
+    // / LookupByAssetName / FnameAdmitsWorldActor — those admitted buildings.
     (void)classId;
     (void)hasLootInteraction;
+    (void)hasContainerLoot;
+    (void)hasItemDataAsset;
     (void)key;
     return false;
 }
@@ -206,15 +208,17 @@ WorldItemCategory ClassifyItem(
 
 static std::unordered_map<uintptr_t, uint8_t> s_itemPosMisses;
 static constexpr uint8_t kItemPosMissEvict = 12;
+static constexpr uint8_t kPickupPosMissEvict = 3;
 
-static bool ItemPosMissShouldEvict(uintptr_t key, bool posOk)
+static bool ItemPosMissShouldEvict(uintptr_t key, bool posOk, bool pickupLike)
 {
     if (posOk) {
         s_itemPosMisses.erase(key);
         return false;
     }
     const uint8_t misses = ++s_itemPosMisses[key];
-    return misses >= kItemPosMissEvict;
+    const uint8_t lim = pickupLike ? kPickupPosMissEvict : kItemPosMissEvict;
+    return misses >= lim;
 }
 
 static void ClearItemPosMiss(uintptr_t key)
@@ -226,6 +230,30 @@ static void ClearItemListStaticMaps()
 {
     s_itemPosMisses.clear();
     ClearGroundLootPickupStickyState();
+}
+
+static bool IsGroundPickupCategory(WorldItemCategory cat)
+{
+    return cat == WorldItemCategory::DroppedPickup
+        || cat == WorldItemCategory::Items
+        || cat == WorldItemCategory::Harvestable;
+}
+
+static std::string JsonEscShort(std::string s, size_t maxLen = 40)
+{
+    if (s.size() > maxLen)
+        s.resize(maxLen);
+    std::string o;
+    o.reserve(s.size());
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\')
+            o.push_back('_');
+        else if (c >= 32 && c < 127)
+            o.push_back(static_cast<char>(c));
+        else
+            o.push_back('_');
+    }
+    return o;
 }
 
 } // namespace
@@ -253,6 +281,7 @@ void Engine::ItemList()
     const std::unordered_set<uint64_t> currentSet(
         ctx.currentActors.begin(),
         ctx.currentActors.end());
+
     WorldScan::PruneStaleEntries(localCache, currentSet);
 
     std::unordered_set<uintptr_t> occupiedCharacterKeys;
@@ -274,8 +303,13 @@ void Engine::ItemList()
     const uintptr_t localPawn = ctx.acknowledgedPawn;
     WorldScan::CollectHeldItemActors(localPawn, occupiedCharacterKeys);
 
-    for (uintptr_t occupied : occupiedCharacterKeys)
+    for (uintptr_t occupied : occupiedCharacterKeys) {
+        if (const auto it = localCache.find(occupied); it != localCache.end()) {
+            if (IsGroundPickupCategory(static_cast<WorldItemCategory>(it->second.worldCategory)))
+                MarkGroundPickupGoneSticky(occupied);
+        }
         localCache.erase(occupied);
+    }
 
     int dbgScanned = 0;
     int dbgAdmitted = 0;
@@ -300,6 +334,9 @@ void Engine::ItemList()
         if (WorldScan::IsHeldEquipmentActor(key))
             continue;
         if (localCache.contains(key))
+            continue;
+
+        if (IsGroundPickupGoneSticky(key))
             continue;
 
         ++dbgScanned;
@@ -510,6 +547,15 @@ void Engine::ItemList()
             continue;
         }
 
+        // F6 / deplete sticky: ItemList snapshots itemCache at start. UserConfirm
+        // can erase the live map mid-scan; without this, localCache writeback
+        // restores the ghost (log: liveNear same key after userMark).
+        if (IsGroundPickupGoneSticky(key)) {
+            ClearItemPosMiss(key);
+            it = localCache.erase(it);
+            continue;
+        }
+
         std::string retainFname = it->second.ActorName;
         if (retainFname.empty())
             retainFname = GetActorFNameStringCached(key);
@@ -519,10 +565,20 @@ void Engine::ItemList()
             it = localCache.erase(it);
             continue;
         }
+        // Evict misrouted containers (e.g. Probe Crashed) stuck from older admits.
+        if (FnameLooksLikeWorldContainer(retainFname)
+            || FnameLooksLikeWorldContainer(retainClass)) {
+            ClearItemPosMiss(key);
+            it = localCache.erase(it);
+            continue;
+        }
 
         const auto retainCat = static_cast<WorldItemCategory>(it->second.worldCategory);
         if (WorldLootCacheEntryDepleted(key, retainFname, retainCat)) {
             ++dbgDepleted;
+            if (IsGroundPickupCategory(retainCat)
+                || FnameLooksLikeDroppedPickup(retainFname))
+                MarkGroundPickupGoneSticky(key);
             ClearItemPosMiss(key);
             it = localCache.erase(it);
             continue;
@@ -589,14 +645,18 @@ void Engine::ItemList()
         const uintptr_t root = retainRoots[i];
         const bool posOk = root && IsValidPointer(root)
             && IsPlausibleWorldPos(retainIters[i]->second.WorldPos);
+        const bool pickupLike = IsGroundPickupCategory(
+            static_cast<WorldItemCategory>(retainIters[i]->second.worldCategory));
         if (!posOk) {
             ++dbgPosSkip;
-            if (ItemPosMissShouldEvict(key, false)) {
+            if (ItemPosMissShouldEvict(key, false, pickupLike)) {
+                if (pickupLike)
+                    MarkGroundPickupGoneSticky(key);
                 ClearItemPosMiss(key);
                 localCache.erase(key);
             }
         } else {
-            ItemPosMissShouldEvict(key, true);
+            ItemPosMissShouldEvict(key, true, pickupLike);
         }
     }
 
@@ -615,6 +675,75 @@ void Engine::ItemList()
     }
 
     FinalizeWorldCacheMap(localCache, ctx.camera, dbgDrawing);
+
+    // H7: ground-pickup shells that were liveNear <6m (hid=0/noCol=0 proven on
+    // live BP_PickupBase) — clear on 0→1 hid/noCol / HiddenOrDestroyed without
+    // waiting for ~15m actorGone (Canister L2258 / Battery L2259: strong=1).
+    // Absolute noCol alone false-positives live shells; require prior live sample.
+    {
+        using S = GroundLootPickupSignal;
+        static std::unordered_map<uintptr_t, uint8_t> s_prevShellBits; // 1=hid 2=noCol
+        static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> s_recentNearLive;
+        constexpr auto kRecentNearTtl = std::chrono::seconds(45);
+        const auto nowShell = std::chrono::steady_clock::now();
+
+        for (auto it = localCache.begin(); it != localCache.end(); ) {
+            const uintptr_t key = it->first;
+            auto& entry = it->second;
+            const auto cat = static_cast<WorldItemCategory>(entry.worldCategory);
+            if (!IsGroundPickupCategory(cat)
+                && !FnameLooksLikeDroppedPickup(entry.ActorName)) {
+                ++it;
+                continue;
+            }
+
+            const GroundLootPickupSignal sig =
+                ProbeGroundLootPickupSignals(key, entry.ActorName);
+            const int hid = ((sig & S::HiddenOrDestroyed) != S::None) ? 1 : 0;
+            const int noCol = ((sig & S::NoCollision) != S::None) ? 1 : 0;
+            const int strong = GroundLootPickupHasStrongSignal(sig) ? 1 : 0;
+
+            // Stamp only when proven live under 6m (both flags clear).
+            if (entry.Drawing && entry.Distance >= 0.f && entry.Distance < 6.f
+                && hid == 0 && noCol == 0) {
+                s_recentNearLive[key] = nowShell;
+            }
+
+            const auto nearIt = s_recentNearLive.find(key);
+            const bool recentNear = nearIt != s_recentNearLive.end()
+                && (nowShell - nearIt->second) <= kRecentNearTtl;
+
+            // First sample: seed prev without clearing (need a live baseline).
+            if (!s_prevShellBits.contains(key)) {
+                s_prevShellBits[key] = static_cast<uint8_t>(
+                    (hid ? 1u : 0u) | (noCol ? 2u : 0u));
+                ++it;
+                continue;
+            }
+            const uint8_t prevBits = s_prevShellBits[key];
+            const int prevHid = (prevBits & 1u) ? 1 : 0;
+            const int prevNoCol = (prevBits & 2u) ? 1 : 0;
+            const bool hidRise = (hid == 1 && prevHid == 0);
+            const bool noColRise = (noCol == 1 && prevNoCol == 0);
+            // recentNear stamped only while hid=0&&noCol=0 under 6m → live baseline.
+            const bool gate = recentNear && (hidRise || noColRise);
+            s_prevShellBits[key] = static_cast<uint8_t>(
+                (hid ? 1u : 0u) | (noCol ? 2u : 0u));
+
+            if (!gate) {
+                ++it;
+                continue;
+            }
+
+            MarkGroundPickupGoneSticky(key);
+            ClearItemPosMiss(key);
+            s_recentNearLive.erase(key);
+            s_prevShellBits.erase(key);
+            it = localCache.erase(it);
+        }
+    }
+
+
 
     if (m_worldGeneration.load(std::memory_order_acquire) != genAtStart)
         return;
@@ -743,6 +872,86 @@ void Engine::ItemList()
             << " lootDist=" << static_cast<int>(var::loot_distance)
             << std::endl;
     }
+
+    // Always refresh nearest live pickup for the on-screen item-pick panel
+    // (does not require Show offset validation).
+    {
+        static auto s_lastNear = std::chrono::steady_clock::time_point{};
+        const auto nowNear = std::chrono::steady_clock::now();
+        if (s_lastNear.time_since_epoch().count() == 0
+            || nowNear - s_lastNear >= std::chrono::seconds(1)) {
+            s_lastNear = nowNear;
+            float bestDist = 1.0e9f;
+            uintptr_t bestKey = 0;
+            std::string bestLab;
+            std::string bestFname;
+            WorldItemCategory bestCat = WorldItemCategory::Items;
+            bool found = false;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_itemCacheMutex);
+                for (const auto& [actorKey, entry] : itemCache) {
+                    if (!entry.Drawing)
+                        continue;
+                    const auto cat = static_cast<WorldItemCategory>(entry.worldCategory);
+                    if (!IsGroundPickupCategory(cat))
+                        continue;
+                    if (entry.Distance < bestDist) {
+                        bestDist = entry.Distance;
+                        bestKey = actorKey;
+                        bestLab = entry.ItemDisplayName.empty()
+                            ? entry.ActorName : entry.ItemDisplayName;
+                        bestFname = entry.ActorName;
+                        bestCat = cat;
+                        found = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void Engine::CollectDrawingGroundPickups(std::vector<GroundPickupHudRow>& out) const
+{
+    out.clear();
+    std::shared_lock<std::shared_mutex> lock(m_itemCacheMutex);
+    out.reserve(itemCache.size());
+    for (const auto& [key, entry] : itemCache) {
+        if (!entry.Drawing)
+            continue;
+        const auto cat = static_cast<WorldItemCategory>(entry.worldCategory);
+        if (cat != WorldItemCategory::DroppedPickup
+            && cat != WorldItemCategory::Items
+            && cat != WorldItemCategory::Harvestable)
+            continue;
+        GroundPickupHudRow row{};
+        row.key = key;
+        row.name = entry.ItemDisplayName.empty() ? entry.ActorName : entry.ItemDisplayName;
+        row.distM = entry.Distance;
+        row.worldCategory = entry.worldCategory;
+        row.fname = entry.ActorName;
+        out.push_back(std::move(row));
+    }
+    std::sort(
+        out.begin(),
+        out.end(),
+        [](const GroundPickupHudRow& a, const GroundPickupHudRow& b) {
+            return a.distM < b.distM;
+        });
+    if (out.size() > 24)
+        out.resize(24);
+}
+
+void Engine::UserConfirmGroundItemPicked(uintptr_t key)
+{
+    if (!key)
+        return;
+
+    {
+        std::unique_lock<std::shared_mutex> lock(m_itemCacheMutex);
+        itemCache.erase(key);
+    }
+
+    MarkGroundPickupGoneSticky(key);
 }
 
 namespace WorldScan {

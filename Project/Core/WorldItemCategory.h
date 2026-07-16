@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <string>
 
+class Engine;
+
 struct WorldLootFilterView {
     uint8_t worldCategory = 0;
     std::string actorName;
@@ -146,6 +148,9 @@ GroundLootPickupSignal ProbeGroundLootPickupSignals(
 bool GroundLootLooksPickedUp(uintptr_t actor, const std::string& fnameHint = {});
 /** Clear sticky pickup-collision state on raid/world reset. */
 void ClearGroundLootPickupStickyState();
+/** After a ground pickup shell fails position (picked ghost), block re-admit. */
+void MarkGroundPickupGoneSticky(uintptr_t actor);
+bool IsGroundPickupGoneSticky(uintptr_t actor);
 /** True when cached world/item entry should be evicted (opened container or taken pickup). */
 bool WorldLootCacheEntryDepleted(
     uintptr_t actor,

@@ -13,6 +13,7 @@
 
 #include "../Core/AssetNames.h"
 #include "../Functions/RobotList.h"
+#include "WorldScanCommon.h"
 #include "../Core/Cache.hpp"
 #include "../Core/Memory.h"
 #include "../Core/SteamDecrypt.hpp"
@@ -224,9 +225,11 @@ bool Engine::RefreshCameraFromViewTarget()
 		return f > 1.0f && f < 179.0f;
 	};
 
+	// LP may be 0 (encrypted GI→LP). Prefer PCM FName → PCOwner → AckPawn
+	// (help/esp.txt Step 4–5); never require LocalPlayer for camera.
 	if (pc && !IsPcmValid(pcm))
 		pcm = Memory::read<uintptr_t>(pc + Offsets::APlayerCameraManager);
-	if (!IsPcmValid(pcm) && pc)
+	if (!IsPcmValid(pcm))
 		pcm = GetCameraManagerFromActors();
 	if (!IsPcmValid(pcm)) {
 		uintptr_t level = 0;
@@ -242,7 +245,7 @@ bool Engine::RefreshCameraFromViewTarget()
 			uintptr_t foundPcm = pcm;
 			if (ResolvePcFromLevelCameraManager(level, actors, pcmPc, pcmPawn, foundPcm)) {
 				pcm = foundPcm;
-				if (pcmPc && pcmPc != pc) {
+				if (pcmPc && (!pc || pcmPc != pc)) {
 					std::unique_lock<std::shared_mutex> lock(m_stateMutex);
 					PlayerController = pcmPc;
 					AcknowledgedPawn = pcmPawn;
@@ -360,23 +363,18 @@ namespace {
 void RotationGetAxes(const Vector3& rot, Vector3& axisX, Vector3& axisY, Vector3& axisZ)
 {
 	constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
-	auto toVector = [&](double pitchDeg, double yawDeg) -> Vector3 {
-		const double pitch = pitchDeg * kDegToRad;
-		const double yaw = yawDeg * kDegToRad;
-		const double cp = std::cos(pitch);
-		const double sp = std::sin(pitch);
-		const double cy = std::cos(yaw);
-		const double sy = std::sin(yaw);
-		return Vector3{ cp * cy, cp * sy, sp };
-	};
+	const double sp = std::sin(rot.x * kDegToRad);
+	const double cp = std::cos(rot.x * kDegToRad);
+	const double sy = std::sin(rot.y * kDegToRad);
+	const double cy = std::cos(rot.y * kDegToRad);
+	const double sr = std::sin(rot.z * kDegToRad);
+	const double cr = std::cos(rot.z * kDegToRad);
 
-	axisX = toVector(rot.x, rot.y);
+	axisX = Vector3{ cy * cp, sy * cp, sp };
 
-	Vector3 right = toVector(0.0, rot.y + 90.0);
-	right.z = 0.0;
-	axisY = right;
+	axisY = Vector3{ cy * sp * sr - sy * cr, sy * sp * sr + cy * cr, -cp * sr };
 
-	axisZ = toVector(rot.x + 90.0, rot.y);
+	axisZ = Vector3{ -(cy * sp * cr + sy * sr), cy * sr - sy * sp * cr, cp * cr };
 }
 
 } // namespace
@@ -850,28 +848,54 @@ bool Engine::ResolvePcFromLevelCameraManager(
         return false;
 
     const int scanLimit = (actorCount < 10000) ? actorCount : 10000;
-    for (int i = 0; i < scanLimit; ++i) {
-        const uintptr_t candidate = Memory::read<uintptr_t>(
-            resolvedActors + static_cast<size_t>(i) * sizeof(uintptr_t));
+    const bool fnameReady = InitConsts();
+
+    auto tryCandidate = [&](uintptr_t candidate, bool requireFName) -> bool {
         if (!candidate || !Memory::IsValidPtrFast2(candidate))
-            continue;
+            return false;
+
+        if (requireFName) {
+            const std::string fname = GetActorFNameString(candidate);
+            if (fname.find("PlayerCameraManager") == std::string::npos
+                && fname.find("CameraManager") == std::string::npos)
+                return false;
+        }
 
         const float fov = Memory::read<float>(candidate + Offsets::DefaultFOV);
         if (fov <= 1.f || fov >= 179.f)
-            continue;
+            return false;
 
+        // help/esp.txt: PCOwner @ 0x420 → AcknowledgedPawn (LP not required).
         const uintptr_t owner = Memory::read<uintptr_t>(candidate + Offsets::PCOwner);
         if (!owner || !Memory::IsValidPtrFast2(owner))
-            continue;
+            return false;
 
         const uintptr_t pawn = Memory::read<uintptr_t>(owner + Offsets::AcknowledgedPawn);
         if (!pawn || !Memory::IsValidPtrFast2(pawn) || !PawnHasWorldPosition(pawn))
-            continue;
+            return false;
 
         outPc = owner;
         outPawn = pawn;
         outPcm = candidate;
         return true;
+    };
+
+    // Pass 1 (preferred): FName PCM scan → PCOwner → AckPawn (help/esp.txt Step 4–5).
+    if (fnameReady) {
+        for (int i = 0; i < scanLimit; ++i) {
+            const uintptr_t candidate = Memory::read<uintptr_t>(
+                resolvedActors + static_cast<size_t>(i) * sizeof(uintptr_t));
+            if (tryCandidate(candidate, true))
+                return true;
+        }
+    }
+
+    // Pass 2: FOV structural fallback when FName is cold/unavailable.
+    for (int i = 0; i < scanLimit; ++i) {
+        const uintptr_t candidate = Memory::read<uintptr_t>(
+            resolvedActors + static_cast<size_t>(i) * sizeof(uintptr_t));
+        if (tryCandidate(candidate, false))
+            return true;
     }
 
     return false;
@@ -953,6 +977,8 @@ bool Engine::ResolveLocalPlayerChainFromActors(uintptr_t persistentLevel, uintpt
 
 uintptr_t Engine::GetCameraManagerFromActors()
 {
+	// help/esp.txt Step 4: find PlayerCameraManager by FName; LP/GI may be encrypted.
+	// PCOwner@0x420 is used by callers to recover PC/AckPawn — do not require LP here.
 	uintptr_t pc = 0;
 	uintptr_t level = 0;
 	uintptr_t actorsData = 0;
@@ -963,41 +989,59 @@ uintptr_t Engine::GetCameraManagerFromActors()
 		actorsData = Actors;
 	}
 
-	if (!pc)
-		return 0;
-
-	const uintptr_t pcmDirect = Memory::read<uintptr_t>(pc + Offsets::APlayerCameraManager);
-	if (pcmDirect && IsValidPointer(pcmDirect)) {
-		const float fov = Memory::read<float>(pcmDirect + Offsets::DefaultFOV);
-		if (fov > 1.f && fov < 179.f)
-			return pcmDirect;
+	uintptr_t pcmDirect = 0;
+	if (pc) {
+		pcmDirect = Memory::read<uintptr_t>(pc + Offsets::APlayerCameraManager);
+		if (pcmDirect && IsValidPointer(pcmDirect)) {
+			const float fov = Memory::read<float>(pcmDirect + Offsets::DefaultFOV);
+			if (fov > 1.f && fov < 179.f)
+				return pcmDirect;
+		}
 	}
 
 	if (!level || !actorsData)
-		return 0;
+		return pcmDirect && IsValidPointer(pcmDirect) ? pcmDirect : 0;
 
 	int actorCount = 0;
 	uintptr_t resolvedActors = 0;
 	if (!ResolveLevelActors(level, resolvedActors, actorCount))
-		return 0;
+		return pcmDirect && IsValidPointer(pcmDirect) ? pcmDirect : 0;
 	if (resolvedActors != actorsData)
 		actorsData = resolvedActors;
 
 	const int scanLimit = (actorCount < 10000) ? actorCount : 10000;
+	const bool fnameReady = InitConsts();
+	uintptr_t fnameHit = 0;
+
 	for (int i = 0; i < scanLimit; ++i) {
 		const uintptr_t candidate = Memory::read<uintptr_t>(
 			actorsData + static_cast<size_t>(i) * sizeof(uintptr_t));
 		if (!candidate || !IsValidPointer(candidate))
 			continue;
 
-		if (Memory::read<uintptr_t>(candidate + Offsets::PCOwner) != pc)
+		const float fov = Memory::read<float>(candidate + Offsets::DefaultFOV);
+		if (fov <= 1.f || fov >= 179.f)
 			continue;
 
-		const float fov = Memory::read<float>(candidate + Offsets::DefaultFOV);
-		if (fov > 1.f && fov < 179.f)
-			return candidate;
+		if (pc) {
+			if (Memory::read<uintptr_t>(candidate + Offsets::PCOwner) == pc)
+				return candidate;
+		}
+
+		if (fnameReady && !fnameHit) {
+			const std::string fname = GetActorFNameString(candidate);
+			if (fname.find("PlayerCameraManager") != std::string::npos
+				|| fname.find("CameraManager") != std::string::npos) {
+				const uintptr_t owner =
+					Memory::read<uintptr_t>(candidate + Offsets::PCOwner);
+				if (owner && Memory::IsValidPtrFast2(owner))
+					fnameHit = candidate;
+			}
+		}
 	}
 
+	if (fnameHit)
+		return fnameHit;
 	if (pcmDirect && IsValidPointer(pcmDirect))
 		return pcmDirect;
 
@@ -1642,4 +1686,125 @@ bool Engine::InitConsts()
 
     g_fnameTablesReady = true;
     return true;
+}
+
+uintptr_t Engine::ResolveInventoryPtr(uintptr_t raw)
+{
+    if (!raw)
+        return 0;
+    if (Memory::IsValidPtrFast2(raw))
+        return raw;
+    return 0;
+}
+
+void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int& outWeaponQuality,
+    std::string& outStowed0, int& outStowedQ0,
+    std::string& outStowed1, int& outStowedQ1,
+    float& outArmorPlates, float& outArmorPerPlate)
+{
+    outWeaponName.clear();
+    outWeaponQuality = -1;
+    outStowed0.clear();
+    outStowedQ0 = -1;
+    outStowed1.clear();
+    outStowedQ1 = -1;
+    outArmorPlates = 0.f;
+    outArmorPerPlate = 0.f;
+
+    if (!pawn)
+        return;
+
+    const uintptr_t invRaw = Memory::read<uintptr_t>(pawn + Offsets::InventoryComponent);
+    const uintptr_t invComp = ResolveInventoryPtr(invRaw);
+    if (!invComp)
+        return;
+
+    // Read stowed weapon slot 0 at +0x340
+    StowedWeaponInfo slot0 = Memory::read<StowedWeaponInfo>(invComp + Offsets::StowedWeaponSlot0);
+    if (slot0.WeaponVisual && Memory::IsValidPtrFast2(slot0.WeaponVisual)) {
+        std::string name = GetActorFNameString(slot0.WeaponVisual);
+        if (!name.empty()) {
+            std::string stripped = name;
+            // Strip common prefixes
+            static const char* kPrefixes[] = { "DA_WeaponItem_", "DA_ItemDataAsset_", "DA_Item_", "DA_", "Default__" };
+            for (const char* p : kPrefixes) {
+                size_t len = std::strlen(p);
+                if (stripped.size() >= len && stripped.compare(0, len, p) == 0) {
+                    stripped = stripped.substr(len);
+                    break;
+                }
+            }
+            if (stripped.size() > 2 && stripped.compare(stripped.size() - 2, 2, "_C") == 0)
+                stripped.resize(stripped.size() - 2);
+            outStowed0 = GetWeaponName(stripped.empty() ? name : stripped);
+        }
+        if (slot0.WeaponQuality >= 0 && slot0.WeaponQuality <= 3)
+            outStowedQ0 = slot0.WeaponQuality + 1;  // 0-3 → tier I-IV = 1-4
+    }
+
+    // Stowed slot 1 at +0x380
+    StowedWeaponInfo slot1 = Memory::read<StowedWeaponInfo>(invComp + Offsets::StowedWeaponSlot1);
+    if (slot1.WeaponVisual && Memory::IsValidPtrFast2(slot1.WeaponVisual)) {
+        std::string name = GetActorFNameString(slot1.WeaponVisual);
+        if (!name.empty()) {
+            std::string stripped = name;
+            static const char* kPrefixes[] = { "DA_WeaponItem_", "DA_ItemDataAsset_", "DA_Item_", "DA_", "Default__" };
+            for (const char* p : kPrefixes) {
+                size_t len = std::strlen(p);
+                if (stripped.size() >= len && stripped.compare(0, len, p) == 0) {
+                    stripped = stripped.substr(len);
+                    break;
+                }
+            }
+            if (stripped.size() > 2 && stripped.compare(stripped.size() - 2, 2, "_C") == 0)
+                stripped.resize(stripped.size() - 2);
+            outStowed1 = GetWeaponName(stripped.empty() ? name : stripped);
+        }
+        if (slot1.WeaponQuality >= 0 && slot1.WeaponQuality <= 3)
+            outStowedQ1 = slot1.WeaponQuality + 1;
+    }
+
+    // Read equipped primary item at +0x520
+    const uintptr_t eqRaw = Memory::read<uintptr_t>(invComp + Offsets::EquippedPrimaryItem);
+    const uintptr_t equipped = ResolveInventoryPtr(eqRaw);
+    if (equipped) {
+        std::string eqName = GetActorFNameString(equipped);
+        if (!eqName.empty()) {
+            std::string stripped = eqName;
+            static const char* kPrefixes[] = { "BP_WeaponActor_", "BP_Weapon_", "BP_ItemActor_", "BP_Item_", "BP_WItem_", "BP_", "Default__" };
+            for (const char* p : kPrefixes) {
+                size_t len = std::strlen(p);
+                if (stripped.size() >= len && stripped.compare(0, len, p) == 0) {
+                    stripped = stripped.substr(len);
+                    break;
+                }
+            }
+            if (stripped.size() > 2 && stripped.compare(stripped.size() - 2, 2, "_C") == 0)
+                stripped.resize(stripped.size() - 2);
+            outWeaponName = GetWeaponName(stripped.empty() ? eqName : stripped);
+        }
+    }
+
+    // Match equipped name to stowed slots for quality
+    if (!outWeaponName.empty()) {
+        if (outWeaponName == outStowed0) outWeaponQuality = outStowedQ0;
+        else if (outWeaponName == outStowed1) outWeaponQuality = outStowedQ1;
+    }
+    // If no quality from stowed, try direct read from weapon actor as fallback
+    if (outWeaponQuality < 0) {
+        const uintptr_t held = WorldScan::ResolvePreferredHeldItemActor(pawn);
+        if (held) {
+            outWeaponQuality = GetWeaponQualityFromActor(held);
+            if (outWeaponQuality >= 0 && outWeaponQuality <= 4)
+                outWeaponQuality += 1;  // 0-4 raw → 1-5 display
+        }
+    }
+
+    // Read armor from EquippedArmor at +0x518
+    const uintptr_t armorRaw = Memory::read<uintptr_t>(invComp + Offsets::EquippedArmor);
+    const uintptr_t armorItem = ResolveInventoryPtr(armorRaw);
+    if (armorItem) {
+        outArmorPlates = static_cast<float>(Memory::read<int32_t>(armorItem + 0x264));
+        outArmorPerPlate = static_cast<float>(Memory::read<float>(armorItem + 0x268));
+    }
 }

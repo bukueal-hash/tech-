@@ -1,4 +1,5 @@
 #include "../Core/Engine.h"
+#include "../Core/ActorType.h"
 #include "../Core/AssetNames.h"
 #include "../Core/Memory.h"
 #include "../Core/WorldItemCategory.h"
@@ -296,7 +297,8 @@ static bool ResolvePcmForEspFrame(
 
     if (pc && !IsPcmValid(pcm))
         pcm = Memory::read<uintptr_t>(pc + Offsets::APlayerCameraManager);
-    if (!IsPcmValid(pcm) && pc)
+    // LP may be 0 — still recover PCM via FName / PCOwner scan.
+    if (!IsPcmValid(pcm))
         pcm = eng.GetCameraManagerFromActors();
     if (!IsPcmValid(pcm)) {
         const uintptr_t level = eng.PersistentLevel;
@@ -446,26 +448,6 @@ static ImU32 WeaponTierColor(int quality)
     }
 }
 
-static void DrawWeaponLabel(
-    ImDrawList* drawList,
-    const Engine::PlayerCacheEntry& actor,
-    float anchorX,
-    float anchorY)
-{
-    if (!var::show_weapon || actor.weaponName.empty())
-        return;
-
-    const ImU32 wColor = actor.weaponQuality > 0
-        ? WeaponTierColor(actor.weaponQuality)
-        : IM_COL32(220, 220, 220, 255); // consumables / nades / unknown held
-    EspDraw::DrawLabelEsp(
-        drawList,
-        ImVec2(anchorX, anchorY),
-        actor.weaponName.c_str(),
-        wColor,
-        actor.Distance);
-}
-
 static float LabelTextHeight(const char* text, float distanceM)
 {
     if (!text || !text[0])
@@ -475,6 +457,45 @@ static float LabelTextHeight(const char* text, float distanceM)
     if (font)
         return font->CalcTextSizeA(px, FLT_MAX, 0.f, text).y;
     return ImGui::CalcTextSize(text).y;
+}
+
+static void DrawWeaponLabel(
+    ImDrawList* drawList,
+    const Engine::PlayerCacheEntry& actor,
+    float anchorX,
+    float& labelStackY)
+{
+    if (!var::show_weapon)
+        return;
+
+    // Active weapon
+    if (!actor.weaponName.empty()) {
+        const ImU32 wColor = actor.weaponQuality > 0
+            ? WeaponTierColor(actor.weaponQuality)
+            : IM_COL32(220, 220, 220, 255);
+        EspDraw::DrawLabelEsp(
+            drawList,
+            ImVec2(anchorX, labelStackY),
+            actor.weaponName.c_str(),
+            wColor,
+            actor.Distance);
+        labelStackY -= LabelTextHeight(actor.weaponName.c_str(), actor.Distance) + 4.f;
+    }
+
+    // Stowed weapons
+    for (const std::string* sw : { &actor.stowedWeapon0, &actor.stowedWeapon1 }) {
+        if (sw->empty()) continue;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "  %s", sw->c_str());
+        const ImU32 sColor = IM_COL32(180, 180, 180, 200);
+        EspDraw::DrawLabelEsp(
+            drawList,
+            ImVec2(anchorX + 8.f, labelStackY),
+            buf,
+            sColor,
+            actor.Distance);
+        labelStackY -= LabelTextHeight(buf, actor.Distance) + 2.f;
+    }
 }
 
 static float StackPlayerLabels(
@@ -495,9 +516,8 @@ static float StackPlayerLabels(
         labelStackY -= LabelTextHeight(nameLabel, actor.Distance) + 6.f;
     }
 
-    if (var::show_weapon && !actor.weaponName.empty()) {
+    if (var::show_weapon) {
         DrawWeaponLabel(drawList, actor, headX, labelStackY);
-        labelStackY -= LabelTextHeight(actor.weaponName.c_str(), actor.Distance) + 4.f;
     }
 
     if (var::show_distance) {
@@ -1176,20 +1196,39 @@ static void RenderRobotEspFromFrame(
                 fname = engine.GetActorFNameString(key);
         }
 
-        const std::string botLabel =
+        std::string botLabel =
             ResolveBotDrawLabel(key, robot.ActorName, fname);
-        // No name → no draw (distance/heart-only rows are ghost spots).
-        // Never use ARC/Bot/Oil placeholders.
-        if (botLabel.empty()) {
+        // Constructable token = label not settled yet; retry class/enemy DA (c190fb H3).
+        if (botLabel.empty()
+            && (robot.ActorName.empty()
+                || robot.ActorName == kBotStructAdmissionToken)) {
+            const std::string classFn = engine.GetActorClassFName(key);
+            if (!classFn.empty())
+                botLabel = ResolveBotDrawLabel(key, std::string{}, classFn);
+            if (botLabel.empty()) {
+                const std::string fromEnemy = ResolveEnemyAssetBotLabel(key);
+                if (!fromEnemy.empty()
+                    && IsAcceptedBotEspLabel(engine, fromEnemy, classFn))
+                    botLabel = fromEnemy;
+            }
+        }
+        // Impostors with no name stay hidden. Class bots may draw box/heart while
+        // the label decrypts (never ARC/Bot/Oil placeholders).
+        if (botLabel.empty() && !ArcActorType::IsAnyBotActor(key)) {
             RecordBotDrawLabelMiss();
             continue;
         }
         if (!EspDraw::IsEspBoxOnScreen(head, feet))
             continue;
 
-        // Heart only — no bot health bars (constructable HealthService often unread /
-        // unused; heart is the consistent marker and matches robot Center aim).
+        // Bot health bar + heart
         float botLabelY = head.y;
+        if (robot.maxhealth > 0.f && robot.health > 0.f) {
+            botLabelY = Visuals::HealthShieldBarsAboveHead(
+                head.x, head.y, boxH * 0.65f,
+                robot.health, robot.maxhealth,
+                0.f, 0.f, scale, drawList);
+        }
         if (var::showRobots && var::bot_heart)
             DrawBotHeartIfEnabled(drawList, head, feet, boxH, scale, color);
 
@@ -1273,6 +1312,29 @@ void Engine::RenderEsp()
         RenderQueue::flushToDrawList(
             drawList,
             g_renderQueue.takeCommands());
+        if (var::show_debug_overlay && drawWorld) {
+            const bool useFrame = CameraOkForEsp(frame.camera);
+            const char* camSrc = useFrame ? "FRAME" : "g_Cam";
+            Engine::CameraCache gCam{};
+            {
+                std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
+                gCam = engine.g_Camera;
+            }
+            char dbgTxt[512];
+            const int n = std::snprintf(dbgTxt, sizeof(dbgTxt),
+                "Cam: %s | Loc: %.0f,%.0f,%.0f | Rot: %.1f,%.1f,%.1f | FOV: %.1f\n"
+                "g_Cam: %s | Loc: %.0f,%.0f,%.0f | Rot: %.1f,%.1f,%.1f | FOV: %.1f",
+                camSrc,
+                renderCam.Location.x, renderCam.Location.y, renderCam.Location.z,
+                renderCam.Rotation.x, renderCam.Rotation.y, renderCam.Rotation.z,
+                renderCam.FOV,
+                CameraOkForEsp(gCam) ? "ok" : "BAD",
+                gCam.Location.x, gCam.Location.y, gCam.Location.z,
+                gCam.Rotation.x, gCam.Rotation.y, gCam.Rotation.z,
+                gCam.FOV);
+            if (n > 0 && n < (int)sizeof(dbgTxt))
+                drawList->AddText(ImVec2(10, 10), 0xFF00FF00, dbgTxt);
+        }
     }
 
     if (var::show_debug_overlay && drawWorld) {
@@ -1280,6 +1342,12 @@ void Engine::RenderEsp()
         const auto now = std::chrono::steady_clock::now();
         if (now - lastWorldDbg >= std::chrono::seconds(1)) {
             lastWorldDbg = now;
+            std::cout << "[debugCam] src="
+                << (CameraOkForEsp(frame.camera) ? "frame" : "g_Camera")
+                << " loc=" << renderCam.Location.x << "," << renderCam.Location.y << "," << renderCam.Location.z
+                << " rot=" << renderCam.Rotation.x << "," << renderCam.Rotation.y << "," << renderCam.Rotation.z
+                << " fov=" << renderCam.FOV
+                << std::endl;
             std::cout << "[debugWorldEsp] frame=" << g_worldEspDbg.frameEntries
                 << " rendered=" << g_worldEspDbg.rendered
                 << " skipAllow=" << g_worldEspDbg.skipAllow

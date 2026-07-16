@@ -80,7 +80,7 @@ static void DrawDebugOffsetValidation(Engine& eng)
     const float x1 = 20.f;
     const float x2 = x1 + colW + spacing;
     const float x3 = x2 + colW + spacing;
-    const float y = 20.f;
+    const float y = 55.f;
 
     ImDrawList* dl = ImGui::GetForegroundDrawList();
 

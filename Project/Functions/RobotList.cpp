@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cctype>
 #include <atomic>
+#include <chrono>
+#include <fstream>
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
@@ -112,7 +114,7 @@ std::string ResolveBotLabelFromFName(const std::string& name)
 
 std::string ResolveBotLabelFromActor(uintptr_t actor, const std::string& fnameHint)
 {
-    // Single chain ù same as draw/admission.
+    // Single chain ÔøΩ same as draw/admission.
     return ResolveBotTypeLabel(actor, fnameHint);
 }
 
@@ -285,13 +287,13 @@ bool HasStrongEnemyDataAsset(uintptr_t actor)
 //
 // This is THE single authoritative gate. Every admission pass and every
 // retention pass runs an actor through it, so a bot must independently prove
-// itself twice before it draws. Guarantee: only real ARC enemies survive ù
+// itself twice before it draws. Guarantee: only real ARC enemies survive ÔøΩ
 // never the local player, other players, guns, dropped items, boxes or
 // containers. Fuzzy fname/mesh name matches ALONE are never enough; a bot must
 // present real structural proof (an ARC enemy data-asset, the ARC class tag,
 // or a constructable enemy pointer) backed by a resolvable identity.
 // -------------------------------------------------------------------------
-// Skip VerifyBotActor on props/containers ù full verify on every actor was taking
+// Skip VerifyBotActor on props/containers ÔøΩ full verify on every actor was taking
 // tens of seconds per pass over the whole level (SyncedThread waits to finish).
 bool QuickBotCandidate(uintptr_t actor)
 {
@@ -331,7 +333,7 @@ bool QuickBotCandidate(uintptr_t actor)
         return false;
     };
 
-    // Cached fname first (cheap). Fresh snitch spawns often miss the cache ù
+    // Cached fname first (cheap). Fresh snitch spawns often miss the cache ÔøΩ
     // decrypt once so QuickBot does not skip actors Verify would accept.
     const std::string fnameCached = engine.GetActorFNameStringCached(actor);
     if (fnameLooksLikeBot(fnameCached))
@@ -352,7 +354,7 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
     if (localPawn && actor == localPawn)
         return false;
 
-    // (1) Absolute player negatives ù veto every positive signal below.
+    // (1) Absolute player negatives ÔøΩ veto every positive signal below.
     const uint32_t masked =
         ArcActorType::MaskActorTypeId(ArcActorType::ReadActorTypeId(actor));
     if (ArcActorType::IsPlayerClassId(masked))
@@ -366,7 +368,7 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
     if (playerState && engine.IsValidPointer(playerState))
         return false;
 
-    // Arc entry / cargo / caches / socket containers are world ESP ù never bots,
+    // Arc entry / cargo / caches / socket containers are world ESP ÔøΩ never bots,
     // even when they carry constructable or enemy-type data assets.
     {
         std::string probe = fname;
@@ -385,42 +387,75 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
     }
 
     // (2) DEFINITIVE proof: validated ARC EnemyType data-asset (tech- style).
-    // Bot-exclusive ù DA_EnemyType_* / ResolveEnemyAssetBotLabel. Bare
+    // Bot-exclusive ÔøΩ DA_EnemyType_* / ResolveEnemyAssetBotLabel. Bare
     // constructable pointers alone leaked Camera/ghost junk into bot ESP.
-    if (HasStrongEnemyDataAsset(actor))
-        return ResolveBotSceneRoot(actor) != 0;
+    // Fresh spawns often have DA before RootComponent settles ÔøΩ fall through
+    // so mesh/root/class can still admit instead of hard-failing here.
+    if (HasStrongEnemyDataAsset(actor) && ResolveBotSceneRoot(actor) != 0)
+        return true;
 
     // (3) No definitive proof ? weak candidate. Reject anything that carries
     //     gun / item / pickup / container structure. This is what kept your gun,
-    //     ground boxes and containers OUT ù they never reach the bot cache.
+    //     ground boxes and containers OUT ÔøΩ they never reach the bot cache.
     if (HasWorldItemStructure(actor))
         return false;
     if (IsLikelyContainerActor(actor, fname))
         return false;
 
-    // (4) A bot is a skeletal pawn with a resolvable scene root.
-    const uintptr_t mesh = engine.GetActorSkeletalMesh(actor);
-    if (!mesh || !engine.IsValidPointer(mesh))
-        return false;
+    // (4) Scene root required for world pos. Mesh preferred but optional for
+    // fresh class bots (Snitch/drone can spawn flying before skeletal mesh binds).
     if (ResolveBotSceneRoot(actor) == 0)
         return false;
 
-    // (5) Corroborated weak proof: a constructable enemy/AI pointer OR the ARC
-    //     class tag, BACKED by a resolvable bot identity. A fuzzy name match with
-    //     no structural signal behind it is rejected ù that was the leak that
-    //     turned guns/boxes into "bots".
-    const bool structuralBotSignal =
-        HasConstructableEnemyAsset(actor)
-        || ArcActorType::IsBotClassId(masked)
-        || ArcActorType::IsTargetBotActor(actor);
-    if (structuralBotSignal && ActorHasKnownBotIdentity(actor, fname))
+    const uintptr_t mesh = engine.GetActorSkeletalMesh(actor);
+    const bool meshOk = mesh && engine.IsValidPointer(mesh);
+
+    // (5) Live ARC bot class / TARGET is enough for fresh Snitch/drone spawns.
+    // fname/DA identity often decrypts 1-N ticks later. Mesh optional when class proves bot.
+    if (ArcActorType::IsAnyBotActor(actor))
+        return true;
+
+    // (5b) Durable admit: known bot fname/class/mesh + root before mesh/DA settles.
+    // QuickBotCandidate can pass on fname while skeletal mesh is still unbound ‚Äî
+    // the old !meshOk hard-fail dropped nearby Wasps/Snitches (c190fb H1).
+    auto knownBotName = [&](const std::string& n) -> bool {
+        if (n.empty())
+            return false;
+        if (!ResolveRobotTypeFromFName(engine, n).empty())
+            return true;
+        if (!LookupEnemyBotByFName(n).empty())
+            return true;
+        if (!LookupBotClassToken(n).empty())
+            return true;
+        return false;
+    };
+    if (knownBotName(fname))
+        return true;
+    {
+        const std::string classFname = engine.GetActorClassFName(actor);
+        if (knownBotName(classFname))
+            return true;
+    }
+    if (meshOk) {
+        std::string meshFname = engine.GetActorFNameStringCached(mesh);
+        if (meshFname.empty())
+            meshFname = engine.GetActorFNameString(mesh);
+        if (knownBotName(meshFname))
+            return true;
+    }
+
+    if (!meshOk)
+        return false;
+
+    // Constructable enemy pointer still needs resolvable identity (no Camera leak).
+    if (HasConstructableEnemyAsset(actor) && ActorHasKnownBotIdentity(actor, fname))
         return true;
 
     return false;
 }
 
 // Internal cache label when struct detection succeeds but fname decrypt fails.
-// Never shown on screen ù draw uses ResolveBotDrawLabel for a real name.
+// Never shown on screen ÔøΩ draw uses ResolveBotDrawLabel for a real name.
 
 std::string ResolveStructBotAdmissionLabel(uintptr_t actor, const std::string& fname)
 {
@@ -428,7 +463,7 @@ std::string ResolveStructBotAdmissionLabel(uintptr_t actor, const std::string& f
     if (!label.empty())
         return label;
 
-    // Identity decrypt failed ù still admit struct bots for boxes; draw resolves name.
+    // Identity decrypt failed ÔøΩ still admit struct bots for boxes; draw resolves name.
     if (HasVerifiedEnemyAsset(actor, fname)
         || ActorHasKnownBotIdentity(actor, fname)
         || ArcActorType::IsAnyBotActor(actor)
@@ -500,7 +535,7 @@ Vector3 ReadComponentWorldPos(uintptr_t component)
     return Engine::ReadSceneWorldPos(component);
 }
 
-// Live bot tracking ù mirror EntityList ResolvePlayerWorldPos (NOCACHE).
+// Live bot tracking ÔøΩ mirror EntityList ResolvePlayerWorldPos (NOCACHE).
 // Cached Memory::read / RelativeLocation froze ESP boxes at the spawn footprint.
 Vector3 ReadBotSceneWorldPosLive(uintptr_t component)
 {
@@ -762,6 +797,16 @@ bool ComponentHasPlausibleWorldPos(uintptr_t component)
     return IsPlausibleWorldPos(ReadComponentWorldPos(component));
 }
 
+// Visual liveness for bots MUST match ResolveBotWorldPos (NOCACHE WorldLocation).
+// Cached Memory::read of WorldLocation often returns 0/stale for ARC meshes/roots
+// while read_nocache still works ‚Äî that produced cache>0 drawing=0 visSkip=cache.
+bool ComponentHasLiveBotWorldPos(uintptr_t component)
+{
+    if (!component || !engine.IsValidPointer(component))
+        return false;
+    return IsPlausibleWorldPos(ReadBotSceneWorldPosLive(component));
+}
+
 // Transient DMA / mesh transform reads can fail for a few passes; don't evict
 // bots from cache on the first miss or ESP randomly blinks off.
 static std::unordered_map<uintptr_t, uint8_t> s_botVisualMisses;
@@ -787,40 +832,40 @@ static void ClearRobotListStaticMaps()
     s_botVisualMisses.clear();
 }
 
+
+
 bool HasLiveBotVisual(uintptr_t actor, uintptr_t mesh)
 {
-    // Prefer mesh / embark CTW when readable. Do NOT treat raw actor WorldPos
-    // alone as live (stale ghost transforms). Debug (c190fb): Wasp admitted with
-    // visRootOk=1 visMeshBad=1 and drawing=0 for entire cache ù ARC bot mesh
-    // ComponentToWorld is often unreadable while scene root stays valid.
-    if (ComponentHasPlausibleWorldPos(mesh))
+    // Prefer mesh / embark / root via NOCACHE WorldLocation (same as WorldPos path).
+    // Do NOT use cached ReadSceneWorldPos here ‚Äî it false-negatives live ARC bots.
+    if (ComponentHasLiveBotWorldPos(mesh))
         return true;
 
     if (mesh && engine.IsValidPointer(mesh)) {
         std::vector<uintptr_t> childComps;
         ReadChildComponentsLocal(mesh, childComps, 3);
         for (uintptr_t child : childComps) {
-            if (ComponentHasPlausibleWorldPos(child))
+            if (ComponentHasLiveBotWorldPos(child))
                 return true;
         }
     }
 
     const uintptr_t embarkMesh = Memory::read<uintptr_t>(actor + Offsets::EmbarkMesh);
     if (embarkMesh && embarkMesh != mesh && engine.IsValidPointer(embarkMesh)) {
-        if (ComponentHasPlausibleWorldPos(embarkMesh))
+        if (ComponentHasLiveBotWorldPos(embarkMesh))
             return true;
         std::vector<uintptr_t> embarkChildren;
         ReadChildComponentsLocal(embarkMesh, embarkChildren, 2);
         for (uintptr_t child : embarkChildren) {
-            if (ComponentHasPlausibleWorldPos(child))
+            if (ComponentHasLiveBotWorldPos(child))
                 return true;
         }
     }
 
-    // Scene root CTW as live proof after Verify (mesh CTW often unreadable).
+    // Scene root NOCACHE WorldLocation after Verify (mesh often unreadable).
     const uintptr_t root = ResolveBotSceneRoot(actor);
     if (root && root != mesh && root != embarkMesh
-        && ComponentHasPlausibleWorldPos(root))
+        && ComponentHasLiveBotWorldPos(root))
         return true;
 
     return false;
@@ -830,22 +875,12 @@ bool HasLiveBotVisual(uintptr_t actor, uintptr_t mesh)
 
 uint8_t ReadBotBrokenFlag(uintptr_t actor)
 {
-    // Constructable pawns: only trust explicit destroyed flag @0x1210.
-    if (WorldScan::HasArcEnemyAssetPointer(actor)) {
-        const uint8_t destroyed =
-            Memory::read<uint8_t>(actor + Offsets::Constructable_bIsDestroyed);
-        return destroyed == 1 ? 1 : 0;
-    }
-
-    uint8_t broken = Memory::read<uint8_t>(actor + Offsets::bIsBreaked);
-    if (broken != 1)
-        broken = Memory::read<uint8_t>(actor + Offsets::Constructable_bIsDestroyed);
-    if (broken == 1)
-        return 1;
-
-    // Do not treat Health?0 as dead here ù spawn frames often read 0 HP and
-    // that blocked snitch admits until the next healthy admission window.
-    return 0;
+    // Soft-deprecate bIsBreaked@0x1220 (not in SDK). Prefer only
+    // Constructable_bIsDestroyed@0x1210 (help/esp.txt + SDK). Do not treat
+    // Health==0 as dead ‚Äî spawn frames often read 0 HP and blocked admits.
+    const uint8_t destroyed =
+        Memory::read<uint8_t>(actor + Offsets::Constructable_bIsDestroyed);
+    return destroyed == 1 ? 1 : 0;
 }
 
 static std::atomic<int> g_botDrawLabelMiss{ 0 };
@@ -951,7 +986,7 @@ std::string ResolveBotDrawLabel(
             return hit;
     }
 
-    // Bot-only fallbacks when FName decrypt flakes ù do not use item/world naming.
+    // Bot-only fallbacks when FName decrypt flakes ÔøΩ do not use item/world naming.
     auto tryToken = [&](const std::string& name) -> std::string {
         if (name.empty())
             return {};
@@ -1028,7 +1063,7 @@ void Engine::RobotList()
                 localPos = rootPos;
         }
     }
-    // LOS mesh rebuild is owned by Update ù calling it every RobotList tick
+    // LOS mesh rebuild is owned by Update ÔøΩ calling it every RobotList tick
     // kept VisCheck rebuilding=1 with smc thousands (overlay lag).
 
     const float maxDistM = var::bot_esp_distance > 0.f ? var::bot_esp_distance : var::kMaxDistanceSliderM;
@@ -1057,6 +1092,14 @@ void Engine::RobotList()
     int dbgVisSkip = 0;
     int dbgDistSkip = 0;
     int dbgStructHit = 0;
+    int dbgQuickPass = 0;
+    int dbgVerifyFail = 0;
+    int dbgReEvict = 0;
+    int dbgAdmitAnyBot = 0;
+    int dbgFailNoRoot = 0;
+    int dbgFailNoMesh = 0;
+    int dbgFailNoId = 0;
+    int dbgFailOther = 0;
 
     if (doAdmission) {
     for (uint64_t actor : currentActors)
@@ -1072,15 +1115,34 @@ void Engine::RobotList()
 
         if (!QuickBotCandidate(actor))
             continue;
+        ++dbgQuickPass;
 
         std::string fname = engine.GetActorFNameStringCached(actor);
         if (fname.empty())
             fname = engine.GetActorFNameString(actor);
 
-        // CHECK #1 ù authoritative verification at admission. Only actors that
+        // CHECK #1 ÔøΩ authoritative verification at admission. Only actors that
         // prove they are ARC bots (and not players/guns/items/containers) pass.
         if (!VerifyBotActor(actor, sAcknowledgedPawn, fname)) {
             ++dbgStructHit;
+            if (!localCache.contains(actor)) {
+                ++dbgVerifyFail;
+                const bool anyBot = ArcActorType::IsAnyBotActor(actor);
+                const bool strongDa = HasStrongEnemyDataAsset(actor);
+                const bool hasRoot = ResolveBotSceneRoot(actor) != 0;
+                const uintptr_t meshProbe = engine.GetActorSkeletalMesh(actor);
+                const bool hasMesh = meshProbe && engine.IsValidPointer(meshProbe);
+                const bool hasId = ActorHasKnownBotIdentity(actor, fname);
+                if (!hasRoot)
+                    ++dbgFailNoRoot;
+                else if (!hasMesh && !anyBot)
+                    ++dbgFailNoMesh;
+                else if (!hasId && !anyBot && !strongDa)
+                    ++dbgFailNoId;
+                else
+                    ++dbgFailOther;
+
+            }
             continue;
         }
 
@@ -1089,11 +1151,32 @@ void Engine::RobotList()
 
         ++dbgScanned;
 
-        // Resolve a real name. Struct bots with encrypted fnames fall back to an
-        // internal admission token; Esp re-resolves a display name at draw time.
+        // Prefer a real bot name before the Constructable token ‚Äî Esp skips draw
+        // when ResolveBotDrawLabel stays empty for that token (c190fb H3).
         std::string itemName = ResolveStructBotAdmissionLabel(actor, fname);
-        if (itemName.empty())
-            itemName = ResolveRobotTypeFromFName(engine, fname);
+        if (itemName.empty() || itemName == kBotStructAdmissionToken) {
+            if (const std::string drawn = ResolveBotDrawLabel(actor, itemName, fname);
+                !drawn.empty())
+                itemName = drawn;
+        }
+        if (itemName.empty() || itemName == kBotStructAdmissionToken) {
+            if (const std::string fromF = ResolveRobotTypeFromFName(engine, fname);
+                !fromF.empty())
+                itemName = fromF;
+        }
+        if (itemName.empty() || itemName == kBotStructAdmissionToken) {
+            const std::string classFn = engine.GetActorClassFName(actor);
+            if (const std::string fromClass = ResolveRobotTypeFromFName(engine, classFn);
+                !fromClass.empty())
+                itemName = fromClass;
+            else if (const std::string tok = LookupBotClassToken(classFn); !tok.empty())
+                itemName = tok;
+        }
+        if (itemName.empty() || itemName == kBotStructAdmissionToken) {
+            if (const std::string fromEnemy = ResolveEnemyAssetBotLabel(actor);
+                !fromEnemy.empty())
+                itemName = fromEnemy;
+        }
         if (itemName.empty())
             itemName = kBotStructAdmissionToken;
 
@@ -1124,10 +1207,13 @@ void Engine::RobotList()
         entry.IsBreaked = broken != 0;
         entry.category = 3;
         ++dbgAdmitted;
+        if (ArcActorType::IsAnyBotActor(actor))
+            ++dbgAdmitAnyBot;
+
     }
     }
 
-    // ComponentToWorld / WorldLocation via NOCACHE ù not RelativeLocation.
+    // ComponentToWorld / WorldLocation via NOCACHE ÔøΩ not RelativeLocation.
     int dbgScenePosOk = 0;
     int dbgScenePosFail = 0;
     for (auto it = localCache.begin(); it != localCache.end(); ++it) {
@@ -1176,9 +1262,10 @@ void Engine::RobotList()
             continue;
         }
 
-        // CHECK #2 ù re-verify every cached bot each pass (tech- balance):
+        // CHECK #2 ÔøΩ re-verify every cached bot each pass (tech- balance):
         // impostors (Camera/ghosts) that fail strong/weak proof are dropped.
         if (!VerifyBotActor(key, sAcknowledgedPawn, fname)) {
+            ++dbgReEvict;
             ClearBotVisualMiss(key);
             it = localCache.erase(it);
             continue;
@@ -1234,15 +1321,30 @@ void Engine::RobotList()
 
         PopulateBotPartCache(actor, key);
 
-        // Destroyed bots can linger in the actor list with a stale root transform.
-        // Do not rescue with WorldPos alone ù that kept ghosts Drawing at old spots.
+        // Destroyed bots can linger with stale roots. Visual proof uses NOCACHE
+        // WorldLocation (HasLiveBotVisual). During miss grace keep Drawing if the
+        // last WorldPos is plausible so near bots don't blank on brief DMA flakes.
         if (!broken) {
             bool visualOk = HasLiveBotVisual(key, actor.Mesh);
             if (!visualOk) {
                 ++dbgVisSkip;
+                const float approxDistM = IsPlausibleWorldPos(actor.WorldPos)
+                    ? (static_cast<float>(std::sqrt(
+                           (actor.WorldPos.x - cam.Location.x) * (actor.WorldPos.x - cam.Location.x)
+                         + (actor.WorldPos.y - cam.Location.y) * (actor.WorldPos.y - cam.Location.y)
+                         + (actor.WorldPos.z - cam.Location.z) * (actor.WorldPos.z - cam.Location.z)))
+                       / 100.0f)
+                    : -1.f;
+                if (approxDistM >= 0.f && approxDistM <= 12.f) {
+
+                }
                 if (BotVisualMissShouldEvict(key, false)) {
                     ClearBotVisualMiss(key);
                     it = localCache.erase(it);
+                } else if (IsPlausibleWorldPos(actor.WorldPos)) {
+                    actor.Drawing = true;
+                    ++dbgDrawing;
+                    ++it;
                 } else {
                     actor.Drawing = false;
                     ++it;
@@ -1254,6 +1356,7 @@ void Engine::RobotList()
 
         if (!IsPlausibleWorldPos(actor.WorldPos)) {
             ++dbgZeroPos;
+
             ClearBotVisualMiss(key);
             it = localCache.erase(it);
             continue;
@@ -1310,6 +1413,14 @@ void Engine::RobotList()
             << " drawing=" << dbgDrawing
             << " cache=" << robotCache.size()
             << " structHit=" << dbgStructHit
+            << " quickPass=" << dbgQuickPass
+            << " verifyFail=" << dbgVerifyFail
+            << " reEvict=" << dbgReEvict
+            << " admitAny=" << dbgAdmitAnyBot
+            << " failRoot=" << dbgFailNoRoot
+            << " failMesh=" << dbgFailNoMesh
+            << " failId=" << dbgFailNoId
+            << " failOther=" << dbgFailOther
             << " fnameHit=" << dbgFnameHit
             << " visSkip=" << dbgVisSkip
             << " distSkip=" << dbgDistSkip

@@ -12,6 +12,13 @@ namespace Offsets {
     constexpr uint64_t GUObjectArrayChunksRva = 0xE3B61C0ULL;
     constexpr uint64_t GObjPshufbMaskRva = 0xAD97CC0ULL;
 
+    // ── UObjectBase (standard UE layout; not game-specific dump) ─────────────
+    /** EObjectFlags ObjectFlags — forum "SleepingInPool" concept maps here / GUObjectItem. */
+    constexpr std::ptrdiff_t UObject_ObjectFlags = 0x08;
+    // Common RF bits (probe-only; do not treat as deplete until log-proven):
+    constexpr uint32_t RF_BeginDestroyed = 0x00800000u;
+    constexpr uint32_t RF_FinishDestroyed = 0x01000000u;
+
     // ── UWorld ───────────────────────────────────────────────────────────────
     constexpr std::ptrdiff_t PersistentLevel = 0x158;
     constexpr std::ptrdiff_t StreamingLevels = 0x178;
@@ -80,13 +87,16 @@ namespace Offsets {
     constexpr std::ptrdiff_t Pawn_Controller = 0x3D8;
 
     // ── PlayerCameraManager ──────────────────────────────────────────────────
+    // help/esp.txt Step 5 (CL-1315578 live): ViewTarget = 0x4B0 — do NOT use SDK 0x4A0.
+    // Absolute POV base = ViewTarget + 0x10 (= 0x4C0). Composition stays Loc/Rot/FOV @ 0x00/0x28/0x50.
     constexpr std::ptrdiff_t CameraCachePrivate = 0x4B0;
-    constexpr std::ptrdiff_t ViewTarget = 0x04B0;
+    constexpr std::ptrdiff_t ViewTarget = 0x04B0;   // help/esp.txt live; SDK 0x4A0 is stale
     constexpr std::ptrdiff_t ViewTargetTarget = ViewTarget;
     constexpr std::ptrdiff_t ViewTargetPOV = 0x10;
     constexpr std::ptrdiff_t CameraCachePOV = 0x10;
 
-    // POV relative (UC CL-1315578: Location +0x00, Rotation +0x28, FOV +0x50)
+    // POV relative (help/esp.txt): Location +0x00, Rotation +0x28, FOV +0x50.
+    // Do NOT add ViewTargetPOV(0x10) again here — that double-shift made Cam Loc Y/Z=0, Rot 0, FOV fallback 90.
     constexpr std::ptrdiff_t CameraPOV_Location = 0x00;
     constexpr std::ptrdiff_t CameraPOV_Rotation = 0x28;
     constexpr std::ptrdiff_t CameraPOV_FOV = 0x50;
@@ -162,8 +172,9 @@ namespace Offsets {
     constexpr std::ptrdiff_t PlayerState_Armor = 0x540;
     constexpr std::ptrdiff_t PlayerState_MaxArmor = 0x548; // same slot as PlayerStatus — armor readers use this name (#22)
     constexpr std::ptrdiff_t Health = 0x668;  // HealthComponent::CachedHealth (SDK-confirmed)
-    constexpr std::ptrdiff_t MaxHealth = 0x2E0;
-    constexpr std::ptrdiff_t Shield = 0x140;
+    constexpr std::ptrdiff_t MaxHealth = 0x308;
+    constexpr std::ptrdiff_t Shield = 0x150;     // ArmorSlot.Health (SDK-confirmed)
+    constexpr std::ptrdiff_t ShieldMax = 0x160; // ArmorSlot.CurrentMaxArmor (SDK-confirmed)
     constexpr std::ptrdiff_t MaxDBNO = 0x2E8;
     constexpr std::ptrdiff_t TeamID = 0x812;
 
@@ -171,6 +182,12 @@ namespace Offsets {
     constexpr std::ptrdiff_t LocalCurrentItemActors = 0x4B0;
     constexpr std::ptrdiff_t EquippedPrimaryItem = 0x520;
     constexpr std::ptrdiff_t WeaponQuality = 0x472;
+
+    // Stowed weapon slots in InventoryComponent (each FStowedWeaponInfo, 0x40 bytes)
+    constexpr std::ptrdiff_t StowedWeaponSlot0 = 0x340;
+    constexpr std::ptrdiff_t StowedWeaponSlot1 = 0x380;
+    // EquippedArmor in InventoryComponent
+    constexpr std::ptrdiff_t EquippedArmor = 0x518;
 
     // LootContainerSingle (help SDK): LootInteraction@0xB58, ItemContainer@0xB60.
     // 0xB68 is MetadataTagComponent — do not use as loot interaction.
@@ -199,10 +216,22 @@ namespace Offsets {
     constexpr std::ptrdiff_t Pickup_RootCollider = 0x460;
     constexpr std::ptrdiff_t Pickup_Interaction = 0x478;
     constexpr std::ptrdiff_t Pickup_DefaultPickupDataAsset = 0x488;
+    /** BP_PickupBase ContainedItem_BB (BBItemContainerItem, 0x30). */
+    constexpr std::ptrdiff_t Pickup_ContainedItem_BB = 0x490;
+    constexpr std::ptrdiff_t BBItem_DataAssetIndex = 0x0; // uint16
+    /** ContainedItem_BB.Amount is ABInt @ +0x4; ABInt.Value @ +0xC within ABInt. */
+    constexpr std::ptrdiff_t BBItem_AmountValue = 0x4 + 0xC; // int32 @ ContainedItem+0x10
+    /** StandardInteractionComponent::bIsActive @ +0x137 mask 0x8. */
+    constexpr std::ptrdiff_t Interaction_bIsActiveByte = 0x137;
+    constexpr uint8_t Interaction_bIsActiveMask = 0x8;
+    /** BaseInteractionComponent::CurrentInteractionState @ +0x43D (ECurrentInteractionState). */
+    constexpr std::ptrdiff_t Interaction_CurrentInteractionState = 0x43d;
 
+    /** Soft-deprecated bot-dead gate (not in SDK). Overlay may still list it; prefer Constructable_bIsDestroyed. */
     constexpr std::ptrdiff_t bIsBreaked = 0x1220;
     constexpr std::ptrdiff_t Constructable_EnemyTypeDataAsset = 0x11A0;
     constexpr std::ptrdiff_t Constructable_AITemplateData = 0x1190;
+    /** Primary bot destroyed flag (help/SDK). Use this instead of bIsBreaked@0x1220. */
     constexpr std::ptrdiff_t Constructable_bIsDestroyed = 0x1210;
     constexpr std::ptrdiff_t Constructable_HealthService = 0x1270;
     constexpr std::ptrdiff_t Constructable_HealthGroupService = 0x1298;

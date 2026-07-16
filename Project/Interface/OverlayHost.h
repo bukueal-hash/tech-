@@ -3,8 +3,8 @@
 #include <Windows.h>
 #include <string>
 
-/** Transparent ESP overlay — toggles click-through vs menu interaction. */
-void ApplyOverlayMode(HWND hwnd, bool menuVisible);
+/** Transparent ESP overlay — clickable when menu or an overlay HUD panel needs mouse. */
+void ApplyOverlayMode(HWND hwnd, bool interactive);
 
 /** Bind overlay HWND and optional MSBuild resize triggers (Project.cpp). */
 void OverlayDisplay_Bind(HWND overlayHwnd, UINT* resizeWidth, UINT* resizeHeight);

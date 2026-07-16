@@ -2497,9 +2497,18 @@ bool FnameLooksLikeWorldContainer(const std::string& actorFName)
         "ammobox", "ammo_box", "container_ammo",
         "grenadecontainer", "grenadetube", "container_grenade",
         "locker", "lockers", "footlocker", "storagelocker",
+        // Bare crate/drawer/cabinet — not only fieldcrate / *_container.
+        // Without these, drawers/crates that lack a live LI pointer at 0xB58
+        // fail QuickContainerCandidate → preSkip (user standing on banks).
+        "crate", "drawer", "cabinet", "chest", "lootcrate", "cartcrate",
+        "objectcrate", "weaponchest",
         "bintrash", "trashbin", "trashcan", "dumpster", "wastebin", "wastebasket",
         "deaddrop", "dead_drop", "buried_detectable",
         "supplycall", "supply_call", "supplystation",
+        // Crashed ARC Probe is a lootable world container (not BP_PickupBase).
+        // Log proof: BP_ProbeCrashed_02_C admitted as item cat=DroppedPickup.
+        "probecrashed", "probe_crashed", "bp_probe", "crashedarcprobe", "arcprobe",
+        "probe",
     };
     for (const char* token : kTokens) {
         if (lower.find(token) != std::string::npos)
