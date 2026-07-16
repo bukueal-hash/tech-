@@ -781,91 +781,16 @@ void Engine::ItemList()
                 || cat == WorldItemCategory::Items
                 || cat == WorldItemCategory::Harvestable)
                 ++dbgPickup;
-
-            const GroundLootPickupSignal sig =
-                ProbeGroundLootPickupSignals(actorKey, entry.ActorName);
-            using S = GroundLootPickupSignal;
-            if ((sig & S::HiddenOrDestroyed) != S::None)
-                ++dbgPickedHidden;
-            if ((sig & S::LootSearched) != S::None)
-                ++dbgPickedSearched;
-            if ((sig & S::NoItemDa) != S::None)
-                ++dbgPickedNoDa;
-            if ((sig & S::NoCollision) != S::None)
-                ++dbgPickedNoCol;
-            if ((sig & S::SpawnItemsEmpty) != S::None)
-                ++dbgPickedSpawnEmpty;
-            if ((sig & S::StillHasAssetId) != S::None)
-                ++dbgPickedStillId;
+            // Do NOT ProbeGroundLootPickupSignals here. DMA under this shared_lock
+            // saturated the FPGA bus and (via writer-preference) stalled paint
+            // Present 500-700ms (ghost flicker: espMs/overlayMs == paint_gap).
+            // picked* counters come from the admit/evict path when available.
+            (void)actorKey;
         }
 
-        // Name discovery: distinct drawing items (and any suspicious label once).
-        static std::unordered_set<std::string> s_seenItemNames;
-        for (const auto& [actorKey, entry] : itemCache) {
-            if (!entry.Drawing)
-                continue;
-            const std::string label = entry.ItemDisplayName.empty()
-                ? entry.ActorName : entry.ItemDisplayName;
-            const std::string lower = ToLowerCopy(label);
-            const bool suspicious =
-                lower.find("instance") != std::string::npos
-                || lower.find("window") != std::string::npos
-                || lower.find("style") != std::string::npos
-                || lower.find("property") != std::string::npos
-                || (lower.find("magnet") != std::string::npos
-                    && entry.ActorName.find("DA_Item_") == std::string::npos
-                    && ToLowerCopy(GetActorDataAssetFName(actorKey)).find("da_item_")
-                        == std::string::npos)
-                || IsJunkWorldEspLabel(label)
-                || IsGenericWorldEspLabel(label);
-
-            char dedupeBuf[96]{};
-            snprintf(dedupeBuf, sizeof(dedupeBuf), "%s|%s",
-                entry.ActorName.c_str(), label.c_str());
-            if (!s_seenItemNames.insert(dedupeBuf).second)
-                continue;
-
-            const std::string classFname = GetActorClassFName(actorKey);
-            const std::string dataAsset = GetActorDataAssetFName(actorKey);
-            std::cout << "[itemName]"
-                << " actor=" << std::hex << actorKey << std::dec
-                << " fname=\"" << entry.ActorName << "\""
-                << " class=\"" << classFname << "\""
-                << " dataAsset=\"" << dataAsset << "\""
-                << " label=\"" << label << "\""
-                << " cat=" << static_cast<int>(entry.worldCategory)
-                << (suspicious ? " SUSPECT" : "")
-                << std::endl;
-
-            // #region agent log
-            {
-                static std::mutex s_nameLogMu;
-                std::lock_guard<std::mutex> lk(s_nameLogMu);
-                std::ofstream f("F:/Test/ARCs/debug-5681af.log", std::ios::app);
-                if (f) {
-                    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    auto esc = [](std::string s) {
-                        std::string o;
-                        for (char c : s) {
-                            if (c == '"' || c == '\\') o.push_back('\\');
-                            if (static_cast<unsigned char>(c) >= 32) o.push_back(c);
-                        }
-                        return o;
-                    };
-                    f << "{\"sessionId\":\"5681af\",\"runId\":\"names\",\"hypothesisId\":\"N\""
-                      << ",\"location\":\"ItemList.cpp:itemName\",\"message\":\"item_label\""
-                      << ",\"data\":{\"fname\":\"" << esc(entry.ActorName)
-                      << "\",\"class\":\"" << esc(classFname)
-                      << "\",\"dataAsset\":\"" << esc(dataAsset)
-                      << "\",\"label\":\"" << esc(label)
-                      << "\",\"cat\":" << static_cast<int>(entry.worldCategory)
-                      << ",\"suspect\":" << (suspicious ? 1 : 0) << "}"
-                      << ",\"timestamp\":" << ms << "}\n";
-                }
-            }
-            // #endregion
-        }
+        // Name-discovery DMA (GetActorClassFName / GetActorDataAssetFName) under
+        // this shared_lock was removed — it stalled Present alongside the pickup
+        // probes (ghost flicker). Use admit-time labels only.
 
         std::cout << "[debugItem] scanned=" << dbgScanned
             << " admitted=" << dbgAdmitted

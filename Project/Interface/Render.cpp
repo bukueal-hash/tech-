@@ -1,13 +1,16 @@
 #include <Windows.h>
+#include <chrono>
 #include <cstdarg>
 #include <cfloat>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include "../ThirdParty/ImGui/imgui.h"
 #include "../ThirdParty/ImGui/imgui_impl_win32.h"
 #include "../ThirdParty/ImGui/imgui_impl_dx11.h"
 #include "Utils/Variables/index.h"
 #include "../Core/Engine.h"
+#include "../Core/Memory.h"
 #include "Overlay/Menu.h"
 #include "OverlayHost.h"
 #include "Utils/AutoConfig.h"
@@ -23,6 +26,11 @@ void Render(HWND hwnd)
 {
     (void)hwnd;
 
+    // Declared in Esp.cpp — flicker hitch probes.
+    extern void FlickerNoteMenuOpen();
+    extern void FlickerNoteRenderLoop();
+    FlickerNoteRenderLoop();
+
     {
         static bool insertWasDown = false;
         const bool insertDown = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
@@ -35,7 +43,32 @@ void Render(HWND hwnd)
         insertWasDown = insertDown;
     }
 
+    // #region agent log
+    // H2: raid gate flapping mid-raid silently skips RenderEsp — invisible to
+    // the [debugFlicker] counters. Log every transition with menu state.
+    {
+        static bool s_prevEspActive = false;
+        static bool s_espActiveInit = false;
+        const bool nowActive = engine.IsEspRaidActive();
+        if (s_espActiveInit && nowActive != s_prevEspActive) {
+            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+            if (f) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker\",\"hypothesisId\":\"H2\""
+                  << ",\"location\":\"Render.cpp:Render\",\"message\":\"raid_active_flip\""
+                  << ",\"data\":{\"active\":" << (nowActive ? 1 : 0)
+                  << ",\"menu\":" << (showmenu ? 1 : 0)
+                  << "},\"timestamp\":" << ms << "}\n";
+            }
+        }
+        s_prevEspActive = nowActive;
+        s_espActiveInit = true;
+    }
+    // #endregion
+
     if (showmenu) {
+        FlickerNoteMenuOpen();
         ApplyOverlayMode(hwnd, true);
         DrawArcSidebar(showmenu, requestExit);
     } else {
@@ -56,8 +89,34 @@ void Render(HWND hwnd)
         engine.RenderRadar(showmenu);
 
     if (var::show_debug_overlay && !showmenu) {
+        // #region agent log
+        const auto tDbg0 = std::chrono::steady_clock::now();
+        // #endregion
         DrawDebugOffsetValidation(engine);
+        // #region agent log
+        const auto tDbg1 = std::chrono::steady_clock::now();
+        // #endregion
         engine.PrintVisCheckDebugConsole();
+        // #region agent log
+        {
+            const int64_t overlayMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                tDbg1 - tDbg0).count();
+            const int64_t consoleMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tDbg1).count();
+            if (overlayMs > 30 || consoleMs > 30) {
+                std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+                if (f) {
+                    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker2\",\"hypothesisId\":\"H9\""
+                      << ",\"location\":\"Render.cpp:Render\",\"message\":\"debug_overlay_cost\""
+                      << ",\"data\":{\"overlayMs\":" << overlayMs
+                      << ",\"consoleMs\":" << consoleMs
+                      << "},\"timestamp\":" << ms << "}\n";
+                }
+            }
+        }
+        // #endregion
     }
 
     if (requestExit) {
@@ -70,6 +129,205 @@ void Render(HWND hwnd)
 
 static void DrawDebugOffsetValidation(Engine& eng)
 {
+    // #region agent log
+    // G1/H9: blocking shared_lock on paint while workers hold caches (or wait
+    // for unique) stalled Present 595-849ms (overlayMs==paint_gap). Ghost flash
+    // = delayed Present after Clear. Never block: try_lock + keep last snap.
+    struct OverlaySnap {
+        uintptr_t base = 0;
+        Engine::EngineStateSnapshot state{};
+        size_t playerCacheSz = 0;
+        size_t drawTargets = 0;
+        size_t worldCacheSz = 0;
+        size_t worldDrawSz = 0;
+        size_t robotDrawSz = 0;
+        Engine::VisCheckDebugStats visDbg{};
+        int actorCount = 0;
+        float camFov = 0.f;
+        uintptr_t playerState = 0;
+    };
+    static OverlaySnap s_snap{};
+    static auto s_lastHeavy = std::chrono::steady_clock::time_point{};
+    const auto nowHeavy = std::chrono::steady_clock::now();
+    if (s_lastHeavy.time_since_epoch().count() == 0
+        || nowHeavy - s_lastHeavy >= std::chrono::milliseconds(500)) {
+        const auto t0 = std::chrono::steady_clock::now();
+        int64_t msState = 0, msFrame = 0, msPlayer = 0, msWorld = 0, msRobot = 0, msCam = 0;
+        int gotState = 0, gotFrame = 0, gotPlayer = 0, gotWorld = 0, gotRobot = 0, gotCam = 0;
+        OverlaySnap next = s_snap;
+        next.base = Memory::getBaseAddress();
+        next.actorCount = 0;
+
+        {
+            const auto tA = std::chrono::steady_clock::now();
+            std::shared_lock<std::shared_mutex> lock(eng.m_stateMutex, std::try_to_lock);
+            if (lock.owns_lock()) {
+                gotState = 1;
+                next.state.gWorld = eng.GWorld;
+                next.state.gWorldRaw = eng.m_gWorldRaw.load(std::memory_order_relaxed);
+                next.state.gWorldFailStep = eng.m_gWorldFailStep.load(std::memory_order_relaxed);
+                next.state.persistentLevel = eng.PersistentLevel;
+                next.state.actors = eng.Actors;
+                next.state.playerController = eng.PlayerController;
+                next.state.acknowledgedPawn = eng.AcknowledgedPawn;
+                next.state.rootComponent = eng.RootComponent;
+                next.state.playerCameraManager = eng.PlayerCameraManager;
+                next.state.owningGameInstance = eng.OwningGameInstance;
+                next.state.localPlayer = eng.localplayer;
+                next.playerState = eng.PlayerState;
+            }
+            msState = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tA).count();
+        }
+        {
+            const auto tA = std::chrono::steady_clock::now();
+            std::shared_lock<std::shared_mutex> lock(eng.m_espFrameMutex, std::try_to_lock);
+            if (lock.owns_lock() && eng.m_lastEspFrame.valid) {
+                gotFrame = 1;
+                next.drawTargets = eng.m_lastEspFrame.players.size();
+                next.robotDrawSz = eng.m_lastEspFrame.robots.size();
+                next.worldDrawSz = eng.m_lastEspFrame.world.size();
+            }
+            msFrame = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tA).count();
+        }
+        {
+            const auto tA = std::chrono::steady_clock::now();
+            std::shared_lock<std::shared_mutex> lock(eng.m_playerCacheMutex, std::try_to_lock);
+            if (lock.owns_lock()) {
+                gotPlayer = 1;
+                next.playerCacheSz = eng.playerCache.size();
+                next.visDbg.playersTotal = 0;
+                next.visDbg.playersMeshVisible = 0;
+                size_t drawN = 0;
+                for (const auto& [key, actor] : eng.playerCache) {
+                    (void)key;
+                    if (!actor.Drawing)
+                        continue;
+                    if (!(actor.isAlly && var::hide_allies))
+                        ++drawN;
+                    ++next.visDbg.playersTotal;
+                    if (actor.isVisible)
+                        ++next.visDbg.playersMeshVisible;
+                }
+                if (!gotFrame)
+                    next.drawTargets = drawN;
+            }
+            msPlayer = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tA).count();
+        }
+        {
+            const auto tA = std::chrono::steady_clock::now();
+            size_t contN = 0, itemN = 0, contDraw = 0, itemDraw = 0;
+            bool okC = false, okI = false;
+            {
+                std::shared_lock<std::shared_mutex> lock(eng.m_containerCacheMutex, std::try_to_lock);
+                if (lock.owns_lock()) {
+                    okC = true;
+                    contN = eng.containerCache.size();
+                    for (const auto& [key, e] : eng.containerCache) {
+                        (void)key;
+                        if (e.Drawing)
+                            ++contDraw;
+                    }
+                }
+            }
+            {
+                std::shared_lock<std::shared_mutex> lock(eng.m_itemCacheMutex, std::try_to_lock);
+                if (lock.owns_lock()) {
+                    okI = true;
+                    itemN = eng.itemCache.size();
+                    for (const auto& [key, e] : eng.itemCache) {
+                        (void)key;
+                        if (e.Drawing)
+                            ++itemDraw;
+                    }
+                }
+            }
+            if (okC || okI) {
+                gotWorld = 1;
+                if (okC && okI)
+                    next.worldCacheSz = contN + itemN;
+                else if (okC)
+                    next.worldCacheSz = contN;
+                else
+                    next.worldCacheSz = itemN;
+                if (!gotFrame)
+                    next.worldDrawSz = contDraw + itemDraw;
+            }
+            msWorld = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tA).count();
+        }
+        {
+            const auto tA = std::chrono::steady_clock::now();
+            std::shared_lock<std::shared_mutex> lock(eng.m_robotCacheMutex, std::try_to_lock);
+            if (lock.owns_lock()) {
+                gotRobot = 1;
+                next.visDbg.botsTotal = 0;
+                next.visDbg.botsMeshVisible = 0;
+                size_t drawN = 0;
+                for (const auto& [key, entry] : eng.robotCache) {
+                    (void)key;
+                    if (!entry.Drawing)
+                        continue;
+                    ++drawN;
+                    ++next.visDbg.botsTotal;
+                    if (entry.isVisible)
+                        ++next.visDbg.botsMeshVisible;
+                }
+                if (!gotFrame)
+                    next.robotDrawSz = drawN;
+            }
+            msRobot = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tA).count();
+        }
+        {
+            const auto tA = std::chrono::steady_clock::now();
+            std::shared_lock<std::shared_mutex> lock(eng.m_cameraMutex, std::try_to_lock);
+            if (lock.owns_lock()) {
+                gotCam = 1;
+                next.camFov = eng.g_Camera.FOV;
+            }
+            msCam = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tA).count();
+        }
+
+        s_snap = next;
+        // Always advance timer so a busy-lock frame cannot retry-spam every paint.
+        s_lastHeavy = nowHeavy;
+
+        const int64_t totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        // Only log real stalls. gotFrame=0 every 500ms was opening debug-c190fb.log
+        // on the paint thread and produced overlayMs=522 (== paint_gap) while
+        // try_lock capture itself reported totalMs=0.
+        if (totalMs > 20) {
+            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+            if (f) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"sessionId\":\"c190fb\",\"runId\":\"ghost-flicker\",\"hypothesisId\":\"G1\""
+                  << ",\"location\":\"Render.cpp:DrawDebugOffsetValidation\",\"message\":\"overlay_try_refresh\""
+                  << ",\"data\":{\"totalMs\":" << totalMs
+                  << ",\"msState\":" << msState
+                  << ",\"msFrame\":" << msFrame
+                  << ",\"msPlayer\":" << msPlayer
+                  << ",\"msWorld\":" << msWorld
+                  << ",\"msRobot\":" << msRobot
+                  << ",\"msCam\":" << msCam
+                  << ",\"gotState\":" << gotState
+                  << ",\"gotFrame\":" << gotFrame
+                  << ",\"gotPlayer\":" << gotPlayer
+                  << ",\"gotWorld\":" << gotWorld
+                  << ",\"gotRobot\":" << gotRobot
+                  << ",\"gotCam\":" << gotCam
+                  << "},\"timestamp\":" << ms << "}\n";
+            }
+        }
+    }
+    const OverlaySnap& snap = s_snap;
+    // #endregion
+
     const float pad = 12.f;
     const float lineH = 20.f;
     const float colW = 360.f;
@@ -105,8 +363,8 @@ static void DrawDebugOffsetValidation(Engine& eng)
         dl->AddText(font, fontSize, ImVec2(xPos + pad, ry), col, line);
     };
 
-    const uintptr_t base = Memory::getBaseAddress();
-    const Engine::EngineStateSnapshot state = eng.GetStateSnapshot();
+    const uintptr_t base = snap.base;
+    const Engine::EngineStateSnapshot& state = snap.state;
     bool ok;
 
     {
@@ -165,27 +423,22 @@ static void DrawDebugOffsetValidation(Engine& eng)
         ok = eng.IsEspRaidActive();
         drawRow(xPos, row++, "EspRaid", ok, "%s", ok ? "YES" : "NO");
 
-        const size_t playerCacheSz = eng.PlayerCacheCount();
-        ok = playerCacheSz > 0;
-        drawRow(xPos, row++, "PlayerCache", ok, "%zu", playerCacheSz);
+        ok = snap.playerCacheSz > 0;
+        drawRow(xPos, row++, "PlayerCache", ok, "%zu", snap.playerCacheSz);
 
-        const size_t drawTargets = eng.CountEspDrawablePlayers();
-        ok = drawTargets > 0;
-        drawRow(xPos, row++, "EspDraw", ok, "%zu", drawTargets);
+        ok = snap.drawTargets > 0;
+        drawRow(xPos, row++, "EspDraw", ok, "%zu", snap.drawTargets);
 
-        const size_t worldCacheSz = eng.WorldCacheCount();
-        ok = worldCacheSz > 0;
-        drawRow(xPos, row++, "WorldCache", ok, "%zu", worldCacheSz);
+        ok = snap.worldCacheSz > 0;
+        drawRow(xPos, row++, "WorldCache", ok, "%zu", snap.worldCacheSz);
 
-        const size_t worldDrawSz = eng.CountWorldDrawable();
-        ok = worldDrawSz > 0;
-        drawRow(xPos, row++, "WorldDraw", ok, "%zu", worldDrawSz);
+        ok = snap.worldDrawSz > 0;
+        drawRow(xPos, row++, "WorldDraw", ok, "%zu", snap.worldDrawSz);
 
-        const size_t robotDrawSz = eng.CountRobotDrawable();
-        ok = robotDrawSz > 0;
-        drawRow(xPos, row++, "BotDraw", ok, "%zu", robotDrawSz);
+        ok = snap.robotDrawSz > 0;
+        drawRow(xPos, row++, "BotDraw", ok, "%zu", snap.robotDrawSz);
 
-        const Engine::VisCheckDebugStats visDbg = eng.CollectVisCheckDebugStats();
+        const Engine::VisCheckDebugStats& visDbg = snap.visDbg;
         drawRow(xPos, row++, "MeshVisMode", true, "%s",
             var::visiblecheck ? "render_time" : "off");
         drawRow(xPos, row++, "PlrMeshVis", visDbg.playersTotal > 0,
@@ -200,20 +453,11 @@ static void DrawDebugOffsetValidation(Engine& eng)
                 visDbg.sampleSubmit);
         }
 
-        int actorCount = 0;
-        if (state.persistentLevel) {
-            actorCount = Memory::read<int>(state.persistentLevel + Offsets::AActors + 8);
-        }
-        ok = actorCount > 0 && actorCount < 10000;
-        drawRow(xPos, row++, "ActorCount", ok, "%d", actorCount);
+        ok = snap.actorCount > 0 && snap.actorCount < 10000;
+        drawRow(xPos, row++, "ActorCount", ok, "%d", snap.actorCount);
 
-        Engine::CameraCache cam{};
-        {
-            std::shared_lock<std::shared_mutex> lock(eng.m_cameraMutex);
-            cam = eng.g_Camera;
-        }
-        ok = IsUsableCameraFov(cam.FOV);
-        drawRow(xPos, row++, "CameraRead", ok, "FOV:%.1f", cam.FOV);
+        ok = IsUsableCameraFov(snap.camFov);
+        drawRow(xPos, row++, "CameraRead", ok, "FOV:%.1f", snap.camFov);
     }
 
     {
@@ -224,8 +468,8 @@ static void DrawDebugOffsetValidation(Engine& eng)
 
         ok = true;
         drawRow(xPos, row++, "ControlRot", ok, "0x%llX", (unsigned long long)Offsets::ControlRotation);
-        ok = eng.IsUsermodePtr(eng.PlayerState);
-        drawRow(xPos, row++, "PlayerState", ok, "0x%llX", (unsigned long long)eng.PlayerState);
+        ok = eng.IsUsermodePtr(snap.playerState);
+        drawRow(xPos, row++, "PlayerState", ok, "0x%llX", (unsigned long long)snap.playerState);
         drawRow(xPos, row++, "PlayerNameOff", true, "0x%llX", (unsigned long long)Offsets::PlayerNamePrivate);
         drawRow(xPos, row++, "CharMovement", true, "0x%llX", (unsigned long long)Offsets::CharacterMovement);
         drawRow(xPos, row++, "HealthComp", true, "0x%llX", (unsigned long long)Offsets::HealthComponent);

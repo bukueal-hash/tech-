@@ -6,6 +6,8 @@
 #include <immintrin.h>
 #include <iostream>
 #include <cstring>
+#include <chrono>
+#include <shared_mutex>
 
 namespace {
 
@@ -183,56 +185,184 @@ Engine::VisCheckDebugStats Engine::CollectVisCheckDebugStats() const
 {
 	VisCheckDebugStats stats{};
 
-	auto applySample = [&](const MeshVisProbe& probe) {
-		stats.sampleSubmit = probe.lastSubmit;
-		stats.sampleRender = probe.lastRender;
-		stats.sampleRenderScr = probe.lastRenderOnScreen;
-		stats.sampleOnScreen = probe.onScreen;
-		stats.sampleRecent = probe.recent;
-		stats.sampleVisible = probe.visible;
-		stats.sampleDecryptedLrtos = probe.decryptedLrtos;
-		stats.sampleWorldTimeSeconds = probe.worldTimeSeconds;
-		stats.samplePathUsed = probe.pathUsed ? probe.pathUsed : "fail";
-		stats.hasSample = true;
-	};
-
+	// Paint/debug path must stay DMA-free AND non-blocking. Blocking shared_lock
+	// here waits behind unique_lock waiters while ItemList debug probes hold
+	// shared+DMA (writer-preference) — same class as overlayMs=595==paint_gap.
 	{
-		std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
-		for (const auto& [key, actor] : playerCache) {
-			if (!actor.Drawing)
-				continue;
-			++stats.playersTotal;
-			if (actor.isVisible)
-				++stats.playersMeshVisible;
-			if (!stats.hasSample) {
-				const uintptr_t mesh = actor.actorMesh
-					? actor.actorMesh
-					: GetActorSkeletalMesh(key);
-				if (mesh && IsValidPointer(mesh))
-					applySample(ProbeMeshVisibility(mesh));
+		std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex, std::try_to_lock);
+		if (lock.owns_lock()) {
+			for (const auto& [key, actor] : playerCache) {
+				(void)key;
+				if (!actor.Drawing)
+					continue;
+				++stats.playersTotal;
+				if (actor.isVisible)
+					++stats.playersMeshVisible;
 			}
 		}
 	}
 
 	{
-		std::shared_lock<std::shared_mutex> lock(m_robotCacheMutex);
-		for (const auto& [key, entry] : robotCache) {
-			if (!entry.Drawing)
-				continue;
-			++stats.botsTotal;
-			if (entry.isVisible)
-				++stats.botsMeshVisible;
-			if (!stats.hasSample) {
-				const uintptr_t mesh = entry.Mesh
-					? entry.Mesh
-					: GetActorSkeletalMesh(key);
-				if (mesh && IsValidPointer(mesh))
-					applySample(ProbeMeshVisibility(mesh));
+		std::shared_lock<std::shared_mutex> lock(m_robotCacheMutex, std::try_to_lock);
+		if (lock.owns_lock()) {
+			for (const auto& [key, entry] : robotCache) {
+				(void)key;
+				if (!entry.Drawing)
+					continue;
+				++stats.botsTotal;
+				if (entry.isVisible)
+					++stats.botsMeshVisible;
 			}
 		}
 	}
 
 	return stats;
+}
+
+void Engine::TryCaptureDebugOverlaySnap(DebugOverlaySnap& io) const
+{
+	using clock = std::chrono::steady_clock;
+	const auto t0 = clock::now();
+	auto msOf = [](clock::time_point a, clock::time_point b) {
+		return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+	};
+
+	DebugOverlaySnap next = io;
+	next.base = Memory::getBaseAddress();
+	next.actorCount = 0;
+	next.gotState = next.gotFrame = next.gotPlayer = 0;
+	next.gotWorld = next.gotRobot = next.gotCam = 0;
+
+	{
+		const auto tA = clock::now();
+		std::shared_lock<std::shared_mutex> lock(m_stateMutex, std::try_to_lock);
+		if (lock.owns_lock()) {
+			next.gotState = 1;
+			next.state.gWorld = GWorld;
+			next.state.gWorldRaw = m_gWorldRaw.load(std::memory_order_relaxed);
+			next.state.gWorldFailStep = m_gWorldFailStep.load(std::memory_order_relaxed);
+			next.state.persistentLevel = PersistentLevel;
+			next.state.actors = Actors;
+			next.state.playerController = PlayerController;
+			next.state.acknowledgedPawn = AcknowledgedPawn;
+			next.state.rootComponent = RootComponent;
+			next.state.playerCameraManager = PlayerCameraManager;
+			next.state.owningGameInstance = OwningGameInstance;
+			next.state.localPlayer = localplayer;
+			next.playerState = PlayerState;
+		}
+		next.msState = msOf(tA, clock::now());
+	}
+	{
+		const auto tA = clock::now();
+		std::shared_lock<std::shared_mutex> lock(m_espFrameMutex, std::try_to_lock);
+		if (lock.owns_lock() && m_lastEspFrame.valid) {
+			next.gotFrame = 1;
+			next.drawTargets = m_lastEspFrame.players.size();
+			next.robotDrawSz = m_lastEspFrame.robots.size();
+			next.worldDrawSz = m_lastEspFrame.world.size();
+		}
+		next.msFrame = msOf(tA, clock::now());
+	}
+	{
+		const auto tA = clock::now();
+		std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex, std::try_to_lock);
+		if (lock.owns_lock()) {
+			next.gotPlayer = 1;
+			next.playerCacheSz = playerCache.size();
+			next.visDbg.playersTotal = 0;
+			next.visDbg.playersMeshVisible = 0;
+			size_t drawN = 0;
+			for (const auto& [key, actor] : playerCache) {
+				(void)key;
+				if (!actor.Drawing)
+					continue;
+				if (!(actor.isAlly && var::hide_allies))
+					++drawN;
+				++next.visDbg.playersTotal;
+				if (actor.isVisible)
+					++next.visDbg.playersMeshVisible;
+			}
+			if (!next.gotFrame)
+				next.drawTargets = drawN;
+		}
+		next.msPlayer = msOf(tA, clock::now());
+	}
+	{
+		const auto tA = clock::now();
+		size_t contN = 0, itemN = 0, contDraw = 0, itemDraw = 0;
+		bool okC = false, okI = false;
+		{
+			std::shared_lock<std::shared_mutex> lock(m_containerCacheMutex, std::try_to_lock);
+			if (lock.owns_lock()) {
+				okC = true;
+				contN = containerCache.size();
+				for (const auto& [key, e] : containerCache) {
+					(void)key;
+					if (e.Drawing)
+						++contDraw;
+				}
+			}
+		}
+		{
+			std::shared_lock<std::shared_mutex> lock(m_itemCacheMutex, std::try_to_lock);
+			if (lock.owns_lock()) {
+				okI = true;
+				itemN = itemCache.size();
+				for (const auto& [key, e] : itemCache) {
+					(void)key;
+					if (e.Drawing)
+						++itemDraw;
+				}
+			}
+		}
+		if (okC || okI) {
+			next.gotWorld = 1;
+			if (okC && okI)
+				next.worldCacheSz = contN + itemN;
+			else if (okC)
+				next.worldCacheSz = contN;
+			else
+				next.worldCacheSz = itemN;
+			if (!next.gotFrame)
+				next.worldDrawSz = contDraw + itemDraw;
+		}
+		next.msWorld = msOf(tA, clock::now());
+	}
+	{
+		const auto tA = clock::now();
+		std::shared_lock<std::shared_mutex> lock(m_robotCacheMutex, std::try_to_lock);
+		if (lock.owns_lock()) {
+			next.gotRobot = 1;
+			next.visDbg.botsTotal = 0;
+			next.visDbg.botsMeshVisible = 0;
+			size_t drawN = 0;
+			for (const auto& [key, entry] : robotCache) {
+				(void)key;
+				if (!entry.Drawing)
+					continue;
+				++drawN;
+				++next.visDbg.botsTotal;
+				if (entry.isVisible)
+					++next.visDbg.botsMeshVisible;
+			}
+			if (!next.gotFrame)
+				next.robotDrawSz = drawN;
+		}
+		next.msRobot = msOf(tA, clock::now());
+	}
+	{
+		const auto tA = clock::now();
+		std::shared_lock<std::shared_mutex> lock(m_cameraMutex, std::try_to_lock);
+		if (lock.owns_lock()) {
+			next.gotCam = 1;
+			next.camFov = g_Camera.FOV;
+		}
+		next.msCam = msOf(tA, clock::now());
+	}
+
+	next.totalMs = msOf(t0, clock::now());
+	io = next;
 }
 
 void Engine::PrintVisCheckDebugConsole()

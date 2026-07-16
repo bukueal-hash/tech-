@@ -94,7 +94,8 @@ private:
     std::unique_ptr<SyncedThread> m_positionThread;
     std::unique_ptr<SyncedThread> m_frameBuilderThread;
 
-    // Thread synchronization
+public:
+    // Thread synchronization (paint debug overlay uses try_lock on these)
     mutable std::shared_mutex m_stateMutex;       // Protects state pointers (GWorld, PersistentLevel, etc.)
     mutable std::shared_mutex m_playerCacheMutex;  // Protects playerCache
     mutable std::shared_mutex m_containerCacheMutex; // Protects containerCache
@@ -102,6 +103,7 @@ private:
     mutable std::shared_mutex m_robotCacheMutex;   // Protects robotCache
     std::atomic<uint64_t> m_worldGeneration{ 0 };    // Incremented on world change
 
+private:
     std::atomic<bool> m_raidRaw{ false };
     std::atomic<bool> m_espRaidActive{ false };
     /** Scanners may run; ESP/aim only draw after caches prove healthy. */
@@ -326,6 +328,8 @@ public:
 
     std::string GetEnglishItemName(uint64_t actor);
     std::string GetWeaponName(const std::string& internal_name);
+    /** True for real loadout weapons; false for Unarmed, blueprints, recipes, junk. */
+    bool IsPlayerWeaponEspLabel(const std::string& label);
 
     struct EngineStateSnapshot {
         uintptr_t gWorld = 0;
@@ -341,6 +345,35 @@ public:
         uintptr_t localPlayer = 0;
     };
     EngineStateSnapshot GetStateSnapshot() const;
+
+    /** Paint-thread safe: try_lock only — never waits on worker cache locks. */
+    struct DebugOverlaySnap {
+        uintptr_t base = 0;
+        EngineStateSnapshot state{};
+        size_t playerCacheSz = 0;
+        size_t drawTargets = 0;
+        size_t worldCacheSz = 0;
+        size_t worldDrawSz = 0;
+        size_t robotDrawSz = 0;
+        VisCheckDebugStats visDbg{};
+        int actorCount = 0;
+        float camFov = 0.f;
+        uintptr_t playerState = 0;
+        int64_t totalMs = 0;
+        int64_t msState = 0;
+        int64_t msFrame = 0;
+        int64_t msPlayer = 0;
+        int64_t msWorld = 0;
+        int64_t msRobot = 0;
+        int64_t msCam = 0;
+        int gotState = 0;
+        int gotFrame = 0;
+        int gotPlayer = 0;
+        int gotWorld = 0;
+        int gotRobot = 0;
+        int gotCam = 0;
+    };
+    void TryCaptureDebugOverlaySnap(DebugOverlaySnap& io) const;
 
     /** Last GWorld probe (updated every Update tick, even on miss). */
     std::atomic<uintptr_t> m_gWorldRaw{0};

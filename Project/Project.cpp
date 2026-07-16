@@ -6,6 +6,8 @@
 #include <tchar.h>
 #include <dwmapi.h>
 #include <iostream>
+#include <chrono>
+#include <fstream>
 
 #include "Core/Memory.h"
 #include "DMA/Memory.h"
@@ -229,8 +231,22 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
+        // #region agent log
+        // H8/H9/H11: split main-loop hitch — Render vs Present(vsync) vs AutoConfig.
+        const auto tFrame0 = std::chrono::steady_clock::now();
+        // #endregion
+
         Render(hwnd);
+
+        // #region agent log
+        const auto tAfterRender = std::chrono::steady_clock::now();
+        // #endregion
+
         AutoConfig_Tick();
+
+        // #region agent log
+        const auto tAfterCfg = std::chrono::steady_clock::now();
+        // #endregion
 
         if (GetAsyncKeyState(VK_END) & 0x1)
             SendMessage(hwnd, WM_CLOSE, 0, 0);
@@ -250,8 +266,50 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color_with_alpha);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
+        // #region agent log
+        const auto tBeforePresent = std::chrono::steady_clock::now();
+        // #endregion
+
         HRESULT hr = g_pSwapChain->Present(1, 0);
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
+
+        // #region agent log
+        {
+            const auto tAfterPresent = std::chrono::steady_clock::now();
+            const auto msOf = [](auto a, auto b) {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+            };
+            const int64_t renderMs = msOf(tFrame0, tAfterRender);
+            const int64_t cfgMs = msOf(tAfterRender, tAfterCfg);
+            const int64_t presentMs = msOf(tBeforePresent, tAfterPresent);
+            const int64_t totalMs = msOf(tFrame0, tAfterPresent);
+            if (renderMs > 50 || cfgMs > 50 || presentMs > 50 || totalMs > 100) {
+                static auto s_last = std::chrono::steady_clock::time_point{};
+                if (s_last.time_since_epoch().count() == 0
+                    || tAfterPresent - s_last >= std::chrono::milliseconds(200)) {
+                    s_last = tAfterPresent;
+                    std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+                    if (f) {
+                        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker2\",\"hypothesisId\":\"H8\""
+                          << ",\"location\":\"Project.cpp:main\",\"message\":\"frame_phases\""
+                          << ",\"data\":{\"renderMs\":" << renderMs
+                          << ",\"cfgMs\":" << cfgMs
+                          << ",\"presentMs\":" << presentMs
+                          << ",\"totalMs\":" << totalMs
+                          << ",\"vsync\":1"
+                          << "},\"timestamp\":" << ms << "}\n";
+                    }
+                    std::cout << "[debugFlickerPhase] renderMs=" << renderMs
+                        << " cfgMs=" << cfgMs
+                        << " presentMs=" << presentMs
+                        << " totalMs=" << totalMs
+                        << std::endl;
+                }
+            }
+        }
+        // #endregion
     }
 
     AutoConfig_SaveNow();

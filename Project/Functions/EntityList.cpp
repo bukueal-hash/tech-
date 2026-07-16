@@ -731,7 +731,13 @@ void Engine::EntityList()
         float invArmorPlates = 0.f, invArmorPerPlate = 0.f;
         ReadPlayerInventory(key, invWeapon, invWq, invStowed0, invSq0, invStowed1, invSq1,
             invArmorPlates, invArmorPerPlate);
-        actor.weaponName = invWeapon.empty() ? "Unarmed" : invWeapon;
+        // Only show Unarmed when there is no real gun in primary or stowed.
+        if (!invWeapon.empty())
+            actor.weaponName = invWeapon;
+        else if (invStowed0.empty() && invStowed1.empty())
+            actor.weaponName = "Unarmed";
+        else
+            actor.weaponName.clear();
         actor.weaponQuality = invWq;
         actor.stowedWeapon0 = invStowed0;
         actor.stowedQuality0 = invSq0;

@@ -1,6 +1,7 @@
 #include "../Core/Engine.h"
 #include <cmath>
 #include <cstring>
+#include <cctype>
 #include <algorithm>
 #include <chrono>
 #include <unordered_set>
@@ -1298,6 +1299,37 @@ std::string Engine::GetWeaponName(const std::string& internal_name) {
     return {};
 }
 
+bool Engine::IsPlayerWeaponEspLabel(const std::string& label)
+{
+    if (label.empty())
+        return false;
+
+    std::string lower = label;
+    for (char& c : lower)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    if (lower == "unarmed")
+        return false;
+
+    static const char* kJunk[] = {
+        "blueprint",
+        "recipe",
+        "schematic",
+        "outfit",
+        "cosmetic",
+        "emote",
+        "augment",
+        "quest",
+        "keycard",
+        "salvage",
+    };
+    for (const char* junk : kJunk) {
+        if (lower.find(junk) != std::string::npos)
+            return false;
+    }
+    return true;
+}
+
 namespace {
 
 bool FnameMatchesLootItemBucket(const std::string& actorNameLower)
@@ -1900,8 +1932,7 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
                 if (stripped.size() > 2 && stripped.compare(stripped.size() - 2, 2, "_C") == 0)
                     stripped.resize(stripped.size() - 2);
                 const std::string friendly = GetWeaponName(stripped.empty() ? nm : stripped);
-                if (friendly.empty() || friendly == "Unarmed"
-                    || friendly.find("Unarmed") != std::string::npos)
+                if (!IsPlayerWeaponEspLabel(friendly))
                     continue;
                 outWeaponName = friendly;
                 const int q = GetWeaponQualityFromActor(resolved);
@@ -1911,14 +1942,49 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
             }
         };
         tryItemArray(Offsets::CurrentItemActors);
-        if (outWeaponName.empty() || outWeaponName == "Unarmed")
+        if (!IsPlayerWeaponEspLabel(outWeaponName))
             tryItemArray(Offsets::LocalCurrentItemActors);
+    }
+
+    // Drop blueprints/recipes from stowed + equipped; promote a real stowed gun
+    // when primary is empty so ESP never shows "Unarmed" beside "Kettle".
+    if (!IsPlayerWeaponEspLabel(outStowed0)) {
+        outStowed0.clear();
+        outStowedQ0 = -1;
+    }
+    if (!IsPlayerWeaponEspLabel(outStowed1)) {
+        outStowed1.clear();
+        outStowedQ1 = -1;
+    }
+    if (!IsPlayerWeaponEspLabel(outWeaponName)) {
+        outWeaponName.clear();
+        outWeaponQuality = -1;
+        if (!outStowed0.empty()) {
+            outWeaponName = outStowed0;
+            outWeaponQuality = outStowedQ0;
+            outStowed0.clear();
+            outStowedQ0 = -1;
+        } else if (!outStowed1.empty()) {
+            outWeaponName = outStowed1;
+            outWeaponQuality = outStowedQ1;
+            outStowed1.clear();
+            outStowedQ1 = -1;
+        }
     }
 
     // Match equipped name to stowed slots for quality
     if (!outWeaponName.empty()) {
         if (outWeaponName == outStowed0) outWeaponQuality = outStowedQ0;
         else if (outWeaponName == outStowed1) outWeaponQuality = outStowedQ1;
+    }
+    // Avoid duplicating the active gun in the stowed list.
+    if (!outWeaponName.empty() && outWeaponName == outStowed0) {
+        outStowed0.clear();
+        outStowedQ0 = -1;
+    }
+    if (!outWeaponName.empty() && outWeaponName == outStowed1) {
+        outStowed1.clear();
+        outStowedQ1 = -1;
     }
     // If no quality from stowed, try direct read from weapon actor as fallback
     if (outWeaponQuality < 0) {

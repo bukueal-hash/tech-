@@ -329,9 +329,10 @@ static bool ResolveLiveRenderCamera(
     const Engine::EspRenderFrame& frame,
     Engine::CameraCache& outCam)
 {
-    // Per-paint POV from stored PCM — kills right-stick look-drag caused by
-    // 16ms-old g_Camera. No PCM rediscovery; no entity-position scatter.
-    // Clamped yaw/pitch extrapolate bridges residual DMA latency.
+    // Paint path must NOT DMA. TryBuildCameraFromPcmPov (read_nocache x4) stalled
+    // Present 200-441ms per hitch (debugFlicker maxCamMs≈maxEspMs; H6 slow_cam).
+    // Worker UpdateCamera already publishes g_Camera; frame.camera is the backup.
+    // Rotation extrapolate still bridges look-drag without touching the FPGA bus.
     static Engine::CameraCache s_prevCam{};
     static bool s_prevOk = false;
     static auto s_prevTp = std::chrono::steady_clock::time_point{};
@@ -346,7 +347,6 @@ static bool ResolveLiveRenderCamera(
                     raw.Rotation.y - s_prevCam.Rotation.y);
                 const float dpitch = static_cast<float>(
                     raw.Rotation.x - s_prevCam.Rotation.x);
-                // Assume sample is ~half a frame late; push rotation forward.
                 constexpr float kLead = 0.5f;
                 constexpr float kMaxDeg = 3.5f;
                 float leadYaw = dyaw * kLead;
@@ -365,27 +365,16 @@ static bool ResolveLiveRenderCamera(
     };
 
     {
-        const uintptr_t pcm = engine.PlayerCameraManager;
-        Engine::CameraCache live{};
-        if (engine.TryBuildCameraFromPcmPov(pcm, live) && CameraOkForEsp(live)) {
-            applyRotExtrap(live);
-            {
-                std::unique_lock<std::shared_mutex> lock(engine.m_cameraMutex);
-                engine.g_Camera = live;
-            }
-            outCam = live;
-            return true;
-        }
-    }
-    {
         std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
         if (CameraOkForEsp(engine.g_Camera)) {
             outCam = engine.g_Camera;
+            applyRotExtrap(outCam);
             return true;
         }
     }
     if (frame.valid && CameraOkForEsp(frame.camera)) {
         outCam = frame.camera;
+        applyRotExtrap(outCam);
         return true;
     }
     return false;
@@ -513,33 +502,88 @@ static void DrawWeaponLabel(
     if (!var::show_weapon)
         return;
 
-    // Active weapon
-    if (!actor.weaponName.empty()) {
-        const ImU32 wColor = actor.weaponQuality > 0
+    std::string active = actor.weaponName;
+    std::string stowed0 = actor.stowedWeapon0;
+    std::string stowed1 = actor.stowedWeapon1;
+    if (!engine.IsPlayerWeaponEspLabel(active)
+        && active != "Unarmed")
+        active.clear();
+    if (!engine.IsPlayerWeaponEspLabel(stowed0))
+        stowed0.clear();
+    if (!engine.IsPlayerWeaponEspLabel(stowed1))
+        stowed1.clear();
+    // Prefer a real gun over placeholder Unarmed.
+    if ((active.empty() || active == "Unarmed") && !stowed0.empty()) {
+        active = stowed0;
+        stowed0.clear();
+    } else if ((active.empty() || active == "Unarmed") && !stowed1.empty()) {
+        active = stowed1;
+        stowed1.clear();
+    }
+    if (active == stowed0)
+        stowed0.clear();
+    if (active == stowed1)
+        stowed1.clear();
+
+    // #region agent log
+    {
+        static auto s_lastWeaponLog = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now - s_lastWeaponLog > std::chrono::milliseconds(1500)) {
+            s_lastWeaponLog = now;
+            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+            if (f) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch()).count();
+                auto esc = [](const std::string& s) {
+                    std::string o;
+                    o.reserve(s.size());
+                    for (char c : s) {
+                        if (c == '"' || c == '\\') o.push_back('\\');
+                        o.push_back(c);
+                    }
+                    return o;
+                };
+                f << "{\"sessionId\":\"c190fb\",\"runId\":\"weapon-label\",\"hypothesisId\":\"H1\""
+                  << ",\"location\":\"Esp.cpp:DrawWeaponLabel\",\"message\":\"player weapon stack\""
+                  << ",\"data\":{\"rawActive\":\"" << esc(actor.weaponName)
+                  << "\",\"rawS0\":\"" << esc(actor.stowedWeapon0)
+                  << "\",\"rawS1\":\"" << esc(actor.stowedWeapon1)
+                  << "\",\"drawActive\":\"" << esc(active)
+                  << "\",\"drawS0\":\"" << esc(stowed0)
+                  << "\",\"drawS1\":\"" << esc(stowed1)
+                  << "\",\"anchorX\":" << anchorX
+                  << "},\"timestamp\":" << ms << "}\n";
+            }
+        }
+    }
+    // #endregion
+
+    // Active weapon — centered on head X (same as name/distance).
+    if (!active.empty()) {
+        const ImU32 wColor = (active != "Unarmed" && actor.weaponQuality > 0)
             ? WeaponTierColor(actor.weaponQuality)
             : IM_COL32(220, 220, 220, 255);
         EspDraw::DrawLabelEsp(
             drawList,
             ImVec2(anchorX, labelStackY),
-            actor.weaponName.c_str(),
+            active.c_str(),
             wColor,
             actor.Distance);
-        labelStackY -= LabelTextHeight(actor.weaponName.c_str(), actor.Distance) + 4.f;
+        labelStackY -= LabelTextHeight(active.c_str(), actor.Distance) + 4.f;
     }
 
-    // Stowed weapons
-    for (const std::string* sw : { &actor.stowedWeapon0, &actor.stowedWeapon1 }) {
+    // Stowed weapons — same center X (no indent / leading spaces).
+    for (const std::string* sw : { &stowed0, &stowed1 }) {
         if (sw->empty()) continue;
-        char buf[64];
-        snprintf(buf, sizeof(buf), "  %s", sw->c_str());
         const ImU32 sColor = IM_COL32(180, 180, 180, 200);
         EspDraw::DrawLabelEsp(
             drawList,
-            ImVec2(anchorX + 8.f, labelStackY),
-            buf,
+            ImVec2(anchorX, labelStackY),
+            sw->c_str(),
             sColor,
             actor.Distance);
-        labelStackY -= LabelTextHeight(buf, actor.Distance) + 2.f;
+        labelStackY -= LabelTextHeight(sw->c_str(), actor.Distance) + 2.f;
     }
 }
 
@@ -1278,31 +1322,13 @@ static void RenderRobotEspFromFrame(
         const Visuals::EspDrawScale scale =
             Visuals::ComputeEspScaleFromBox(boxH > 1.f ? boxH : 24.f, distM);
 
-        std::string fname;
-        if (robot.ActorName.empty()
-            || robot.ActorName == kBotStructAdmissionToken
-            || !IsAcceptedBotEspLabel(engine, robot.ActorName)) {
-            fname = engine.GetActorFNameStringCached(key);
-            if (fname.empty())
-                fname = engine.GetActorFNameString(key);
-        }
-
-        std::string botLabel =
-            ResolveBotDrawLabel(key, robot.ActorName, fname);
-        // Constructable token = label not settled yet; retry class/enemy DA (c190fb H3).
-        if (botLabel.empty()
-            && (robot.ActorName.empty()
-                || robot.ActorName == kBotStructAdmissionToken)) {
-            const std::string classFn = engine.GetActorClassFName(key);
-            if (!classFn.empty())
-                botLabel = ResolveBotDrawLabel(key, std::string{}, classFn);
-            if (botLabel.empty()) {
-                const std::string fromEnemy = ResolveEnemyAssetBotLabel(key);
-                if (!fromEnemy.empty()
-                    && IsAcceptedBotEspLabel(engine, fromEnemy, classFn))
-                    botLabel = fromEnemy;
-            }
-        }
+        // Paint path must stay DMA-free. Live GetActorFNameString / GetActorClassFName
+        // / ResolveEnemyAssetBotLabel here stalled Present (espMs 500-700). Names are
+        // resolved on the robot worker into ActorName / ItemDisplayName.
+        const std::string& fname = robot.ActorName;
+        std::string botLabel = ResolveBotDrawLabel(key, robot.ActorName, fname);
+        if (botLabel.empty() && !robot.ItemDisplayName.empty())
+            botLabel = ResolveBotDrawLabel(key, robot.ItemDisplayName, fname);
         // No real name → no ESP (heart/dist alone = ghost bots; log GC Electrified).
         // Never use ARC/Bot/Oil placeholders. IsAnyBotActor alone is not enough.
         if (botLabel.empty() || !IsAcceptedBotEspLabel(engine, botLabel, fname)) {
@@ -1385,6 +1411,92 @@ static void RenderRobotEspFromFrame(
     }
 }
 
+// Flicker diagnosis: every whole-screen ESP blink is a paint that drew nothing.
+// Classify WHY (frame not valid vs camera resolve fail vs frame builder stalled)
+// so we fix the real gate instead of guessing. Enabled by show_debug_overlay.
+struct FlickerDbg {
+    uint64_t paints = 0;        // RenderEsp calls past the enable check
+    uint64_t drew = 0;          // paints that reached the draw path
+    uint64_t blankFrame = 0;    // bailed: frame.valid == false
+    uint64_t blankCam = 0;      // bailed: ResolveLiveRenderCamera failed
+    uint64_t staleFrame = 0;    // drew, but frame builder republished no new seq
+    uint64_t blankStreak = 0;   // consecutive blank paints right now
+    uint64_t maxBlankStreak = 0;// worst streak this window
+    uint64_t lastFrameSeq = 0;
+    // H3/H4/H5/H6/H7 flicker probes
+    int prevTotalEntities = -1;
+    uint64_t contentDrops = 0;  // new frame arrived >50% smaller than previous
+    uint64_t paintGaps = 0;     // >150ms between paints while menu was closed
+    uint64_t menuGaps = 0;      // >150ms gaps caused by INSERT menu (false positive)
+    uint64_t loopGaps = 0;      // >150ms between Render() calls (true overlay hitch)
+    int64_t maxPaintGapMs = 0;
+    int64_t maxLoopGapMs = 0;
+    int64_t maxEspMs = 0;       // slowest RenderEsp wall time (DMA/cam)
+    int64_t maxCamMs = 0;       // slowest ResolveLiveRenderCamera
+    std::chrono::steady_clock::time_point lastPaintTp{};
+    std::chrono::steady_clock::time_point lastLoopTp{};
+    bool menuInterrupted = false; // RenderEsp skipped because menu was open
+};
+static FlickerDbg g_flickerDbg;
+
+static void FlickerNoteBlank(const char* reason)
+{
+    FlickerDbg& d = g_flickerDbg;
+    ++d.blankStreak;
+    if (d.blankStreak > d.maxBlankStreak)
+        d.maxBlankStreak = d.blankStreak;
+    static auto s_last = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (s_last.time_since_epoch().count() == 0
+        || now - s_last >= std::chrono::milliseconds(200)) {
+        s_last = now;
+        std::ofstream f("F:/Test/ARCs/debug-flicker.log", std::ios::app);
+        if (f) {
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            f << "{\"sessionId\":\"flicker\",\"location\":\"Esp.cpp:RenderEsp\""
+              << ",\"message\":\"blank_paint\",\"data\":{\"reason\":\"" << reason << "\""
+              << ",\"streak\":" << d.blankStreak
+              << "},\"timestamp\":" << ms << "}\n";
+        }
+    }
+}
+
+// Visible to Render.cpp — menu / loop hitch probes (H5 / H7).
+void FlickerNoteMenuOpen()
+{
+    g_flickerDbg.menuInterrupted = true;
+}
+
+void FlickerNoteRenderLoop()
+{
+    // #region agent log
+    if (!var::show_debug_overlay)
+        return;
+    const auto nowTp = std::chrono::steady_clock::now();
+    if (g_flickerDbg.lastLoopTp.time_since_epoch().count() != 0) {
+        const int64_t gapMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                nowTp - g_flickerDbg.lastLoopTp).count();
+        if (gapMs > 150) {
+            ++g_flickerDbg.loopGaps;
+            if (gapMs > g_flickerDbg.maxLoopGapMs)
+                g_flickerDbg.maxLoopGapMs = gapMs;
+            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+            if (f) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker\",\"hypothesisId\":\"H7\""
+                  << ",\"location\":\"Esp.cpp:FlickerNoteRenderLoop\",\"message\":\"loop_gap\""
+                  << ",\"data\":{\"gapMs\":" << gapMs
+                  << "},\"timestamp\":" << ms << "}\n";
+            }
+        }
+    }
+    g_flickerDbg.lastLoopTp = nowTp;
+    // #endregion
+}
+
 void Engine::RenderEsp()
 {
     const bool drawPlayers = var::enableesp;
@@ -1393,22 +1505,188 @@ void Engine::RenderEsp()
     if (!drawPlayers && !drawBots && !drawWorld && !var::show_radar)
         return;
 
+    const bool flickerDbgOn = var::show_debug_overlay;
+    const auto espStartTp = std::chrono::steady_clock::now();
+    if (flickerDbgOn)
+        ++g_flickerDbg.paints;
+
     SetProjectionViewport(
         ImGui::GetIO().DisplaySize.x,
         ImGui::GetIO().DisplaySize.y);
 
-    EspRenderFrame frame{};
+    // G2: never block paint on m_espFrameMutex. Frame builder unique_lock +
+    // aimbot shared copies caused writer-preference waits → espMs=500-717
+    // (debug-c190fb slow_esp == paint_gap). Keep last good frame if busy.
+    static EspRenderFrame s_paintFrame{};
+    int frameLockGot = 0;
+    int64_t frameCopyMs = 0;
     {
-        std::shared_lock<std::shared_mutex> lock(m_espFrameMutex);
-        frame = m_lastEspFrame;
+        const auto tCopy0 = std::chrono::steady_clock::now();
+        std::shared_lock<std::shared_mutex> lock(m_espFrameMutex, std::try_to_lock);
+        if (lock.owns_lock()) {
+            frameLockGot = 1;
+            if (m_lastEspFrame.valid)
+                s_paintFrame = m_lastEspFrame;
+        }
+        frameCopyMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - tCopy0).count();
     }
+    const EspRenderFrame& frame = s_paintFrame;
     if (!frame.valid) {
+        if (flickerDbgOn) {
+            ++g_flickerDbg.blankFrame;
+            FlickerNoteBlank("frame_invalid");
+        }
         return;
     }
 
     Engine::CameraCache renderCam{};
-    if (!ResolveLiveRenderCamera(frame, renderCam)) {
+    const auto camStartTp = std::chrono::steady_clock::now();
+    const bool camOk = ResolveLiveRenderCamera(frame, renderCam);
+    if (flickerDbgOn) {
+        const int64_t camMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - camStartTp).count();
+        if (camMs > g_flickerDbg.maxCamMs)
+            g_flickerDbg.maxCamMs = camMs;
+        // #region agent log
+        // H6: DMA camera resolve on the paint thread blocking Present.
+        if (camMs > 50) {
+            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+            if (f) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker\",\"hypothesisId\":\"H6\""
+                  << ",\"location\":\"Esp.cpp:RenderEsp\",\"message\":\"slow_cam\""
+                  << ",\"data\":{\"camMs\":" << camMs
+                  << ",\"ok\":" << (camOk ? 1 : 0)
+                  << "},\"timestamp\":" << ms << "}\n";
+            }
+        }
+        // #endregion
+    }
+    if (!camOk) {
+        if (flickerDbgOn) {
+            ++g_flickerDbg.blankCam;
+            FlickerNoteBlank("cam_fail");
+        }
         return;
+    }
+
+    if (flickerDbgOn) {
+        ++g_flickerDbg.drew;
+
+        // #region agent log
+        // H4/H5: gap between paints. Menu-open skips RenderEsp and must not
+        // count as a real hitch (H5). Only count when menu stayed closed.
+        {
+            const auto nowTp = std::chrono::steady_clock::now();
+            if (g_flickerDbg.lastPaintTp.time_since_epoch().count() != 0) {
+                const int64_t gapMs =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        nowTp - g_flickerDbg.lastPaintTp).count();
+                if (gapMs > 150) {
+                    if (g_flickerDbg.menuInterrupted) {
+                        ++g_flickerDbg.menuGaps;
+                        std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+                        if (f) {
+                            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count();
+                            f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker\",\"hypothesisId\":\"H5\""
+                              << ",\"location\":\"Esp.cpp:RenderEsp\",\"message\":\"menu_gap\""
+                              << ",\"data\":{\"gapMs\":" << gapMs
+                              << "},\"timestamp\":" << ms << "}\n";
+                        }
+                    } else {
+                        ++g_flickerDbg.paintGaps;
+                        if (gapMs > g_flickerDbg.maxPaintGapMs)
+                            g_flickerDbg.maxPaintGapMs = gapMs;
+                        std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+                        if (f) {
+                            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count();
+                            f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker\",\"hypothesisId\":\"H4\""
+                              << ",\"location\":\"Esp.cpp:RenderEsp\",\"message\":\"paint_gap\""
+                              << ",\"data\":{\"gapMs\":" << gapMs
+                              << "},\"timestamp\":" << ms << "}\n";
+                        }
+                    }
+                }
+            }
+            g_flickerDbg.menuInterrupted = false;
+            g_flickerDbg.lastPaintTp = nowTp;
+        }
+        // #endregion
+
+        // Same frameSeq as last paint = frame builder published nothing new
+        // this interval (DMA/hitch stall) even though the old frame is valid.
+        if (frame.frameSeq == g_flickerDbg.lastFrameSeq) {
+            ++g_flickerDbg.staleFrame;
+        } else {
+            // #region agent log
+            // H3: fresh frame arrived with far fewer entities than the previous
+            // one — mass blink while paint keeps running.
+            const int total = static_cast<int>(
+                frame.players.size() + frame.robots.size() + frame.world.size());
+            if (g_flickerDbg.prevTotalEntities >= 4
+                && total * 2 < g_flickerDbg.prevTotalEntities) {
+                ++g_flickerDbg.contentDrops;
+                std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+                if (f) {
+                    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker\",\"hypothesisId\":\"H3\""
+                      << ",\"location\":\"Esp.cpp:RenderEsp\",\"message\":\"frame_content_drop\""
+                      << ",\"data\":{\"before\":" << g_flickerDbg.prevTotalEntities
+                      << ",\"after\":" << total
+                      << ",\"players\":" << frame.players.size()
+                      << ",\"bots\":" << frame.robots.size()
+                      << ",\"world\":" << frame.world.size()
+                      << "},\"timestamp\":" << ms << "}\n";
+                }
+            }
+            g_flickerDbg.prevTotalEntities = total;
+            // #endregion
+        }
+        g_flickerDbg.lastFrameSeq = frame.frameSeq;
+        g_flickerDbg.blankStreak = 0;
+
+        static auto s_lastRep = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - s_lastRep >= std::chrono::seconds(1)) {
+            s_lastRep = now;
+            const FlickerDbg d = g_flickerDbg;
+            std::cout << "[debugFlicker] paints=" << d.paints
+                << " drew=" << d.drew
+                << " blankFrame=" << d.blankFrame
+                << " blankCam=" << d.blankCam
+                << " staleFrame=" << d.staleFrame
+                << " maxBlankStreak=" << d.maxBlankStreak
+                << " contentDrops=" << d.contentDrops
+                << " paintGaps=" << d.paintGaps
+                << " menuGaps=" << d.menuGaps
+                << " loopGaps=" << d.loopGaps
+                << " maxGapMs=" << d.maxPaintGapMs
+                << " maxLoopMs=" << d.maxLoopGapMs
+                << " maxCamMs=" << d.maxCamMs
+                << " maxEspMs=" << d.maxEspMs
+                << std::endl;
+            std::ofstream lf("F:/Test/ARCs/debug-flicker.log", std::ios::app);
+            if (lf) {
+                const auto msn = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                lf << "{\"sessionId\":\"flicker\",\"location\":\"Esp.cpp:RenderEsp\""
+                   << ",\"message\":\"flicker_summary\",\"data\":{"
+                   << "\"paints\":" << d.paints
+                   << ",\"drew\":" << d.drew
+                   << ",\"blankFrame\":" << d.blankFrame
+                   << ",\"blankCam\":" << d.blankCam
+                   << ",\"staleFrame\":" << d.staleFrame
+                   << ",\"maxBlankStreak\":" << d.maxBlankStreak
+                   << "},\"timestamp\":" << msn << "}\n";
+            }
+            g_flickerDbg.maxBlankStreak = 0;
+        }
     }
 
     g_renderQueue.newFrame();
@@ -1417,10 +1695,43 @@ void Engine::RenderEsp()
         RenderPlayerEspFromFrame(frame.players, renderCam);
     if (var::showRobots)
         RenderRobotEspFromFrame(frame.robots, renderCam);
-    if (drawWorld)
-        RenderWorldEspFromFrame(frame.world, renderCam);
+    if (drawWorld) {
+        // World loot positions were sampled with frame.camera. Projecting them with
+        // live renderCam (rot-extrapolated) desyncs W2S → skipProj spikes and
+        // labels blink while the fixed debug overlay stays solid (no projection).
+        // Evidence: paintGaps=0 but skipProj=4-7 of frame=9, rendered oscillating 1-4.
+        const Engine::CameraCache& worldCam =
+            CameraOkForEsp(frame.camera) ? frame.camera : renderCam;
+        RenderWorldEspFromFrame(frame.world, worldCam);
+    }
 
     g_renderQueue.endFrame();
+
+    if (flickerDbgOn) {
+        const int64_t espMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - espStartTp).count();
+        if (espMs > g_flickerDbg.maxEspMs)
+            g_flickerDbg.maxEspMs = espMs;
+        // #region agent log
+        if (espMs > 50 || frameCopyMs > 20) {
+            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+            if (f) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"sessionId\":\"c190fb\",\"runId\":\"ghost-flicker\",\"hypothesisId\":\"G2\""
+                  << ",\"location\":\"Esp.cpp:RenderEsp\",\"message\":\"slow_esp\""
+                  << ",\"data\":{\"espMs\":" << espMs
+                  << ",\"frameCopyMs\":" << frameCopyMs
+                  << ",\"frameLockGot\":" << frameLockGot
+                  << ",\"players\":" << frame.players.size()
+                  << ",\"robots\":" << frame.robots.size()
+                  << ",\"world\":" << frame.world.size()
+                  << "},\"timestamp\":" << ms << "}\n";
+            }
+        }
+        // #endregion
+    }
 
     if (ImDrawList* drawList = ImGui::GetForegroundDrawList()) {
         RenderQueue::flushToDrawList(
@@ -1468,6 +1779,7 @@ void Engine::RenderEsp()
                 << " skipPos=" << g_worldEspDbg.skipPos
                 << " skipDist=" << g_worldEspDbg.skipDist
                 << " skipProj=" << g_worldEspDbg.skipProj
+                << " worldCam=" << (CameraOkForEsp(frame.camera) ? "frame" : "live")
                 << std::endl;
         }
     }
@@ -1487,12 +1799,13 @@ static void RenderWorldEspFromFrame(
     if (!drawList)
         return;
 
-    const Engine::EngineStateSnapshot stateSnap = engine.GetStateSnapshot();
-    const Vector3 distRef = engine.ResolveDistanceReference(
-        frameCam, stateSnap.acknowledgedPawn);
+    // Paint path must stay DMA-free. Frame builder already resolved WorldPos +
+    // labels. Live GetActorFNameString / GetEnglishItemName / ContainerLootLooksOpenedAny
+    // / ResolveWorldEspDrawPos here stalled Present 200-700ms (debugFlicker:
+    // maxEspMs=713 with menuGaps=0; H6 slow_esp without matching slow_cam).
+    const Vector3& distRef = frameCam.Location;
 
     for (const Engine::EspFrameWorld& item : world) {
-        const uintptr_t key = item.actorKey;
         const Engine::WorldCacheEntry& entry = item.entry;
         if (!engine.getAllowWorldEntry(entry)) {
             ++dbg.skipAllow;
@@ -1503,33 +1816,18 @@ static void RenderWorldEspFromFrame(
             continue;
         }
 
-        const Vector3 worldPos = ResolveWorldEspDrawPos(key, entry);
-        if (!IsPlausibleWorldPos(worldPos)) {
-            ++dbg.skipPos;
-            continue;
-        }
+        const Vector3& worldPos = entry.WorldPos;
         const double dx = static_cast<double>(worldPos.x) - distRef.x;
         const double dy = static_cast<double>(worldPos.y) - distRef.y;
         const double dz = static_cast<double>(worldPos.z) - distRef.z;
         const float distM = static_cast<float>(
             std::sqrt(dx * dx + dy * dy + dz * dz) / 100.0);
 
-        std::string fname = engine.GetActorFNameStringCached(key);
-        if (fname.empty())
-            fname = engine.GetActorFNameString(key);
-        if (fname.empty() && !entry.ActorName.empty())
-            fname = entry.ActorName;
-
         const auto cat = static_cast<WorldItemCategory>(entry.worldCategory);
         const bool isGroundLoot = IsGroundLootEspCategory(cat);
         const bool isContainerEsp =
             WorldCategoryIsContainerProp(cat) && !isGroundLoot;
-
-        std::string classFname;
-        if (isContainerEsp)
-            classFname = engine.GetActorClassFName(key);
-        if (fname.empty() && !classFname.empty())
-            fname = classFname;
+        const std::string& fname = entry.ActorName;
 
         if (!isContainerEsp && !isGroundLoot) {
             Vector3 headScreen{};
@@ -1552,79 +1850,45 @@ static void RenderWorldEspFromFrame(
         if (isGroundLoot) {
             label = entry.ItemDisplayName;
             if (label.empty() || IsGenericWorldEspLabel(label) || !IsPlausibleEspLabel(label)) {
-                const std::string memName = engine.GetEnglishItemName(key);
-                if (!memName.empty() && IsPlausibleEspLabel(memName))
-                    label = memName;
-            }
-            if (label.empty() || IsGenericWorldEspLabel(label) || !IsPlausibleEspLabel(label)) {
-                label = ResolveWorldDisplayLabel(
-                    key, fname, static_cast<int>(entry.worldCategory));
-            }
-            if (label.empty() || IsGenericWorldEspLabel(label) || !IsPlausibleEspLabel(label)) {
                 label = ResolveWorldDrawLabel(
                     entry.worldCategory,
                     entry.ActorName,
                     entry.ItemDisplayName);
             }
         } else if (isContainerEsp) {
-            label = ResolveContainerEspDrawLabel(key, entry, fname, classFname);
-            if (label.empty() || IsJunkWorldEspLabel(label) || IsGarbledEspLabel(label))
-                label = ContainerCategoryFallbackLabel(
-                    static_cast<WorldItemCategory>(entry.worldCategory));
+            label = entry.ItemDisplayName;
+            if (label.empty() || IsJunkWorldEspLabel(label) || IsGarbledEspLabel(label)
+                || !IsCleanContainerName(label)) {
+                label = ContainerCategoryFallbackLabel(cat);
+            }
+            if (var::show_world_open_container
+                && cat == WorldItemCategory::OpenedContainer
+                && label.find("(Open)") == std::string::npos) {
+                label = AppendContainerOpenSuffix(std::move(label));
+            }
         } else {
             label = entry.ItemDisplayName;
             if (label.empty() || IsGenericWorldEspLabel(label) || !IsPlausibleEspLabel(label)) {
-                const std::string memName = engine.GetEnglishItemName(key);
-                if (!memName.empty() && !IsGenericWorldEspLabel(memName))
-                    label = memName;
-            }
-            if (label.empty() || IsGenericWorldEspLabel(label) || !IsPlausibleEspLabel(label)) {
-                label = ResolveWorldDisplayLabel(
-                    key, fname, static_cast<int>(entry.worldCategory));
+                label = ResolveWorldDrawLabel(
+                    entry.worldCategory,
+                    entry.ActorName,
+                    entry.ItemDisplayName);
             }
         }
 
-        // Non-container world rows still need a real label; ground loot always draws.
         if (!isContainerEsp && !isGroundLoot
             && (label.empty() || IsGenericWorldEspLabel(label)
                 || !IsPlausibleEspLabel(label) || IsJunkWorldEspLabel(label)
                 || IsGarbledEspLabel(label)))
             continue;
         if (isGroundLoot && (label.empty() || IsJunkWorldEspLabel(label)
-                || IsGarbledEspLabel(label) || !IsPlausibleEspLabel(label))) {
-            if (const std::string mem = engine.GetEnglishItemName(key);
-                !mem.empty() && !IsJunkWorldEspLabel(mem)
-                && !IsGarbledEspLabel(mem) && IsPlausibleEspLabel(mem))
-                label = mem;
-            if (label.empty() || IsJunkWorldEspLabel(label) || IsGarbledEspLabel(label)
-                || !IsPlausibleEspLabel(label) || IsGenericWorldEspLabel(label)) {
-                if (const int64_t assetId = TryReadItemGameAssetIdFromActor(key);
-                    assetId != 0) {
-                    const std::string fromId = LookupDisplayByAssetId(assetId);
-                    if (!fromId.empty() && !IsJunkWorldEspLabel(fromId)
-                        && !IsGarbledEspLabel(fromId) && IsPlausibleEspLabel(fromId))
-                        label = fromId;
-                }
-            }
-            if (label.empty() || IsJunkWorldEspLabel(label) || IsGarbledEspLabel(label)
-                || !IsPlausibleEspLabel(label) || IsGenericWorldEspLabel(label)) {
-                if (!fname.empty()) {
-                    const std::string fromAsset = LookupByAssetName(fname);
-                    if (!fromAsset.empty() && !IsJunkWorldEspLabel(fromAsset)
-                        && IsPlausibleEspLabel(fromAsset))
-                        label = fromAsset;
-                }
-            }
-            // Never draw engine junk (Interface Property, Root Collider, …) as loot.
-            if (label.empty() || IsJunkWorldEspLabel(label) || IsGarbledEspLabel(label)
-                || !IsPlausibleEspLabel(label) || IsGenericWorldEspLabel(label))
-                continue;
-        }
+                || IsGarbledEspLabel(label) || !IsPlausibleEspLabel(label)
+                || IsGenericWorldEspLabel(label)))
+            continue;
         if (label.empty())
             continue;
         if (isContainerEsp && (IsJunkWorldEspLabel(label) || IsGarbledEspLabel(label)))
-            label = ContainerCategoryFallbackLabel(
-                static_cast<WorldItemCategory>(entry.worldCategory));
+            label = ContainerCategoryFallbackLabel(cat);
 
         label = FormatEspDisplayLabel(label);
         if (label.empty())
@@ -1632,54 +1896,26 @@ static void RenderWorldEspFromFrame(
 
         int lootValue = entry.lootValue;
         int lootTier = entry.lootRarityTier;
-        WorldLootFilterView preMetaView{
-            entry.worldCategory,
-            entry.ActorName.empty() ? fname : entry.ActorName,
-            label,
-            lootValue,
-            lootTier};
-        const bool preMetaContainer = isContainerEsp
-            || WorldLootEntryLooksLikeContainer(preMetaView);
-        if (preMetaContainer) {
-            lootValue = 0;
-            lootTier = 0;
-        } else if (!isGroundLoot) {
-            if (lootValue <= 0 || lootTier <= 0) {
-                ResolveItemMetaForActor(engine, key, fname, label, lootTier, lootValue);
-                if (lootValue <= 0 || lootTier <= 0) {
-                    const std::string memName = engine.GetEnglishItemName(key);
-                    if (!memName.empty() && memName != label) {
-                        int altTier = 0;
-                        int altValue = 0;
-                        if (ResolveItemMetaForActor(engine, key, fname, memName, altTier, altValue)) {
-                            if (lootValue <= 0)
-                                lootValue = altValue;
-                            if (lootTier <= 0)
-                                lootTier = altTier;
-                        }
-                    }
-                }
-            }
-        } else if (lootValue <= 0 || lootTier <= 0) {
-            // Trust scan-time meta; only resolve when still missing (#9).
-            ResolveItemMetaForActor(
-                engine, key, fname, label.empty() ? entry.ItemDisplayName : label,
-                lootTier, lootValue);
-        }
-
         WorldLootFilterView filterView{
             entry.worldCategory,
             entry.ActorName.empty() ? fname : entry.ActorName,
             label,
             lootValue,
             lootTier};
+        const bool looksLikeContainer = isContainerEsp
+            || WorldLootEntryLooksLikeContainer(filterView);
+        if (looksLikeContainer) {
+            lootValue = 0;
+            lootTier = 0;
+            filterView.lootValue = 0;
+            filterView.lootRarityTier = 0;
+        }
         if (distM > WorldLootPickupMaxDrawMeters(cat, &filterView)) {
             ++dbg.skipDist;
             continue;
         }
 
         const bool isPickup = LootItemLooksLikePickup(filterView);
-        const bool looksLikeContainer = WorldLootEntryLooksLikeContainer(filterView);
 
         Vector3 screen{};
         if (!ProjectWorldEspPoint(worldPos, frameCam, screen)) {
@@ -1694,15 +1930,7 @@ static void RenderWorldEspFromFrame(
             continue;
 
         const ImU32 color = WorldLootLabelColor(
-            [&]() -> WorldItemCategory {
-                if (!isContainerEsp || !var::show_world_open_container)
-                    return cat;
-                if (ContainerLootLooksOpenedAny(
-                        key,
-                        entry.ActorName.empty() ? fname : entry.ActorName))
-                    return WorldItemCategory::OpenedContainer;
-                return cat;
-            }(),
+            cat,
             lootTier,
             isPickup && !looksLikeContainer);
 
@@ -1747,16 +1975,15 @@ void Engine::RenderRadar(bool interactive)
     if (!drawList)
         return;
 
+    // Never CollectEspRenderFrame on the paint thread (DMA). try_lock only.
     EspRenderFrame frame{};
     {
-        std::shared_lock<std::shared_mutex> lock(m_espFrameMutex);
-        frame = m_lastEspFrame;
+        std::shared_lock<std::shared_mutex> lock(m_espFrameMutex, std::try_to_lock);
+        if (lock.owns_lock())
+            frame = m_lastEspFrame;
     }
-    if (!frame.valid) {
-        EspRenderFrame fresh{};
-        if (CollectEspRenderFrame(fresh))
-            frame = std::move(fresh);
-    }
+    if (!frame.valid)
+        return;
 
     Engine::CameraCache frameCam{};
     {
