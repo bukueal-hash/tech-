@@ -334,7 +334,7 @@ void KmboxController::renderKmboxSettings() {
     ImGui::SameLine();
     if (ImGui::Button("Test fire"))
         fireTest();
-    ImGui::SetItemTooltip("Sends a test left click through the device.");
+    ImGui::SetItemTooltip("Manual hardware left-click test. This is not used by aimbot.");
 
     if (kmboxConfig.initialized)
         ImGui::TextColored(ImVec4(0, 1, 0, 1.f), "Status: connected");
@@ -487,30 +487,6 @@ void KmboxController::LeftClick() {
     }
     if (kmboxConfig.minDelay > 0)
         Sleep(static_cast<DWORD>(kmboxConfig.minDelay));
-}
-
-bool KmboxController::IsPhysicalLeftDown() const
-{
-    if (!kmboxConfig.initialized)
-        return false;
-    if (kmboxConfig.type == "MAKCU")
-        return MyMakcu::IsPhysicalLeftDown();
-    if (kmboxConfig.type == "Net") {
-        const int st = kmNet_monitor_mouse_left();
-        return st == 1;
-    }
-    return false;
-}
-
-bool KmboxController::FiringProxyAvailable() const
-{
-    if (!kmboxConfig.initialized)
-        return false;
-    if (kmboxConfig.type == "MAKCU")
-        return true;
-    if (kmboxConfig.type == "Net")
-        return kmNet_monitor_mouse_left() >= 0;
-    return false;
 }
 
 KmboxController g_kmbox;

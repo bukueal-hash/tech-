@@ -1195,7 +1195,14 @@ std::string LookupEnemyBotDisplayLabel(const std::string& displayLabel)
 {
     if (displayLabel.empty())
         return {};
-    return NormalizeBotDisplayName(displayLabel);
+    // Only return real robot-list types — never echo arbitrary strings
+    // (old path made getAllowType accept "GC Electrified" as a bot).
+    const std::string mapped = NormalizeBotDisplayName(displayLabel);
+    if (IsRobotsListType(mapped))
+        return mapped;
+    if (IsRobotsListType(displayLabel))
+        return displayLabel;
+    return {};
 }
 
 // SHARED GATE — grep callers before edit
@@ -1209,19 +1216,18 @@ bool IsAcceptedBotEspLabel(
     if (label == "Loot Item" || label == "World Item" || label == "Corpse"
         || label == "Raider stock" || label == "Arc Cargoship")
         return false;
+    if (label == "Bot" || label == "Oil")
+        return false;
 
     if (eng.robotsList.contains(label))
         return true;
-    if (!LookupEnemyBotByFName(label).empty())
+    if (const std::string fromPat = LookupEnemyBotByFName(label); !fromPat.empty()
+        && eng.robotsList.contains(fromPat))
         return true;
 
     const std::string mapped = LookupEnemyBotDisplayLabel(label);
-    if (!mapped.empty()) {
-        if (eng.robotsList.contains(mapped))
-            return true;
-        if (!LookupEnemyBotByFName(mapped).empty())
-            return true;
-    }
+    if (!mapped.empty() && eng.robotsList.contains(mapped))
+        return true;
 
     if (!fnameHint.empty()) {
         const std::string fromEntity = eng.getEntityType(fnameHint);
@@ -1245,7 +1251,8 @@ static std::string MapDisplayToRobotType(Engine& eng, const std::string& display
         return mapped;
     if (eng.robotsList.contains(display))
         return display;
-    if (const std::string fromPat = LookupEnemyBotByFName(display); !fromPat.empty())
+    if (const std::string fromPat = LookupEnemyBotByFName(display); !fromPat.empty()
+        && eng.robotsList.contains(fromPat))
         return fromPat;
     return {};
 }
@@ -1710,6 +1717,30 @@ static std::string StripUeClassSuffix(std::string s)
     const std::string lower = ToLowerCopy(s);
     if (lower.rfind("default__", 0) == 0)
         s = s.substr(9);
+
+    // World Partition / UAID instance suffixes (help/esp.txt NormalizeClassName).
+    {
+        const std::string lo = ToLowerCopy(s);
+        const size_t uaid = lo.find("_uaid_");
+        if (uaid != std::string::npos)
+            s.resize(uaid);
+        // Trailing _<16 hex>
+        if (s.size() > 17) {
+            const size_t us = s.rfind('_');
+            if (us != std::string::npos && s.size() - us - 1 == 16) {
+                bool hex = true;
+                for (size_t i = us + 1; i < s.size(); ++i) {
+                    const char c = static_cast<char>(std::tolower(static_cast<unsigned char>(s[i])));
+                    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+                        hex = false;
+                        break;
+                    }
+                }
+                if (hex)
+                    s.resize(us);
+            }
+        }
+    }
     return s;
 }
 
@@ -2234,6 +2265,13 @@ std::string HumanizeActorFName(const std::string& actorFName)
         return {};
     if (FnameLooksLikeEngineSubobjectClass(actorFName))
         return {};
+
+    {
+        const std::string lower = ToLowerCopy(actorFName);
+        if (lower.find("da_oi_outfit") != std::string::npos
+            || lower.find("oi_outfit") != std::string::npos)
+            return {};
+    }
 
     std::string cleaned = StripUeClassSuffix(actorFName);
     StripEspFnamePrefixes(cleaned);

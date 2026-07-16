@@ -31,7 +31,8 @@ bool IsZeroWorldPos(const Vector3& pos)
     return pos.x == 0.0 && pos.y == 0.0 && pos.z == 0.0;
 }
 
-// Mid-raid pollution leaked into bot ESP (log sample ActorName "Camera").
+// Mid-raid pollution leaked into bot ESP (log: ActorName "GC Electrified",
+// Camera). GameplayCue / Niagara must never become bots.
 bool IsBotEspPollutionName(const std::string& s)
 {
     if (s.empty())
@@ -39,12 +40,19 @@ bool IsBotEspPollutionName(const std::string& s)
     std::string lower = s;
     for (char& c : lower)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower.rfind("gc_", 0) == 0 || lower.rfind("gc ", 0) == 0)
+        return true;
+    if (lower.rfind("ns_", 0) == 0)
+        return true;
     return lower.find("camera") != std::string::npos
         || lower.find("spectator") != std::string::npos
         || lower.find("playercontroller") != std::string::npos
         || lower.find("cheatmanager") != std::string::npos
         || lower.find("debug") != std::string::npos
-        || lower.find("widget") != std::string::npos;
+        || lower.find("widget") != std::string::npos
+        || lower.find("gameplaycue") != std::string::npos
+        || lower.find("niagara") != std::string::npos
+        || lower.find("electrified") != std::string::npos;
 }
 
 bool IsMislabeledLootName(const std::string& label, const std::string& fname)
@@ -99,9 +107,14 @@ std::string FinalizeBotAdmissionLabel(
     if (!label.empty() && IsWorldEspLabel(label))
         label.clear();
 
-    if (!label.empty() && !isBotEntry && !IsAcceptedBotEspLabel(engine, label, fname))
+    if (!label.empty() && IsBotEspPollutionName(label))
+        label.clear();
+
+    // Always require accepted robot-list labels (even for struct bots).
+    if (!label.empty() && !IsAcceptedBotEspLabel(engine, label, fname))
         return {};
 
+    (void)isBotEntry;
     return label;
 }
 
@@ -333,7 +346,7 @@ bool QuickBotCandidate(uintptr_t actor)
         return false;
     };
 
-    // Cached fname first (cheap). Fresh snitch spawns often miss the cache �
+    // Cached fname first (cheap). Fresh snitch spawns often miss the cache —
     // decrypt once so QuickBot does not skip actors Verify would accept.
     const std::string fnameCached = engine.GetActorFNameStringCached(actor);
     if (fnameLooksLikeBot(fnameCached))
@@ -343,6 +356,13 @@ bool QuickBotCandidate(uintptr_t actor)
         if (fnameLooksLikeBot(fname))
             return true;
     }
+    // Class FName (C_LightDrone / C_SnitchBot) — sky-drop spawns often have
+    // class before instance fname decrypts.
+    const std::string classFn = engine.GetActorClassFName(actor);
+    if (fnameLooksLikeBot(classFn))
+        return true;
+    if (!LookupBotClassToken(classFn).empty())
+        return true;
 
     return false;
 }
@@ -1335,9 +1355,31 @@ void Engine::RobotList()
                          + (actor.WorldPos.z - cam.Location.z) * (actor.WorldPos.z - cam.Location.z)))
                        / 100.0f)
                     : -1.f;
+                // #region agent log
                 if (approxDistM >= 0.f && approxDistM <= 12.f) {
-
+                    static auto s_lastNearVis = std::chrono::steady_clock::time_point{};
+                    const auto nowVis = std::chrono::steady_clock::now();
+                    if (s_lastNearVis.time_since_epoch().count() == 0
+                        || nowVis - s_lastNearVis >= std::chrono::milliseconds(200)) {
+                        s_lastNearVis = nowVis;
+                        std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+                        if (f) {
+                            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count();
+                            const int misses = static_cast<int>(s_botVisualMisses[key]);
+                            f << "{\"sessionId\":\"c190fb\",\"runId\":\"near-bot\",\"hypothesisId\":\"H2\""
+                              << ",\"location\":\"RobotList.cpp:visSkip\",\"message\":\"near_bot_vis_miss\""
+                              << ",\"data\":{\"key\":" << key
+                              << ",\"distM\":" << approxDistM
+                              << ",\"misses\":" << misses
+                              << ",\"hasPos\":" << (IsPlausibleWorldPos(actor.WorldPos) ? 1 : 0)
+                              << ",\"broken\":" << static_cast<int>(broken)
+                              << ",\"name\":\"" << actor.ActorName << "\""
+                              << "},\"timestamp\":" << ms << "}\n";
+                        }
+                    }
                 }
+                // #endregion
                 if (BotVisualMissShouldEvict(key, false)) {
                     ClearBotVisualMiss(key);
                     it = localCache.erase(it);
@@ -1430,6 +1472,51 @@ void Engine::RobotList()
             << " sceneFail=" << dbgScenePosFail
             << " enemyCount=" << dbgEnemyCount
             << std::endl;
+        // #region agent log
+        {
+            int nearCache = 0;
+            int nearDraw = 0;
+            int nearDead = 0;
+            for (const auto& [rk, re] : robotCache) {
+                if (!IsPlausibleWorldPos(re.WorldPos))
+                    continue;
+                const float dm = static_cast<float>(std::sqrt(
+                    (re.WorldPos.x - cam.Location.x) * (re.WorldPos.x - cam.Location.x)
+                  + (re.WorldPos.y - cam.Location.y) * (re.WorldPos.y - cam.Location.y)
+                  + (re.WorldPos.z - cam.Location.z) * (re.WorldPos.z - cam.Location.z))) / 100.f;
+                if (dm > 12.f)
+                    continue;
+                ++nearCache;
+                if (re.Drawing)
+                    ++nearDraw;
+                if (re.IsBreaked)
+                    ++nearDead;
+            }
+            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+            if (f) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"sessionId\":\"c190fb\",\"runId\":\"near-bot\",\"hypothesisId\":\"H1-H5\""
+                  << ",\"location\":\"RobotList.cpp:summary\",\"message\":\"near_bot_summary\""
+                  << ",\"data\":{\"scanned\":" << dbgScanned
+                  << ",\"admitted\":" << dbgAdmitted
+                  << ",\"drawing\":" << dbgDrawing
+                  << ",\"cache\":" << robotCache.size()
+                  << ",\"nearCache\":" << nearCache
+                  << ",\"nearDraw\":" << nearDraw
+                  << ",\"nearDead\":" << nearDead
+                  << ",\"visSkip\":" << dbgVisSkip
+                  << ",\"verifyFail\":" << dbgVerifyFail
+                  << ",\"structHit\":" << dbgStructHit
+                  << ",\"quickPass\":" << dbgQuickPass
+                  << ",\"fnameHit\":" << dbgFnameHit
+                  << ",\"zeroPos\":" << dbgZeroPos
+                  << ",\"showRobots\":" << (var::showRobots ? 1 : 0)
+                  << ",\"enemyCount\":" << dbgEnemyCount
+                  << "},\"timestamp\":" << ms << "}\n";
+            }
+        }
+        // #endregion
     }
 }
 

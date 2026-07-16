@@ -585,14 +585,18 @@ uintptr_t ResolvePreferredHeldItemActor(uintptr_t pawn)
     if (!pawn)
         return 0;
 
-    // (1) Inventory CurrentItemActors[0] — local + remotes when replicated.
+    // (1) Inventory CurrentItemActors[0] — replicated; LocalCurrentItemActors for self.
     const uintptr_t inv =
         Memory::read<uintptr_t>(pawn + Offsets::InventoryComponent);
     if (inv && engine.IsValidPointer(inv)) {
-        const uint64_t data =
-            Memory::read<uint64_t>(inv + Offsets::LocalCurrentItemActors);
-        const int32_t count =
-            Memory::read<int32_t>(inv + Offsets::LocalCurrentItemActors + 0x8);
+        uint64_t data =
+            Memory::read<uint64_t>(inv + Offsets::CurrentItemActors);
+        int32_t count =
+            Memory::read<int32_t>(inv + Offsets::CurrentItemActors + 0x8);
+        if (!data || count <= 0) {
+            data = Memory::read<uint64_t>(inv + Offsets::LocalCurrentItemActors);
+            count = Memory::read<int32_t>(inv + Offsets::LocalCurrentItemActors + 0x8);
+        }
         if (data && count > 0 && count <= 64) {
             const uintptr_t item = Memory::read<uintptr_t>(data);
             // Inventory slot is authoritative for "in hand" — including BP_ItemActor
@@ -686,36 +690,32 @@ void CollectHeldItemActors(uintptr_t pawn, std::unordered_set<uintptr_t>& out)
     if (!pawn)
         return;
 
-    // (1) Local InventoryComponent item array — accurate for the LOCAL player.
+    // (1) CurrentItemActors (replicated) then LocalCurrentItemActors.
     const uintptr_t inv =
         Memory::read<uintptr_t>(pawn + Offsets::InventoryComponent);
     if (inv && engine.IsValidPointer(inv)) {
-        // FTArray at LocalCurrentItemActors: { void* Data; int32 Count; int32 Max; }
-        const uint64_t data =
-            Memory::read<uint64_t>(inv + Offsets::LocalCurrentItemActors);
-        const int32_t count =
-            Memory::read<int32_t>(inv + Offsets::LocalCurrentItemActors + 0x8);
-        if (data && count > 0 && count <= 64) {
+        auto collectFromArr = [&](std::ptrdiff_t arrOff) {
+            const uint64_t data = Memory::read<uint64_t>(inv + arrOff);
+            const int32_t count = Memory::read<int32_t>(inv + arrOff + 0x8);
+            if (!data || count <= 0 || count > 64)
+                return;
             for (int32_t i = 0; i < count; ++i) {
                 const uintptr_t item = Memory::read<uintptr_t>(
                     data + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
                 if (!item || !engine.IsValidPointer(item))
                     continue;
-                // Never blacklist floor/world harvest shells via inventory array
-                // if DMA ever aliases them — held weapons/use-items still exclude.
                 std::string cls = engine.GetActorClassFName(item);
                 if (cls.empty())
                     cls = engine.GetActorFNameStringCached(item);
                 if (!cls.empty() && FnameLooksLikeHarvestableActor(cls))
                     continue;
-                // Console+NDJSON proof: occupied_held skipped masked=0xC0000 keys
-                // (incl. CameraMgr) — LocalCurrentItemActors can alias floor loot /
-                // garbage pointers. Only blacklist real held/use actors.
                 if (ScoreHeldUseActor(item) < 0 && !IsHeldEquipmentActor(item))
                     continue;
                 out.insert(item);
             }
-        }
+        };
+        collectFromArr(Offsets::CurrentItemActors);
+        collectFromArr(Offsets::LocalCurrentItemActors);
     }
 
     // (2) Reverse Instigator/Owner index — covers REMOTE players' equipped and

@@ -5,8 +5,8 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
-#include <thread>
 #include <cstdint>
+#include <thread>
 
 namespace {
 
@@ -92,14 +92,8 @@ void MyMakcu::MoveBezier(int x, int y, uint32_t segments, int32_t ctrl_x, int32_
 void MyMakcu::LeftClick() {
     if (!g_device.isConnected())
         return;
-    // Device::click() sends press+release with no gap; many games ignore that as noise.
+    // Manual KmBox settings test only; aimbot has no auto-fire path.
     g_device.mouseDown(makcu::MouseButton::LEFT);
     std::this_thread::sleep_for(std::chrono::milliseconds(22));
     g_device.mouseUp(makcu::MouseButton::LEFT);
-}
-
-bool MyMakcu::IsPhysicalLeftDown() {
-    if (!g_device.isConnected())
-        return false;
-    return g_device.mouseButtonState(makcu::MouseButton::LEFT);
 }

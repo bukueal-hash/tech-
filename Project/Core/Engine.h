@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <limits>
 #include <random>
 #include <deque>
 #include <chrono>
@@ -54,6 +55,7 @@ public:
     struct WorldCacheEntry;
 
     // FStowedWeaponInfo — 0x40 bytes per stowed weapon slot in InventoryComponent
+    // (CL-1315578). Pack(1) without pad put WeaponQuality at +0x30 — wrong.
 #pragma pack(push, 1)
     struct StowedWeaponInfo {
         uint64_t Item = 0;              // +0x00 ItemBase*
@@ -62,13 +64,15 @@ public:
         uint64_t WeaponVisual = 0;      // +0x18 WeaponVisualsDataAsset*
         uint64_t QualityVisual = 0;     // +0x20 WeaponQualityVisualizationAsset*
         uint64_t WeaponVisualMods = 0;  // +0x28 FArrayProperty (ptr)
-        int32_t  WeaponQuality = 0;     // +0x38 int32 (0-3 = I-IV)
+        uint64_t _pad30 = 0;            // +0x30 pad → quality at +0x38
+        int32_t  WeaponQuality = 0;     // +0x38 int32 (0-3 = I–IV)
         uint8_t  bShouldBeStowed = 0;   // +0x3C
         uint8_t  bSlotHidden = 0;       // +0x3D
         uint8_t  bUsePrimary = 0;       // +0x3E
         uint8_t  WantedSlot = 0;        // +0x3F
     };
 #pragma pack(pop)
+    static_assert(sizeof(StowedWeaponInfo) == 0x40, "FStowedWeaponInfo must be 0x40");
 
     /** Try plaintext then decrypt_object_ptr for InventoryComponent chain. */
     static uintptr_t ResolveInventoryPtr(uintptr_t raw);
@@ -239,6 +243,8 @@ public:
     void SetProjectionViewport(float width, float height);
     Vector3 GetProjectionScreenCenter() const;
     bool RefreshCameraFromViewTarget();
+    /** Lean render-path POV: three nocache reads from stored PCM. No rediscovery. */
+    bool TryBuildCameraFromPcmPov(uintptr_t pcm, CameraCache& outCamera) const;
 
     struct CameraProbeSnapshot {
         char src[32]{};
@@ -960,31 +966,36 @@ public:
         return ptr > 0x10000 && ptr < 0x00007FFFFFFFFFFF;
     }
 
+    /** help/esp.txt: pawn+0xDC8 → HC, then HC+0x668 / HC+0x308 as double.
+     *  Use NOCACHE — cached Memory::read left HP stuck at 100% (same class of
+     *  bug as frozen remote positions before nocache). */
     static double ReadHealthComponentStat(uintptr_t actor, std::ptrdiff_t compOff)
     {
+        if (!actor)
+            return std::numeric_limits<double>::quiet_NaN();
         const uintptr_t health_comp =
-            Memory::read<uintptr_t>(actor + Offsets::HealthComponent);
+            Memory::read_nocache<uintptr_t>(actor + Offsets::HealthComponent);
         if (!health_comp || !IsPlausibleUsermodePtr(health_comp))
-            return 0.0;
-        const double value = Memory::read<double>(health_comp + compOff);
-        return std::isfinite(value) ? value : 0.0;
+            return std::numeric_limits<double>::quiet_NaN();
+        const double value = Memory::read_nocache<double>(health_comp + compOff);
+        if (!std::isfinite(value))
+            return std::numeric_limits<double>::quiet_NaN();
+        return value;
     }
 
-    /** PioneerPlayerState+0x530 is not HealthInfo — prefer HealthComponent always. */
+    /** PioneerPlayerState+0x530 is bIsInEncounter — never use as HP. */
     static double ReadPlayerStatWithHealthFallback(
         uintptr_t actor,
         std::ptrdiff_t psOff,
         std::ptrdiff_t compOff)
     {
+        (void)psOff;
         if (!actor)
             return 0.0;
 
         const double hcValue = ReadHealthComponentStat(actor, compOff);
-        if (std::isfinite(hcValue))
+        if (std::isfinite(hcValue) && hcValue >= 0.0 && hcValue < 100000.0)
             return hcValue;
-
-        // HC missing only — do not trust PS+0x530 as live HP on Pioneer.
-        (void)psOff;
         return 0.0;
     }
 
@@ -1004,14 +1015,16 @@ public:
     {
         if (!actor)
             return 0.0;
-        return ReadHealthComponentStat(actor, Offsets::Shield);
+        const double v = ReadHealthComponentStat(actor, Offsets::Shield);
+        return std::isfinite(v) ? v : 0.0;
     }
 
     double get_maxarmor(uintptr_t actor)
     {
         if (!actor)
             return 0.0;
-        return ReadHealthComponentStat(actor, Offsets::ShieldMax);
+        const double v = ReadHealthComponentStat(actor, Offsets::ShieldMax);
+        return std::isfinite(v) ? v : 0.0;
     }
 
     struct PlayerHealthInfo {
@@ -1035,12 +1048,14 @@ public:
         if (!inventoryComponent)
             return 0;
 
-        FTArrayRaw LocalCurrentItemActors = Memory::read<FTArrayRaw>(inventoryComponent + Offsets::LocalCurrentItemActors);
-
-        if (!LocalCurrentItemActors.Data || LocalCurrentItemActors.Count <= 0)
+        // Prefer replicated CurrentItemActors (remotes); fall back to local array.
+        FTArrayRaw items = Memory::read<FTArrayRaw>(inventoryComponent + Offsets::CurrentItemActors);
+        if (!items.Data || items.Count <= 0)
+            items = Memory::read<FTArrayRaw>(inventoryComponent + Offsets::LocalCurrentItemActors);
+        if (!items.Data || items.Count <= 0)
             return 0;
 
-        return Memory::read<uintptr_t>(LocalCurrentItemActors.Data);
+        return Memory::read<uintptr_t>(items.Data);
     }
 
     int GetWeaponQuality(uintptr_t actor) {
@@ -1049,7 +1064,9 @@ public:
         if (!inventoryComponent)
             return -1;
 
-        FTArrayRaw itemArray = Memory::read<FTArrayRaw>(inventoryComponent + Offsets::LocalCurrentItemActors);
+        FTArrayRaw itemArray = Memory::read<FTArrayRaw>(inventoryComponent + Offsets::CurrentItemActors);
+        if (!itemArray.Data || itemArray.Count <= 0)
+            itemArray = Memory::read<FTArrayRaw>(inventoryComponent + Offsets::LocalCurrentItemActors);
 
         if (!itemArray.Data || itemArray.Count <= 0 || itemArray.Count > 100)
             return -1;

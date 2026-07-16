@@ -329,9 +329,54 @@ static bool ResolveLiveRenderCamera(
     const Engine::EspRenderFrame& frame,
     Engine::CameraCache& outCam)
 {
-    // Live POV (refreshed on the render path) first — left-stick move updates
-    // camera Location; right-stick look updates Rotation. Stale frame.camera made
-    // walk-tracking lag while look still "stuck" to the overlay.
+    // Per-paint POV from stored PCM — kills right-stick look-drag caused by
+    // 16ms-old g_Camera. No PCM rediscovery; no entity-position scatter.
+    // Clamped yaw/pitch extrapolate bridges residual DMA latency.
+    static Engine::CameraCache s_prevCam{};
+    static bool s_prevOk = false;
+    static auto s_prevTp = std::chrono::steady_clock::time_point{};
+
+    auto applyRotExtrap = [&](Engine::CameraCache& cam) {
+        const auto now = std::chrono::steady_clock::now();
+        const Engine::CameraCache raw = cam;
+        if (s_prevOk) {
+            const float dtSec = std::chrono::duration<float>(now - s_prevTp).count();
+            if (dtSec > 0.0005f && dtSec < 0.05f) {
+                const float dyaw = static_cast<float>(
+                    raw.Rotation.y - s_prevCam.Rotation.y);
+                const float dpitch = static_cast<float>(
+                    raw.Rotation.x - s_prevCam.Rotation.x);
+                // Assume sample is ~half a frame late; push rotation forward.
+                constexpr float kLead = 0.5f;
+                constexpr float kMaxDeg = 3.5f;
+                float leadYaw = dyaw * kLead;
+                float leadPitch = dpitch * kLead;
+                if (leadYaw > kMaxDeg) leadYaw = kMaxDeg;
+                else if (leadYaw < -kMaxDeg) leadYaw = -kMaxDeg;
+                if (leadPitch > kMaxDeg) leadPitch = kMaxDeg;
+                else if (leadPitch < -kMaxDeg) leadPitch = -kMaxDeg;
+                cam.Rotation.y += leadYaw;
+                cam.Rotation.x += leadPitch;
+            }
+        }
+        s_prevCam = raw;
+        s_prevOk = true;
+        s_prevTp = now;
+    };
+
+    {
+        const uintptr_t pcm = engine.PlayerCameraManager;
+        Engine::CameraCache live{};
+        if (engine.TryBuildCameraFromPcmPov(pcm, live) && CameraOkForEsp(live)) {
+            applyRotExtrap(live);
+            {
+                std::unique_lock<std::shared_mutex> lock(engine.m_cameraMutex);
+                engine.g_Camera = live;
+            }
+            outCam = live;
+            return true;
+        }
+    }
     {
         std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
         if (CameraOkForEsp(engine.g_Camera)) {
@@ -1174,13 +1219,59 @@ static void RenderRobotEspFromFrame(
 
         Vector3 headWorld{};
         Vector3 feetWorld{};
-        if (!EspDraw::ResolveBotHeadFeetWorld(drawEntry, headWorld, feetWorld))
+        if (!EspDraw::ResolveBotHeadFeetWorld(drawEntry, headWorld, feetWorld)) {
+            // #region agent log
+            if (distM <= 12.f) {
+                static auto s_lastHf = std::chrono::steady_clock::time_point{};
+                const auto nowHf = std::chrono::steady_clock::now();
+                if (s_lastHf.time_since_epoch().count() == 0
+                    || nowHf - s_lastHf >= std::chrono::milliseconds(250)) {
+                    s_lastHf = nowHf;
+                    std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+                    if (f) {
+                        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"near-bot\",\"hypothesisId\":\"H4\""
+                          << ",\"location\":\"Esp.cpp:RenderRobot\",\"message\":\"near_bot_headfeet_fail\""
+                          << ",\"data\":{\"key\":" << key
+                          << ",\"distM\":" << distM
+                          << ",\"drawing\":" << (robot.Drawing ? 1 : 0)
+                          << ",\"name\":\"" << robot.ActorName << "\""
+                          << "},\"timestamp\":" << ms << "}\n";
+                    }
+                }
+            }
+            // #endregion
             continue;
+        }
 
         ImVec2 head{};
         ImVec2 feet{};
-        if (!EspDraw::WorldToScreenBox(engine, frameCam, headWorld, feetWorld, head, feet))
+        if (!EspDraw::WorldToScreenBox(engine, frameCam, headWorld, feetWorld, head, feet)) {
+            // #region agent log
+            if (distM <= 12.f) {
+                static auto s_lastW2s = std::chrono::steady_clock::time_point{};
+                const auto nowW2s = std::chrono::steady_clock::now();
+                if (s_lastW2s.time_since_epoch().count() == 0
+                    || nowW2s - s_lastW2s >= std::chrono::milliseconds(250)) {
+                    s_lastW2s = nowW2s;
+                    std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+                    if (f) {
+                        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"near-bot\",\"hypothesisId\":\"H4\""
+                          << ",\"location\":\"Esp.cpp:RenderRobot\",\"message\":\"near_bot_w2s_fail\""
+                          << ",\"data\":{\"key\":" << key
+                          << ",\"distM\":" << distM
+                          << ",\"camFov\":" << frameCam.FOV
+                          << ",\"name\":\"" << robot.ActorName << "\""
+                          << "},\"timestamp\":" << ms << "}\n";
+                    }
+                }
+            }
+            // #endregion
             continue;
+        }
 
         const ImU32 color = BotEspColor(robot.isVisible, robot.IsBreaked);
         const float boxH = feet.y - head.y;
@@ -1212,10 +1303,33 @@ static void RenderRobotEspFromFrame(
                     botLabel = fromEnemy;
             }
         }
-        // Impostors with no name stay hidden. Class bots may draw box/heart while
-        // the label decrypts (never ARC/Bot/Oil placeholders).
-        if (botLabel.empty() && !ArcActorType::IsAnyBotActor(key)) {
+        // No real name → no ESP (heart/dist alone = ghost bots; log GC Electrified).
+        // Never use ARC/Bot/Oil placeholders. IsAnyBotActor alone is not enough.
+        if (botLabel.empty() || !IsAcceptedBotEspLabel(engine, botLabel, fname)) {
             RecordBotDrawLabelMiss();
+            // #region agent log
+            if (distM <= 12.f) {
+                static auto s_lastLbl = std::chrono::steady_clock::time_point{};
+                const auto nowLbl = std::chrono::steady_clock::now();
+                if (s_lastLbl.time_since_epoch().count() == 0
+                    || nowLbl - s_lastLbl >= std::chrono::milliseconds(250)) {
+                    s_lastLbl = nowLbl;
+                    std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+                    if (f) {
+                        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"bot-gate\",\"hypothesisId\":\"GHOST\""
+                          << ",\"location\":\"Esp.cpp:RenderRobot\",\"message\":\"near_bot_label_skip\""
+                          << ",\"data\":{\"key\":" << key
+                          << ",\"distM\":" << distM
+                          << ",\"actorName\":\"" << robot.ActorName << "\""
+                          << ",\"fname\":\"" << fname << "\""
+                          << ",\"anyBot\":" << (ArcActorType::IsAnyBotActor(key) ? 1 : 0)
+                          << "},\"timestamp\":" << ms << "}\n";
+                    }
+                }
+            }
+            // #endregion
             continue;
         }
         if (!EspDraw::IsEspBoxOnScreen(head, feet))

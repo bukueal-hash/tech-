@@ -535,11 +535,6 @@ void DrawArcAimbotTab()
 {
     ArcMenuLayout::Checkbox("Enable Aimbot", &var::enable_aimbot);
     ArcMenuHoverTooltip("KmBox hardware aim — requires MAKCU or Net device connected.");
-    if (g_kmbox.FiringProxyAvailable()) {
-        ArcMenuLayout::Checkbox("Triggerbot", &var::enable_triggerbot);
-        ArcMenuHoverTooltip(
-            "When locked and on-target, send LeftClick via hardware. Skips if physical LMB already down.");
-    }
     if (ArcMenuLayout::Checkbox("Robot aim", &var::robotAimEnabled))
         RequestArcSlowCache();
     ArcMenuHoverTooltip("Aim at robots (works without Show robots on Visuals).");

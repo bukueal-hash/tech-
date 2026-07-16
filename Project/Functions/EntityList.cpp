@@ -512,6 +512,52 @@ void Engine::EntityList()
         }
     }
 
+    // U8: all-Levels BP_PioneerCharacter_C class FName backup when GS/PS chase missed.
+    for (uint64_t actorU64 : currentActors) {
+        const uintptr_t actor = static_cast<uintptr_t>(actorU64);
+        if (!actor || actor == sAcknowledgedPawn || localCache.contains(actor))
+            continue;
+        const std::string classFname = GetActorClassFName(actor);
+        if (classFname.empty())
+            continue;
+        std::string cl = classFname;
+        for (char& c : cl)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (cl.find("pioneercharacter") == std::string::npos
+            && cl.find("bp_pioneercharacter") == std::string::npos)
+            continue;
+
+        uintptr_t playerState = 0;
+        bool viaActorType = false;
+        TryResolvePlayerStateAny(actor, playerState, viaActorType);
+        if (localPlayerState && playerState == localPlayerState)
+            continue;
+        if (playerState && PlayerStateIsBot(playerState))
+            continue;
+
+        const uintptr_t root =
+            Memory::read<uintptr_t>(actor + Offsets::RootComponent);
+        if (!root)
+            continue;
+        const uintptr_t mesh =
+            Memory::read<uintptr_t>(actor + Offsets::USkeletalMeshComponent);
+        const uintptr_t charMesh = ResolvePlayerSkeletalMesh(actor);
+        if (!charMesh && !mesh)
+            continue;
+
+        const std::string playerName =
+            playerState ? GetPlayerName(playerState, actor) : std::string("Player");
+        auto [it, inserted] = localCache.emplace(
+            actor,
+            PlayerCacheEntry(
+                playerName.c_str(), root, actor, charMesh ? charMesh : mesh));
+        if (inserted) {
+            it->second.actorState = playerState;
+            ++dbgAdmitted;
+            ++dbgActorTypeAdmit;
+        }
+    }
+
     dbgPreAdmit = static_cast<int>(localCache.size());
 
     const uint8_t myTeamId =
@@ -640,6 +686,44 @@ void Engine::EntityList()
         actor.maxhealth = static_cast<float>(get_maxhealth(key));
         actor.shield = static_cast<float>(get_armor(key));
         actor.maxshield = static_cast<float>(get_maxarmor(key));
+
+        // #region agent log
+        {
+            static auto s_lastHpLog = std::chrono::steady_clock::time_point{};
+            static uintptr_t s_lastHpKey = 0;
+            const auto nowHp = std::chrono::steady_clock::now();
+            const bool forceKey = (key != s_lastHpKey);
+            if (actor.Drawing
+                && (forceKey
+                    || s_lastHpLog.time_since_epoch().count() == 0
+                    || nowHp - s_lastHpLog >= std::chrono::milliseconds(400))) {
+                s_lastHpLog = nowHp;
+                s_lastHpKey = key;
+                const uintptr_t hc = Memory::read_nocache<uintptr_t>(
+                    key + Offsets::HealthComponent);
+                float pct = -1.f;
+                if (actor.maxhealth >= 1.f)
+                    pct = 100.f * (actor.health / actor.maxhealth);
+                std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+                if (f) {
+                    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"hp-nocache\",\"hypothesisId\":\"HP1\""
+                      << ",\"location\":\"EntityList.cpp:health\",\"message\":\"player_health\""
+                      << ",\"data\":{\"pawn\":" << key
+                      << ",\"hc\":" << hc
+                      << ",\"hcOk\":" << (hc && Memory::IsValidPtrFast2(hc) ? 1 : 0)
+                      << ",\"hp\":" << actor.health
+                      << ",\"maxHp\":" << actor.maxhealth
+                      << ",\"armor\":" << actor.shield
+                      << ",\"maxArmor\":" << actor.maxshield
+                      << ",\"pct\":" << pct
+                      << ",\"dist\":" << actor.Distance
+                      << "},\"timestamp\":" << ms << "}\n";
+                }
+            }
+        }
+        // #endregion
 
         // Read weapon system from InventoryComponent (stowed slots + equipped + armor)
         std::string invWeapon, invStowed0, invStowed1;

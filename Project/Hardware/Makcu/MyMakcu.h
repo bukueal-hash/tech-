@@ -14,6 +14,4 @@ struct MyMakcu {
     /// Cubic-style curved move with one control point (see makcu::Device::mouseMoveBezier).
     static void MoveBezier(int x, int y, uint32_t segments, int32_t ctrl_x, int32_t ctrl_y);
     static void LeftClick();
-    /** Physical LMB state (requires button monitoring on device). */
-    static bool IsPhysicalLeftDown();
 };

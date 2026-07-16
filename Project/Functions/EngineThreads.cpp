@@ -26,12 +26,12 @@ void Engine::StartWorkerThreads()
             return;
         ContainerList();
         ItemList();
-    }, 50);
+    }, 16);
     m_positionThread = std::make_unique<SyncedThread>([this] {
         if (!IsEspRaidActive())
             return;
         PositionRefreshPass();
-    }, 20);
+    }, 16);
     m_frameBuilderThread = std::make_unique<SyncedThread>([this] {
         if (!IsEspRaidActive())
             return;
@@ -41,7 +41,7 @@ void Engine::StartWorkerThreads()
         if (!IsEspRaidActive() || showmenu)
             return;
         AimAssistence();
-    }, 8);
+    }, 4);
 }
 
 void Engine::StopWorkerThreads()

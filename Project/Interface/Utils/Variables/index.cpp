@@ -30,7 +30,6 @@ namespace var {
 
     /* Aimbot */
     bool enable_aimbot = false;
-    bool enable_triggerbot = false;
     bool robotAimEnabled = false;
     int aim_hold_key = 0x10; // VK_SHIFT
     AimBoneMode aim_bone_mode = AimBoneMode::Chest;

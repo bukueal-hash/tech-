@@ -39,10 +39,6 @@ public:
     void MoveSmooth(int x, int y, uint32_t segments);
     void MoveBezier(int x, int y, uint32_t segments, int32_t ctrl_x, int32_t ctrl_y);
     void LeftClick();
-    /** Physical LMB from KmBox/MAKCU monitor path; false if device not ready. */
-    bool IsPhysicalLeftDown() const;
-    /** True when hardware can report physical mouse buttons. */
-    bool FiringProxyAvailable() const;
     void moveTest();
     void fireTest();
 

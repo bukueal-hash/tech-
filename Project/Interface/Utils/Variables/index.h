@@ -63,7 +63,6 @@ namespace var {
 
     /* Aimbot */
     extern bool enable_aimbot;
-    extern bool enable_triggerbot;
     extern bool robotAimEnabled;
     extern int aim_hold_key;
     extern AimBoneMode aim_bone_mode;

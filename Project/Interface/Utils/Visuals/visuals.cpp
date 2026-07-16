@@ -698,9 +698,13 @@ float Visuals::HealthShieldBarsAboveHead(
 {
     const float z = scale.espScale > 0.f ? scale.espScale : 1.f;
 
-    int healthPct = static_cast<int>(std::round(
-        100.f * std::clamp(health / std::max(maxHealth, 1.f), 0.f, 1.f)));
-    healthPct = std::clamp(healthPct, 0, 100);
+    int healthPct = 0;
+    if (maxHealth >= 1.f && health >= 0.f) {
+        healthPct = static_cast<int>(std::round(
+            100.f * std::clamp(health / maxHealth, 0.f, 1.f)));
+        healthPct = std::clamp(healthPct, 0, 100);
+    }
+    // maxHealth < 1 → invalid read; do NOT treat as 100% (was health/max(0,1)).
 
     int shieldHeal = static_cast<int>(std::round(std::max(0.f, shield)));
     int shieldMax = static_cast<int>(std::round(std::max(0.f, maxShield)));

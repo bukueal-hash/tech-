@@ -163,24 +163,28 @@ namespace Offsets {
     constexpr std::ptrdiff_t CharacterMovement = 0x438;
     constexpr std::ptrdiff_t Velocity = 0x1A8;
     constexpr std::ptrdiff_t PioneerCharacterMovement = 0xb38;
-    constexpr std::ptrdiff_t HealthComponent = 0xDC8;
+    constexpr std::ptrdiff_t HealthComponent = 0xDC8; // PioneerPlayerCharacter (help/esp.txt + SDK)
     constexpr std::ptrdiff_t InventoryComponent = 0xCA0; // PioneerPlayerCharacter; 0xCB0 is FieldSalvagingComponent
 
+    // PioneerPlayerState+0x530 is bIsInEncounter — NOT health. Keep names for legacy
+    // call sites; get_health() must use HealthComponent only.
     constexpr std::ptrdiff_t HealthInfo = 0x530;
     constexpr std::ptrdiff_t PlayerState_Health = HealthInfo;
-    constexpr std::ptrdiff_t PlayerState_MaxHealth = 0x538;
+    constexpr std::ptrdiff_t PlayerState_MaxHealth = 0x538; // SDK: PioneerCharacter* — not max HP
     constexpr std::ptrdiff_t PlayerState_Armor = 0x540;
-    constexpr std::ptrdiff_t PlayerState_MaxArmor = 0x548; // same slot as PlayerStatus — armor readers use this name (#22)
-    constexpr std::ptrdiff_t Health = 0x668;  // HealthComponent::CachedHealth (SDK-confirmed)
-    constexpr std::ptrdiff_t MaxHealth = 0x308;
+    constexpr std::ptrdiff_t PlayerState_MaxArmor = 0x548;
+    constexpr std::ptrdiff_t Health = 0x668;  // HealthComponent::CachedHealth (double; help/esp.txt)
+    constexpr std::ptrdiff_t MaxHealth = 0x308; // HealthComponent::MaxHealth (double; help/esp.txt)
     constexpr std::ptrdiff_t Shield = 0x150;     // ArmorSlot.Health (SDK-confirmed)
     constexpr std::ptrdiff_t ShieldMax = 0x160; // ArmorSlot.CurrentMaxArmor (SDK-confirmed)
     constexpr std::ptrdiff_t MaxDBNO = 0x2E8;
     constexpr std::ptrdiff_t TeamID = 0x812;
 
-    // CurrentItemActors (replicated) — LocalCurrentItemActors@0x4D0 is empty for remotes.
-    constexpr std::ptrdiff_t LocalCurrentItemActors = 0x4B0;
-    constexpr std::ptrdiff_t EquippedPrimaryItem = 0x520;
+    // InventoryComponent item arrays (CL-1315578 weapon guide).
+    // CurrentItemActors @ 0x4B0 is replicated (use for remotes). Local @ 0x4D0 is local-only.
+    constexpr std::ptrdiff_t CurrentItemActors = 0x4B0;
+    constexpr std::ptrdiff_t LocalCurrentItemActors = 0x4D0;
+    constexpr std::ptrdiff_t EquippedPrimaryItem = 0x510; // was wrongly 0x520
     constexpr std::ptrdiff_t WeaponQuality = 0x472;
 
     // Stowed weapon slots in InventoryComponent (each FStowedWeaponInfo, 0x40 bytes)

@@ -46,6 +46,27 @@ bool IsPlausibleWorldPosD(const Engine::FVector3d& p)
 	});
 }
 
+/** help/esp.txt: live POV FOV in (1,170) and non-trivial location. */
+bool PcmLivePovLooksSane(uintptr_t pcm)
+{
+	if (!pcm || !Memory::IsValidPtrFast2(pcm))
+		return false;
+	const uintptr_t povBase = pcm + Offsets::ViewTarget + Offsets::ViewTargetPOV;
+	const float fov = Memory::read_nocache<float>(povBase + Offsets::CameraPOV_FOV);
+	if (!(fov > 1.f && fov < 170.f)) {
+		const float defFov = Memory::read<float>(pcm + Offsets::DefaultFOV);
+		if (!(defFov > 1.f && defFov < 179.f))
+			return false;
+	}
+	const Engine::FVector3d loc =
+		Memory::read_nocache<Engine::FVector3d>(povBase + Offsets::CameraPOV_Location);
+	if (!IsPlausibleWorldPosD(loc))
+		return false;
+	if (std::fabs(loc.x) < 100.0 && std::fabs(loc.y) < 100.0)
+		return false;
+	return true;
+}
+
 bool IsPlausibleRotation(const Engine::FVector3d& rot)
 {
 	if (!std::isfinite(rot.x) || !std::isfinite(rot.y) || !std::isfinite(rot.z))
@@ -332,8 +353,41 @@ bool Engine::RefreshCameraFromViewTarget()
 	return true;
 }
 
-// Worker threads should not call this (race with Update). RenderEsp uses
-// ResolveLiveRenderCamera (g_Camera from Update / frame.camera) — no per-paint DMA.
+bool Engine::TryBuildCameraFromPcmPov(uintptr_t pcm, CameraCache& outCamera) const
+{
+	if (!pcm || !IsValidPointer(pcm))
+		return false;
+
+	const uintptr_t povBase =
+		pcm + Offsets::ViewTargetTarget + Offsets::ViewTargetPOV;
+	const FVector3d povLoc =
+		Memory::read_nocache<FVector3d>(povBase + Offsets::CameraLocation);
+	const FVector3d povRot =
+		Memory::read_nocache<FVector3d>(povBase + Offsets::CameraRotation);
+	const float povFov =
+		Memory::read_nocache<float>(povBase + Offsets::CameraFOV);
+	const float defFov =
+		Memory::read_nocache<float>(pcm + Offsets::DefaultFOV);
+
+	Vector3 unusedPawn{};
+	Vector3 unusedCtrl{};
+	return BuildCameraCacheFromPovReads(
+		true,
+		povFov,
+		defFov,
+		0.f,
+		povLoc,
+		povRot,
+		unusedPawn,
+		false,
+		unusedCtrl,
+		false,
+		outCamera,
+		nullptr);
+}
+
+// Worker camera refresh (Update thread). RenderEsp also reads POV per-paint via
+// TryBuildCameraFromPcmPov inside ResolveLiveRenderCamera — keep this as fallback.
 void Engine::UpdateCamera()
 {
 	RefreshCameraFromViewTarget();
@@ -839,6 +893,34 @@ bool Engine::ResolvePcFromLevelCameraManager(
     uintptr_t& outPawn,
     uintptr_t& outPcm)
 {
+    // Prefer all-Levels FName PCM path (help/esp.txt). Fall back to single-level
+    // scan only when CollectLevelActors is unavailable.
+    {
+        uintptr_t gworld = 0;
+        uintptr_t persistent = 0;
+        {
+            std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+            gworld = GWorld;
+            persistent = PersistentLevel;
+        }
+        const uintptr_t pcm = GetCameraManagerFromActors();
+        if (pcm) {
+            const uintptr_t owner = Memory::read<uintptr_t>(pcm + Offsets::PCOwner);
+            if (owner && Memory::IsValidPtrFast2(owner)) {
+                const uintptr_t pawn =
+                    Memory::read<uintptr_t>(owner + Offsets::AcknowledgedPawn);
+                if (pawn && Memory::IsValidPtrFast2(pawn) && PawnHasWorldPosition(pawn)) {
+                    outPc = owner;
+                    outPawn = pawn;
+                    outPcm = pcm;
+                    return true;
+                }
+            }
+        }
+        (void)gworld;
+        (void)persistent;
+    }
+
     if (!level || !actorsData)
         return false;
 
@@ -848,54 +930,37 @@ bool Engine::ResolvePcFromLevelCameraManager(
         return false;
 
     const int scanLimit = (actorCount < 10000) ? actorCount : 10000;
-    const bool fnameReady = InitConsts();
+    if (!InitConsts())
+        return false;
 
-    auto tryCandidate = [&](uintptr_t candidate, bool requireFName) -> bool {
+    for (int i = 0; i < scanLimit; ++i) {
+        const uintptr_t candidate = Memory::read<uintptr_t>(
+            resolvedActors + static_cast<size_t>(i) * sizeof(uintptr_t));
         if (!candidate || !Memory::IsValidPtrFast2(candidate))
-            return false;
+            continue;
 
-        if (requireFName) {
+        std::string cn = GetActorClassFName(candidate);
+        if (cn.find("PlayerCameraManager") == std::string::npos
+            && cn.find("CameraManager") == std::string::npos) {
             const std::string fname = GetActorFNameString(candidate);
             if (fname.find("PlayerCameraManager") == std::string::npos
                 && fname.find("CameraManager") == std::string::npos)
-                return false;
+                continue;
         }
+        if (!PcmLivePovLooksSane(candidate))
+            continue;
 
-        const float fov = Memory::read<float>(candidate + Offsets::DefaultFOV);
-        if (fov <= 1.f || fov >= 179.f)
-            return false;
-
-        // help/esp.txt: PCOwner @ 0x420 → AcknowledgedPawn (LP not required).
         const uintptr_t owner = Memory::read<uintptr_t>(candidate + Offsets::PCOwner);
         if (!owner || !Memory::IsValidPtrFast2(owner))
-            return false;
-
+            continue;
         const uintptr_t pawn = Memory::read<uintptr_t>(owner + Offsets::AcknowledgedPawn);
         if (!pawn || !Memory::IsValidPtrFast2(pawn) || !PawnHasWorldPosition(pawn))
-            return false;
+            continue;
 
         outPc = owner;
         outPawn = pawn;
         outPcm = candidate;
         return true;
-    };
-
-    // Pass 1 (preferred): FName PCM scan → PCOwner → AckPawn (help/esp.txt Step 4–5).
-    if (fnameReady) {
-        for (int i = 0; i < scanLimit; ++i) {
-            const uintptr_t candidate = Memory::read<uintptr_t>(
-                resolvedActors + static_cast<size_t>(i) * sizeof(uintptr_t));
-            if (tryCandidate(candidate, true))
-                return true;
-        }
-    }
-
-    // Pass 2: FOV structural fallback when FName is cold/unavailable.
-    for (int i = 0; i < scanLimit; ++i) {
-        const uintptr_t candidate = Memory::read<uintptr_t>(
-            resolvedActors + static_cast<size_t>(i) * sizeof(uintptr_t));
-        if (tryCandidate(candidate, false))
-            return true;
     }
 
     return false;
@@ -977,74 +1042,74 @@ bool Engine::ResolveLocalPlayerChainFromActors(uintptr_t persistentLevel, uintpt
 
 uintptr_t Engine::GetCameraManagerFromActors()
 {
-	// help/esp.txt Step 4: find PlayerCameraManager by FName; LP/GI may be encrypted.
-	// PCOwner@0x420 is used by callers to recover PC/AckPawn — do not require LP here.
+	// help/esp.txt: FName PCM over all Levels; LP not required; prefer PCOwner match;
+	// live POV FOV + location sanity (not DefaultFOV-only / FOV-scan).
 	uintptr_t pc = 0;
-	uintptr_t level = 0;
-	uintptr_t actorsData = 0;
+	uintptr_t gworld = 0;
+	uintptr_t persistent = 0;
 	{
 		std::shared_lock<std::shared_mutex> lock(m_stateMutex);
 		pc = PlayerController;
-		level = PersistentLevel;
-		actorsData = Actors;
+		gworld = GWorld;
+		persistent = PersistentLevel;
 	}
 
 	uintptr_t pcmDirect = 0;
 	if (pc) {
 		pcmDirect = Memory::read<uintptr_t>(pc + Offsets::APlayerCameraManager);
-		if (pcmDirect && IsValidPointer(pcmDirect)) {
-			const float fov = Memory::read<float>(pcmDirect + Offsets::DefaultFOV);
-			if (fov > 1.f && fov < 179.f)
-				return pcmDirect;
-		}
+		if (pcmDirect && IsValidPointer(pcmDirect)
+			&& PcmLivePovLooksSane(pcmDirect))
+			return pcmDirect;
 	}
 
-	if (!level || !actorsData)
+	std::vector<uint64_t> actors;
+	WorldScan::CollectLevelActors(gworld, persistent, actors);
+	if (actors.empty())
 		return pcmDirect && IsValidPointer(pcmDirect) ? pcmDirect : 0;
 
-	int actorCount = 0;
-	uintptr_t resolvedActors = 0;
-	if (!ResolveLevelActors(level, resolvedActors, actorCount))
-		return pcmDirect && IsValidPointer(pcmDirect) ? pcmDirect : 0;
-	if (resolvedActors != actorsData)
-		actorsData = resolvedActors;
-
-	const int scanLimit = (actorCount < 10000) ? actorCount : 10000;
 	const bool fnameReady = InitConsts();
+	uintptr_t ownedHit = 0;
 	uintptr_t fnameHit = 0;
 
-	for (int i = 0; i < scanLimit; ++i) {
-		const uintptr_t candidate = Memory::read<uintptr_t>(
-			actorsData + static_cast<size_t>(i) * sizeof(uintptr_t));
+	auto classOrInstanceIsPcm = [&](uintptr_t candidate) -> bool {
+		if (!fnameReady)
+			return false;
+		std::string cn = GetActorClassFName(candidate);
+		if (cn.find("PlayerCameraManager") != std::string::npos
+			|| cn.find("CameraManager") != std::string::npos)
+			return true;
+		const std::string fn = GetActorFNameString(candidate);
+		return fn.find("PlayerCameraManager") != std::string::npos
+			|| fn.find("CameraManager") != std::string::npos;
+	};
+
+	for (uint64_t a : actors) {
+		const uintptr_t candidate = static_cast<uintptr_t>(a);
 		if (!candidate || !IsValidPointer(candidate))
 			continue;
-
-		const float fov = Memory::read<float>(candidate + Offsets::DefaultFOV);
-		if (fov <= 1.f || fov >= 179.f)
+		if (!classOrInstanceIsPcm(candidate))
+			continue;
+		if (!PcmLivePovLooksSane(candidate))
 			continue;
 
-		if (pc) {
-			if (Memory::read<uintptr_t>(candidate + Offsets::PCOwner) == pc)
-				return candidate;
-		}
-
-		if (fnameReady && !fnameHit) {
-			const std::string fname = GetActorFNameString(candidate);
-			if (fname.find("PlayerCameraManager") != std::string::npos
-				|| fname.find("CameraManager") != std::string::npos) {
-				const uintptr_t owner =
-					Memory::read<uintptr_t>(candidate + Offsets::PCOwner);
-				if (owner && Memory::IsValidPtrFast2(owner))
-					fnameHit = candidate;
-			}
+		const uintptr_t owner =
+			Memory::read<uintptr_t>(candidate + Offsets::PCOwner);
+		if (pc && owner == pc)
+			return candidate;
+		if (owner && Memory::IsValidPtrFast2(owner)) {
+			if (!ownedHit)
+				ownedHit = candidate;
+		} else if (!fnameHit) {
+			fnameHit = candidate;
 		}
 	}
 
+	if (ownedHit)
+		return ownedHit;
 	if (fnameHit)
 		return fnameHit;
 	if (pcmDirect && IsValidPointer(pcmDirect))
 		return pcmDirect;
-
 	return 0;
 }
 
@@ -1057,19 +1122,22 @@ bool Engine::getAllowType(const std::string& actorName, int category) const
     if (robotsList.find(actorName) != robotsList.end())
         return wantBots;
 
-    // category 3: RobotList — Lookup fname/display maps first, then accepted labels.
+    // category 3: RobotList — only real robot-list names / fname maps.
+    // NEVER accept arbitrary strings via NormalizeBotDisplayName echo
+    // (that admitted "GC Electrified" as a bot — c190fb near_bot_w2s_fail).
     if (wantBots && category == 3) {
         if (actorName.empty())
             return false;
         if (actorName == kBotStructAdmissionToken)
             return true;
-        if (!LookupEnemyBotByFName(actorName).empty())
+        if (robotsList.find(actorName) != robotsList.end())
             return true;
-        if (robotsList.find(actorName) == robotsList.end()) {
-            const std::string fromDisplay = LookupEnemyBotDisplayLabel(actorName);
-            if (!fromDisplay.empty())
-                return true;
-        }
+        if (const std::string fromPat = LookupEnemyBotByFName(actorName); !fromPat.empty()
+            && robotsList.find(fromPat) != robotsList.end())
+            return true;
+        if (const std::string fromDisplay = LookupEnemyBotDisplayLabel(actorName);
+            !fromDisplay.empty() && robotsList.find(fromDisplay) != robotsList.end())
+            return true;
         return IsAcceptedBotEspLabel(
             *const_cast<Engine*>(this), actorName, std::string{});
     }
@@ -1475,6 +1543,14 @@ std::string GetActorDataAssetFName(uint64_t actor)
         std::string lower = name;
         for (char& c : lower)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        // Cosmetic outfit DAs (DA_OI_Outfit_*) are not floor-loot names — reading
+        // them produced "OI Outfit Agile Astronaut Color White" for Air Freshener.
+        if (lower.find("da_oi_outfit") != std::string::npos
+            || lower.find("oi_outfit") != std::string::npos
+            || lower.find("_outfit_") != std::string::npos
+            || lower.find("outfit_agile") != std::string::npos
+            || lower.find("outfit_abandoned") != std::string::npos)
+            return false;
         if (lower.find("da_item") != std::string::npos
             || lower.find("wid_") != std::string::npos
             || lower.find("bp_pickup") != std::string::npos)
@@ -1764,14 +1840,18 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
             outStowedQ1 = slot1.WeaponQuality + 1;
     }
 
-    // Read equipped primary item at +0x520
+    // Read equipped primary item at Inv+0x510 (CL-1315578).
     const uintptr_t eqRaw = Memory::read<uintptr_t>(invComp + Offsets::EquippedPrimaryItem);
     const uintptr_t equipped = ResolveInventoryPtr(eqRaw);
     if (equipped) {
         std::string eqName = GetActorFNameString(equipped);
         if (!eqName.empty()) {
             std::string stripped = eqName;
-            static const char* kPrefixes[] = { "BP_WeaponActor_", "BP_Weapon_", "BP_ItemActor_", "BP_Item_", "BP_WItem_", "BP_", "Default__" };
+            static const char* kPrefixes[] = {
+                "DA_WeaponItem_", "DA_ItemDataAsset_", "DA_Item_", "DA_",
+                "BP_WeaponActor_", "BP_Weapon_", "BP_ItemActor_", "BP_Item_",
+                "BP_WItem_", "BP_", "Default__"
+            };
             for (const char* p : kPrefixes) {
                 size_t len = std::strlen(p);
                 if (stripped.size() >= len && stripped.compare(0, len, p) == 0) {
@@ -1785,6 +1865,56 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
         }
     }
 
+    // Fallback: iterate CurrentItemActors TArray @ 0x4B0 (then Local @ 0x4D0).
+    if (outWeaponName.empty()
+        || outWeaponName == "Unarmed"
+        || outWeaponName.find("Unarmed") != std::string::npos) {
+        auto tryItemArray = [&](std::ptrdiff_t arrOff) {
+            const uint64_t data = Memory::read<uint64_t>(invComp + arrOff);
+            const int32_t count = Memory::read<int32_t>(invComp + arrOff + 0x8);
+            if (!data || count <= 0 || count > 64)
+                return;
+            for (int32_t i = 0; i < count; ++i) {
+                const uintptr_t itemActor = Memory::read<uintptr_t>(
+                    static_cast<uintptr_t>(data) + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
+                const uintptr_t resolved = ResolveInventoryPtr(itemActor);
+                if (!resolved)
+                    continue;
+                std::string nm = GetActorFNameString(resolved);
+                if (nm.empty())
+                    nm = GetActorClassFName(resolved);
+                if (nm.empty())
+                    continue;
+                std::string stripped = nm;
+                static const char* kPrefixes[] = {
+                    "BP_WeaponActor_", "BP_Weapon_", "BP_ItemActor_", "BP_Item_",
+                    "BP_WItem_", "BP_", "DA_WeaponItem_", "DA_Item_", "DA_", "Default__"
+                };
+                for (const char* p : kPrefixes) {
+                    size_t len = std::strlen(p);
+                    if (stripped.size() >= len && stripped.compare(0, len, p) == 0) {
+                        stripped = stripped.substr(len);
+                        break;
+                    }
+                }
+                if (stripped.size() > 2 && stripped.compare(stripped.size() - 2, 2, "_C") == 0)
+                    stripped.resize(stripped.size() - 2);
+                const std::string friendly = GetWeaponName(stripped.empty() ? nm : stripped);
+                if (friendly.empty() || friendly == "Unarmed"
+                    || friendly.find("Unarmed") != std::string::npos)
+                    continue;
+                outWeaponName = friendly;
+                const int q = GetWeaponQualityFromActor(resolved);
+                if (q >= 0 && q <= 3)
+                    outWeaponQuality = q + 1;
+                return;
+            }
+        };
+        tryItemArray(Offsets::CurrentItemActors);
+        if (outWeaponName.empty() || outWeaponName == "Unarmed")
+            tryItemArray(Offsets::LocalCurrentItemActors);
+    }
+
     // Match equipped name to stowed slots for quality
     if (!outWeaponName.empty()) {
         if (outWeaponName == outStowed0) outWeaponQuality = outStowedQ0;
@@ -1795,8 +1925,10 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
         const uintptr_t held = WorldScan::ResolvePreferredHeldItemActor(pawn);
         if (held) {
             outWeaponQuality = GetWeaponQualityFromActor(held);
-            if (outWeaponQuality >= 0 && outWeaponQuality <= 4)
-                outWeaponQuality += 1;  // 0-4 raw → 1-5 display
+            if (outWeaponQuality >= 0 && outWeaponQuality <= 3)
+                outWeaponQuality += 1;  // 0-3 → tier I-IV
+            else if (outWeaponQuality == 4)
+                outWeaponQuality = 4;
         }
     }
 
