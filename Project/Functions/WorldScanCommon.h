@@ -92,4 +92,19 @@ void RefreshWorldCacheRetainPositions(std::vector<WorldCacheRetainRow>& rows);
  */
 void DedupeWorldCacheByRoot(std::unordered_map<uintptr_t, Engine::WorldCacheEntry>& cache);
 
+/** EMA blend for aim/ESP velocity; zeros if |newVel| >= 3000 cm/s. */
+inline void BlendCachedVelocity(Vector3& cachedVelocity, const Vector3& newVel)
+{
+    const double mag2 = static_cast<double>(newVel.x) * newVel.x
+        + static_cast<double>(newVel.y) * newVel.y
+        + static_cast<double>(newVel.z) * newVel.z;
+    if (mag2 < (3000.0 * 3000.0)) {
+        cachedVelocity.x = cachedVelocity.x * 0.5f + newVel.x * 0.5f;
+        cachedVelocity.y = cachedVelocity.y * 0.5f + newVel.y * 0.5f;
+        cachedVelocity.z = cachedVelocity.z * 0.5f + newVel.z * 0.5f;
+    } else {
+        cachedVelocity = {};
+    }
+}
+
 } // namespace WorldScan

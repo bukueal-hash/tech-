@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "../Core/AgentLog.h"
 
 std::string ResolveBotTypeLabel(uintptr_t actor, const std::string& fname);
 
@@ -68,8 +69,6 @@ bool IsMislabeledLootName(const std::string& label, const std::string& fname)
     return LookupItemMeta(label, rarity, value);
 }
 
-std::string ResolveBotLabelFromFName(const std::string& name);
-std::string ResolveBotLabelFromActor(uintptr_t actor, const std::string& fnameHint);
 bool IsArcBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fnameHint);
 uintptr_t ResolveBotSceneRoot(uintptr_t actor);
 
@@ -118,32 +117,14 @@ std::string FinalizeBotAdmissionLabel(
     return label;
 }
 
-std::string ResolveBotLabelFromFName(const std::string& name)
-{
-    if (name.empty())
-        return {};
-    return ResolveRobotTypeFromFName(engine, name);
-}
-
-std::string ResolveBotLabelFromActor(uintptr_t actor, const std::string& fnameHint)
-{
-    // Single chain � same as draw/admission.
-    return ResolveBotTypeLabel(actor, fnameHint);
-}
-
 bool ActorHasKnownBotIdentity(uintptr_t actor, const std::string& fnameHint)
 {
-    return !ResolveBotLabelFromActor(actor, fnameHint).empty();
-}
-
-bool HasConstructableEnemyAsset(uintptr_t actor)
-{
-    return WorldScan::HasArcEnemyAssetPointer(actor);
+    return !ResolveBotTypeLabel(actor, fnameHint).empty();
 }
 
 bool HasVerifiedEnemyAsset(uintptr_t actor, const std::string& fname)
 {
-    if (!HasConstructableEnemyAsset(actor))
+    if (!WorldScan::HasArcEnemyAssetPointer(actor))
         return false;
     if (ActorHasKnownBotIdentity(actor, fname))
         return true;
@@ -170,17 +151,12 @@ bool IsVerifiedCachedBot(
     return false;
 }
 
-bool IsLikelyContainerActor(uintptr_t actor, const std::string& fname)
-{
-    return WorldScan::LooksLikeContainerActor(actor, fname);
-}
-
 bool IsLikelyWorldItemActor(uintptr_t actor)
 {
     if (!actor)
         return false;
 
-    if (HasConstructableEnemyAsset(actor))
+    if (WorldScan::HasArcEnemyAssetPointer(actor))
         return false;
 
     std::string fname = engine.GetActorFNameStringCached(actor);
@@ -230,7 +206,7 @@ bool QualifiesAsConstructableBot(uintptr_t actor, const std::string& fname)
     if (HasVerifiedEnemyAsset(actor, fname))
         return true;
 
-    if (IsLikelyContainerActor(actor, fname))
+    if (WorldScan::LooksLikeContainerActor(actor, fname))
         return false;
 
     if (IsLikelyWorldItemActor(actor))
@@ -399,8 +375,8 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
         const std::string classFname = engine.GetActorClassFName(actor);
         if (IsBotEspPollutionName(probe) || IsBotEspPollutionName(classFname))
             return false;
-        if (IsLikelyContainerActor(actor, probe)
-            || (!classFname.empty() && IsLikelyContainerActor(actor, classFname))
+        if (WorldScan::LooksLikeContainerActor(actor, probe)
+            || (!classFname.empty() && WorldScan::LooksLikeContainerActor(actor, classFname))
             || (!probe.empty() && FnameLooksLikeWorldContainer(probe))
             || (!classFname.empty() && FnameLooksLikeWorldContainer(classFname)))
             return false;
@@ -419,7 +395,7 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
     //     ground boxes and containers OUT � they never reach the bot cache.
     if (HasWorldItemStructure(actor))
         return false;
-    if (IsLikelyContainerActor(actor, fname))
+    if (WorldScan::LooksLikeContainerActor(actor, fname))
         return false;
 
     // (4) Scene root required for world pos. Mesh preferred but optional for
@@ -468,7 +444,7 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
         return false;
 
     // Constructable enemy pointer still needs resolvable identity (no Camera leak).
-    if (HasConstructableEnemyAsset(actor) && ActorHasKnownBotIdentity(actor, fname))
+    if (WorldScan::HasArcEnemyAssetPointer(actor) && ActorHasKnownBotIdentity(actor, fname))
         return true;
 
     return false;
@@ -531,16 +507,7 @@ void UpdateBotVelocity(Engine::WorldCacheEntry& actor, const Vector3& worldPosRe
                 worldPosRead.z - actor.lastWorldPos.z,
             };
             Vector3 newVel{ delta.x / dtSec, delta.y / dtSec, delta.z / dtSec };
-            const double mag2 = static_cast<double>(newVel.x) * newVel.x
-                + static_cast<double>(newVel.y) * newVel.y
-                + static_cast<double>(newVel.z) * newVel.z;
-            if (mag2 < (3000.0 * 3000.0)) {
-                actor.cachedVelocity.x = actor.cachedVelocity.x * 0.5f + newVel.x * 0.5f;
-                actor.cachedVelocity.y = actor.cachedVelocity.y * 0.5f + newVel.y * 0.5f;
-                actor.cachedVelocity.z = actor.cachedVelocity.z * 0.5f + newVel.z * 0.5f;
-            } else {
-                actor.cachedVelocity = {};
-            }
+            WorldScan::BlendCachedVelocity(actor.cachedVelocity, newVel);
         }
     }
 
@@ -743,7 +710,7 @@ bool IsArcBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fnam
     if (ActorHasKnownBotIdentity(actor, fnameHint))
         return ResolveBotSceneRoot(actor) != 0;
 
-    if (IsLikelyContainerActor(actor, fnameHint))
+    if (WorldScan::LooksLikeContainerActor(actor, fnameHint))
         return false;
 
     auto meshResolvesToBot = [&](uintptr_t comp) -> bool {
@@ -1357,6 +1324,28 @@ void Engine::RobotList()
                     : -1.f;
                 // #region agent log
                 if (approxDistM >= 0.f && approxDistM <= 12.f) {
+                    static auto s_lastNearVisAgent = std::chrono::steady_clock::time_point{};
+                    const auto nowVisAgent = std::chrono::steady_clock::now();
+                    if (s_lastNearVisAgent.time_since_epoch().count() == 0
+                        || nowVisAgent - s_lastNearVisAgent >= std::chrono::milliseconds(200)) {
+                        s_lastNearVisAgent = nowVisAgent;
+                        const int misses = static_cast<int>(s_botVisualMisses[key]);
+                        ArcAgentLog(
+                            "bot-missing",
+                            "B3",
+                            "RobotList.cpp:visSkip",
+                            "near_bot_vis_miss",
+                            std::string("{\"key\":") + std::to_string(key)
+                                + ",\"distM\":" + std::to_string(approxDistM)
+                                + ",\"misses\":" + std::to_string(misses)
+                                + ",\"hasPos\":" + (IsPlausibleWorldPos(actor.WorldPos) ? "1" : "0")
+                                + ",\"broken\":" + std::to_string(static_cast<int>(broken))
+                                + ",\"name\":\"" + ArcAgentLogJsonEscape(actor.ActorName)
+                                + "\"}");
+                    }
+                }
+#if ARC_AGENT_NDJSON
+                if (approxDistM >= 0.f && approxDistM <= 12.f) {
                     static auto s_lastNearVis = std::chrono::steady_clock::time_point{};
                     const auto nowVis = std::chrono::steady_clock::now();
                     if (s_lastNearVis.time_since_epoch().count() == 0
@@ -1379,6 +1368,7 @@ void Engine::RobotList()
                         }
                     }
                 }
+#endif // ARC_AGENT_NDJSON
                 // #endregion
                 if (BotVisualMissShouldEvict(key, false)) {
                     ClearBotVisualMiss(key);
@@ -1478,6 +1468,57 @@ void Engine::RobotList()
             int nearDraw = 0;
             int nearDead = 0;
             for (const auto& [rk, re] : robotCache) {
+                (void)rk;
+                if (!IsPlausibleWorldPos(re.WorldPos))
+                    continue;
+                const float dm = static_cast<float>(std::sqrt(
+                    (re.WorldPos.x - cam.Location.x) * (re.WorldPos.x - cam.Location.x)
+                  + (re.WorldPos.y - cam.Location.y) * (re.WorldPos.y - cam.Location.y)
+                  + (re.WorldPos.z - cam.Location.z) * (re.WorldPos.z - cam.Location.z))) / 100.f;
+                if (dm > 12.f)
+                    continue;
+                ++nearCache;
+                if (re.Drawing)
+                    ++nearDraw;
+                if (re.IsBreaked)
+                    ++nearDead;
+            }
+            ArcAgentLog(
+                "bot-missing",
+                "B1-B3",
+                "RobotList.cpp:summary",
+                "near_bot_summary",
+                std::string("{\"scanned\":") + std::to_string(dbgScanned)
+                    + ",\"admitted\":" + std::to_string(dbgAdmitted)
+                    + ",\"drawing\":" + std::to_string(dbgDrawing)
+                    + ",\"cache\":" + std::to_string(robotCache.size())
+                    + ",\"nearCache\":" + std::to_string(nearCache)
+                    + ",\"nearDraw\":" + std::to_string(nearDraw)
+                    + ",\"nearDead\":" + std::to_string(nearDead)
+                    + ",\"visSkip\":" + std::to_string(dbgVisSkip)
+                    + ",\"distSkip\":" + std::to_string(dbgDistSkip)
+                    + ",\"verifyFail\":" + std::to_string(dbgVerifyFail)
+                    + ",\"reEvict\":" + std::to_string(dbgReEvict)
+                    + ",\"structHit\":" + std::to_string(dbgStructHit)
+                    + ",\"quickPass\":" + std::to_string(dbgQuickPass)
+                    + ",\"failRoot\":" + std::to_string(dbgFailNoRoot)
+                    + ",\"failMesh\":" + std::to_string(dbgFailNoMesh)
+                    + ",\"failId\":" + std::to_string(dbgFailNoId)
+                    + ",\"failOther\":" + std::to_string(dbgFailOther)
+                    + ",\"fnameHit\":" + std::to_string(dbgFnameHit)
+                    + ",\"zeroPos\":" + std::to_string(dbgZeroPos)
+                    + ",\"sceneOk\":" + std::to_string(dbgScenePosOk)
+                    + ",\"sceneFail\":" + std::to_string(dbgScenePosFail)
+                    + ",\"showRobots\":" + (var::showRobots ? "1" : "0")
+                    + ",\"enemyCount\":" + std::to_string(dbgEnemyCount)
+                    + "}");
+        }
+#if ARC_AGENT_NDJSON
+        {
+            int nearCache = 0;
+            int nearDraw = 0;
+            int nearDead = 0;
+            for (const auto& [rk, re] : robotCache) {
                 if (!IsPlausibleWorldPos(re.WorldPos))
                     continue;
                 const float dm = static_cast<float>(std::sqrt(
@@ -1516,6 +1557,7 @@ void Engine::RobotList()
                   << "},\"timestamp\":" << ms << "}\n";
             }
         }
+#endif // ARC_AGENT_NDJSON
         // #endregion
     }
 }

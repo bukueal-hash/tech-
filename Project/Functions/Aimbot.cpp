@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <numbers>
 #include <cfloat>
+#include "../Core/AgentLog.h"
 
 // ============================================
 // RANDOM BONE SYSTEM (SEQUENCIAL)
@@ -474,31 +475,37 @@ static float VelocityMag(const Vector3& v)
     return static_cast<float>(std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z));
 }
 
-static void ExtrapolateRobotWorldPosToNow(Engine::WorldCacheEntry& entry)
+/** Shared aim lead ramp (velMag>80/+0.055s, >400/+0.035s). maxDtSec is intentional
+ *  per-category (robot 0.25, player 0.20). Returns false if no lead applied. */
+static bool ComputeVelocityLeadDelta(
+    Vector3& outDelta,
+    const Vector3& vel,
+    float lastVelocityUpdate,
+    float maxDtSec)
 {
-    if (entry.lastVelocityUpdate <= 0.f)
-        return;
-
+    outDelta = {};
+    if (lastVelocityUpdate <= 0.f)
+        return false;
     const uint64_t nowMs = NowMs();
     float dtSec =
-        (nowMs - static_cast<uint64_t>(entry.lastVelocityUpdate)) * 0.001f;
-    if (dtSec <= 0.f || dtSec > 0.25f)
-        return;
-
-    const Vector3 vel = entry.cachedVelocity;
+        (nowMs - static_cast<uint64_t>(lastVelocityUpdate)) * 0.001f;
+    if (dtSec <= 0.f || dtSec > maxDtSec)
+        return false;
     const float velMag = VelocityMag(vel);
-    // Tracking lead: aim ahead of movers so mouse isn't always chasing a ghost
-    // (post-fix: distPx rose 14→21 while moveMag stayed 7–15).
     if (velMag > 80.f)
         dtSec += 0.055f;
     if (velMag > 400.f)
         dtSec += 0.035f;
+    outDelta = { vel.x * dtSec, vel.y * dtSec, vel.z * dtSec };
+    return true;
+}
 
-    const Vector3 delta{
-        vel.x * dtSec,
-        vel.y * dtSec,
-        vel.z * dtSec
-    };
+static void ExtrapolateRobotWorldPosToNow(Engine::WorldCacheEntry& entry)
+{
+    Vector3 delta{};
+    if (!ComputeVelocityLeadDelta(
+            delta, entry.cachedVelocity, entry.lastVelocityUpdate, 0.25f))
+        return;
 
     if (IsPlausibleWorldPos(entry.WorldPos)) {
         entry.WorldPos.x += delta.x;
@@ -532,21 +539,14 @@ static void ExtrapolatePlayerAimWorldToNow(
     const Vector3& cachedVelocity,
     float lastVelocityUpdate)
 {
-    if (!IsPlausibleWorldPos(worldPos) || lastVelocityUpdate <= 0.f)
+    if (!IsPlausibleWorldPos(worldPos))
         return;
-    const uint64_t nowMs = NowMs();
-    float dtSec =
-        (nowMs - static_cast<uint64_t>(lastVelocityUpdate)) * 0.001f;
-    if (dtSec <= 0.f || dtSec > 0.20f)
+    Vector3 delta{};
+    if (!ComputeVelocityLeadDelta(delta, cachedVelocity, lastVelocityUpdate, 0.20f))
         return;
-    const float velMag = VelocityMag(cachedVelocity);
-    if (velMag > 80.f)
-        dtSec += 0.055f;
-    if (velMag > 400.f)
-        dtSec += 0.035f;
-    worldPos.x += cachedVelocity.x * dtSec;
-    worldPos.y += cachedVelocity.y * dtSec;
-    worldPos.z += cachedVelocity.z * dtSec;
+    worldPos.x += delta.x;
+    worldPos.y += delta.y;
+    worldPos.z += delta.z;
 }
 
 static float RobotWorldAgeMs(const Engine::WorldCacheEntry& entry)
@@ -867,14 +867,16 @@ struct AimDebugSnapshot {
     uint8_t posSrc = 0;
     float worldAgeMs = 0.f;
     int grace = 0;
-    // #region agent log
+    // Used by [debugAim] console overlay + aim suppress path (always on).
     int lockedInCand = -1;
     int isRobot = -1;
     float distPx = -1.f;
     float velMag = -1.f;
-    float stickyFov = -1.f;
     int dropReason = 0; // 0 none, 1 notInCand, 2 graceExpire, 3 noBest, 4 kmbox
     float pullScale = 1.f;
+    // #region agent log
+#if ARC_AGENT_NDJSON
+    float stickyFov = -1.f;
     int remX = 0;
     int remY = 0;
     float moveMag = 0.f;
@@ -884,6 +886,7 @@ struct AimDebugSnapshot {
     float pxPerMouse = 0.f;
     float closeFrac = 0.f;
     int fastPath = 0;
+#endif // ARC_AGENT_NDJSON
     // #endregion
 };
 static AimDebugSnapshot s_aimDbg;
@@ -1016,8 +1019,10 @@ float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain =
         *outGain = gainOut;
 
     // #region agent log
+#if ARC_AGENT_NDJSON
     s_aimDbg.pxPerMouse = s_pxPerMouse;
     s_aimDbg.closeFrac = closeFrac;
+#endif // ARC_AGENT_NDJSON
     // #endregion
 
     int remX = static_cast<int>(std::round(mx));
@@ -1032,9 +1037,11 @@ float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain =
     }
 
     // #region agent log
+#if ARC_AGENT_NDJSON
     s_aimDbg.remX = remX;
     s_aimDbg.remY = remY;
     s_aimDbg.moveMag = hypotf(static_cast<float>(remX), static_cast<float>(remY));
+#endif // ARC_AGENT_NDJSON
     // #endregion
     if (remX == 0 && remY == 0)
         return gainOut;
@@ -1065,6 +1072,7 @@ float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain =
 }
 
 // #region agent log
+#if ARC_AGENT_NDJSON
 static void WriteAimTrackNdjson(const AimDebugSnapshot& d, bool suppress)
 {
     static auto s_last = std::chrono::steady_clock::time_point{};
@@ -1119,6 +1127,7 @@ static void WriteAimTrackNdjson(const AimDebugSnapshot& d, bool suppress)
       << ",\"pullScale\":" << d.pullScale
       << "},\"timestamp\":" << ms << "}\n";
 }
+#endif // ARC_AGENT_NDJSON
 // #endregion
 
 } // namespace
@@ -1140,6 +1149,7 @@ void Engine::AimAssistence()
     static uint64_t s_graceStampMs = 0;
 
     // #region agent log
+#if ARC_AGENT_NDJSON
     const auto aimTickStart = std::chrono::steady_clock::now();
     auto stampAimTickMs = [&]() {
         s_aimDbg.tickMs = std::chrono::duration<float, std::milli>(
@@ -1147,6 +1157,7 @@ void Engine::AimAssistence()
         if (s_aimDbg.tickMs > 0.5f)
             s_lastAimTickMs = s_aimDbg.tickMs;
     };
+#endif // ARC_AGENT_NDJSON
     // #endregion
 
     s_aimDbg = {};
@@ -1236,8 +1247,10 @@ void Engine::AimAssistence()
     // Final suppress is decided after we know bone distPx (below).
     bool suppressAimOutput = false;
     // #region agent log
+#if ARC_AGENT_NDJSON
     s_aimDbg.viewShakeDeg = viewShakeDeg;
     s_aimDbg.suppressed = 0;
+#endif // ARC_AGENT_NDJSON
     // #endregion
 
     EspRenderFrame espFrame{};
@@ -1312,7 +1325,9 @@ void Engine::AimAssistence()
     g_aimStickyExtraFovPx = 0.f;
 
     // #region agent log
+#if ARC_AGENT_NDJSON
     s_aimDbg.candidates = static_cast<int>(allTargets.size());
+#endif // ARC_AGENT_NDJSON
     // #endregion
 
     if (lockedTarget != 0) {
@@ -1343,13 +1358,9 @@ void Engine::AimAssistence()
                 break;
             }
         }
-        // #region agent log
         s_aimDbg.lockedInCand = lockedInCandidates ? 1 : 0;
-        // #endregion
         if (!lockedInCandidates) {
-            // #region agent log
             s_aimDbg.dropReason = 1;
-            // #endregion
             if (var::aim_loss_of_sight_grace_enabled
                 && var::aim_loss_of_sight_grace_ms > 0
                 && s_graceTarget.entityKey == lockedTarget) {
@@ -1391,9 +1402,11 @@ void Engine::AimAssistence()
                     s_aimDbg.locked = 0;
                     s_aimDbg.grace = 0;
                     // #region agent log
+#if ARC_AGENT_NDJSON
                     s_aimDbg.dropReason = 2;
                     stampAimTickMs();
                     WriteAimTrackNdjson(s_aimDbg, suppressAimOutput);
+#endif // ARC_AGENT_NDJSON
                     // #endregion
                     return;
                 }
@@ -1406,9 +1419,11 @@ void Engine::AimAssistence()
                 s_graceStampMs = 0;
                 s_aimDbg.locked = 0;
                 // #region agent log
+#if ARC_AGENT_NDJSON
                 s_aimDbg.dropReason = 1;
                 stampAimTickMs();
                 WriteAimTrackNdjson(s_aimDbg, suppressAimOutput);
+#endif // ARC_AGENT_NDJSON
                 // #endregion
                 return;
             }
@@ -1418,6 +1433,7 @@ void Engine::AimAssistence()
     AimTarget* bestTarget = nullptr;
     float bestScore = -FLT_MAX;
     // #region agent log
+#if ARC_AGENT_NDJSON
     int playerCand = 0;
     int robotCand = 0;
     float bestPlayerDist = FLT_MAX;
@@ -1427,11 +1443,13 @@ void Engine::AimAssistence()
     uint64_t bestPlayerKey = 0;
     uint64_t bestRobotKey = 0;
     uint64_t lockedCandidateKey = 0;
+#endif // ARC_AGENT_NDJSON
     // #endregion
 
     for (auto& target : allTargets)
     {
         // #region agent log
+#if ARC_AGENT_NDJSON
         if (target.isRobot) {
             ++robotCand;
             if (target.distToCenter < bestRobotDist) {
@@ -1447,11 +1465,14 @@ void Engine::AimAssistence()
                 bestPlayerKey = target.entityKey;
             }
         }
+#endif // ARC_AGENT_NDJSON
         // #endregion
         if (lockedTarget == target.entityKey)
         {
             // #region agent log
+#if ARC_AGENT_NDJSON
             lockedCandidateKey = target.entityKey;
+#endif // ARC_AGENT_NDJSON
             // #endregion
             // Sticky retention FOV only — still pick highest score (closest FOV).
             // Do not break early (post-fix3: stuck on farther player).
@@ -1474,15 +1495,16 @@ void Engine::AimAssistence()
         s_graceActive = false;
         s_aimDbg.locked = 0;
         // #region agent log
+#if ARC_AGENT_NDJSON
         s_aimDbg.dropReason = 3;
         stampAimTickMs();
         WriteAimTrackNdjson(s_aimDbg, suppressAimOutput);
+#endif // ARC_AGENT_NDJSON
         // #endregion
         return;
     }
 
     s_aimDbg.candidates = static_cast<int>(allTargets.size());
-    // #region agent log
     s_aimDbg.isRobot = bestTarget->isRobot ? 1 : 0;
     s_aimDbg.distPx = bestTarget->distToCenter;
     {
@@ -1490,6 +1512,8 @@ void Engine::AimAssistence()
         s_aimDbg.velMag = static_cast<float>(
             std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z));
     }
+    // #region agent log
+#if ARC_AGENT_NDJSON
     s_aimDbg.stickyFov = fovRadius + (var::sticky_target_lock
         ? (std::max)(0.f, var::aim_sticky_fov_bias_px)
         : 0.f);
@@ -1530,6 +1554,7 @@ void Engine::AimAssistence()
             }
         }
     }
+#endif // ARC_AGENT_NDJSON
     // #endregion
 
     if (bestTarget->worldPos.x == 0.0 && bestTarget->worldPos.y == 0.0 && bestTarget->worldPos.z == 0.0)
@@ -1585,9 +1610,11 @@ void Engine::AimAssistence()
             humanizer.Reset();
             s_graceActive = false;
             // #region agent log
+#if ARC_AGENT_NDJSON
             s_aimDbg.dropReason = 4;
             stampAimTickMs();
             WriteAimTrackNdjson(s_aimDbg, suppressAimOutput);
+#endif // ARC_AGENT_NDJSON
             // #endregion
         }
         return;
@@ -1617,20 +1644,20 @@ void Engine::AimAssistence()
     s_aimDbg.lastDy = dy;
     s_aimDbg.posSrc = bestTarget->aimPosSrc;
     s_aimDbg.worldAgeMs = bestTarget->aimWorldAgeMs;
-    // #region agent log
     s_aimDbg.pullScale = pullScale;
     s_aimDbg.distPx = hypotf(
         static_cast<float>(bestTarget->aimPos.x - screenCenter.x),
         static_cast<float>(bestTarget->aimPos.y - screenCenter.y));
     if (targetVelMag > 0.f)
         s_aimDbg.velMag = targetVelMag;
-    // #endregion
 
     // Only suppress reload/flinch jitter when already close — never cancel catch-up.
     if (viewShakeDeg >= kAimViewShakeSuppressDeg && s_aimDbg.distPx < 35.f) {
         suppressAimOutput = true;
         // #region agent log
+#if ARC_AGENT_NDJSON
         s_aimDbg.suppressed = 1;
+#endif // ARC_AGENT_NDJSON
         // #endregion
     }
 
@@ -1684,8 +1711,10 @@ void Engine::AimAssistence()
     }
 
     // #region agent log
+#if ARC_AGENT_NDJSON
     stampAimTickMs();
     s_aimDbg.fastPath = g_aimFastPath;
     WriteAimTrackNdjson(s_aimDbg, suppressAimOutput);
+#endif // ARC_AGENT_NDJSON
     // #endregion
 }

@@ -12,6 +12,16 @@
 
 namespace EspDraw {
 
+/** float rgba [0..1] → ImGui packed color (matches prior hand-roll sites). */
+inline ImU32 ColorFromRGBA(const float c[4])
+{
+    return IM_COL32(
+        static_cast<int>(c[0] * 255.f),
+        static_cast<int>(c[1] * 255.f),
+        static_cast<int>(c[2] * 255.f),
+        static_cast<int>(c[3] * 255.f));
+}
+
 inline bool ResolveBotHeadFeetWorld(const Vector3& worldPos, Vector3& headWorld, Vector3& feetWorld)
 {
     if (!IsPlausibleWorldPos(worldPos))

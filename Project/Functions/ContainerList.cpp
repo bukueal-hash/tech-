@@ -16,6 +16,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include "../Core/AgentLog.h"
 
 namespace {
 
@@ -36,188 +37,6 @@ std::string ToLowerCopy(std::string s)
     for (char& c : s)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
-}
-
-float DistanceMeters(const Vector3& a, const Vector3& b)
-{
-    const double dx = static_cast<double>(a.x - b.x);
-    const double dy = static_cast<double>(a.y - b.y);
-    const double dz = static_cast<double>(a.z - b.z);
-    return static_cast<float>(std::sqrt(dx * dx + dy * dy + dz * dz) / 100.0);
-}
-
-static std::string JsonEscShortCont(std::string s, size_t maxLen = 48)
-{
-    if (s.size() > maxLen)
-        s.resize(maxLen);
-    std::string o;
-    o.reserve(s.size());
-    for (unsigned char c : s) {
-        if (c == '"' || c == '\\')
-            o.push_back('_');
-        else if (c >= 32 && c < 127)
-            o.push_back(static_cast<char>(c));
-        else
-            o.push_back('_');
-    }
-    return o;
-}
-
-/** Snapshot of open/searched-related fields while standing next to a container. */
-struct ContainerOpenMidProbe {
-    uintptr_t liB58 = 0;
-    uintptr_t liBB8 = 0;
-    uintptr_t liSimple = 0;
-    int liB58Ok = 0;
-    int liBB8Ok = 0;
-    int liSimpleOk = 0;
-    int liB58OuterOk = 0;
-    int liSimpleOuterOk = 0;
-    int simplePath = 0;
-    uint8_t searchedB58 = 0;
-    uint8_t searchedBB8 = 0;
-    uint8_t searchedSimple = 0;
-    int openedBitB58 = 0;
-    int openedBitAny = 0;
-    int salvageChosen = -1;
-    int salvageOpen = 0;
-    float openTime = -1.f;
-    float openTimeAlt = -1.f;
-    int interactState = -1;
-    int interactActive = -1;
-    int probeSignal = 0;
-    int looksOpened = 0;
-    int looksOpenedAny = 0;
-};
-
-static bool FnameHintsSimpleLootActivity(const std::string& fnameLower)
-{
-    return fnameLower.find("raidercache") != std::string::npos
-        || fnameLower.find("raider_cache") != std::string::npos
-        || fnameLower.find("bp_raidercache") != std::string::npos
-        || fnameLower.find("cargoship") != std::string::npos
-        || fnameLower.find("arc_cargo") != std::string::npos
-        || fnameLower.find("arc_cargoship") != std::string::npos
-        || fnameLower.find("simplelootactivity") != std::string::npos;
-}
-
-static ContainerOpenMidProbe ReadContainerOpenMidProbe(
-    uintptr_t key, const std::string& fnameHint)
-{
-    ContainerOpenMidProbe p{};
-    if (!key || !Memory::IsValidPtrFast2(key))
-        return p;
-
-    const std::string fnameLower = ToLowerCopy(fnameHint);
-    p.simplePath = FnameHintsSimpleLootActivity(fnameLower) ? 1 : 0;
-
-    p.liB58 = Memory::read<uintptr_t>(
-        key + static_cast<uint64_t>(Offsets::LootInteractionComponent));
-    p.liBB8 = Memory::read<uintptr_t>(
-        key + static_cast<uint64_t>(Offsets::LootInteraction_Container));
-    p.liSimple = Memory::read<uintptr_t>(
-        key + static_cast<uint64_t>(Offsets::SimpleLootActivity_LootInteraction));
-
-    auto liValid = [](uintptr_t li) -> int {
-        return (li && Memory::IsValidPtrFast2(li)) ? 1 : 0;
-    };
-    auto outerOk = [key](uintptr_t li) -> int {
-        if (!li || !Memory::IsValidPtrFast2(li))
-            return 0;
-        // UObject::OuterPrivate @ 0x20 — same gate as ProbeContainerOpenSignals.
-        return (Memory::read<uintptr_t>(li + 0x20) == key) ? 1 : 0;
-    };
-    auto readSearched = [](uintptr_t li) -> uint8_t {
-        if (!li || !Memory::IsValidPtrFast2(li))
-            return 0;
-        return Memory::read<uint8_t>(
-            li + static_cast<uint64_t>(Offsets::LootInteraction_Searched));
-    };
-
-    p.liB58Ok = liValid(p.liB58);
-    p.liBB8Ok = liValid(p.liBB8);
-    p.liSimpleOk = liValid(p.liSimple);
-    p.liB58OuterOk = outerOk(p.liB58);
-    p.liSimpleOuterOk = outerOk(p.liSimple);
-    if (p.liSimpleOk)
-        p.simplePath = 1;
-
-    p.searchedB58 = readSearched(p.liB58);
-    p.searchedBB8 = readSearched(p.liBB8);
-    p.searchedSimple = readSearched(p.liSimple);
-    p.openedBitB58 = (p.searchedB58 & 0x1) ? 1 : 0;
-    p.openedBitAny = ((p.searchedB58 | p.searchedBB8 | p.searchedSimple) & 0x1) ? 1 : 0;
-
-    // Watch LI interaction state during open (same BaseInteraction offsets as pickup).
-    uintptr_t liWatch = 0;
-    if (p.liB58Ok && p.liB58OuterOk)
-        liWatch = p.liB58;
-    else if (p.liSimpleOk && p.liSimpleOuterOk)
-        liWatch = p.liSimple;
-    else if (p.liB58Ok)
-        liWatch = p.liB58;
-    else if (p.liSimpleOk)
-        liWatch = p.liSimple;
-    else if (p.liBB8Ok)
-        liWatch = p.liBB8;
-    if (liWatch) {
-        p.interactState = static_cast<int>(Memory::read<uint8_t>(
-            liWatch + static_cast<uint64_t>(Offsets::Interaction_CurrentInteractionState)));
-        const uint8_t actByte = Memory::read<uint8_t>(
-            liWatch + static_cast<uint64_t>(Offsets::Interaction_bIsActiveByte));
-        p.interactActive =
-            ((actByte & Offsets::Interaction_bIsActiveMask) != 0) ? 1 : 0;
-    }
-
-    p.salvageChosen = static_cast<int>(Memory::read<int32_t>(
-        key + static_cast<uint64_t>(Offsets::SalvageContainer_ChosenMesh)));
-    p.salvageOpen = (p.salvageChosen == 2) ? 1 : 0;
-
-    // ItemContainer OpenTime — logged only (not used as open gate; known FPs).
-    const uintptr_t itemCont = Memory::read<uintptr_t>(
-        key + static_cast<uint64_t>(Offsets::LootContainer_ItemContainer));
-    if (itemCont && Memory::IsValidPtrFast2(itemCont)) {
-        p.openTime = Memory::read<float>(
-            itemCont + static_cast<uint64_t>(Offsets::ItemContainer_OpenTime));
-        p.openTimeAlt = Memory::read<float>(
-            itemCont + static_cast<uint64_t>(Offsets::ConstructableItemContainer_OpenTime));
-    } else {
-        const uintptr_t simpleIc = Memory::read<uintptr_t>(
-            key + static_cast<uint64_t>(Offsets::SimpleLootActivity_ItemContainer));
-        if (simpleIc && Memory::IsValidPtrFast2(simpleIc)) {
-            p.openTime = Memory::read<float>(
-                simpleIc + static_cast<uint64_t>(Offsets::ItemContainer_OpenTime));
-            p.openTimeAlt = Memory::read<float>(
-                simpleIc + static_cast<uint64_t>(Offsets::ConstructableItemContainer_OpenTime));
-        }
-    }
-
-    const ContainerOpenSignal sig = ProbeContainerOpenSignals(key, fnameHint);
-    p.probeSignal = static_cast<int>(sig);
-    p.looksOpened = ContainerLootLooksOpened(key, fnameHint) ? 1 : 0;
-    p.looksOpenedAny = ContainerLootLooksOpenedAny(key, fnameHint) ? 1 : 0;
-    return p;
-}
-
-static bool ContainerOpenMidProbeChanged(
-    const ContainerOpenMidProbe& a, const ContainerOpenMidProbe& b)
-{
-    return a.liB58Ok != b.liB58Ok || a.liBB8Ok != b.liBB8Ok
-        || a.liSimpleOk != b.liSimpleOk || a.liB58OuterOk != b.liB58OuterOk
-        || a.liSimpleOuterOk != b.liSimpleOuterOk || a.simplePath != b.simplePath
-        || a.searchedB58 != b.searchedB58 || a.searchedBB8 != b.searchedBB8
-        || a.searchedSimple != b.searchedSimple
-        || a.openedBitB58 != b.openedBitB58 || a.openedBitAny != b.openedBitAny
-        || a.salvageChosen != b.salvageChosen || a.salvageOpen != b.salvageOpen
-        || a.interactState != b.interactState || a.interactActive != b.interactActive
-        || a.probeSignal != b.probeSignal || a.looksOpened != b.looksOpened
-        || a.looksOpenedAny != b.looksOpenedAny
-        || (a.openTime >= 0.f && b.openTime >= 0.f
-            && std::fabs(a.openTime - b.openTime) > 0.01f)
-        || (a.openTimeAlt >= 0.f && b.openTimeAlt >= 0.f
-            && std::fabs(a.openTimeAlt - b.openTimeAlt) > 0.01f)
-        || ((a.openTime < 0.f) != (b.openTime < 0.f))
-        || ((a.openTimeAlt < 0.f) != (b.openTimeAlt < 0.f));
 }
 
 bool QuickContainerCandidate(
@@ -642,6 +461,7 @@ void Engine::ContainerList()
             {
                 ++dbgPreSkip;
                 // #region agent log
+#if ARC_AGENT_NDJSON
                 {
                     const std::string fl = ToLowerCopy(fname);
                     const std::string cl = ToLowerCopy(classFname);
@@ -656,6 +476,7 @@ void Engine::ContainerList()
                         || cl.find("cabinet") != std::string::npos
                         || cl.find("probe") != std::string::npos;
                     }
+#endif // ARC_AGENT_NDJSON
                 // #endregion
                 continue;
             }
@@ -1013,6 +834,7 @@ void Engine::ContainerList()
                 << std::endl;
 
             // #region agent log
+#if ARC_AGENT_NDJSON
             {
                 static std::mutex s_nameLogMu;
                 std::lock_guard<std::mutex> lk(s_nameLogMu);
@@ -1038,6 +860,7 @@ void Engine::ContainerList()
                       << ",\"timestamp\":" << ms << "}\n";
                 }
             }
+#endif // ARC_AGENT_NDJSON
             // #endregion
         }
         std::cout << "[debugContainer] scanned=" << dbgScanned

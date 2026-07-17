@@ -11,6 +11,7 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
+#include "../Core/AgentLog.h"
 
 namespace {
 
@@ -688,6 +689,7 @@ void Engine::EntityList()
         actor.maxshield = static_cast<float>(get_maxarmor(key));
 
         // #region agent log
+#if ARC_AGENT_NDJSON
         {
             static auto s_lastHpLog = std::chrono::steady_clock::time_point{};
             static uintptr_t s_lastHpKey = 0;
@@ -723,6 +725,7 @@ void Engine::EntityList()
                 }
             }
         }
+#endif // ARC_AGENT_NDJSON
         // #endregion
 
         // Read weapon system from InventoryComponent (stowed slots + equipped + armor)
@@ -784,12 +787,6 @@ void Engine::EntityList()
             }
         }
 
-        ProjectWorldLocationToRadar(
-            cam.Location,
-            actor.WorldPos,
-            static_cast<float>(cam.Rotation.y),
-            actor.RadarPos);
-
         if (!haveScreenBox)
             ++dbgBoneMiss;
 
@@ -823,6 +820,7 @@ void Engine::EntityList()
     }
 
     // #region agent log
+#if ARC_AGENT_NDJSON
     {
         static auto s_lastPlayerLog = std::chrono::steady_clock::time_point{};
         const auto nowLog = std::chrono::steady_clock::now();
@@ -859,6 +857,7 @@ void Engine::EntityList()
             }
         }
     }
+#endif // ARC_AGENT_NDJSON
     // #endregion
 
     if (var::show_debug_overlay) {

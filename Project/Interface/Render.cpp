@@ -15,6 +15,7 @@
 #include "OverlayHost.h"
 #include "Utils/AutoConfig.h"
 #include "Utils/Visuals/visuals.hpp"
+#include "../Core/AgentLog.h"
 
 bool showmenu = false;
 bool requestExit = false;
@@ -25,11 +26,6 @@ static void DrawDebugOffsetValidation(Engine& eng);
 void Render(HWND hwnd)
 {
     (void)hwnd;
-
-    // Declared in Esp.cpp — flicker hitch probes.
-    extern void FlickerNoteMenuOpen();
-    extern void FlickerNoteRenderLoop();
-    FlickerNoteRenderLoop();
 
     {
         static bool insertWasDown = false;
@@ -43,32 +39,7 @@ void Render(HWND hwnd)
         insertWasDown = insertDown;
     }
 
-    // #region agent log
-    // H2: raid gate flapping mid-raid silently skips RenderEsp — invisible to
-    // the [debugFlicker] counters. Log every transition with menu state.
-    {
-        static bool s_prevEspActive = false;
-        static bool s_espActiveInit = false;
-        const bool nowActive = engine.IsEspRaidActive();
-        if (s_espActiveInit && nowActive != s_prevEspActive) {
-            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-            if (f) {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker\",\"hypothesisId\":\"H2\""
-                  << ",\"location\":\"Render.cpp:Render\",\"message\":\"raid_active_flip\""
-                  << ",\"data\":{\"active\":" << (nowActive ? 1 : 0)
-                  << ",\"menu\":" << (showmenu ? 1 : 0)
-                  << "},\"timestamp\":" << ms << "}\n";
-            }
-        }
-        s_prevEspActive = nowActive;
-        s_espActiveInit = true;
-    }
-    // #endregion
-
     if (showmenu) {
-        FlickerNoteMenuOpen();
         ApplyOverlayMode(hwnd, true);
         DrawArcSidebar(showmenu, requestExit);
     } else {
@@ -89,34 +60,8 @@ void Render(HWND hwnd)
         engine.RenderRadar(showmenu);
 
     if (var::show_debug_overlay && !showmenu) {
-        // #region agent log
-        const auto tDbg0 = std::chrono::steady_clock::now();
-        // #endregion
         DrawDebugOffsetValidation(engine);
-        // #region agent log
-        const auto tDbg1 = std::chrono::steady_clock::now();
-        // #endregion
         engine.PrintVisCheckDebugConsole();
-        // #region agent log
-        {
-            const int64_t overlayMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                tDbg1 - tDbg0).count();
-            const int64_t consoleMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - tDbg1).count();
-            if (overlayMs > 30 || consoleMs > 30) {
-                std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-                if (f) {
-                    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker2\",\"hypothesisId\":\"H9\""
-                      << ",\"location\":\"Render.cpp:Render\",\"message\":\"debug_overlay_cost\""
-                      << ",\"data\":{\"overlayMs\":" << overlayMs
-                      << ",\"consoleMs\":" << consoleMs
-                      << "},\"timestamp\":" << ms << "}\n";
-                }
-            }
-        }
-        // #endregion
     }
 
     if (requestExit) {
@@ -129,7 +74,6 @@ void Render(HWND hwnd)
 
 static void DrawDebugOffsetValidation(Engine& eng)
 {
-    // #region agent log
     // G1/H9: blocking shared_lock on paint while workers hold caches (or wait
     // for unique) stalled Present 595-849ms (overlayMs==paint_gap). Ghost flash
     // = delayed Present after Clear. Never block: try_lock + keep last snap.
@@ -298,35 +242,47 @@ static void DrawDebugOffsetValidation(Engine& eng)
 
         const int64_t totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
-        // Only log real stalls. gotFrame=0 every 500ms was opening debug-c190fb.log
-        // on the paint thread and produced overlayMs=522 (== paint_gap) while
-        // try_lock capture itself reported totalMs=0.
+        // #region agent log
+#if ARC_AGENT_NDJSON
+        // Never ofstream on paint — async queue only (CreateFile stalled Present).
         if (totalMs > 20) {
-            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-            if (f) {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                f << "{\"sessionId\":\"c190fb\",\"runId\":\"ghost-flicker\",\"hypothesisId\":\"G1\""
-                  << ",\"location\":\"Render.cpp:DrawDebugOffsetValidation\",\"message\":\"overlay_try_refresh\""
-                  << ",\"data\":{\"totalMs\":" << totalMs
-                  << ",\"msState\":" << msState
-                  << ",\"msFrame\":" << msFrame
-                  << ",\"msPlayer\":" << msPlayer
-                  << ",\"msWorld\":" << msWorld
-                  << ",\"msRobot\":" << msRobot
-                  << ",\"msCam\":" << msCam
-                  << ",\"gotState\":" << gotState
-                  << ",\"gotFrame\":" << gotFrame
-                  << ",\"gotPlayer\":" << gotPlayer
-                  << ",\"gotWorld\":" << gotWorld
-                  << ",\"gotRobot\":" << gotRobot
-                  << ",\"gotCam\":" << gotCam
-                  << "},\"timestamp\":" << ms << "}\n";
-            }
+            ArcAgentLog(
+                "ghost-flicker",
+                "G1",
+                "Render.cpp:DrawDebugOffsetValidation",
+                "overlay_try_refresh",
+                std::string("{\"totalMs\":") + std::to_string(totalMs)
+                    + ",\"msState\":" + std::to_string(msState)
+                    + ",\"msFrame\":" + std::to_string(msFrame)
+                    + ",\"msPlayer\":" + std::to_string(msPlayer)
+                    + ",\"msWorld\":" + std::to_string(msWorld)
+                    + ",\"msRobot\":" + std::to_string(msRobot)
+                    + ",\"msCam\":" + std::to_string(msCam)
+                    + ",\"gotState\":" + std::to_string(gotState)
+                    + ",\"gotFrame\":" + std::to_string(gotFrame)
+                    + ",\"gotPlayer\":" + std::to_string(gotPlayer)
+                    + ",\"gotWorld\":" + std::to_string(gotWorld)
+                    + ",\"gotRobot\":" + std::to_string(gotRobot)
+                    + ",\"gotCam\":" + std::to_string(gotCam)
+                    + "}");
         }
+#endif // ARC_AGENT_NDJSON
+        // #endregion
+        (void)totalMs;
+        (void)msState;
+        (void)msFrame;
+        (void)msPlayer;
+        (void)msWorld;
+        (void)msRobot;
+        (void)msCam;
+        (void)gotState;
+        (void)gotFrame;
+        (void)gotPlayer;
+        (void)gotWorld;
+        (void)gotRobot;
+        (void)gotCam;
     }
     const OverlaySnap& snap = s_snap;
-    // #endregion
 
     const float pad = 12.f;
     const float lineH = 20.f;

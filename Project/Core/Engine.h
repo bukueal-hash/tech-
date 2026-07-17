@@ -1,4 +1,5 @@
 #pragma once
+#include "AgentLog.h"
 #include "Vector.hpp"
 #include "Cache.hpp"
 #include "Offsets.h"
@@ -278,7 +279,6 @@ public:
     void DbgStoreCameraProbe(const CameraProbeSnapshot& probe);
     bool ProjectWorldLocationToScreen(Vector3 world_location, Vector3& screen);
     bool ProjectWorldLocationToScreen(Vector3 world_location, Vector3& screen, const CameraCache& camera);
-    bool ProjectWorldLocationToRadar(const Vector3& myWorldLocation, const Vector3& enemyWorldLocation, float myYaw, Vector3& outRadar);
     bool Visible(uintptr_t mesh) const;
     bool VisibleActor(uintptr_t actor) const;
     /** Bot-only mesh vis: embark-first + SDK recently-rendered fallback. */
@@ -415,7 +415,6 @@ public: // PlayerCache
         uintptr_t APawn = NULL;
 
         Vector3 WorldPos;
-        Vector3 RadarPos;
 
         Vector3 head;
         Vector3 feet;
@@ -753,6 +752,27 @@ public:
     static bool IsUsableObjectPtr(uintptr_t p)
     {
         return p != 0 && p != UINTPTR_MAX && Memory::IsValidPtrFast2(p);
+    }
+
+    /** Reject pointers that look like packed ASCII UTF-16 (common GWorld/GI garbage). */
+    static bool LooksLikeUtf16Garbage(uintptr_t p)
+    {
+        if (!p)
+            return true;
+        int asciiPairs = 0;
+        for (int i = 0; i < 4; ++i) {
+            const unsigned char lo = static_cast<unsigned char>((p >> (i * 16)) & 0xFF);
+            const unsigned char hi = static_cast<unsigned char>((p >> (i * 16 + 8)) & 0xFF);
+            if (hi == 0 && lo >= 0x20 && lo < 0x7F)
+                ++asciiPairs;
+        }
+        return asciiPairs >= 3;
+    }
+
+    /** Usable object ptr that also rejects UTF-16-looking garbage (Update GWorld path). */
+    static bool IsPlausibleObjPtr(uintptr_t p)
+    {
+        return IsUsableObjectPtr(p) && !LooksLikeUtf16Garbage(p);
     }
 
  	/** RootComponent is often TObjectPtr — 0xFF..FF is invalid; try alt offsets + mesh. */

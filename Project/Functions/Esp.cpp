@@ -21,6 +21,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
+#include "../Core/AgentLog.h"
 
 extern Engine engine;
 
@@ -329,9 +330,8 @@ static bool ResolveLiveRenderCamera(
     const Engine::EspRenderFrame& frame,
     Engine::CameraCache& outCam)
 {
-    // Paint path must NOT DMA. TryBuildCameraFromPcmPov (read_nocache x4) stalled
-    // Present 200-441ms per hitch (debugFlicker maxCamMs≈maxEspMs; H6 slow_cam).
-    // Worker UpdateCamera already publishes g_Camera; frame.camera is the backup.
+    // Paint path must NOT DMA. TryBuildCameraFromPcmPov stalled Present;
+    // worker UpdateCamera publishes g_Camera; frame.camera is the backup.
     // Rotation extrapolate still bridges look-drag without touching the FPGA bus.
     static Engine::CameraCache s_prevCam{};
     static bool s_prevOk = false;
@@ -451,11 +451,7 @@ static bool ProjectWorldEspPoint(
 static ImU32 PlayerEspColor(const Engine::PlayerCacheEntry& actor)
 {
     const float* c = actor.isVisible ? var::esp_color_visible : var::esp_color_invisible;
-    return IM_COL32(
-        static_cast<int>(c[0] * 255.f),
-        static_cast<int>(c[1] * 255.f),
-        static_cast<int>(c[2] * 255.f),
-        static_cast<int>(c[3] * 255.f));
+    return EspDraw::ColorFromRGBA(c);
 }
 
 static ImU32 BotEspColor(bool visible, bool isBreaked = false)
@@ -463,11 +459,7 @@ static ImU32 BotEspColor(bool visible, bool isBreaked = false)
     const float* c = isBreaked
         ? var::color_dead_bots
         : (visible ? var::bot_color_visible : var::bot_color_invisible);
-    return IM_COL32(
-        static_cast<int>(c[0] * 255.f),
-        static_cast<int>(c[1] * 255.f),
-        static_cast<int>(c[2] * 255.f),
-        static_cast<int>(c[3] * 255.f));
+    return EspDraw::ColorFromRGBA(c);
 }
 
 static ImU32 WeaponTierColor(int quality)
@@ -526,37 +518,28 @@ static void DrawWeaponLabel(
         stowed1.clear();
 
     // #region agent log
+#if ARC_AGENT_NDJSON
     {
         static auto s_lastWeaponLog = std::chrono::steady_clock::time_point{};
         const auto now = std::chrono::steady_clock::now();
         if (now - s_lastWeaponLog > std::chrono::milliseconds(1500)) {
             s_lastWeaponLog = now;
-            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-            if (f) {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now.time_since_epoch()).count();
-                auto esc = [](const std::string& s) {
-                    std::string o;
-                    o.reserve(s.size());
-                    for (char c : s) {
-                        if (c == '"' || c == '\\') o.push_back('\\');
-                        o.push_back(c);
-                    }
-                    return o;
-                };
-                f << "{\"sessionId\":\"c190fb\",\"runId\":\"weapon-label\",\"hypothesisId\":\"H1\""
-                  << ",\"location\":\"Esp.cpp:DrawWeaponLabel\",\"message\":\"player weapon stack\""
-                  << ",\"data\":{\"rawActive\":\"" << esc(actor.weaponName)
-                  << "\",\"rawS0\":\"" << esc(actor.stowedWeapon0)
-                  << "\",\"rawS1\":\"" << esc(actor.stowedWeapon1)
-                  << "\",\"drawActive\":\"" << esc(active)
-                  << "\",\"drawS0\":\"" << esc(stowed0)
-                  << "\",\"drawS1\":\"" << esc(stowed1)
-                  << "\",\"anchorX\":" << anchorX
-                  << "},\"timestamp\":" << ms << "}\n";
-            }
+            ArcAgentLog(
+                "weapon-label",
+                "H1",
+                "Esp.cpp:DrawWeaponLabel",
+                "player weapon stack",
+                std::string("{\"rawActive\":\"") + ArcAgentLogJsonEscape(actor.weaponName)
+                    + "\",\"rawS0\":\"" + ArcAgentLogJsonEscape(actor.stowedWeapon0)
+                    + "\",\"rawS1\":\"" + ArcAgentLogJsonEscape(actor.stowedWeapon1)
+                    + "\",\"drawActive\":\"" + ArcAgentLogJsonEscape(active)
+                    + "\",\"drawS0\":\"" + ArcAgentLogJsonEscape(stowed0)
+                    + "\",\"drawS1\":\"" + ArcAgentLogJsonEscape(stowed1)
+                    + "\",\"anchorX\":" + std::to_string(anchorX)
+                    + "}");
         }
     }
+#endif // ARC_AGENT_NDJSON
     // #endregion
 
     // Active weapon — centered on head X (same as name/distance).
@@ -880,6 +863,7 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         return false;
 
     // #region agent log
+#if ARC_AGENT_NDJSON
     {
         static auto s_lastFrameDmaLog = std::chrono::steady_clock::time_point{};
         const auto nowLog = std::chrono::steady_clock::now();
@@ -900,6 +884,7 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             }
         }
     }
+#endif // ARC_AGENT_NDJSON
     // #endregion
 
     Vector3 pawnPos = Engine::ToVector3(pawnWorld);
@@ -926,6 +911,9 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
 
+    // Intentional ESP-only lead: tighter 0.12s clamp and no velMag boost
+    // (Aimbot uses ComputeVelocityLeadDelta with 0.20/0.25 + velMag). Keep
+    // separate so paint frames stay conservative vs aim prediction.
     auto extrapolateEntry = [&](Vector3& pos, const Vector3& vel, float lastUpdateMs) {
         if (lastUpdateMs <= 0.f)
             return;
@@ -1234,7 +1222,18 @@ static void RenderRobotEspFromFrame(
     const Vector3 distRef = engine.ResolveDistanceReference(
         frameCam, stateSnap.acknowledgedPawn);
 
+    int dbgRobotFrame = 0;
+    int dbgRobotRendered = 0;
+    int dbgRobotDistSkip = 0;
+    int dbgRobotHeadFeetFail = 0;
+    int dbgRobotW2sFail = 0;
+    int dbgRobotLabelSkip = 0;
+    int dbgRobotOffscreen = 0;
+    int dbgNearFrame = 0;
+    int dbgNearRendered = 0;
+
     for (const Engine::EspFrameWorld& item : robots) {
+        ++dbgRobotFrame;
         const uintptr_t key = item.actorKey;
         const Engine::WorldCacheEntry& robot = item.entry;
         if (!key || !engine.IsValidPointer(key))
@@ -1256,35 +1255,41 @@ static void RenderRobotEspFromFrame(
 
         const float botMaxM =
             var::bot_esp_distance > 0.f ? var::bot_esp_distance : var::kMaxDistanceSliderM;
-        if (distM > botMaxM)
+        const bool nearBot = distM <= 12.f;
+        if (nearBot)
+            ++dbgNearFrame;
+        if (distM > botMaxM) {
+            ++dbgRobotDistSkip;
             continue;
+        }
 
         Engine::WorldCacheEntry drawEntry = robot;
 
         Vector3 headWorld{};
         Vector3 feetWorld{};
         if (!EspDraw::ResolveBotHeadFeetWorld(drawEntry, headWorld, feetWorld)) {
+            ++dbgRobotHeadFeetFail;
             // #region agent log
-            if (distM <= 12.f) {
+#if ARC_AGENT_NDJSON
+            if (nearBot) {
                 static auto s_lastHf = std::chrono::steady_clock::time_point{};
                 const auto nowHf = std::chrono::steady_clock::now();
                 if (s_lastHf.time_since_epoch().count() == 0
                     || nowHf - s_lastHf >= std::chrono::milliseconds(250)) {
                     s_lastHf = nowHf;
-                    std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-                    if (f) {
-                        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
-                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"near-bot\",\"hypothesisId\":\"H4\""
-                          << ",\"location\":\"Esp.cpp:RenderRobot\",\"message\":\"near_bot_headfeet_fail\""
-                          << ",\"data\":{\"key\":" << key
-                          << ",\"distM\":" << distM
-                          << ",\"drawing\":" << (robot.Drawing ? 1 : 0)
-                          << ",\"name\":\"" << robot.ActorName << "\""
-                          << "},\"timestamp\":" << ms << "}\n";
-                    }
+                    ArcAgentLog(
+                        "bot-missing",
+                        "B4",
+                        "Esp.cpp:RenderRobot",
+                        "near_bot_headfeet_fail",
+                        std::string("{\"key\":") + std::to_string(key)
+                            + ",\"distM\":" + std::to_string(distM)
+                            + ",\"drawing\":" + (robot.Drawing ? "1" : "0")
+                            + ",\"name\":\"" + ArcAgentLogJsonEscape(robot.ActorName)
+                            + "\"}");
                 }
             }
+#endif // ARC_AGENT_NDJSON
             // #endregion
             continue;
         }
@@ -1292,27 +1297,28 @@ static void RenderRobotEspFromFrame(
         ImVec2 head{};
         ImVec2 feet{};
         if (!EspDraw::WorldToScreenBox(engine, frameCam, headWorld, feetWorld, head, feet)) {
+            ++dbgRobotW2sFail;
             // #region agent log
-            if (distM <= 12.f) {
+#if ARC_AGENT_NDJSON
+            if (nearBot) {
                 static auto s_lastW2s = std::chrono::steady_clock::time_point{};
                 const auto nowW2s = std::chrono::steady_clock::now();
                 if (s_lastW2s.time_since_epoch().count() == 0
                     || nowW2s - s_lastW2s >= std::chrono::milliseconds(250)) {
                     s_lastW2s = nowW2s;
-                    std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-                    if (f) {
-                        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
-                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"near-bot\",\"hypothesisId\":\"H4\""
-                          << ",\"location\":\"Esp.cpp:RenderRobot\",\"message\":\"near_bot_w2s_fail\""
-                          << ",\"data\":{\"key\":" << key
-                          << ",\"distM\":" << distM
-                          << ",\"camFov\":" << frameCam.FOV
-                          << ",\"name\":\"" << robot.ActorName << "\""
-                          << "},\"timestamp\":" << ms << "}\n";
-                    }
+                    ArcAgentLog(
+                        "bot-missing",
+                        "B4",
+                        "Esp.cpp:RenderRobot",
+                        "near_bot_w2s_fail",
+                        std::string("{\"key\":") + std::to_string(key)
+                            + ",\"distM\":" + std::to_string(distM)
+                            + ",\"camFov\":" + std::to_string(frameCam.FOV)
+                            + ",\"name\":\"" + ArcAgentLogJsonEscape(robot.ActorName)
+                            + "\"}");
                 }
             }
+#endif // ARC_AGENT_NDJSON
             // #endregion
             continue;
         }
@@ -1333,33 +1339,36 @@ static void RenderRobotEspFromFrame(
         // Never use ARC/Bot/Oil placeholders. IsAnyBotActor alone is not enough.
         if (botLabel.empty() || !IsAcceptedBotEspLabel(engine, botLabel, fname)) {
             RecordBotDrawLabelMiss();
+            ++dbgRobotLabelSkip;
             // #region agent log
-            if (distM <= 12.f) {
+#if ARC_AGENT_NDJSON
+            if (nearBot) {
                 static auto s_lastLbl = std::chrono::steady_clock::time_point{};
                 const auto nowLbl = std::chrono::steady_clock::now();
                 if (s_lastLbl.time_since_epoch().count() == 0
                     || nowLbl - s_lastLbl >= std::chrono::milliseconds(250)) {
                     s_lastLbl = nowLbl;
-                    std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-                    if (f) {
-                        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
-                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"bot-gate\",\"hypothesisId\":\"GHOST\""
-                          << ",\"location\":\"Esp.cpp:RenderRobot\",\"message\":\"near_bot_label_skip\""
-                          << ",\"data\":{\"key\":" << key
-                          << ",\"distM\":" << distM
-                          << ",\"actorName\":\"" << robot.ActorName << "\""
-                          << ",\"fname\":\"" << fname << "\""
-                          << ",\"anyBot\":" << (ArcActorType::IsAnyBotActor(key) ? 1 : 0)
-                          << "},\"timestamp\":" << ms << "}\n";
-                    }
+                    ArcAgentLog(
+                        "bot-missing",
+                        "B5",
+                        "Esp.cpp:RenderRobot",
+                        "near_bot_label_skip",
+                        std::string("{\"key\":") + std::to_string(key)
+                            + ",\"distM\":" + std::to_string(distM)
+                            + ",\"actorName\":\"" + ArcAgentLogJsonEscape(robot.ActorName)
+                            + "\",\"fname\":\"" + ArcAgentLogJsonEscape(fname)
+                            + "\",\"anyBot\":" + (ArcActorType::IsAnyBotActor(key) ? "1" : "0")
+                            + "}");
                 }
             }
+#endif // ARC_AGENT_NDJSON
             // #endregion
             continue;
         }
-        if (!EspDraw::IsEspBoxOnScreen(head, feet))
+        if (!EspDraw::IsEspBoxOnScreen(head, feet)) {
+            ++dbgRobotOffscreen;
             continue;
+        }
 
         // Bot health bar + heart
         float botLabelY = head.y;
@@ -1408,92 +1417,48 @@ static void RenderRobotEspFromFrame(
 
         if (var::bot_snaplines && EspDraw::IsEspPointOnScreen(feet))
             EspDraw::DrawSnaplineEsp(drawList, feet, color, distM);
+        ++dbgRobotRendered;
+        if (nearBot)
+            ++dbgNearRendered;
     }
-}
 
-// Flicker diagnosis: every whole-screen ESP blink is a paint that drew nothing.
-// Classify WHY (frame not valid vs camera resolve fail vs frame builder stalled)
-// so we fix the real gate instead of guessing. Enabled by show_debug_overlay.
-struct FlickerDbg {
-    uint64_t paints = 0;        // RenderEsp calls past the enable check
-    uint64_t drew = 0;          // paints that reached the draw path
-    uint64_t blankFrame = 0;    // bailed: frame.valid == false
-    uint64_t blankCam = 0;      // bailed: ResolveLiveRenderCamera failed
-    uint64_t staleFrame = 0;    // drew, but frame builder republished no new seq
-    uint64_t blankStreak = 0;   // consecutive blank paints right now
-    uint64_t maxBlankStreak = 0;// worst streak this window
-    uint64_t lastFrameSeq = 0;
-    // H3/H4/H5/H6/H7 flicker probes
-    int prevTotalEntities = -1;
-    uint64_t contentDrops = 0;  // new frame arrived >50% smaller than previous
-    uint64_t paintGaps = 0;     // >150ms between paints while menu was closed
-    uint64_t menuGaps = 0;      // >150ms gaps caused by INSERT menu (false positive)
-    uint64_t loopGaps = 0;      // >150ms between Render() calls (true overlay hitch)
-    int64_t maxPaintGapMs = 0;
-    int64_t maxLoopGapMs = 0;
-    int64_t maxEspMs = 0;       // slowest RenderEsp wall time (DMA/cam)
-    int64_t maxCamMs = 0;       // slowest ResolveLiveRenderCamera
-    std::chrono::steady_clock::time_point lastPaintTp{};
-    std::chrono::steady_clock::time_point lastLoopTp{};
-    bool menuInterrupted = false; // RenderEsp skipped because menu was open
-};
-static FlickerDbg g_flickerDbg;
-
-static void FlickerNoteBlank(const char* reason)
-{
-    FlickerDbg& d = g_flickerDbg;
-    ++d.blankStreak;
-    if (d.blankStreak > d.maxBlankStreak)
-        d.maxBlankStreak = d.blankStreak;
-    static auto s_last = std::chrono::steady_clock::time_point{};
-    const auto now = std::chrono::steady_clock::now();
-    if (s_last.time_since_epoch().count() == 0
-        || now - s_last >= std::chrono::milliseconds(200)) {
-        s_last = now;
-        std::ofstream f("F:/Test/ARCs/debug-flicker.log", std::ios::app);
-        if (f) {
-            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            f << "{\"sessionId\":\"flicker\",\"location\":\"Esp.cpp:RenderEsp\""
-              << ",\"message\":\"blank_paint\",\"data\":{\"reason\":\"" << reason << "\""
-              << ",\"streak\":" << d.blankStreak
-              << "},\"timestamp\":" << ms << "}\n";
-        }
-    }
-}
-
-// Visible to Render.cpp — menu / loop hitch probes (H5 / H7).
-void FlickerNoteMenuOpen()
-{
-    g_flickerDbg.menuInterrupted = true;
-}
-
-void FlickerNoteRenderLoop()
-{
     // #region agent log
-    if (!var::show_debug_overlay)
-        return;
-    const auto nowTp = std::chrono::steady_clock::now();
-    if (g_flickerDbg.lastLoopTp.time_since_epoch().count() != 0) {
-        const int64_t gapMs =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                nowTp - g_flickerDbg.lastLoopTp).count();
-        if (gapMs > 150) {
-            ++g_flickerDbg.loopGaps;
-            if (gapMs > g_flickerDbg.maxLoopGapMs)
-                g_flickerDbg.maxLoopGapMs = gapMs;
-            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-            if (f) {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker\",\"hypothesisId\":\"H7\""
-                  << ",\"location\":\"Esp.cpp:FlickerNoteRenderLoop\",\"message\":\"loop_gap\""
-                  << ",\"data\":{\"gapMs\":" << gapMs
-                  << "},\"timestamp\":" << ms << "}\n";
-            }
+#if ARC_AGENT_NDJSON
+    if (var::show_debug_overlay) {
+        static auto s_lastRobotRenderSummary = std::chrono::steady_clock::time_point{};
+        const auto nowRobotRenderSummary = std::chrono::steady_clock::now();
+        if (s_lastRobotRenderSummary.time_since_epoch().count() == 0
+            || nowRobotRenderSummary - s_lastRobotRenderSummary >= std::chrono::seconds(1)) {
+            s_lastRobotRenderSummary = nowRobotRenderSummary;
+            ArcAgentLog(
+                "bot-missing",
+                "B4-B5",
+                "Esp.cpp:RenderRobot",
+                "robot_render_summary",
+                std::string("{\"frame\":") + std::to_string(dbgRobotFrame)
+                    + ",\"rendered\":" + std::to_string(dbgRobotRendered)
+                    + ",\"nearFrame\":" + std::to_string(dbgNearFrame)
+                    + ",\"nearRendered\":" + std::to_string(dbgNearRendered)
+                    + ",\"distSkip\":" + std::to_string(dbgRobotDistSkip)
+                    + ",\"headFeetFail\":" + std::to_string(dbgRobotHeadFeetFail)
+                    + ",\"w2sFail\":" + std::to_string(dbgRobotW2sFail)
+                    + ",\"labelSkip\":" + std::to_string(dbgRobotLabelSkip)
+                    + ",\"offscreen\":" + std::to_string(dbgRobotOffscreen)
+                    + ",\"showRobots\":" + (var::showRobots ? "1" : "0")
+                    + "}");
         }
     }
-    g_flickerDbg.lastLoopTp = nowTp;
+#else
+    (void)dbgRobotFrame;
+    (void)dbgRobotRendered;
+    (void)dbgRobotDistSkip;
+    (void)dbgRobotHeadFeetFail;
+    (void)dbgRobotW2sFail;
+    (void)dbgRobotLabelSkip;
+    (void)dbgRobotOffscreen;
+    (void)dbgNearFrame;
+    (void)dbgNearRendered;
+#endif // ARC_AGENT_NDJSON
     // #endregion
 }
 
@@ -1505,189 +1470,24 @@ void Engine::RenderEsp()
     if (!drawPlayers && !drawBots && !drawWorld && !var::show_radar)
         return;
 
-    const bool flickerDbgOn = var::show_debug_overlay;
-    const auto espStartTp = std::chrono::steady_clock::now();
-    if (flickerDbgOn)
-        ++g_flickerDbg.paints;
-
     SetProjectionViewport(
         ImGui::GetIO().DisplaySize.x,
         ImGui::GetIO().DisplaySize.y);
 
-    // G2: never block paint on m_espFrameMutex. Frame builder unique_lock +
-    // aimbot shared copies caused writer-preference waits → espMs=500-717
-    // (debug-c190fb slow_esp == paint_gap). Keep last good frame if busy.
+    // Never block paint on m_espFrameMutex — keep last good frame if busy.
     static EspRenderFrame s_paintFrame{};
-    int frameLockGot = 0;
-    int64_t frameCopyMs = 0;
     {
-        const auto tCopy0 = std::chrono::steady_clock::now();
         std::shared_lock<std::shared_mutex> lock(m_espFrameMutex, std::try_to_lock);
-        if (lock.owns_lock()) {
-            frameLockGot = 1;
-            if (m_lastEspFrame.valid)
-                s_paintFrame = m_lastEspFrame;
-        }
-        frameCopyMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - tCopy0).count();
+        if (lock.owns_lock() && m_lastEspFrame.valid)
+            s_paintFrame = m_lastEspFrame;
     }
     const EspRenderFrame& frame = s_paintFrame;
-    if (!frame.valid) {
-        if (flickerDbgOn) {
-            ++g_flickerDbg.blankFrame;
-            FlickerNoteBlank("frame_invalid");
-        }
+    if (!frame.valid)
         return;
-    }
 
     Engine::CameraCache renderCam{};
-    const auto camStartTp = std::chrono::steady_clock::now();
-    const bool camOk = ResolveLiveRenderCamera(frame, renderCam);
-    if (flickerDbgOn) {
-        const int64_t camMs =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - camStartTp).count();
-        if (camMs > g_flickerDbg.maxCamMs)
-            g_flickerDbg.maxCamMs = camMs;
-        // #region agent log
-        // H6: DMA camera resolve on the paint thread blocking Present.
-        if (camMs > 50) {
-            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-            if (f) {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker\",\"hypothesisId\":\"H6\""
-                  << ",\"location\":\"Esp.cpp:RenderEsp\",\"message\":\"slow_cam\""
-                  << ",\"data\":{\"camMs\":" << camMs
-                  << ",\"ok\":" << (camOk ? 1 : 0)
-                  << "},\"timestamp\":" << ms << "}\n";
-            }
-        }
-        // #endregion
-    }
-    if (!camOk) {
-        if (flickerDbgOn) {
-            ++g_flickerDbg.blankCam;
-            FlickerNoteBlank("cam_fail");
-        }
+    if (!ResolveLiveRenderCamera(frame, renderCam))
         return;
-    }
-
-    if (flickerDbgOn) {
-        ++g_flickerDbg.drew;
-
-        // #region agent log
-        // H4/H5: gap between paints. Menu-open skips RenderEsp and must not
-        // count as a real hitch (H5). Only count when menu stayed closed.
-        {
-            const auto nowTp = std::chrono::steady_clock::now();
-            if (g_flickerDbg.lastPaintTp.time_since_epoch().count() != 0) {
-                const int64_t gapMs =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        nowTp - g_flickerDbg.lastPaintTp).count();
-                if (gapMs > 150) {
-                    if (g_flickerDbg.menuInterrupted) {
-                        ++g_flickerDbg.menuGaps;
-                        std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-                        if (f) {
-                            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch()).count();
-                            f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker\",\"hypothesisId\":\"H5\""
-                              << ",\"location\":\"Esp.cpp:RenderEsp\",\"message\":\"menu_gap\""
-                              << ",\"data\":{\"gapMs\":" << gapMs
-                              << "},\"timestamp\":" << ms << "}\n";
-                        }
-                    } else {
-                        ++g_flickerDbg.paintGaps;
-                        if (gapMs > g_flickerDbg.maxPaintGapMs)
-                            g_flickerDbg.maxPaintGapMs = gapMs;
-                        std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-                        if (f) {
-                            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch()).count();
-                            f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker\",\"hypothesisId\":\"H4\""
-                              << ",\"location\":\"Esp.cpp:RenderEsp\",\"message\":\"paint_gap\""
-                              << ",\"data\":{\"gapMs\":" << gapMs
-                              << "},\"timestamp\":" << ms << "}\n";
-                        }
-                    }
-                }
-            }
-            g_flickerDbg.menuInterrupted = false;
-            g_flickerDbg.lastPaintTp = nowTp;
-        }
-        // #endregion
-
-        // Same frameSeq as last paint = frame builder published nothing new
-        // this interval (DMA/hitch stall) even though the old frame is valid.
-        if (frame.frameSeq == g_flickerDbg.lastFrameSeq) {
-            ++g_flickerDbg.staleFrame;
-        } else {
-            // #region agent log
-            // H3: fresh frame arrived with far fewer entities than the previous
-            // one — mass blink while paint keeps running.
-            const int total = static_cast<int>(
-                frame.players.size() + frame.robots.size() + frame.world.size());
-            if (g_flickerDbg.prevTotalEntities >= 4
-                && total * 2 < g_flickerDbg.prevTotalEntities) {
-                ++g_flickerDbg.contentDrops;
-                std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-                if (f) {
-                    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker\",\"hypothesisId\":\"H3\""
-                      << ",\"location\":\"Esp.cpp:RenderEsp\",\"message\":\"frame_content_drop\""
-                      << ",\"data\":{\"before\":" << g_flickerDbg.prevTotalEntities
-                      << ",\"after\":" << total
-                      << ",\"players\":" << frame.players.size()
-                      << ",\"bots\":" << frame.robots.size()
-                      << ",\"world\":" << frame.world.size()
-                      << "},\"timestamp\":" << ms << "}\n";
-                }
-            }
-            g_flickerDbg.prevTotalEntities = total;
-            // #endregion
-        }
-        g_flickerDbg.lastFrameSeq = frame.frameSeq;
-        g_flickerDbg.blankStreak = 0;
-
-        static auto s_lastRep = std::chrono::steady_clock::now();
-        const auto now = std::chrono::steady_clock::now();
-        if (now - s_lastRep >= std::chrono::seconds(1)) {
-            s_lastRep = now;
-            const FlickerDbg d = g_flickerDbg;
-            std::cout << "[debugFlicker] paints=" << d.paints
-                << " drew=" << d.drew
-                << " blankFrame=" << d.blankFrame
-                << " blankCam=" << d.blankCam
-                << " staleFrame=" << d.staleFrame
-                << " maxBlankStreak=" << d.maxBlankStreak
-                << " contentDrops=" << d.contentDrops
-                << " paintGaps=" << d.paintGaps
-                << " menuGaps=" << d.menuGaps
-                << " loopGaps=" << d.loopGaps
-                << " maxGapMs=" << d.maxPaintGapMs
-                << " maxLoopMs=" << d.maxLoopGapMs
-                << " maxCamMs=" << d.maxCamMs
-                << " maxEspMs=" << d.maxEspMs
-                << std::endl;
-            std::ofstream lf("F:/Test/ARCs/debug-flicker.log", std::ios::app);
-            if (lf) {
-                const auto msn = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                lf << "{\"sessionId\":\"flicker\",\"location\":\"Esp.cpp:RenderEsp\""
-                   << ",\"message\":\"flicker_summary\",\"data\":{"
-                   << "\"paints\":" << d.paints
-                   << ",\"drew\":" << d.drew
-                   << ",\"blankFrame\":" << d.blankFrame
-                   << ",\"blankCam\":" << d.blankCam
-                   << ",\"staleFrame\":" << d.staleFrame
-                   << ",\"maxBlankStreak\":" << d.maxBlankStreak
-                   << "},\"timestamp\":" << msn << "}\n";
-            }
-            g_flickerDbg.maxBlankStreak = 0;
-        }
-    }
 
     g_renderQueue.newFrame();
 
@@ -1696,42 +1496,13 @@ void Engine::RenderEsp()
     if (var::showRobots)
         RenderRobotEspFromFrame(frame.robots, renderCam);
     if (drawWorld) {
-        // World loot positions were sampled with frame.camera. Projecting them with
-        // live renderCam (rot-extrapolated) desyncs W2S → skipProj spikes and
-        // labels blink while the fixed debug overlay stays solid (no projection).
-        // Evidence: paintGaps=0 but skipProj=4-7 of frame=9, rendered oscillating 1-4.
+        // Prefer frame.camera for world W2S (positions sampled with frame cam).
         const Engine::CameraCache& worldCam =
             CameraOkForEsp(frame.camera) ? frame.camera : renderCam;
         RenderWorldEspFromFrame(frame.world, worldCam);
     }
 
     g_renderQueue.endFrame();
-
-    if (flickerDbgOn) {
-        const int64_t espMs =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - espStartTp).count();
-        if (espMs > g_flickerDbg.maxEspMs)
-            g_flickerDbg.maxEspMs = espMs;
-        // #region agent log
-        if (espMs > 50 || frameCopyMs > 20) {
-            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-            if (f) {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                f << "{\"sessionId\":\"c190fb\",\"runId\":\"ghost-flicker\",\"hypothesisId\":\"G2\""
-                  << ",\"location\":\"Esp.cpp:RenderEsp\",\"message\":\"slow_esp\""
-                  << ",\"data\":{\"espMs\":" << espMs
-                  << ",\"frameCopyMs\":" << frameCopyMs
-                  << ",\"frameLockGot\":" << frameLockGot
-                  << ",\"players\":" << frame.players.size()
-                  << ",\"robots\":" << frame.robots.size()
-                  << ",\"world\":" << frame.world.size()
-                  << "},\"timestamp\":" << ms << "}\n";
-            }
-        }
-        // #endregion
-    }
 
     if (ImDrawList* drawList = ImGui::GetForegroundDrawList()) {
         RenderQueue::flushToDrawList(
@@ -1779,8 +1550,8 @@ void Engine::RenderEsp()
                 << " skipPos=" << g_worldEspDbg.skipPos
                 << " skipDist=" << g_worldEspDbg.skipDist
                 << " skipProj=" << g_worldEspDbg.skipProj
-                << " worldCam=" << (CameraOkForEsp(frame.camera) ? "frame" : "live")
                 << std::endl;
+            g_worldEspDbg = {};
         }
     }
 }
@@ -1799,10 +1570,7 @@ static void RenderWorldEspFromFrame(
     if (!drawList)
         return;
 
-    // Paint path must stay DMA-free. Frame builder already resolved WorldPos +
-    // labels. Live GetActorFNameString / GetEnglishItemName / ContainerLootLooksOpenedAny
-    // / ResolveWorldEspDrawPos here stalled Present 200-700ms (debugFlicker:
-    // maxEspMs=713 with menuGaps=0; H6 slow_esp without matching slow_cam).
+    // Paint path must stay DMA-free. Frame builder already resolved WorldPos + labels.
     const Vector3& distRef = frameCam.Location;
 
     for (const Engine::EspFrameWorld& item : world) {
@@ -2107,11 +1875,7 @@ void Engine::RenderRadar(bool interactive)
     };
 
     auto pickerColor = [](const float rgba[4]) -> ImU32 {
-        return IM_COL32(
-            static_cast<int>(rgba[0] * 255.f),
-            static_cast<int>(rgba[1] * 255.f),
-            static_cast<int>(rgba[2] * 255.f),
-            static_cast<int>(rgba[3] * 255.f));
+        return EspDraw::ColorFromRGBA(rgba);
     };
 
     {

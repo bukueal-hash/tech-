@@ -36,14 +36,6 @@ std::string ToLowerCopy(std::string s)
     return s;
 }
 
-float DistanceMeters(const Vector3& a, const Vector3& b)
-{
-    const double dx = static_cast<double>(a.x - b.x);
-    const double dy = static_cast<double>(a.y - b.y);
-    const double dz = static_cast<double>(a.z - b.z);
-    return static_cast<float>(std::sqrt(dx * dx + dy * dy + dz * dz) / 100.0);
-}
-
 bool FnameLooksLikeNonWorldEspActor(const std::string& fname)
 {
     if (fname.empty())
@@ -248,23 +240,6 @@ static bool IsGroundPickupCategory(WorldItemCategory cat)
     return cat == WorldItemCategory::DroppedPickup
         || cat == WorldItemCategory::Items
         || cat == WorldItemCategory::Harvestable;
-}
-
-static std::string JsonEscShort(std::string s, size_t maxLen = 40)
-{
-    if (s.size() > maxLen)
-        s.resize(maxLen);
-    std::string o;
-    o.reserve(s.size());
-    for (unsigned char c : s) {
-        if (c == '"' || c == '\\')
-            o.push_back('_');
-        else if (c >= 32 && c < 127)
-            o.push_back(static_cast<char>(c));
-        else
-            o.push_back('_');
-    }
-    return o;
 }
 
 } // namespace

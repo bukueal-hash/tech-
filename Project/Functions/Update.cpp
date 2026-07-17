@@ -14,10 +14,12 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include "../Core/AgentLog.h"
 
 namespace {
 
 // #region agent log
+#if ARC_AGENT_NDJSON
 inline void RaidDbgLog(const char* event, const std::string& dataJson)
 {
 	static std::mutex m;
@@ -32,52 +34,32 @@ inline void RaidDbgLog(const char* event, const std::string& dataJson)
 	  << "\",\"data\":" << dataJson
 	  << ",\"timestamp\":" << ms << "}\n";
 }
+#endif // ARC_AGENT_NDJSON
 // #endregion
-
-bool LooksLikeUtf16Garbage(uintptr_t p)
-{
-	if (!p)
-		return true;
-	int asciiPairs = 0;
-	for (int i = 0; i < 4; ++i) {
-		const unsigned char lo = static_cast<unsigned char>((p >> (i * 16)) & 0xFF);
-		const unsigned char hi = static_cast<unsigned char>((p >> (i * 16 + 8)) & 0xFF);
-		if (hi == 0 && lo >= 0x20 && lo < 0x7F)
-			++asciiPairs;
-	}
-	return asciiPairs >= 3;
-}
-
-bool IsPlausibleObjPtr(uintptr_t p)
-{
-	return p != 0 && p != UINTPTR_MAX
-		&& !LooksLikeUtf16Garbage(p)
-		&& Memory::IsValidPtrFast2(p);
-}
 
 uintptr_t ReadWorldFromSlot(uint64_t base, std::ptrdiff_t slotOff)
 {
 	// Bypass VMM page cache — stale GWorld blocks raid re-entry until exe restart.
 	const uintptr_t slot = Memory::read_nocache<uintptr_t>(base + slotOff);
-	return IsPlausibleObjPtr(slot) ? slot : 0;
+	return Engine::IsPlausibleObjPtr(slot) ? slot : 0;
 }
 
 /** Help CL-1315578: PL @ 0x158 (also try prior 0x110), LevelCollections[i]+0x20, Levels[]. */
 bool LevelLooksOwnedByWorld(uintptr_t level, uintptr_t world)
 {
-	if (!IsPlausibleObjPtr(level) || !world)
+	if (!Engine::IsPlausibleObjPtr(level) || !world)
 		return false;
 	const uintptr_t owning = Memory::read<uintptr_t>(level + Offsets::Level_OwningWorld);
 	if (owning == world)
 		return true;
 	const uintptr_t data = Memory::read<uintptr_t>(level + Offsets::AActors);
 	const int count = Memory::read<int>(level + Offsets::ActorsCount);
-	return IsPlausibleObjPtr(data) && count > 0 && count <= 10000;
+	return Engine::IsPlausibleObjPtr(data) && count > 0 && count <= 10000;
 }
 
 uintptr_t ResolvePersistentLevelHelp(uintptr_t world)
 {
-	if (!IsPlausibleObjPtr(world))
+	if (!Engine::IsPlausibleObjPtr(world))
 		return 0;
 
 	// Locked help 0x158; prior CL 0x110 only as probe (does not edit Offsets.h).
@@ -95,7 +77,7 @@ uintptr_t ResolvePersistentLevelHelp(uintptr_t world)
 		Memory::read<uintptr_t>(world + Offsets::LevelCollections);
 	const int32_t collectionsNum =
 		Memory::read<int32_t>(world + Offsets::LevelCollections + 8);
-	if (IsPlausibleObjPtr(collectionsData) && collectionsNum > 0 && collectionsNum <= 16) {
+	if (Engine::IsPlausibleObjPtr(collectionsData) && collectionsNum > 0 && collectionsNum <= 16) {
 		const int limit = (collectionsNum > 4) ? 4 : collectionsNum;
 		for (int i = 0; i < limit; ++i) {
 			const uintptr_t collection =
@@ -109,7 +91,7 @@ uintptr_t ResolvePersistentLevelHelp(uintptr_t world)
 
 	const uintptr_t levelsData = Memory::read<uintptr_t>(world + Offsets::Levels);
 	const int32_t levelsNum = Memory::read<int32_t>(world + Offsets::Levels + 8);
-	if (IsPlausibleObjPtr(levelsData) && levelsNum > 0 && levelsNum < 512) {
+	if (Engine::IsPlausibleObjPtr(levelsData) && levelsNum > 0 && levelsNum < 512) {
 		const int limit = (levelsNum > 8) ? 8 : levelsNum;
 		for (int i = 0; i < limit; ++i) {
 			const uintptr_t level = Memory::read<uintptr_t>(
@@ -128,12 +110,12 @@ uintptr_t TryWorldFromGameStateGlobal(uint64_t base)
 	if (!base)
 		return 0;
 	const uintptr_t gs = Memory::read<uintptr_t>(base + Offsets::GameStateGlobalRva);
-	if (!IsPlausibleObjPtr(gs))
+	if (!Engine::IsPlausibleObjPtr(gs))
 		return 0;
 
 	const uintptr_t arrData = Memory::read<uintptr_t>(gs + Offsets::GameState_PlayerArray);
 	const int32_t arrNum = Memory::read<int32_t>(gs + Offsets::GameState_PlayerArray + 8);
-	if (!IsPlausibleObjPtr(arrData) || arrNum <= 0 || arrNum > 128)
+	if (!Engine::IsPlausibleObjPtr(arrData) || arrNum <= 0 || arrNum > 128)
 		return 0;
 
 	static const std::ptrdiff_t kOuterCands[] = { 0x20, 0x28, 0x18, 0x30, 0x10, 0x40 };
@@ -147,13 +129,13 @@ uintptr_t TryWorldFromGameStateGlobal(uint64_t base)
 
 uintptr_t PickValidWorld(uintptr_t slot)
 {
-	if (!IsPlausibleObjPtr(slot))
+	if (!Engine::IsPlausibleObjPtr(slot))
 		return 0;
 	if (ResolvePersistentLevelHelp(slot))
 		return slot;
 	// Some builds store GWorld** (slot → UWorld*). Accept only if PL validates.
 	const uintptr_t inner = Memory::read<uintptr_t>(slot);
-	if (IsPlausibleObjPtr(inner) && ResolvePersistentLevelHelp(inner))
+	if (Engine::IsPlausibleObjPtr(inner) && ResolvePersistentLevelHelp(inner))
 		return inner;
 	return 0;
 }
@@ -220,17 +202,19 @@ static bool FNameTokensMatch(uintptr_t world, uintptr_t level, const char* const
 	return false;
 }
 
+static constexpr const char* kStrictHubTokens[] = {
+	"sprocket", "mainmenu", "frontend", "front_end",
+	"lobby", "loadout", "hideout", "menuworld", "bilguun",
+	// Post-raid score screen (log: world "EndofRound"). Not listing it kept
+	// raidRaw true on the stay path until the world pointer changed.
+	"endofround",
+};
+static constexpr int kStrictHubTokenCount =
+	static_cast<int>(sizeof(kStrictHubTokens) / sizeof(kStrictHubTokens[0]));
+
 static bool LooksLikeStrictHubWorld(uintptr_t world, uintptr_t level)
 {
-	static const char* kStrictHubTokens[] = {
-		"sprocket", "mainmenu", "frontend", "front_end",
-		"lobby", "loadout", "hideout", "menuworld", "bilguun",
-		// Post-raid score screen (log: world "EndofRound"). Not listing it kept
-		// raidRaw true on the stay path until the world pointer changed.
-		"endofround",
-	};
-	return FNameTokensMatch(world, level, kStrictHubTokens,
-		static_cast<int>(sizeof(kStrictHubTokens) / sizeof(kStrictHubTokens[0])));
+	return FNameTokensMatch(world, level, kStrictHubTokens, kStrictHubTokenCount);
 }
 
 static bool LooksLikeHubWorld(uintptr_t world, uintptr_t level)
@@ -341,12 +325,8 @@ static std::string PeekObjFName(uintptr_t obj)
 
 static const char* MatchHubToken(uintptr_t world, uintptr_t level)
 {
-	static const char* kTokens[] = {
-		"sprocket", "mainmenu", "frontend", "front_end",
-		"lobby", "loadout", "hideout", "menuworld", "bilguun",
-		"endofround",
-	};
-	for (const char* tok : kTokens) {
+	for (int i = 0; i < kStrictHubTokenCount; ++i) {
+		const char* tok = kStrictHubTokens[i];
 		if (ObjectFNameContains(world, tok) || ObjectFNameContains(level, tok))
 			return tok;
 	}
@@ -899,7 +879,9 @@ void Engine::HandleWorldLost()
 	ClearEspCaches();
 	std::cout << "[raid] world_lost" << std::endl;
 	// #region agent log
+#if ARC_AGENT_NDJSON
 	RaidDbgLog("world_lost", "{}");
+#endif // ARC_AGENT_NDJSON
 	// #endregion
 }
 
@@ -994,12 +976,14 @@ void Engine::TickEspCacheReadiness()
 			<< " world=" << world
 			<< std::endl;
 		// #region agent log
+#if ARC_AGENT_NDJSON
 		{
 			std::ostringstream d;
 			d << "{\"players\":" << players << ",\"bots\":" << bots
 			  << ",\"world\":" << world << ",\"mode\":\"hard\"}";
 			RaidDbgLog("caches_ready", d.str());
 		}
+#endif // ARC_AGENT_NDJSON
 		// #endregion
 		return;
 	}
@@ -1021,12 +1005,14 @@ void Engine::TickEspCacheReadiness()
 		<< " world=" << world
 		<< std::endl;
 	// #region agent log
+#if ARC_AGENT_NDJSON
 	{
 		std::ostringstream d;
 		d << "{\"players\":" << players << ",\"bots\":" << bots
 		  << ",\"world\":" << world << ",\"mode\":\"soft\"}";
 		RaidDbgLog("caches_ready_soft", d.str());
 	}
+#endif // ARC_AGENT_NDJSON
 	// #endregion
 }
 
@@ -1056,6 +1042,7 @@ void Engine::TickRaidGate()
 		gw, pl, actors, pawn, pc, root, active);
 
 	// #region agent log
+#if ARC_AGENT_NDJSON
 	{
 		static bool s_lastRaw = false;
 		static bool s_lastActive = false;
@@ -1099,6 +1086,7 @@ void Engine::TickRaidGate()
 			RaidDbgLog(changed ? "raid_state_change" : "raid_heartbeat", d.str());
 		}
 	}
+#endif // ARC_AGENT_NDJSON
 	// #endregion
 
 	if (!raw) {
@@ -1138,11 +1126,13 @@ void Engine::TickRaidGate()
 		ClearEspCaches();
 		std::cout << "[raid] left" << std::endl;
 		// #region agent log
+#if ARC_AGENT_NDJSON
 		{
 			std::ostringstream d;
 			d << "{\"reason\":\"" << rawReason << "\",\"party\":" << partyCount << "}";
 			RaidDbgLog("left", d.str());
 		}
+#endif // ARC_AGENT_NDJSON
 		// #endregion
 		return;
 	}
@@ -1158,12 +1148,14 @@ void Engine::TickRaidGate()
 			m_raidEnterPending = false;
 			std::cout << "[raid] party_wait players=" << partyCount << std::endl;
 			// #region agent log
+#if ARC_AGENT_NDJSON
 			{
 				std::ostringstream d;
 				d << "{\"party\":" << partyCount
 				  << ",\"delayMs\":" << kPartyEnterDelayMs.count() << "}";
 				RaidDbgLog("party_wait", d.str());
 			}
+#endif // ARC_AGENT_NDJSON
 			// #endregion
 			return;
 		}
@@ -1178,12 +1170,14 @@ void Engine::TickRaidGate()
 		m_raidDebSince = now;
 		std::cout << "[raid] enter_wait players=" << partyCount << std::endl;
 		// #region agent log
+#if ARC_AGENT_NDJSON
 		{
 			std::ostringstream d;
 			d << "{\"party\":" << partyCount
 			  << ",\"delayMs\":" << kRaidEnterDelayMs.count() << "}";
 			RaidDbgLog("enter_wait", d.str());
 		}
+#endif // ARC_AGENT_NDJSON
 		// #endregion
 		return;
 	}
@@ -1201,6 +1195,7 @@ void Engine::TickRaidGate()
 	m_worldGeneration.fetch_add(1, std::memory_order_release);
 	std::cout << "[raid] entered players=" << partyCount << std::endl;
 	// #region agent log
+#if ARC_AGENT_NDJSON
 	{
 		std::ostringstream d;
 		d << "{\"party\":" << partyCount
@@ -1208,5 +1203,6 @@ void Engine::TickRaidGate()
 		  << ",\"reason\":\"" << rawReason << "\"}";
 		RaidDbgLog("entered", d.str());
 	}
+#endif // ARC_AGENT_NDJSON
 	// #endregion
 }

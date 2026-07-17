@@ -502,41 +502,6 @@ bool Engine::ProjectWorldLocationToScreen(
 	return ProjectWorldLocationToScreen(WorldLocation, screen, cameraInfo);
 }
 
-bool Engine::ProjectWorldLocationToRadar(
-	const Vector3& myWorldLocation,
-	const Vector3& enemyWorldLocation,
-	float myYaw,
-	Vector3& outRadar)
-{
-	Vector3 delta = enemyWorldLocation - myWorldLocation;
-	delta.z = 0.0;
-
-	const float distance = static_cast<float>(std::sqrt(delta.x * delta.x + delta.y * delta.y));
-
-	const float radarRange = 80.0f;
-
-	if (distance > radarRange)
-	{
-		delta.x *= radarRange / distance;
-		delta.y *= radarRange / distance;
-	}
-
-	const float yawRad = static_cast<float>(DegToRad(static_cast<double>(myYaw)));
-
-	const float cosYaw = static_cast<float>(std::cos(yawRad));
-	const float sinYaw = static_cast<float>(std::sin(yawRad));
-
-	const float forward = static_cast<float>(delta.x * cosYaw + delta.y * sinYaw);
-	const float right = static_cast<float>(-delta.x * sinYaw + delta.y * cosYaw);
-
-	outRadar.x = right / radarRange;
-	outRadar.y = forward / radarRange;
-
-	outRadar.z = static_cast<float>(distance / radarRange);
-
-	return true;
-}
-
 bool Engine::Has(const std::string& s, const char* sub)
 {
     return s.find(sub) != std::string::npos;
@@ -568,7 +533,7 @@ static GITArrayHdr ReadGIArray(uintptr_t gi, std::ptrdiff_t off)
 
 static bool IsUsableObjectPtr(uintptr_t p)
 {
-    return p != 0 && p != UINTPTR_MAX && Memory::IsValidPtrFast2(p);
+    return Engine::IsUsableObjectPtr(p);
 }
 
 static bool ValidatePlayerController(uintptr_t pc, uintptr_t& outPawn, bool requirePawnWorld)
@@ -657,24 +622,10 @@ static bool TryLocalPlayerChain(uintptr_t gi, std::ptrdiff_t localPlayersOff,
     return false;
 }
 
-static bool LooksLikeUtf16GarbageQword(uintptr_t p)
-{
-    if (!p)
-        return true;
-    int asciiPairs = 0;
-    for (int i = 0; i < 4; ++i) {
-        const unsigned char lo = static_cast<unsigned char>((p >> (i * 16)) & 0xFF);
-        const unsigned char hi = static_cast<unsigned char>((p >> (i * 16 + 8)) & 0xFF);
-        if (hi == 0 && lo >= 0x20 && lo < 0x7F)
-            ++asciiPairs;
-    }
-    return asciiPairs >= 3;
-}
-
 static bool ValidateGameInstance(uintptr_t gi, uintptr_t* outLocalPlayer = nullptr,
     uintptr_t* outPlayerController = nullptr)
 {
-    if (!IsUsableObjectPtr(gi) || LooksLikeUtf16GarbageQword(gi))
+    if (!IsUsableObjectPtr(gi) || Engine::LooksLikeUtf16Garbage(gi))
         return false;
 
     uintptr_t lp = 0;
@@ -707,7 +658,7 @@ static bool ValidateGameInstance(uintptr_t gi, uintptr_t* outLocalPlayer = nullp
         if (arr.Max < arr.Num || arr.Max > 64)
             continue;
         const uintptr_t slot0 = Memory::read<uintptr_t>(arr.Data);
-        if (outLocalPlayer && IsUsableObjectPtr(slot0) && !LooksLikeUtf16GarbageQword(slot0))
+        if (outLocalPlayer && IsUsableObjectPtr(slot0) && !Engine::LooksLikeUtf16Garbage(slot0))
             *outLocalPlayer = slot0;
         if (outPlayerController)
             *outPlayerController = 0;
@@ -839,7 +790,7 @@ uintptr_t Engine::ResolveLocalPlayerFromController(uintptr_t playerController)
 
     // Help: LocalPlayer::PLAYER_CONTROLLER 0xA0 must point back at this PC.
     auto lpPointsAtPc = [&](uintptr_t lp) -> bool {
-        if (!IsUsableObjectPtr(lp) || LooksLikeUtf16GarbageQword(lp))
+        if (!IsUsableObjectPtr(lp) || Engine::LooksLikeUtf16Garbage(lp))
             return false;
         return Memory::read<uintptr_t>(lp + Offsets::LocalPlayer_PlayerController)
             == playerController;
@@ -1173,32 +1124,46 @@ bool Engine::getAllowWorldEntry(const WorldCacheEntry& entry) const
         entry.lootRarityTier});
 }
 
+namespace {
+
+/** Union of all former inventory/weapon prefix tables (longest match first). */
+std::string StripWeaponAssetName(std::string name)
+{
+    static const char* kPrefixes[] = {
+        "DA_WeaponItem_",
+        "DA_ItemDataAsset_",
+        "BP_WeaponActor_",
+        "BP_ItemActor_",
+        "BP_WeaponActor",
+        "BP_ItemActor",
+        "BP_Weapon_",
+        "BP_Item_",
+        "BP_WItem_",
+        "DA_Item_",
+        "Default__",
+        "BP_Weapon",
+        "DA_",
+        "BP_",
+    };
+    for (const char* prefix : kPrefixes) {
+        const size_t len = std::strlen(prefix);
+        if (name.size() >= len && name.compare(0, len, prefix) == 0) {
+            name = name.substr(len);
+            break;
+        }
+    }
+    if (name.size() > 2 && name.compare(name.size() - 2, 2, "_C") == 0)
+        name.resize(name.size() - 2);
+    return name;
+}
+
+} // namespace
+
 std::string Engine::GetWeaponName(const std::string& internal_name) {
     if (internal_name.empty())
         return {};
 
-    auto stripPrefixes = [](std::string name) -> std::string {
-        static const char* kPrefixes[] = {
-            "BP_WeaponActor_",
-            "BP_Weapon_",
-            "BP_WeaponActor",
-            "BP_Weapon",
-            "BP_ItemActor_",
-            "BP_ItemActor",
-        };
-        for (const char* prefix : kPrefixes) {
-            const size_t len = std::strlen(prefix);
-            if (name.size() >= len && name.compare(0, len, prefix) == 0) {
-                name = name.substr(len);
-                break;
-            }
-        }
-        if (name.size() > 2 && name.compare(name.size() - 2, 2, "_C") == 0)
-            name.resize(name.size() - 2);
-        return name;
-    };
-
-    const std::string stripped = stripPrefixes(internal_name);
+    const std::string stripped = StripWeaponAssetName(internal_name);
 
     static const std::unordered_map<std::string, std::string> processMap = {     
         { "Pneumatic_01",                     "Kettle" },
@@ -1832,18 +1797,7 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
     if (slot0.WeaponVisual && Memory::IsValidPtrFast2(slot0.WeaponVisual)) {
         std::string name = GetActorFNameString(slot0.WeaponVisual);
         if (!name.empty()) {
-            std::string stripped = name;
-            // Strip common prefixes
-            static const char* kPrefixes[] = { "DA_WeaponItem_", "DA_ItemDataAsset_", "DA_Item_", "DA_", "Default__" };
-            for (const char* p : kPrefixes) {
-                size_t len = std::strlen(p);
-                if (stripped.size() >= len && stripped.compare(0, len, p) == 0) {
-                    stripped = stripped.substr(len);
-                    break;
-                }
-            }
-            if (stripped.size() > 2 && stripped.compare(stripped.size() - 2, 2, "_C") == 0)
-                stripped.resize(stripped.size() - 2);
+            const std::string stripped = StripWeaponAssetName(name);
             outStowed0 = GetWeaponName(stripped.empty() ? name : stripped);
         }
         if (slot0.WeaponQuality >= 0 && slot0.WeaponQuality <= 3)
@@ -1855,17 +1809,7 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
     if (slot1.WeaponVisual && Memory::IsValidPtrFast2(slot1.WeaponVisual)) {
         std::string name = GetActorFNameString(slot1.WeaponVisual);
         if (!name.empty()) {
-            std::string stripped = name;
-            static const char* kPrefixes[] = { "DA_WeaponItem_", "DA_ItemDataAsset_", "DA_Item_", "DA_", "Default__" };
-            for (const char* p : kPrefixes) {
-                size_t len = std::strlen(p);
-                if (stripped.size() >= len && stripped.compare(0, len, p) == 0) {
-                    stripped = stripped.substr(len);
-                    break;
-                }
-            }
-            if (stripped.size() > 2 && stripped.compare(stripped.size() - 2, 2, "_C") == 0)
-                stripped.resize(stripped.size() - 2);
+            const std::string stripped = StripWeaponAssetName(name);
             outStowed1 = GetWeaponName(stripped.empty() ? name : stripped);
         }
         if (slot1.WeaponQuality >= 0 && slot1.WeaponQuality <= 3)
@@ -1878,21 +1822,7 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
     if (equipped) {
         std::string eqName = GetActorFNameString(equipped);
         if (!eqName.empty()) {
-            std::string stripped = eqName;
-            static const char* kPrefixes[] = {
-                "DA_WeaponItem_", "DA_ItemDataAsset_", "DA_Item_", "DA_",
-                "BP_WeaponActor_", "BP_Weapon_", "BP_ItemActor_", "BP_Item_",
-                "BP_WItem_", "BP_", "Default__"
-            };
-            for (const char* p : kPrefixes) {
-                size_t len = std::strlen(p);
-                if (stripped.size() >= len && stripped.compare(0, len, p) == 0) {
-                    stripped = stripped.substr(len);
-                    break;
-                }
-            }
-            if (stripped.size() > 2 && stripped.compare(stripped.size() - 2, 2, "_C") == 0)
-                stripped.resize(stripped.size() - 2);
+            const std::string stripped = StripWeaponAssetName(eqName);
             outWeaponName = GetWeaponName(stripped.empty() ? eqName : stripped);
         }
     }
@@ -1917,20 +1847,7 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
                     nm = GetActorClassFName(resolved);
                 if (nm.empty())
                     continue;
-                std::string stripped = nm;
-                static const char* kPrefixes[] = {
-                    "BP_WeaponActor_", "BP_Weapon_", "BP_ItemActor_", "BP_Item_",
-                    "BP_WItem_", "BP_", "DA_WeaponItem_", "DA_Item_", "DA_", "Default__"
-                };
-                for (const char* p : kPrefixes) {
-                    size_t len = std::strlen(p);
-                    if (stripped.size() >= len && stripped.compare(0, len, p) == 0) {
-                        stripped = stripped.substr(len);
-                        break;
-                    }
-                }
-                if (stripped.size() > 2 && stripped.compare(stripped.size() - 2, 2, "_C") == 0)
-                    stripped.resize(stripped.size() - 2);
+                std::string stripped = StripWeaponAssetName(nm);
                 const std::string friendly = GetWeaponName(stripped.empty() ? nm : stripped);
                 if (!IsPlayerWeaponEspLabel(friendly))
                     continue;

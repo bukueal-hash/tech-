@@ -1,11 +1,13 @@
 #include "../Core/Engine.h"
 #include "../Core/Offsets.h"
 #include "../Interface/Utils/Variables/index.h"
+#include "WorldScanCommon.h"
 
 #include <chrono>
 #include <fstream>
 #include <unordered_map>
 #include <vector>
+#include "../Core/AgentLog.h"
 
 namespace {
 
@@ -62,6 +64,7 @@ void Engine::PositionRefreshPass()
         return;
 
     // #region agent log
+#if ARC_AGENT_NDJSON
     {
         static auto s_lastPosLog = std::chrono::steady_clock::time_point{};
         const auto nowLog = std::chrono::steady_clock::now();
@@ -89,6 +92,7 @@ void Engine::PositionRefreshPass()
             }
         }
     }
+#endif // ARC_AGENT_NDJSON
     // #endregion
 
     // NOCACHE — cached VMM pages froze bot WorldPos (boxes stuck at spawn footprint).
@@ -124,17 +128,7 @@ void Engine::PositionRefreshPass()
                     delta.x / dtSec,
                     delta.y / dtSec,
                     delta.z / dtSec};
-                const double mag2 =
-                    static_cast<double>(newVel.x) * newVel.x
-                    + static_cast<double>(newVel.y) * newVel.y
-                    + static_cast<double>(newVel.z) * newVel.z;
-                if (mag2 < (3000.0 * 3000.0)) {
-                    cachedVelocity.x = cachedVelocity.x * 0.5f + newVel.x * 0.5f;
-                    cachedVelocity.y = cachedVelocity.y * 0.5f + newVel.y * 0.5f;
-                    cachedVelocity.z = cachedVelocity.z * 0.5f + newVel.z * 0.5f;
-                } else {
-                    cachedVelocity = { 0, 0, 0 };
-                }
+                WorldScan::BlendCachedVelocity(cachedVelocity, newVel);
             }
         }
         lastWorldPos = freshPos;

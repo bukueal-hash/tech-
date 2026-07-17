@@ -12,6 +12,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include "../Core/AgentLog.h"
 
 static std::string WideToUtf8(const std::wstring& w) {
     if (w.empty())
@@ -579,7 +580,9 @@ bool PCIMemory::FullRefresh()
         return false;
 
     // #region agent log
+#if ARC_AGENT_NDJSON
     const auto t0 = std::chrono::steady_clock::now();
+#endif // ARC_AGENT_NDJSON
     // #endregion
 
     // Cooldown: back-to-back world flaps must not double-flush the VMM bus.
@@ -588,6 +591,7 @@ bool PCIMemory::FullRefresh()
     if (s_lastRefresh.time_since_epoch().count() != 0
         && now - s_lastRefresh < std::chrono::seconds(5)) {
         // #region agent log
+#if ARC_AGENT_NDJSON
         {
             std::ofstream f("F:/Test/ARCs/debug-5681af.log", std::ios::app);
             if (f) {
@@ -599,6 +603,7 @@ bool PCIMemory::FullRefresh()
                   << ",\"timestamp\":" << ms << "}\n";
             }
         }
+#endif // ARC_AGENT_NDJSON
         // #endregion
         return true;
     }
@@ -610,6 +615,7 @@ bool PCIMemory::FullRefresh()
     const bool ok = tlb != FALSE && mem != FALSE;
 
     // #region agent log
+#if ARC_AGENT_NDJSON
     {
         const auto msDur = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
@@ -624,6 +630,7 @@ bool PCIMemory::FullRefresh()
               << ",\"timestamp\":" << ms << "}\n";
         }
     }
+#endif // ARC_AGENT_NDJSON
     // #endregion
 
     return ok;

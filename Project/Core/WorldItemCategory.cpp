@@ -5,6 +5,7 @@
 #include "Engine.h"
 #include "Offsets.h"
 #include "../Interface/Utils/Variables/index.h"
+#include "../Functions/EspDraw.h"
 #include "../ThirdParty/ImGui/imgui.h"
 
 #include <Windows.h>
@@ -2502,11 +2503,7 @@ namespace {
 
 ImU32 ColorFromPicker(const float rgba[4])
 {
-    return IM_COL32(
-        static_cast<int>(rgba[0] * 255.f),
-        static_cast<int>(rgba[1] * 255.f),
-        static_cast<int>(rgba[2] * 255.f),
-        static_cast<int>(rgba[3] * 255.f));
+    return EspDraw::ColorFromRGBA(rgba);
 }
 
 } // namespace
