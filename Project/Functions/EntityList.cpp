@@ -9,11 +9,17 @@
 #include <chrono>
 #include <fstream>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include "../Core/AgentLog.h"
 
 namespace {
+
+// Distance-edge Drawing hysteresis: require this many consecutive out-of-range
+// scans before clearing Drawing (stops ESP blink at esp_distance boundary).
+static std::unordered_map<uintptr_t, uint8_t> s_playerDistMisses;
+static constexpr uint8_t kPlayerDistMissClearDrawing = 3;
 
 // help FrostDumper 2026-07-12:
 // Prefer root RelativeLocation 0x218, then scene CompToWorld, then net snapshots.
@@ -137,16 +143,7 @@ Vector3 ResolvePlayerWorldPos(uintptr_t pawn, uintptr_t root, uintptr_t /*legacy
 {
     // Bypass VMM page cache — Memory::read was freezing remotes (posSame=N).
     auto trySceneNC = [](uintptr_t comp) -> Vector3 {
-        if (!comp || !Memory::IsValidPtrFast2(comp))
-            return {};
-        const Engine::FVector3d world =
-            Memory::read_nocache<Engine::FVector3d>(comp + Offsets::WorldLocation);
-        const Vector3 w = Engine::ToVector3(world);
-        if (IsPlausibleWorldPos(w))
-            return w;
-        const Vector3 rel =
-            Memory::read_nocache<Vector3>(comp + Offsets::RelativeLocation);
-        return IsPlausibleWorldPos(rel) ? rel : Vector3{};
+        return Engine::ReadWorldLocationNocache(comp, /*allowRelativeFallback=*/true);
     };
     auto tryFVector3dNC = [](uintptr_t addr) -> Vector3 {
         if (!addr || !Memory::IsValidPtrFast2(addr))
@@ -365,9 +362,10 @@ void Engine::EntityList()
     }
 
     for (auto it = localCache.begin(); it != localCache.end(); ) {
-        if (!currentActorSet.contains(it->first))
+        if (!currentActorSet.contains(it->first)) {
+            WorldScan::MissCounterClear(s_playerDistMisses, it->first);
             it = localCache.erase(it);
-        else
+        } else
             ++it;
     }
 
@@ -602,6 +600,7 @@ void Engine::EntityList()
         actor.APawn = key;
 
         if (key == sAcknowledgedPawn) {
+            WorldScan::MissCounterClear(s_playerDistMisses, key);
             it = localCache.erase(it);
             continue;
         }
@@ -610,6 +609,7 @@ void Engine::EntityList()
             Memory::read<uintptr_t>(key + Offsets::RootComponent);
         if (!freshRoot || !IsValidPointer(freshRoot)) {
             ++dbgRootStale;
+            WorldScan::MissCounterClear(s_playerDistMisses, key);
             it = localCache.erase(it);
             continue;
         }
@@ -619,6 +619,7 @@ void Engine::EntityList()
         actor.isAlly = (myTeamId != 0 && myTeamId == enemyTeamId);
         if (actor.isAlly && var::hide_allies) {
             ++dbgTeamEvict;
+            WorldScan::MissCounterClear(s_playerDistMisses, key);
             it = localCache.erase(it);
             continue;
         }
@@ -628,6 +629,7 @@ void Engine::EntityList()
             bool viaActorType = false;
             if (!TryResolvePlayerStateAny(key, playerState, viaActorType)) {
                 ++dbgPsEvict;
+                WorldScan::MissCounterClear(s_playerDistMisses, key);
                 it = localCache.erase(it);
                 continue;
             }
@@ -636,12 +638,14 @@ void Engine::EntityList()
 
         if (localPlayerState && playerState == localPlayerState) {
             ++dbgGhostEvict;
+            WorldScan::MissCounterClear(s_playerDistMisses, key);
             it = localCache.erase(it);
             continue;
         }
 
         if (PlayerStateIsBot(playerState)) {
             ++dbgGsBot;
+            WorldScan::MissCounterClear(s_playerDistMisses, key);
             it = localCache.erase(it);
             continue;
         }
@@ -651,7 +655,6 @@ void Engine::EntityList()
             ++dbgGsEvict;
 
         actor.actorState = playerState;
-        actor.bIsDeathVerge = false;
 
         const std::string liveName = GetPlayerName(playerState, key);
         if (!liveName.empty())
@@ -666,6 +669,7 @@ void Engine::EntityList()
         if (!IsPlausibleWorldPos(actor.WorldPos))
         {
             ++dbgPosEvict;
+            WorldScan::MissCounterClear(s_playerDistMisses, key);
             it = localCache.erase(it);
             continue;
         }
@@ -678,10 +682,18 @@ void Engine::EntityList()
 
         if (distanceSq > maxDistSq) {
             ++dbgDistSkip;
-            actor.Drawing = false;
+            // Soft flap: keep Drawing for a few out-of-range scans so boxes don't
+            // blink at the distance edge. Hard erase paths (ghost/pos) unchanged.
+            if (WorldScan::MissCounterShouldEvict(
+                    s_playerDistMisses, key, false, kPlayerDistMissClearDrawing)) {
+                actor.Drawing = false;
+            } else {
+                actor.Drawing = true;
+            }
             ++it;
             continue;
         }
+        WorldScan::MissCounterClear(s_playerDistMisses, key);
 
         actor.health = static_cast<float>(get_health(key));
         actor.maxhealth = static_cast<float>(get_maxhealth(key));
@@ -706,23 +718,21 @@ void Engine::EntityList()
                 float pct = -1.f;
                 if (actor.maxhealth >= 1.f)
                     pct = 100.f * (actor.health / actor.maxhealth);
-                std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-                if (f) {
-                    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"hp-nocache\",\"hypothesisId\":\"HP1\""
-                      << ",\"location\":\"EntityList.cpp:health\",\"message\":\"player_health\""
-                      << ",\"data\":{\"pawn\":" << key
-                      << ",\"hc\":" << hc
-                      << ",\"hcOk\":" << (hc && Memory::IsValidPtrFast2(hc) ? 1 : 0)
-                      << ",\"hp\":" << actor.health
-                      << ",\"maxHp\":" << actor.maxhealth
-                      << ",\"armor\":" << actor.shield
-                      << ",\"maxArmor\":" << actor.maxshield
-                      << ",\"pct\":" << pct
-                      << ",\"dist\":" << actor.Distance
-                      << "},\"timestamp\":" << ms << "}\n";
-                }
+                ArcAgentLog(
+                    "hp-nocache",
+                    "HP1",
+                    "EntityList.cpp:health",
+                    "player_health",
+                    std::string("{\"pawn\":") + std::to_string(key)
+                        + ",\"hc\":" + std::to_string(hc)
+                        + ",\"hcOk\":" + ((hc && Memory::IsValidPtrFast2(hc)) ? "1" : "0")
+                        + ",\"hp\":" + std::to_string(actor.health)
+                        + ",\"maxHp\":" + std::to_string(actor.maxhealth)
+                        + ",\"armor\":" + std::to_string(actor.shield)
+                        + ",\"maxArmor\":" + std::to_string(actor.maxshield)
+                        + ",\"pct\":" + std::to_string(pct)
+                        + ",\"dist\":" + std::to_string(actor.Distance)
+                        + "}");
             }
         }
 #endif // ARC_AGENT_NDJSON
@@ -749,8 +759,8 @@ void Engine::EntityList()
         actor.armorPlates = invArmorPlates;
         actor.armorPerPlate = invArmorPerPlate;
 
-        GetBones(actor);
-
+        // Skeleton refresh is owned by CollectEspRenderFrame (up to 16 nearest).
+        // Calling GetBones here doubled NOCACHE scatter load and drove FPGA hitch storms.
         Vector3 headScr{};
         Vector3 footScr{};
         bool haveScreenBox = false;
@@ -795,10 +805,7 @@ void Engine::EntityList()
             actor.ScreenBottom = footScr;
         }
 
-        if (var::visiblecheck)
-            actor.isVisible = VisibleActor(key);
-        else
-            actor.isVisible = true;
+        actor.isVisible = true;
 
         actor.Drawing = true;
         ++it;
@@ -832,29 +839,26 @@ void Engine::EntityList()
                 std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
                 cacheN = playerCache.size();
             }
-            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-            if (f) {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                f << "{\"sessionId\":\"c190fb\",\"runId\":\"player-gs-gate\",\"hypothesisId\":\"H2\""
-                  << ",\"location\":\"EntityList.cpp:EntityList\",\"message\":\"player_admit\""
-                  << ",\"data\":{\"scanned\":" << dbgScanned
-                  << ",\"admitted\":" << dbgAdmitted
-                  << ",\"preAdmit\":" << dbgPreAdmit
-                  << ",\"cache\":" << cacheN
-                  << ",\"drawing\":" << dbgDrawing
-                  << ",\"gsArray\":" << dbgGsArray
-                  << ",\"gsEvict\":" << dbgGsEvict
-                  << ",\"gsPawnHit\":" << dbgGsPawnHit
-                  << ",\"gsPawnMiss\":" << dbgGsPawnMiss
-                  << ",\"gsPawnNull\":" << dbgGsPawnNull
-                  << ",\"psSkip\":" << dbgPsSkip
-                  << ",\"posEvict\":" << dbgPosEvict
-                  << ",\"ghostEvict\":" << dbgGhostEvict
-                  << ",\"actorTypeAdmit\":" << dbgActorTypeAdmit
-                  << ",\"lpGate\":0}"
-                  << ",\"timestamp\":" << ms << "}\n";
-            }
+            ArcAgentLog(
+                "player-gs-gate",
+                "H2",
+                "EntityList.cpp:EntityList",
+                "player_admit",
+                std::string("{\"scanned\":") + std::to_string(dbgScanned)
+                    + ",\"admitted\":" + std::to_string(dbgAdmitted)
+                    + ",\"preAdmit\":" + std::to_string(dbgPreAdmit)
+                    + ",\"cache\":" + std::to_string(cacheN)
+                    + ",\"drawing\":" + std::to_string(dbgDrawing)
+                    + ",\"gsArray\":" + std::to_string(dbgGsArray)
+                    + ",\"gsEvict\":" + std::to_string(dbgGsEvict)
+                    + ",\"gsPawnHit\":" + std::to_string(dbgGsPawnHit)
+                    + ",\"gsPawnMiss\":" + std::to_string(dbgGsPawnMiss)
+                    + ",\"gsPawnNull\":" + std::to_string(dbgGsPawnNull)
+                    + ",\"psSkip\":" + std::to_string(dbgPsSkip)
+                    + ",\"posEvict\":" + std::to_string(dbgPosEvict)
+                    + ",\"ghostEvict\":" + std::to_string(dbgGhostEvict)
+                    + ",\"actorTypeAdmit\":" + std::to_string(dbgActorTypeAdmit)
+                    + ",\"lpGate\":0}");
         }
     }
 #endif // ARC_AGENT_NDJSON

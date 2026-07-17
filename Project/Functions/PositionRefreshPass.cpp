@@ -78,18 +78,15 @@ void Engine::PositionRefreshPass()
                 else if (w.key.kind == PosRefreshKey::CacheKind::Robot)
                     ++nBot;
             }
-            std::ofstream f("F:/Test/ARCs/debug-5681af.log", std::ios::app);
-            if (f) {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                f << "{\"sessionId\":\"5681af\",\"runId\":\"post-fix\",\"hypothesisId\":\"H2\""
-                  << ",\"location\":\"PositionRefreshPass.cpp\",\"message\":\"pos_work\""
-                  << ",\"data\":{\"total\":" << work.size()
-                  << ",\"players\":" << nPlayer
-                  << ",\"bots\":" << nBot
-                  << ",\"world\":0,\"cachedScatter\":0}"
-                  << ",\"timestamp\":" << ms << "}\n";
-            }
+            ArcAgentLog5681af(
+                "post-fix",
+                "H2",
+                "PositionRefreshPass.cpp",
+                "pos_work",
+                std::string("{\"total\":") + std::to_string(work.size())
+                    + ",\"players\":" + std::to_string(nPlayer)
+                    + ",\"bots\":" + std::to_string(nBot)
+                    + ",\"world\":0,\"cachedScatter\":0}");
         }
     }
 #endif // ARC_AGENT_NDJSON

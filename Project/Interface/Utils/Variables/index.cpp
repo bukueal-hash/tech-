@@ -33,7 +33,6 @@ namespace var {
     bool robotAimEnabled = false;
     int aim_hold_key = 0x10; // VK_SHIFT
     AimBoneMode aim_bone_mode = AimBoneMode::Chest;
-    bool visiblecheck = true;
     bool predict = true;
     bool humanizer = false;
     bool randombone = true;
@@ -84,7 +83,6 @@ namespace var {
     bool show_world_open_container = true;
     float color_dead_bots[4] = { 0.5f, 0.5f, 0.5f, 1.0f };
     bool showDeadPlayers = true;
-    float world_distance = 250.f;
     float color_dropped_items[4] = { 1.0f, 1.0f, 0.0f, 1.0f };
     float color_raider_stock[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
     float color_arc_entities[4] = { 0.0f, 1.0f, 1.0f, 1.0f };
@@ -115,6 +113,7 @@ namespace var {
 
     /* Loot */
     bool showLoot = true;
+    bool show_near_loot_hud = false;
     float loot_distance = 500.f;
     float container_distance_sp = 500.f;
     float color_loot[4] = { 1.0f, 165.f / 255.f, 0.0f, 1.0f };

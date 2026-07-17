@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 #include "../Core/AgentLog.h"
+#include "../Core/Engine.h"
 
 static std::string WideToUtf8(const std::wstring& w) {
     if (w.empty())
@@ -62,20 +63,6 @@ static VOID cbDtbAddFile(_Inout_ HANDLE /*h*/, _In_ LPCSTR uszName, _In_ ULONG64
         g_dtbFileSize = cb ? cb : 0x80000;
 }
 
-static bool LooksLikeUtf16(uintptr_t p)
-{
-    if (!p)
-        return true;
-    int n = 0;
-    for (int i = 0; i < 4; ++i) {
-        const unsigned char lo = static_cast<unsigned char>((p >> (i * 16)) & 0xFF);
-        const unsigned char hi = static_cast<unsigned char>((p >> (i * 16 + 8)) & 0xFF);
-        if (hi == 0 && lo >= 0x20 && lo < 0x7F)
-            ++n;
-    }
-    return n >= 3;
-}
-
 static bool ReadU64(VMM_HANDLE h, DWORD pid, uint64_t va, uint64_t& out)
 {
     out = 0;
@@ -103,14 +90,14 @@ static bool HasMz(VMM_HANDLE h, DWORD pid, uintptr_t base)
 
 static bool LevelOwnedByWorld(VMM_HANDLE h, DWORD pid, uint64_t level, uint64_t world)
 {
-    if (!level || LooksLikeUtf16(static_cast<uintptr_t>(level)) || level < 0x10000)
+    if (!level || Engine::LooksLikeUtf16Garbage(static_cast<uintptr_t>(level)) || level < 0x10000)
         return false;
     uint64_t owning = 0;
     if (ReadU64(h, pid, level + kHelpLevelOwningWorld, owning) && owning == world)
         return true;
     uint64_t actors = 0;
     int32_t count = 0;
-    if (!ReadU64(h, pid, level + kHelpActors, actors) || LooksLikeUtf16(static_cast<uintptr_t>(actors)))
+    if (!ReadU64(h, pid, level + kHelpActors, actors) || Engine::LooksLikeUtf16Garbage(static_cast<uintptr_t>(actors)))
         return false;
     if (!ReadI32(h, pid, level + kHelpActorCount, count))
         return false;
@@ -124,7 +111,7 @@ static bool ProbeHelpWorld(VMM_HANDLE h, DWORD pid, uintptr_t base)
         return false;
     uint64_t world = 0;
     if (!ReadU64(h, pid, base + kHelpUWorldRva, world)
-        || LooksLikeUtf16(static_cast<uintptr_t>(world)) || world < 0x10000)
+        || Engine::LooksLikeUtf16Garbage(static_cast<uintptr_t>(world)) || world < 0x10000)
         return false;
 
     uint64_t level = 0;
@@ -136,7 +123,7 @@ static bool ProbeHelpWorld(VMM_HANDLE h, DWORD pid, uintptr_t base)
     int32_t colNum = 0;
     if (ReadU64(h, pid, world + kHelpLevelCollections, colData)
         && ReadI32(h, pid, world + kHelpLevelCollections + 8, colNum)
-        && colData && !LooksLikeUtf16(static_cast<uintptr_t>(colData))
+        && colData && !Engine::LooksLikeUtf16Garbage(static_cast<uintptr_t>(colData))
         && colNum > 0 && colNum <= 16) {
         const int limit = colNum > 4 ? 4 : colNum;
         for (int i = 0; i < limit; ++i) {
@@ -593,15 +580,12 @@ bool PCIMemory::FullRefresh()
         // #region agent log
 #if ARC_AGENT_NDJSON
         {
-            std::ofstream f("F:/Test/ARCs/debug-5681af.log", std::ios::app);
-            if (f) {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                f << "{\"sessionId\":\"5681af\",\"runId\":\"post-fix\",\"hypothesisId\":\"H3\""
-                  << ",\"location\":\"Memory.cpp:FullRefresh\",\"message\":\"full_refresh\""
-                  << ",\"data\":{\"durMs\":0,\"mode\":\"cooldown_skip\",\"ok\":1}"
-                  << ",\"timestamp\":" << ms << "}\n";
-            }
+            ArcAgentLog5681af(
+                "post-fix",
+                "H3",
+                "Memory.cpp:FullRefresh",
+                "full_refresh",
+                "{\"durMs\":0,\"mode\":\"cooldown_skip\",\"ok\":1}");
         }
 #endif // ARC_AGENT_NDJSON
         // #endregion
@@ -619,16 +603,13 @@ bool PCIMemory::FullRefresh()
     {
         const auto msDur = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
-        std::ofstream f("F:/Test/ARCs/debug-5681af.log", std::ios::app);
-        if (f) {
-            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            f << "{\"sessionId\":\"5681af\",\"runId\":\"post-fix\",\"hypothesisId\":\"H3\""
-              << ",\"location\":\"Memory.cpp:FullRefresh\",\"message\":\"full_refresh\""
-              << ",\"data\":{\"durMs\":" << msDur
-              << ",\"mode\":\"tlb_mem\",\"ok\":" << (ok ? 1 : 0) << "}"
-              << ",\"timestamp\":" << ms << "}\n";
-        }
+        ArcAgentLog5681af(
+            "post-fix",
+            "H3",
+            "Memory.cpp:FullRefresh",
+            "full_refresh",
+            std::string("{\"durMs\":") + std::to_string(msDur)
+                + ",\"mode\":\"tlb_mem\",\"ok\":" + (ok ? "1" : "0") + "}");
     }
 #endif // ARC_AGENT_NDJSON
     // #endregion

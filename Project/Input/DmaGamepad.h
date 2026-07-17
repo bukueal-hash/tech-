@@ -16,23 +16,11 @@ struct DmaPadRaw {
 };
 #pragma pack(pop)
 
-struct XINPUT_STATE {
-	uint32_t dwPacketNumber;
-	uint16_t wButtons;
-	uint8_t  bLeftTrigger;
-	uint8_t  bRightTrigger;
-	int16_t  sThumbLX;
-	int16_t  sThumbLY;
-	int16_t  sThumbRX;
-	int16_t  sThumbRY;
-};
-
 inline constexpr int kDmaTriggerPressedThreshold = 128;
 
 namespace DmaGamepad {
 
 bool TryInit(DmaMem& mem);
-bool ReadState(XINPUT_STATE& out);
 bool ReadRaw(DmaPadRaw& out);
 bool IsReady();
 const char* GetLastStatusMessage();

@@ -1,10 +1,12 @@
 #include <Windows.h>
+#include <algorithm>
 #include <chrono>
 #include <cstdarg>
 #include <cfloat>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <vector>
 #include "../ThirdParty/ImGui/imgui.h"
 #include "../ThirdParty/ImGui/imgui_impl_win32.h"
 #include "../ThirdParty/ImGui/imgui_impl_dx11.h"
@@ -22,6 +24,7 @@ bool requestExit = false;
 Engine engine = Engine();
 
 static void DrawDebugOffsetValidation(Engine& eng);
+static void DrawNearLootHud(Engine& eng);
 
 void Render(HWND hwnd)
 {
@@ -59,9 +62,11 @@ void Render(HWND hwnd)
     if (engine.IsEspRaidActive() && var::show_radar)
         engine.RenderRadar(showmenu);
 
+    if (engine.IsEspRaidActive() && !showmenu && var::show_near_loot_hud)
+        DrawNearLootHud(engine);
+
     if (var::show_debug_overlay && !showmenu) {
         DrawDebugOffsetValidation(engine);
-        engine.PrintVisCheckDebugConsole();
     }
 
     if (requestExit) {
@@ -69,6 +74,58 @@ void Render(HWND hwnd)
         requestExit = false;
         SendMessage(hwnd, WM_CLOSE, 0, 0);
         return;
+    }
+}
+
+static void DrawNearLootHud(Engine& eng)
+{
+    static std::vector<Engine::GroundPickupHudRow> s_rows;
+    static auto s_lastCollect = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (s_lastCollect.time_since_epoch().count() == 0
+        || now - s_lastCollect >= std::chrono::milliseconds(200)) {
+        s_lastCollect = now;
+        eng.CollectDrawingGroundPickups(s_rows);
+    }
+
+    {
+        static bool f7WasDown = false;
+        const bool f7Down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+        if (f7Down && !f7WasDown && !s_rows.empty())
+            eng.UserConfirmGroundItemPicked(s_rows.front().key);
+        f7WasDown = f7Down;
+    }
+
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    if (!dl)
+        return;
+
+    const float x = 18.f;
+    float y = 120.f;
+    dl->AddText(ImVec2(x, y), IM_COL32(255, 200, 80, 255), "Near loot (F7 = mark nearest picked)");
+    y += 18.f;
+
+    if (s_rows.empty()) {
+        dl->AddText(ImVec2(x, y), IM_COL32(180, 180, 180, 200), "(none drawing)");
+        return;
+    }
+
+    const int maxShow = (std::min)(static_cast<int>(s_rows.size()), 12);
+    for (int i = 0; i < maxShow; ++i) {
+        const auto& row = s_rows[static_cast<size_t>(i)];
+        char line[256];
+        const char* name = row.name.empty() ? "?" : row.name.c_str();
+        std::snprintf(
+            line,
+            sizeof(line),
+            "%s%2d  %.0fm  %s",
+            i == 0 ? "> " : "  ",
+            i + 1,
+            row.distM,
+            name);
+        const ImU32 col = i == 0 ? IM_COL32(120, 255, 140, 255) : IM_COL32(230, 230, 230, 220);
+        dl->AddText(ImVec2(x, y), col, line);
+        y += 16.f;
     }
 }
 
@@ -85,7 +142,6 @@ static void DrawDebugOffsetValidation(Engine& eng)
         size_t worldCacheSz = 0;
         size_t worldDrawSz = 0;
         size_t robotDrawSz = 0;
-        Engine::VisCheckDebugStats visDbg{};
         int actorCount = 0;
         float camFov = 0.f;
         uintptr_t playerState = 0;
@@ -141,8 +197,6 @@ static void DrawDebugOffsetValidation(Engine& eng)
             if (lock.owns_lock()) {
                 gotPlayer = 1;
                 next.playerCacheSz = eng.playerCache.size();
-                next.visDbg.playersTotal = 0;
-                next.visDbg.playersMeshVisible = 0;
                 size_t drawN = 0;
                 for (const auto& [key, actor] : eng.playerCache) {
                     (void)key;
@@ -150,9 +204,6 @@ static void DrawDebugOffsetValidation(Engine& eng)
                         continue;
                     if (!(actor.isAlly && var::hide_allies))
                         ++drawN;
-                    ++next.visDbg.playersTotal;
-                    if (actor.isVisible)
-                        ++next.visDbg.playersMeshVisible;
                 }
                 if (!gotFrame)
                     next.drawTargets = drawN;
@@ -207,17 +258,12 @@ static void DrawDebugOffsetValidation(Engine& eng)
             std::shared_lock<std::shared_mutex> lock(eng.m_robotCacheMutex, std::try_to_lock);
             if (lock.owns_lock()) {
                 gotRobot = 1;
-                next.visDbg.botsTotal = 0;
-                next.visDbg.botsMeshVisible = 0;
                 size_t drawN = 0;
                 for (const auto& [key, entry] : eng.robotCache) {
                     (void)key;
                     if (!entry.Drawing)
                         continue;
                     ++drawN;
-                    ++next.visDbg.botsTotal;
-                    if (entry.isVisible)
-                        ++next.visDbg.botsMeshVisible;
                 }
                 if (!gotFrame)
                     next.robotDrawSz = drawN;
@@ -393,21 +439,6 @@ static void DrawDebugOffsetValidation(Engine& eng)
 
         ok = snap.robotDrawSz > 0;
         drawRow(xPos, row++, "BotDraw", ok, "%zu", snap.robotDrawSz);
-
-        const Engine::VisCheckDebugStats& visDbg = snap.visDbg;
-        drawRow(xPos, row++, "MeshVisMode", true, "%s",
-            var::visiblecheck ? "render_time" : "off");
-        drawRow(xPos, row++, "PlrMeshVis", visDbg.playersTotal > 0,
-            "%d/%d", visDbg.playersMeshVisible, visDbg.playersTotal);
-        drawRow(xPos, row++, "BotMeshVis", visDbg.botsTotal > 0,
-            "%d/%d", visDbg.botsMeshVisible, visDbg.botsTotal);
-        if (visDbg.hasSample) {
-            drawRow(xPos, row++, "VisSample", visDbg.sampleVisible,
-                "on=%d rec=%d s=%.2f",
-                visDbg.sampleOnScreen ? 1 : 0,
-                visDbg.sampleRecent ? 1 : 0,
-                visDbg.sampleSubmit);
-        }
 
         ok = snap.actorCount > 0 && snap.actorCount < 10000;
         drawRow(xPos, row++, "ActorCount", ok, "%d", snap.actorCount);

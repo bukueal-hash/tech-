@@ -87,13 +87,6 @@ void Controller::UpdateState() {
 	(void)readKernelPadState(state);
 }
 
-void Controller::UpdatePressedState() {
-	if (xInputControllerDevice < kKernelPtrMin)
-		return;
-	previousState = state;
-	(void)readKernelPadState(state);
-}
-
 bool Controller::IsButtonDown(uint32_t button) {
 	if (xInputControllerDevice < kKernelPtrMin)
 		return false;
@@ -107,42 +100,4 @@ bool Controller::IsButtonDown(uint32_t button) {
 		return state.rt > 128;
 
 	return (state.buttons & static_cast<uint16_t>(button)) != 0;
-}
-
-bool Controller::IsButtonPressed(uint32_t button) {
-	if (xInputControllerDevice < kKernelPtrMin)
-		return false;
-
-	UpdatePressedState();
-
-	if (button == XINPUT_LT_BTN) {
-		const bool cur = state.lt > 128;
-		const bool prev = previousState.lt > 128;
-		if (cur)
-			previousState.lt = state.lt;
-		else
-			previousState.lt = 0;
-		return cur && !prev;
-	}
-
-	if (button == XINPUT_RT_BTN) {
-		const bool cur = state.rt > 128;
-		const bool prev = previousState.rt > 128;
-		if (cur)
-			previousState.rt = state.rt;
-		else
-			previousState.rt = 0;
-		return cur && !prev;
-	}
-
-	const uint16_t m = static_cast<uint16_t>(button);
-	const bool current = (state.buttons & m) != 0;
-	const bool previous = (previousState.buttons & m) != 0;
-	const bool isPressed = current && !previous;
-	if (current)
-		previousState.buttons |= m;
-	else
-		previousState.buttons &= static_cast<uint16_t>(~m);
-
-	return isPressed;
 }

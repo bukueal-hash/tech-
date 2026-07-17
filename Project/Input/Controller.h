@@ -69,15 +69,11 @@ public:
 
     void UpdateState();
 
-    void UpdatePressedState();
-
     void RefreshState();
 
     const XInputState& GetState() const { return state; }
 
     bool IsButtonDown(uint32_t button);
-
-    bool IsButtonPressed(uint32_t button);
 
     bool IsReady() const { return xInputControllerDevice >= 0xFFFF000000000000ull; }
 

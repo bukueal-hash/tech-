@@ -2,9 +2,11 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <immintrin.h>
 
 #include "../Core/Engine.h"
 #include "../Core/Memory.h"
+#include "../Core/Offsets.h"
 #include "../Core/SteamDecrypt.hpp"
 
 extern Engine engine;
@@ -16,6 +18,59 @@ bool Engine::IsValidPointer(uintptr_t ptr) const {
 bool Engine::IsUsermodePtr(uintptr_t ptr)
 {
     return ptr > 0x10000 && ptr < 0x00007FFFFFFFFFFF;
+}
+
+namespace {
+
+bool MeshHasEncryptedBoneBlock(uintptr_t mesh)
+{
+    if (!mesh)
+        return false;
+
+    __m128i enc780{};
+    if (Memory::ReadRaw(mesh + Offsets::Encrypted, &enc780, sizeof(enc780))
+        && _mm_cvtsi128_si64(enc780) != 0)
+        return true;
+
+    __m128i enc830{};
+    return Memory::ReadRaw(mesh + Offsets::LodSelect, &enc830, sizeof(enc830))
+        && _mm_cvtsi128_si64(enc830) != 0;
+}
+
+} // namespace
+
+uintptr_t Engine::GetActorSkeletalMesh(uintptr_t actor) const
+{
+    if (!actor)
+        return 0;
+
+    uintptr_t mesh = Memory::read<uintptr_t>(actor + Offsets::USkeletalMeshComponent);
+    if (mesh && IsValidPointer(mesh))
+        return mesh;
+
+    mesh = Memory::read<uintptr_t>(actor + Offsets::EmbarkMesh);
+    if (mesh && IsValidPointer(mesh))
+        return mesh;
+
+    return 0;
+}
+
+uintptr_t Engine::GetActorBoneMesh(uintptr_t actor)
+{
+    if (!actor)
+        return 0;
+
+    const uintptr_t embark =
+        Memory::read<uintptr_t>(actor + Offsets::EmbarkMesh);
+    const uintptr_t skel =
+        Memory::read<uintptr_t>(actor + Offsets::USkeletalMeshComponent);
+
+    if (embark && IsValidPointer(embark) && MeshHasEncryptedBoneBlock(embark))
+        return embark;
+    if (skel && IsValidPointer(skel) && MeshHasEncryptedBoneBlock(skel))
+        return skel;
+
+    return GetActorSkeletalMesh(actor);
 }
 
 static bool IsNearZero(const Vector3& v)
@@ -167,13 +222,13 @@ void Engine::GetBones(PlayerCacheEntry& actor)
         componentToWorld = Engine::ReadComponentToWorld(actor.boneMesh);
         for (size_t i = 0; i < boneCount; ++i) {
             const int gameIndex = GameBoneMapArcRaiders[i].first;
+            // Cached sequential reads — per-bone nocache floods DMA (ESP lag).
             boneTransforms[i] = Memory::read<FTransform>(
                 actor.boneArray + (gameIndex * 0x60));
         }
-    } else {
-        // Prefer a fresh CompToWorld — scatter CTW can race mesh motion.
-        componentToWorld = Engine::ReadComponentToWorld(actor.boneMesh);
     }
+    // Batched path: CTW already filled by the scatter prepare above — do not
+    // re-ReadComponentToWorld (extra 2× NOCACHE per player).
 
     const D3DMATRIX ctwMatrix = componentToWorld.ToMatrixWithScale();
 

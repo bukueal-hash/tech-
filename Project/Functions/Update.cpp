@@ -22,17 +22,12 @@ namespace {
 #if ARC_AGENT_NDJSON
 inline void RaidDbgLog(const char* event, const std::string& dataJson)
 {
-	static std::mutex m;
-	std::lock_guard<std::mutex> lock(m);
-	std::ofstream f("F:/Test/ARCs/debug-5681af.log", std::ios::app);
-	if (!f)
-		return;
-	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-		std::chrono::system_clock::now().time_since_epoch()).count();
-	f << "{\"sessionId\":\"5681af\",\"runId\":\"raid-gate\",\"hypothesisId\":\"R\""
-	  << ",\"location\":\"Update.cpp:TickRaidGate\",\"message\":\"" << event
-	  << "\",\"data\":" << dataJson
-	  << ",\"timestamp\":" << ms << "}\n";
+	ArcAgentLog5681af(
+		"raid-gate",
+		"R",
+		"Update.cpp:TickRaidGate",
+		event,
+		dataJson);
 }
 #endif // ARC_AGENT_NDJSON
 // #endregion

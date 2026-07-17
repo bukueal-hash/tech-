@@ -135,17 +135,6 @@ private:
     void ResetRaidTransitionState();
 
 public:
-    enum class EItemRarity : uint8_t
-    {
-        Common = 0,
-        Uncommon = 1,
-        Rare = 2,
-        Epic = 3,
-        Legendary = 4,
-        MAX = 5,
-        INVALID = 0xFF
-    };
-
     struct CameraCache
     {
         Vector3 Location;
@@ -191,7 +180,6 @@ public:
     void StopWorkerThreads();
 
     void RenderEsp();
-    void RenderPlayerEspFromCache(const CameraCache& renderCam);
     void RenderFovCircle();
     void RenderRadar(bool interactive = false);
 
@@ -241,6 +229,18 @@ public:
     bool ControllerHasValidPcm(uintptr_t pc);
     bool ResolvePcFromLevelCameraManager(uintptr_t level, uintptr_t actorsData,
         uintptr_t& outPc, uintptr_t& outPawn, uintptr_t& outPcm);
+    /**
+     * Shared PC→PCM discovery ladder (Esp frame + RefreshCameraFromViewTarget).
+     * nocacheFov: Utils uses read_nocache for DefaultFOV; Esp uses cached read.
+     * Updates pc/pawn/pcm by reference when level scan recovers them.
+     */
+    bool ResolvePlayerCameraManagerLadder(
+        uintptr_t& pc,
+        uintptr_t& pawn,
+        uintptr_t& pcm,
+        uintptr_t level,
+        uintptr_t actors,
+        bool nocacheFov);
 
     void UpdateCamera();
     void SetProjectionViewport(float width, float height);
@@ -279,44 +279,16 @@ public:
     void DbgStoreCameraProbe(const CameraProbeSnapshot& probe);
     bool ProjectWorldLocationToScreen(Vector3 world_location, Vector3& screen);
     bool ProjectWorldLocationToScreen(Vector3 world_location, Vector3& screen, const CameraCache& camera);
-    bool Visible(uintptr_t mesh) const;
-    bool VisibleActor(uintptr_t actor) const;
-    /** Bot-only mesh vis: embark-first + SDK recently-rendered fallback. */
-    bool VisibleBotActor(uintptr_t actor) const;
-
-    struct VisCheckDebugStats {
-        int playersTotal = 0;
-        int playersMeshVisible = 0;
-        int botsTotal = 0;
-        int botsMeshVisible = 0;
-        float sampleSubmit = 0.f;
-        float sampleRender = 0.f;
-        float sampleRenderScr = 0.f;
-        bool sampleOnScreen = false;
-        bool sampleRecent = false;
-        bool sampleVisible = false;
-        /** Decrypted LastRenderTimeOnScreen (UC enc path) or plain onScr. */
-        float sampleDecryptedLrtos = 0.f;
-        float sampleWorldTimeSeconds = 0.f;
-        /** "enc" | "plain" | "fail" */
-        const char* samplePathUsed = "fail";
-        bool hasSample = false;
-    };
-    VisCheckDebugStats CollectVisCheckDebugStats() const;
-    void PrintVisCheckDebugConsole();
 
     uintptr_t GetActorSkeletalMesh(uintptr_t actor) const;
     /** Mesh that owns the encrypted bone block (Embark preferred). */
     uintptr_t GetActorBoneMesh(uintptr_t actor);
-
-    std::uintptr_t GetBoneArrayDecrypt(std::uintptr_t Meh);
 
     bool IsValidPointer(uintptr_t ptr) const;
     bool IsUsermodePtr(uintptr_t ptr);
     std::string getEntityType(const std::string& actorName);
     bool getAllowType(const std::string& actorName, int category = 0) const;
     bool getAllowWorldEntry(const WorldCacheEntry& entry) const;
-    bool Has(const std::string& s, const char* sub);
 
     int32_t GetActorFNameId(uint64_t actor_base);
     std::string GetActorFNameString(uint64_t actor_base);
@@ -346,35 +318,6 @@ public:
     };
     EngineStateSnapshot GetStateSnapshot() const;
 
-    /** Paint-thread safe: try_lock only — never waits on worker cache locks. */
-    struct DebugOverlaySnap {
-        uintptr_t base = 0;
-        EngineStateSnapshot state{};
-        size_t playerCacheSz = 0;
-        size_t drawTargets = 0;
-        size_t worldCacheSz = 0;
-        size_t worldDrawSz = 0;
-        size_t robotDrawSz = 0;
-        VisCheckDebugStats visDbg{};
-        int actorCount = 0;
-        float camFov = 0.f;
-        uintptr_t playerState = 0;
-        int64_t totalMs = 0;
-        int64_t msState = 0;
-        int64_t msFrame = 0;
-        int64_t msPlayer = 0;
-        int64_t msWorld = 0;
-        int64_t msRobot = 0;
-        int64_t msCam = 0;
-        int gotState = 0;
-        int gotFrame = 0;
-        int gotPlayer = 0;
-        int gotWorld = 0;
-        int gotRobot = 0;
-        int gotCam = 0;
-    };
-    void TryCaptureDebugOverlaySnap(DebugOverlaySnap& io) const;
-
     /** Last GWorld probe (updated every Update tick, even on miss). */
     std::atomic<uintptr_t> m_gWorldRaw{0};
     std::atomic<int> m_gWorldFailStep{0};
@@ -392,18 +335,12 @@ public: // Local Cache
     uintptr_t OwningGameInstance;
     uintptr_t localplayer;
 
-    float PlayerPosition;
-
     uintptr_t AcknowledgedPawn;
     uintptr_t RootComponent;
     uintptr_t PlayerState;
     uintptr_t Mesh;
     uintptr_t PlayerCameraManager;
     uintptr_t Actors;
-
-    int LocalPlayerTeam;
-
-    uintptr_t CurrentGun;
 
     uintptr_t AGameStateBase;
 public: // PlayerCache
@@ -434,10 +371,6 @@ public: // PlayerCache
 
         float shield;
         float maxshield;
-        float shieldLevel;
-
-        bool bIsDeathVerge;
-        bool bIsABot;
 
         bool bIsDead;
 
@@ -458,7 +391,6 @@ public: // PlayerCache
         int stowedQuality1 = -1;
         float armorPlates = 0.f;
         float armorPerPlate = 0.f;
-        uintptr_t lastWeaponPtr = 0;
 
         PlayerCacheEntry() {};
 
@@ -508,32 +440,6 @@ public:
 
     std::atomic<bool> m_lastEspFrameValid{ false };
 
-    size_t CountWorldDrawable() const {
-        return CountContainerDrawable() + CountItemDrawable();
-    }
-
-    size_t CountContainerDrawable() const {
-        std::shared_lock<std::shared_mutex> lock(m_containerCacheMutex);
-        size_t count = 0;
-        for (const auto& [key, entry] : containerCache) {
-            (void)key;
-            if (entry.Drawing)
-                ++count;
-        }
-        return count;
-    }
-
-    size_t CountItemDrawable() const {
-        std::shared_lock<std::shared_mutex> lock(m_itemCacheMutex);
-        size_t count = 0;
-        for (const auto& [key, entry] : itemCache) {
-            (void)key;
-            if (entry.Drawing)
-                ++count;
-        }
-        return count;
-    }
-
     size_t CountEspDrawablePlayers() const {
         std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
         size_t count = 0;
@@ -544,17 +450,6 @@ public:
             if (entry.isAlly && var::hide_allies)
                 continue;
             ++count;
-        }
-        return count;
-    }
-
-    size_t CountRobotDrawable() const {
-        std::shared_lock<std::shared_mutex> lock(m_robotCacheMutex);
-        size_t count = 0;
-        for (const auto& [key, entry] : robotCache) {
-            (void)key;
-            if (entry.Drawing)
-                ++count;
         }
         return count;
     }
@@ -598,7 +493,6 @@ public:
 
         std::string ItemDisplayName;
         std::string ItemType;
-        EItemRarity ItemRarity;
 
         int lootRarityTier = 0;
     int lootValue = 0;
@@ -637,26 +531,6 @@ public:
     EspRenderFrame m_lastEspFrame{};
     mutable std::shared_mutex m_espFrameMutex;
     std::atomic<uint64_t> m_espFrameSeq{ 0 };
-
-    struct ActorTypeProbeState {
-        uint32_t localId78 = 0;
-        uint32_t localId70 = 0;
-        uint32_t localId18 = 0;
-        int discoveredOff = -1;
-        uint32_t localIdDisc = 0;
-        bool classIdPath = false;
-        uint32_t nearestId78 = 0;
-        float nearestDistM = 99999.f;
-    };
-
-    mutable std::shared_mutex m_probeMutex;
-    ActorTypeProbeState m_actorTypeProbe{};
-
-    ActorTypeProbeState GetActorTypeProbe() const
-    {
-        std::shared_lock<std::shared_mutex> lock(m_probeMutex);
-        return m_actorTypeProbe;
-    }
 
 public:
     struct FVector3d
@@ -703,6 +577,26 @@ public:
         if (IsPlausibleWorldPos(rel))
             return rel;
         return {};
+    }
+
+    /**
+     * NOCACHE WorldLocation read. allowRelativeFallback matches EntityList
+     * trySceneNC; bots omit RelativeLocation (spawn-footprint freeze).
+     */
+    static Vector3 ReadWorldLocationNocache(uintptr_t sceneComponent, bool allowRelativeFallback)
+    {
+        if (!sceneComponent || !Memory::IsValidPtrFast2(sceneComponent))
+            return {};
+        const FVector3d world =
+            Memory::read_nocache<FVector3d>(sceneComponent + Offsets::WorldLocation);
+        const Vector3 w = ToVector3(world);
+        if (IsPlausibleWorldPos(w))
+            return w;
+        if (!allowRelativeFallback)
+            return {};
+        const Vector3 rel =
+            Memory::read_nocache<Vector3>(sceneComponent + Offsets::RelativeLocation);
+        return IsPlausibleWorldPos(rel) ? rel : Vector3{};
     }
 
     /** FTransform.Translation is float; live world translation is FVector3d @ C2W+0x20. */
@@ -913,33 +807,9 @@ public:
         { UniBone::CalfR,  UniBone::FootR },
     };
 public:
-    double RadToDeg(double radians)
-    {
-        return radians * 180 / M_PI;
-    }
-
     double DegToRad(double deg)
     {
         return deg * M_PI / 180.0;
-    }
-
-    uint32_t ROL4(uint32_t x, uint32_t n)
-    {
-        return (x << n) | (x >> (32 - n));
-    }
-
-    uint64_t ROL8(uint64_t x, uint32_t n)
-    {
-        return (x << n) | (x >> (64 - n));
-    }
-
-    uint32_t rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
-    uint64_t rotl64(uint64_t x, int n) { return (x << n) | (x >> (64 - n)); }
-
-    uint64_t u64_lo(__m128i v) {
-        alignas(16) uint64_t arr[2];
-        _mm_store_si128(reinterpret_cast<__m128i*>(arr), v);
-        return arr[0];
     }
 
     std::string toLower(std::string str)
@@ -947,38 +817,6 @@ public:
         std::transform(str.begin(), str.end(), str.begin(),
             [](unsigned char c) { return std::tolower(c); });
         return str;
-    }
-
-    D3DMATRIX to_matrix(Vector3 rot, Vector3 origin = Vector3(0, 0, 0))
-    {
-        const float radpitch = static_cast<float>(rot.x * M_PI / 180.0);
-        const float radyaw = static_cast<float>(rot.y * M_PI / 180.0);
-        const float radroll = static_cast<float>(rot.z * M_PI / 180.0);
-        float sp = sinf(radpitch);
-        float cp = cosf(radpitch);
-        float sy = sinf(radyaw);
-        float cy = cosf(radyaw);
-        float sr = sinf(radroll);
-        float cr = cosf(radroll);
-        D3DMATRIX matrix{};
-        matrix.m[0][0] = cp * cy;
-        matrix.m[0][1] = cp * sy;
-        matrix.m[0][2] = sp;
-        matrix.m[0][3] = 0.f;
-        matrix.m[1][0] = sr * sp * cy - cr * sy;
-        matrix.m[1][1] = sr * sp * sy + cr * cy;
-        matrix.m[1][2] = -sr * cp;
-        matrix.m[1][3] = 0.f;
-        matrix.m[2][0] = -(cr * sp * cy + sr * sy);
-        matrix.m[2][1] = cy * sr - cr * sp * sy;
-
-        matrix.m[2][2] = cr * cp;
-        matrix.m[2][3] = 0.f;
-        matrix.m[3][0] = static_cast<float>(origin.x);
-        matrix.m[3][1] = static_cast<float>(origin.y);
-        matrix.m[3][2] = static_cast<float>(origin.z);
-        matrix.m[3][3] = 1.f;
-        return matrix;
     }
 
     D3DMATRIX MatrixMultiplication(D3DMATRIX pM1, D3DMATRIX pM2)
@@ -1002,10 +840,6 @@ public:
         pOut._44 = pM1._41 * pM2._14 + pM1._42 * pM2._24 + pM1._43 * pM2._34 + pM1._44 * pM2._44;
 
         return pOut;
-    }
-public:
-    uint32_t rol32(uint32_t v, int s) {
-        return (v << s) | (v >> (32 - s));
     }
 
     std::string GetPlayerName(uintptr_t playerStateAddr, uintptr_t pawnAddr = 0) {
@@ -1079,60 +913,7 @@ public:
         const double v = ReadHealthComponentStat(actor, Offsets::ShieldMax);
         return std::isfinite(v) ? v : 0.0;
     }
-
-    struct PlayerHealthInfo {
-        double Health;
-        double MaxHealth;
-        double Armor;
-        double MaxArmor;
-        bool bHasBrokenArmor;
-        bool bIsDbno;
-        char _pad[6];
-    };
 public:
-    struct FTArrayRaw {
-        uint64_t Data;
-        uint32_t Count;
-        uint32_t Max;
-    };
-    uintptr_t GetCurrentWeaponActor(uintptr_t actor) {
-        if (!actor) return 0;
-        auto inventoryComponent = Memory::read<uintptr_t>(actor + Offsets::InventoryComponent);
-        if (!inventoryComponent)
-            return 0;
-
-        // Prefer replicated CurrentItemActors (remotes); fall back to local array.
-        FTArrayRaw items = Memory::read<FTArrayRaw>(inventoryComponent + Offsets::CurrentItemActors);
-        if (!items.Data || items.Count <= 0)
-            items = Memory::read<FTArrayRaw>(inventoryComponent + Offsets::LocalCurrentItemActors);
-        if (!items.Data || items.Count <= 0)
-            return 0;
-
-        return Memory::read<uintptr_t>(items.Data);
-    }
-
-    int GetWeaponQuality(uintptr_t actor) {
-        if (!actor) return -1;
-        auto inventoryComponent = Memory::read<uintptr_t>(actor + Offsets::InventoryComponent);
-        if (!inventoryComponent)
-            return -1;
-
-        FTArrayRaw itemArray = Memory::read<FTArrayRaw>(inventoryComponent + Offsets::CurrentItemActors);
-        if (!itemArray.Data || itemArray.Count <= 0)
-            itemArray = Memory::read<FTArrayRaw>(inventoryComponent + Offsets::LocalCurrentItemActors);
-
-        if (!itemArray.Data || itemArray.Count <= 0 || itemArray.Count > 100)
-            return -1;
-
-        uintptr_t currentWeapon = Memory::read<uintptr_t>(itemArray.Data);
-        if (!currentWeapon)
-            return -1;
-
-        uint8_t WeaponQuality = Memory::read<uint8_t>(currentWeapon + Offsets::WeaponQuality);
-
-        return static_cast<int>(WeaponQuality);
-    }
-
     // Read WeaponQuality (int8 tier 0..4) directly off a resolved BP_WeaponActor_*
     // instance. Works for remote players' weapons found via Instigator/Owner,
     // where the local InventoryComponent item array is empty.
@@ -1189,43 +970,6 @@ public:
         std::vector<AimTarget>& targets);
 
 public:
-    std::unordered_map<std::string, ImColor> itemImColors = {
-        // Laranja
-        {"loot item",              ImColor(255, 165, 0, 255)},
-
-        // Vermelho
-        {"ai robot",             ImColor(227, 101, 101, 255)},
-        {"turret",             ImColor(227, 101, 101, 255)},
-        {"leaper",             ImColor(227, 101, 101, 255)},
-        {"roll bot",             ImColor(227, 101, 101, 255)},
-        {"fireball",             ImColor(227, 101, 101, 255)},
-        {"pop",             ImColor(227, 101, 101, 255)},
-        {"surveyor",             ImColor(227, 101, 101, 255)},
-        {"hornet",             ImColor(227, 101, 101, 255)},
-        {"rocketeer",             ImColor(227, 101, 101, 255)},
-        {"the queen",             ImColor(227, 101, 101, 255)},
-        {"matriarch",             ImColor(227, 101, 101, 255)},
-        {"pinger robot",             ImColor(227, 101, 101, 255)},
-        {"bastion",             ImColor(227, 101, 101, 255)},
-        {"bombardier",             ImColor(227, 101, 101, 255)},
-        {"sentinel",             ImColor(227, 101, 101, 255)},
-        {"shredder",             ImColor(227, 101, 101, 255)},
-        {"snitch",             ImColor(227, 101, 101, 255)},
-        {"wasp",             ImColor(227, 101, 101, 255)},
-        {"spotter",             ImColor(227, 101, 101, 255)},
-        {"comet",             ImColor(227, 101, 101, 255)},
-        {"firefly",             ImColor(227, 101, 101, 255)},
-
-        // Azul
-        {"arc cargoship",             ImColor(0, 255, 255, 255)},
-
-        // Magenta
-        {"raider stock",              ImColor(255, 0, 255, 255)},
-
-        // Verde claro
-        {"corpse",             ImColor(144, 238, 144, 255)},
-    };
-public:
     std::unordered_set<std::string> robotsList = kRobotsList;
 public:
     class FNameCache {
@@ -1241,40 +985,9 @@ public:
             return instance;
         }
 
-        bool TryGet(int32_t fnameId, std::string& outName) const {
-            if (fnameId == 0)
-                return false;
-
-            std::shared_lock<std::shared_mutex> lock(m_mutex);
-            auto it = m_cache.find(fnameId);
-            if (it != m_cache.end()) {
-                outName = it->second;
-                return true;
-            }
-            return false;
-        }
-
-        void Add(int32_t fnameId, const std::string& name) {
-            if (fnameId == 0 || name.empty())
-                return;
-
-            std::unique_lock<std::shared_mutex> lock(m_mutex);
-            m_cache[fnameId] = name;
-        }
-
-        bool Contains(int32_t fnameId) const {
-            std::shared_lock<std::shared_mutex> lock(m_mutex);
-            return m_cache.find(fnameId) != m_cache.end();
-        }
-
         void Clear() {
             std::unique_lock<std::shared_mutex> lock(m_mutex);
             m_cache.clear();
-        }
-
-        size_t Size() const {
-            std::shared_lock<std::shared_mutex> lock(m_mutex);
-            return m_cache.size();
         }
     };
 public:

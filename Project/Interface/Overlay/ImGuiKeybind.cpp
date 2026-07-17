@@ -10,7 +10,6 @@
 
 #include "../../ThirdParty/ImGui/imgui_internal.h"
 
-#include "MenuLayout.h"
 #include "../Utils/AutoConfig.h"
 
 
@@ -93,7 +92,7 @@ const char* KeyDisplayName(int key) {
 
 
 
-bool ImGui::Keybind(const char* label, int* key, int* mode, bool enablemode) {
+bool ImGui::Keybind(const char* label, int* key) {
 
     ImGuiWindow* window = ImGui::GetCurrentWindow();
 
@@ -245,16 +244,6 @@ bool ImGui::Keybind(const char* label, int* key, int* mode, bool enablemode) {
             waitingFrame = false;
 
         }
-
-    }
-
-
-
-    if (mode && enablemode) {
-
-        const char* mode_items[] = { "Toggle", "Hold" };
-
-        ArcMenuLayout::Combo("Key Mode", "##keybind_mode", mode, mode_items, IM_ARRAYSIZE(mode_items));
 
     }
 

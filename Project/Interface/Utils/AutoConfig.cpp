@@ -117,9 +117,8 @@ struct Snapshot {
     bool robotAimEnabled{};
     int aim_hold_key{};
     int aim_bone_mode{};
-    bool visiblecheck{};
-    bool predict{};
     bool humanizer{};
+    bool predict{};
     bool randombone{};
     float aimbot_fov{};
     int aimbot_priority{};
@@ -166,7 +165,6 @@ struct Snapshot {
     bool show_world_buried{};
     bool show_world_deaddrop{};
     bool show_world_open_container{};
-    float world_distance{};
     float color_dropped_items[4]{};
     float color_raider_stock[4]{};
     float color_arc_entities[4]{};
@@ -196,6 +194,7 @@ struct Snapshot {
     float color_world_open_container[4]{};
 
     bool showLoot{};
+    bool show_near_loot_hud{};
     float loot_distance{};
     float container_distance_sp{};
     float color_loot[4]{};
@@ -301,7 +300,6 @@ Snapshot CaptureSnapshot()
     s.robotAimEnabled = var::robotAimEnabled;
     s.aim_hold_key = var::aim_hold_key;
     s.aim_bone_mode = static_cast<int>(var::aim_bone_mode);
-    s.visiblecheck = var::visiblecheck;
     s.predict = var::predict;
     s.humanizer = var::humanizer;
     s.randombone = var::randombone;
@@ -349,7 +347,6 @@ Snapshot CaptureSnapshot()
     s.show_world_buried = var::show_world_buried;
     s.show_world_deaddrop = var::show_world_deaddrop;
     s.show_world_open_container = var::show_world_open_container;
-    s.world_distance = var::world_distance;
     std::memcpy(s.color_dropped_items, var::color_dropped_items, sizeof(s.color_dropped_items));
     std::memcpy(s.color_raider_stock, var::color_raider_stock, sizeof(s.color_raider_stock));
     std::memcpy(s.color_arc_entities, var::color_arc_entities, sizeof(s.color_arc_entities));
@@ -379,6 +376,7 @@ Snapshot CaptureSnapshot()
     std::memcpy(s.color_world_open_container, var::color_world_open_container, sizeof(s.color_world_open_container));
 
     s.showLoot = var::showLoot;
+    s.show_near_loot_hud = var::show_near_loot_hud;
     s.loot_distance = var::loot_distance;
     s.container_distance_sp = var::container_distance_sp;
     std::memcpy(s.color_loot, var::color_loot, sizeof(s.color_loot));
@@ -443,7 +441,6 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.robotAimEnabled == b.robotAimEnabled &&
         a.aim_hold_key == b.aim_hold_key &&
         a.aim_bone_mode == b.aim_bone_mode &&
-        a.visiblecheck == b.visiblecheck &&
         a.predict == b.predict &&
         a.humanizer == b.humanizer &&
         a.randombone == b.randombone &&
@@ -490,7 +487,6 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.show_world_buried == b.show_world_buried &&
         a.show_world_deaddrop == b.show_world_deaddrop &&
         a.show_world_open_container == b.show_world_open_container &&
-        a.world_distance == b.world_distance &&
         ColorsEqual(a.color_dropped_items, b.color_dropped_items) &&
         ColorsEqual(a.color_raider_stock, b.color_raider_stock) &&
         ColorsEqual(a.color_arc_entities, b.color_arc_entities) &&
@@ -519,6 +515,7 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         ColorsEqual(a.color_world_deaddrop, b.color_world_deaddrop) &&
         ColorsEqual(a.color_world_open_container, b.color_world_open_container) &&
         a.showLoot == b.showLoot &&
+        a.show_near_loot_hud == b.show_near_loot_hud &&
         a.loot_distance == b.loot_distance &&
         a.container_distance_sp == b.container_distance_sp &&
         ColorsEqual(a.color_loot, b.color_loot) &&
@@ -551,9 +548,8 @@ bool ParseBool(const std::string& val, bool defaultVal)
 bool ApplyLootConfigKey(const std::string& key, const std::string& val)
 {
     if (key == "showLoot") { var::showLoot = ParseBool(val, var::showLoot); return true; }
-    if (key == "hideOpenedLoot") {
-        if (ParseBool(val, false))
-            var::show_world_open_container = false;
+    if (key == "show_near_loot_hud") {
+        var::show_near_loot_hud = ParseBool(val, var::show_near_loot_hud);
         return true;
     }
     if (key == "loot_distance") {
@@ -564,17 +560,8 @@ bool ApplyLootConfigKey(const std::string& key, const std::string& val)
         var::container_distance_sp = std::clamp(static_cast<float>(std::atof(val.c_str())), 20.f, var::kMaxDistanceSliderM);
         return true;
     }
-    if (key == "container_distance_long") {
-        var::container_distance_sp = std::clamp(static_cast<float>(std::atof(val.c_str())), 20.f, var::kMaxDistanceSliderM);
-        return true;
-    }
     if (key.rfind("container_range_sp_", 0) == 0) {
         const std::string suffix = key.substr(19);
-        if (TrySetContainerRangeFromConfigSuffix(suffix.c_str(), ParseBool(val, false)))
-            return true;
-    }
-    if (key.rfind("container_range_long_", 0) == 0) {
-        const std::string suffix = key.substr(21);
         if (TrySetContainerRangeFromConfigSuffix(suffix.c_str(), ParseBool(val, false)))
             return true;
     }
@@ -706,10 +693,6 @@ static bool ApplyWorldConfigKey(const std::string& key, const std::string& val)
     if (key == "show_world_deaddrop") { var::show_world_deaddrop = ParseBool(val, var::show_world_deaddrop); return true; }
     if (key == "showArc") { var::showArc = ParseBool(val, var::showArc); return true; }
     if (key == "showDeadPlayers") { var::showDeadPlayers = ParseBool(val, var::showDeadPlayers); return true; }
-    if (key == "world_distance") {
-        var::world_distance = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.f, var::kMaxDistanceSliderM);
-        return true;
-    }
     return false;
 }
 
@@ -739,7 +722,6 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     else if (key == "show_radar") var::show_radar = ParseBool(val, var::show_radar);
     else if (key == "show_debug_overlay") var::show_debug_overlay = ParseBool(val, var::show_debug_overlay);
     else if (key == "esp_text_scale") var::esp_text_scale = static_cast<float>(std::atof(val.c_str()));
-    else if (key == "ui_text_scale") var::esp_text_scale = static_cast<float>(std::atof(val.c_str())); // back-compat: old key name
     else if (key == "radar_scale") var::radar_scale = static_cast<float>(std::atof(val.c_str()));
     else if (key == "radar_range") {
         var::radar_range = std::clamp(static_cast<float>(std::atof(val.c_str())), 20.f, var::kMaxDistanceSliderM);
@@ -773,8 +755,7 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
         const int m = std::clamp(std::atoi(val.c_str()), 0, 5);
         var::aim_bone_mode = static_cast<AimBoneMode>(m);
     }
-    else if (key == "visiblecheck") var::visiblecheck = ParseBool(val, var::visiblecheck);
-    else if (key == "predict" || key == "Prediction") var::predict = ParseBool(val, var::predict);
+    else if (key == "predict") var::predict = ParseBool(val, var::predict);
     else if (key == "humanizer") var::humanizer = ParseBool(val, var::humanizer);
     else if (key == "randombone") var::randombone = ParseBool(val, var::randombone);
     else if (key == "aimbot_fov") var::aimbot_fov = static_cast<float>(std::atof(val.c_str()));
@@ -796,32 +777,27 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     }
     else if (key == "sticky_target_lock") var::sticky_target_lock = ParseBool(val, var::sticky_target_lock);
     else if (key == "showmenu") showmenu = ParseBool(val, showmenu);
-    else if (key == "kmbox_type" || key == "typeName")
-        g_kmbox.kmboxConfig.type = val;
-    else if (key == "kmbox_comPort" || key == "comPort")
+    else if (key == "kmbox_type") {
+        if (val == "BPro")
+            g_kmbox.kmboxConfig.type = "MAKCU";
+        else if (val == "Net" || val == "MAKCU")
+            g_kmbox.kmboxConfig.type = val;
+    }
+    else if (key == "kmbox_comPort")
         g_kmbox.kmboxConfig.comPort = val;
-    else if (key == "kmbox_baudRate" || key == "baudRate")
+    else if (key == "kmbox_baudRate")
         g_kmbox.kmboxConfig.baudRate = val;
-    else if (key == "kmbox_ip" || key == "ip")
+    else if (key == "kmbox_ip")
         g_kmbox.kmboxConfig.ip = val;
-    else if (key == "kmbox_port" || key == "port")
+    else if (key == "kmbox_port")
         g_kmbox.kmboxConfig.port = val;
-    else if (key == "kmbox_uuid" || key == "uuid")
+    else if (key == "kmbox_uuid")
         g_kmbox.kmboxConfig.uuid = val;
-    else if (key == "kmbox_minDelay" || key == "minDelay")
+    else if (key == "kmbox_minDelay")
         g_kmbox.kmboxConfig.minDelay = std::atoi(val.c_str());
-    else if (key == "kmbox_monitorIndex" || key == "monitorIndex") {
+    else if (key == "kmbox_monitorIndex") {
         g_kmbox.kmboxConfig.monitorIndex = std::atoi(val.c_str());
         OverlayDisplay_SetSelectedMonitor(g_kmbox.kmboxConfig.monitorIndex);
-    }
-    else if (key == "type") {
-        const int typeCode = std::atoi(val.c_str());
-        if (typeCode == 0)
-            g_kmbox.kmboxConfig.type = "BPro";
-        else if (typeCode == 1)
-            g_kmbox.kmboxConfig.type = "Net";
-        else if (typeCode == 2)
-            g_kmbox.kmboxConfig.type = "MAKCU";
     }
 }
 
@@ -867,8 +843,7 @@ void WriteIni()
         return;
     }
 
-    file << "# Arc Raiders auto config (saved automatically)\n";
-    file << "configVersion=1\n\n";
+    file << "# Arc Raiders auto config (saved automatically)\n\n";
 
     file << "enableesp=" << (var::enableesp ? 1 : 0) << '\n';
     file << "box=" << (var::box ? 1 : 0) << '\n';
@@ -910,7 +885,6 @@ void WriteIni()
     file << "robotAimEnabled=" << (var::robotAimEnabled ? 1 : 0) << '\n';
     file << "aim_hold_key=" << var::aim_hold_key << '\n';
     file << "aim_bone_mode=" << static_cast<int>(var::aim_bone_mode) << '\n';
-    file << "visiblecheck=" << (var::visiblecheck ? 1 : 0) << '\n';
     file << "predict=" << (var::predict ? 1 : 0) << '\n';
     file << "humanizer=" << (var::humanizer ? 1 : 0) << '\n';
     file << "randombone=" << (var::randombone ? 1 : 0) << '\n';
@@ -958,7 +932,6 @@ void WriteIni()
     file << "show_world_deaddrop=" << (var::show_world_deaddrop ? 1 : 0) << '\n';
     file << "showArc=" << (var::showArc ? 1 : 0) << '\n';
     file << "showDeadPlayers=" << (var::showDeadPlayers ? 1 : 0) << '\n';
-    file << "world_distance=" << var::world_distance << '\n';
     WriteColor4(file, "color_dropped_items", var::color_dropped_items);
     WriteColor4(file, "color_raider_stock", var::color_raider_stock);
     WriteColor4(file, "color_arc_entities", var::color_arc_entities);
@@ -988,6 +961,7 @@ void WriteIni()
     WriteColor4(file, "color_world_deaddrop", var::color_world_deaddrop);
 
     file << "showLoot=" << (var::showLoot ? 1 : 0) << '\n';
+    file << "show_near_loot_hud=" << (var::show_near_loot_hud ? 1 : 0) << '\n';
     file << "loot_distance=" << var::loot_distance << '\n';
     file << "container_distance_sp=" << var::container_distance_sp << '\n';
     for (size_t i = 0; i < static_cast<size_t>(WorldItemCategory::Count); ++i) {

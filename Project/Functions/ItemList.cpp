@@ -29,13 +29,6 @@ inline bool AnyItemEspEnabled()
         var::show_world_harvestable || var::show_world_keys);
 }
 
-std::string ToLowerCopy(std::string s)
-{
-    for (char& c : s)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return s;
-}
-
 bool FnameLooksLikeNonWorldEspActor(const std::string& fname)
 {
     if (fname.empty())
@@ -215,18 +208,13 @@ static constexpr uint8_t kPickupPosMissEvict = 3;
 
 static bool ItemPosMissShouldEvict(uintptr_t key, bool posOk, bool pickupLike)
 {
-    if (posOk) {
-        s_itemPosMisses.erase(key);
-        return false;
-    }
-    const uint8_t misses = ++s_itemPosMisses[key];
     const uint8_t lim = pickupLike ? kPickupPosMissEvict : kItemPosMissEvict;
-    return misses >= lim;
+    return WorldScan::MissCounterShouldEvict(s_itemPosMisses, key, posOk, lim);
 }
 
 static void ClearItemPosMiss(uintptr_t key)
 {
-    s_itemPosMisses.erase(key);
+    WorldScan::MissCounterClear(s_itemPosMisses, key);
 }
 
 static void ClearItemListStaticMaps()

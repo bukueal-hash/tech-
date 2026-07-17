@@ -237,11 +237,6 @@ namespace Offsets {
     constexpr std::ptrdiff_t Constructable_AITemplateData = 0x1190;
     /** Primary bot destroyed flag (help/SDK). Use this instead of bIsBreaked@0x1220. */
     constexpr std::ptrdiff_t Constructable_bIsDestroyed = 0x1210;
-    constexpr std::ptrdiff_t Constructable_HealthService = 0x1270;
-    constexpr std::ptrdiff_t Constructable_HealthGroupService = 0x1298;
-    constexpr std::ptrdiff_t HealthGroupService_BaseGroup = 0x1A8;
-    constexpr std::ptrdiff_t BotHealthCached = 0x668;
-    constexpr std::ptrdiff_t BotHealthMax = 0x308;
     constexpr std::ptrdiff_t LastSubmitTimeAlt = 0x4CC;
     constexpr std::ptrdiff_t CurrentHealth = 0x1D0;
     constexpr std::ptrdiff_t UseDistance = 0x268;

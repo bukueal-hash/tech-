@@ -15,7 +15,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include "../Core/AgentLog.h"
 
 std::string ResolveBotTypeLabel(uintptr_t actor, const std::string& fname);
 
@@ -522,18 +521,10 @@ Vector3 ReadComponentWorldPos(uintptr_t component)
     return Engine::ReadSceneWorldPos(component);
 }
 
-// Live bot tracking � mirror EntityList ResolvePlayerWorldPos (NOCACHE).
-// Cached Memory::read / RelativeLocation froze ESP boxes at the spawn footprint.
+// Live bot tracking — mirror EntityList (NOCACHE WorldLocation, no RelativeLocation).
 Vector3 ReadBotSceneWorldPosLive(uintptr_t component)
 {
-    if (!component || !engine.IsValidPointer(component))
-        return {};
-    const Engine::FVector3d world =
-        Memory::read_nocache<Engine::FVector3d>(component + Offsets::WorldLocation);
-    const Vector3 w = Engine::ToVector3(world);
-    if (IsPlausibleWorldPos(w))
-        return w;
-    return {};
+    return Engine::ReadWorldLocationNocache(component, /*allowRelativeFallback=*/false);
 }
 
 Vector3 ResolveBotWorldPos(uintptr_t actor, uintptr_t root, uintptr_t mesh)
@@ -801,17 +792,13 @@ static constexpr uint8_t kBotVisualMissEvict = 15;
 
 static bool BotVisualMissShouldEvict(uintptr_t key, bool visualOk)
 {
-    if (visualOk) {
-        s_botVisualMisses.erase(key);
-        return false;
-    }
-    const uint8_t misses = ++s_botVisualMisses[key];
-    return misses >= kBotVisualMissEvict;
+    return WorldScan::MissCounterShouldEvict(
+        s_botVisualMisses, key, visualOk, kBotVisualMissEvict);
 }
 
 static void ClearBotVisualMiss(uintptr_t key)
 {
-    s_botVisualMisses.erase(key);
+    WorldScan::MissCounterClear(s_botVisualMisses, key);
 }
 
 static void ClearRobotListStaticMaps()
@@ -823,38 +810,65 @@ static void ClearRobotListStaticMaps()
 
 bool HasLiveBotVisual(uintptr_t actor, uintptr_t mesh)
 {
-    // Prefer mesh / embark / root via NOCACHE WorldLocation (same as WorldPos path).
-    // Do NOT use cached ReadSceneWorldPos here — it false-negatives live ARC bots.
-    if (ComponentHasLiveBotWorldPos(mesh))
-        return true;
+    // Batch NOCACHE WorldLocation probes (was serial read_nocache per component).
+    // Miss grace (kBotVisualMissEvict) unchanged — this only cuts DMA flaps.
+    // Do NOT use cached WorldLocation — it false-negatives live ARC bots.
+    constexpr size_t kMaxVisProbeComps = 16;
+    std::vector<uintptr_t> comps;
+    comps.reserve(kMaxVisProbeComps);
 
+    auto addComp = [&](uintptr_t c) {
+        if (!c || !engine.IsValidPointer(c) || comps.size() >= kMaxVisProbeComps)
+            return;
+        for (uintptr_t existing : comps) {
+            if (existing == c)
+                return;
+        }
+        comps.push_back(c);
+    };
+
+    addComp(mesh);
     if (mesh && engine.IsValidPointer(mesh)) {
         std::vector<uintptr_t> childComps;
         ReadChildComponentsLocal(mesh, childComps, 3);
-        for (uintptr_t child : childComps) {
-            if (ComponentHasLiveBotWorldPos(child))
-                return true;
-        }
+        for (uintptr_t child : childComps)
+            addComp(child);
     }
 
     const uintptr_t embarkMesh = Memory::read<uintptr_t>(actor + Offsets::EmbarkMesh);
     if (embarkMesh && embarkMesh != mesh && engine.IsValidPointer(embarkMesh)) {
-        if (ComponentHasLiveBotWorldPos(embarkMesh))
-            return true;
+        addComp(embarkMesh);
         std::vector<uintptr_t> embarkChildren;
         ReadChildComponentsLocal(embarkMesh, embarkChildren, 2);
-        for (uintptr_t child : embarkChildren) {
-            if (ComponentHasLiveBotWorldPos(child))
-                return true;
+        for (uintptr_t child : embarkChildren)
+            addComp(child);
+    }
+
+    const uintptr_t root = ResolveBotSceneRoot(actor);
+    if (root && root != mesh && root != embarkMesh)
+        addComp(root);
+
+    if (comps.empty())
+        return false;
+
+    ScatterSession session; // default NOCACHE
+    if (session.isValid()) {
+        std::vector<Engine::FVector3d> worlds(comps.size());
+        for (size_t i = 0; i < comps.size(); ++i)
+            session.prepare(comps[i] + Offsets::WorldLocation, worlds[i]);
+        if (session.execute()) {
+            for (const Engine::FVector3d& w : worlds) {
+                if (IsPlausibleWorldPos(Engine::ToVector3(w)))
+                    return true;
+            }
+            return false;
         }
     }
 
-    // Scene root NOCACHE WorldLocation after Verify (mesh often unreadable).
-    const uintptr_t root = ResolveBotSceneRoot(actor);
-    if (root && root != mesh && root != embarkMesh
-        && ComponentHasLiveBotWorldPos(root))
-        return true;
-
+    for (uintptr_t c : comps) {
+        if (ComponentHasLiveBotWorldPos(c))
+            return true;
+    }
     return false;
 }
 
@@ -1282,26 +1296,9 @@ void Engine::RobotList()
             continue;
         }
 
-        // Health: constructables via HealthService; regular bots via HealthComponent.
-        if (WorldScan::HasArcEnemyAssetPointer(key)) {
-            const uintptr_t healthSvc =
-                Memory::read<uintptr_t>(key + static_cast<uint64_t>(Offsets::Constructable_HealthService));
-            if (healthSvc && Memory::IsValidPtrFast2(healthSvc)) {
-                const double h = Memory::read<double>(healthSvc + static_cast<uint64_t>(Offsets::BotHealthCached));
-                const double m = Memory::read<double>(healthSvc + static_cast<uint64_t>(Offsets::BotHealthMax));
-                if (std::isfinite(h) && std::isfinite(m) && m > 0.0) {
-                    actor.health    = static_cast<float>(h);
-                    actor.maxhealth = static_cast<float>(m);
-                }
-            }
-        } else {
-            const double h = Engine::ReadHealthComponentStat(key, Offsets::Health);
-            const double m = Engine::ReadHealthComponentStat(key, Offsets::MaxHealth);
-            if (std::isfinite(h) && std::isfinite(m) && m > 0.0) {
-                actor.health    = static_cast<float>(h);
-                actor.maxhealth = static_cast<float>(m);
-            }
-        }
+        // Bot HP readers removed (wrong offsets; NDJSON probes deleted).
+        actor.health = 0.f;
+        actor.maxhealth = 0.f;
 
         if (!actor.Mesh || !IsValidPointer(actor.Mesh))
             actor.Mesh = GetActorSkeletalMesh(key);
@@ -1315,61 +1312,6 @@ void Engine::RobotList()
             bool visualOk = HasLiveBotVisual(key, actor.Mesh);
             if (!visualOk) {
                 ++dbgVisSkip;
-                const float approxDistM = IsPlausibleWorldPos(actor.WorldPos)
-                    ? (static_cast<float>(std::sqrt(
-                           (actor.WorldPos.x - cam.Location.x) * (actor.WorldPos.x - cam.Location.x)
-                         + (actor.WorldPos.y - cam.Location.y) * (actor.WorldPos.y - cam.Location.y)
-                         + (actor.WorldPos.z - cam.Location.z) * (actor.WorldPos.z - cam.Location.z)))
-                       / 100.0f)
-                    : -1.f;
-                // #region agent log
-                if (approxDistM >= 0.f && approxDistM <= 12.f) {
-                    static auto s_lastNearVisAgent = std::chrono::steady_clock::time_point{};
-                    const auto nowVisAgent = std::chrono::steady_clock::now();
-                    if (s_lastNearVisAgent.time_since_epoch().count() == 0
-                        || nowVisAgent - s_lastNearVisAgent >= std::chrono::milliseconds(200)) {
-                        s_lastNearVisAgent = nowVisAgent;
-                        const int misses = static_cast<int>(s_botVisualMisses[key]);
-                        ArcAgentLog(
-                            "bot-missing",
-                            "B3",
-                            "RobotList.cpp:visSkip",
-                            "near_bot_vis_miss",
-                            std::string("{\"key\":") + std::to_string(key)
-                                + ",\"distM\":" + std::to_string(approxDistM)
-                                + ",\"misses\":" + std::to_string(misses)
-                                + ",\"hasPos\":" + (IsPlausibleWorldPos(actor.WorldPos) ? "1" : "0")
-                                + ",\"broken\":" + std::to_string(static_cast<int>(broken))
-                                + ",\"name\":\"" + ArcAgentLogJsonEscape(actor.ActorName)
-                                + "\"}");
-                    }
-                }
-#if ARC_AGENT_NDJSON
-                if (approxDistM >= 0.f && approxDistM <= 12.f) {
-                    static auto s_lastNearVis = std::chrono::steady_clock::time_point{};
-                    const auto nowVis = std::chrono::steady_clock::now();
-                    if (s_lastNearVis.time_since_epoch().count() == 0
-                        || nowVis - s_lastNearVis >= std::chrono::milliseconds(200)) {
-                        s_lastNearVis = nowVis;
-                        std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-                        if (f) {
-                            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch()).count();
-                            const int misses = static_cast<int>(s_botVisualMisses[key]);
-                            f << "{\"sessionId\":\"c190fb\",\"runId\":\"near-bot\",\"hypothesisId\":\"H2\""
-                              << ",\"location\":\"RobotList.cpp:visSkip\",\"message\":\"near_bot_vis_miss\""
-                              << ",\"data\":{\"key\":" << key
-                              << ",\"distM\":" << approxDistM
-                              << ",\"misses\":" << misses
-                              << ",\"hasPos\":" << (IsPlausibleWorldPos(actor.WorldPos) ? 1 : 0)
-                              << ",\"broken\":" << static_cast<int>(broken)
-                              << ",\"name\":\"" << actor.ActorName << "\""
-                              << "},\"timestamp\":" << ms << "}\n";
-                        }
-                    }
-                }
-#endif // ARC_AGENT_NDJSON
-                // #endregion
                 if (BotVisualMissShouldEvict(key, false)) {
                     ClearBotVisualMiss(key);
                     it = localCache.erase(it);
@@ -1396,9 +1338,7 @@ void Engine::RobotList()
 
         UpdateBotVelocity(actor, actor.WorldPos);
 
-        actor.isVisible = var::visiblecheck
-            ? VisibleBotActor(key)
-            : true;
+        actor.isVisible = true;
 
         Vector3 delta = actor.WorldPos - cam.Location;
         const float distanceSq = static_cast<float>(
@@ -1462,103 +1402,6 @@ void Engine::RobotList()
             << " sceneFail=" << dbgScenePosFail
             << " enemyCount=" << dbgEnemyCount
             << std::endl;
-        // #region agent log
-        {
-            int nearCache = 0;
-            int nearDraw = 0;
-            int nearDead = 0;
-            for (const auto& [rk, re] : robotCache) {
-                (void)rk;
-                if (!IsPlausibleWorldPos(re.WorldPos))
-                    continue;
-                const float dm = static_cast<float>(std::sqrt(
-                    (re.WorldPos.x - cam.Location.x) * (re.WorldPos.x - cam.Location.x)
-                  + (re.WorldPos.y - cam.Location.y) * (re.WorldPos.y - cam.Location.y)
-                  + (re.WorldPos.z - cam.Location.z) * (re.WorldPos.z - cam.Location.z))) / 100.f;
-                if (dm > 12.f)
-                    continue;
-                ++nearCache;
-                if (re.Drawing)
-                    ++nearDraw;
-                if (re.IsBreaked)
-                    ++nearDead;
-            }
-            ArcAgentLog(
-                "bot-missing",
-                "B1-B3",
-                "RobotList.cpp:summary",
-                "near_bot_summary",
-                std::string("{\"scanned\":") + std::to_string(dbgScanned)
-                    + ",\"admitted\":" + std::to_string(dbgAdmitted)
-                    + ",\"drawing\":" + std::to_string(dbgDrawing)
-                    + ",\"cache\":" + std::to_string(robotCache.size())
-                    + ",\"nearCache\":" + std::to_string(nearCache)
-                    + ",\"nearDraw\":" + std::to_string(nearDraw)
-                    + ",\"nearDead\":" + std::to_string(nearDead)
-                    + ",\"visSkip\":" + std::to_string(dbgVisSkip)
-                    + ",\"distSkip\":" + std::to_string(dbgDistSkip)
-                    + ",\"verifyFail\":" + std::to_string(dbgVerifyFail)
-                    + ",\"reEvict\":" + std::to_string(dbgReEvict)
-                    + ",\"structHit\":" + std::to_string(dbgStructHit)
-                    + ",\"quickPass\":" + std::to_string(dbgQuickPass)
-                    + ",\"failRoot\":" + std::to_string(dbgFailNoRoot)
-                    + ",\"failMesh\":" + std::to_string(dbgFailNoMesh)
-                    + ",\"failId\":" + std::to_string(dbgFailNoId)
-                    + ",\"failOther\":" + std::to_string(dbgFailOther)
-                    + ",\"fnameHit\":" + std::to_string(dbgFnameHit)
-                    + ",\"zeroPos\":" + std::to_string(dbgZeroPos)
-                    + ",\"sceneOk\":" + std::to_string(dbgScenePosOk)
-                    + ",\"sceneFail\":" + std::to_string(dbgScenePosFail)
-                    + ",\"showRobots\":" + (var::showRobots ? "1" : "0")
-                    + ",\"enemyCount\":" + std::to_string(dbgEnemyCount)
-                    + "}");
-        }
-#if ARC_AGENT_NDJSON
-        {
-            int nearCache = 0;
-            int nearDraw = 0;
-            int nearDead = 0;
-            for (const auto& [rk, re] : robotCache) {
-                if (!IsPlausibleWorldPos(re.WorldPos))
-                    continue;
-                const float dm = static_cast<float>(std::sqrt(
-                    (re.WorldPos.x - cam.Location.x) * (re.WorldPos.x - cam.Location.x)
-                  + (re.WorldPos.y - cam.Location.y) * (re.WorldPos.y - cam.Location.y)
-                  + (re.WorldPos.z - cam.Location.z) * (re.WorldPos.z - cam.Location.z))) / 100.f;
-                if (dm > 12.f)
-                    continue;
-                ++nearCache;
-                if (re.Drawing)
-                    ++nearDraw;
-                if (re.IsBreaked)
-                    ++nearDead;
-            }
-            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-            if (f) {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                f << "{\"sessionId\":\"c190fb\",\"runId\":\"near-bot\",\"hypothesisId\":\"H1-H5\""
-                  << ",\"location\":\"RobotList.cpp:summary\",\"message\":\"near_bot_summary\""
-                  << ",\"data\":{\"scanned\":" << dbgScanned
-                  << ",\"admitted\":" << dbgAdmitted
-                  << ",\"drawing\":" << dbgDrawing
-                  << ",\"cache\":" << robotCache.size()
-                  << ",\"nearCache\":" << nearCache
-                  << ",\"nearDraw\":" << nearDraw
-                  << ",\"nearDead\":" << nearDead
-                  << ",\"visSkip\":" << dbgVisSkip
-                  << ",\"verifyFail\":" << dbgVerifyFail
-                  << ",\"structHit\":" << dbgStructHit
-                  << ",\"quickPass\":" << dbgQuickPass
-                  << ",\"fnameHit\":" << dbgFnameHit
-                  << ",\"zeroPos\":" << dbgZeroPos
-                  << ",\"showRobots\":" << (var::showRobots ? 1 : 0)
-                  << ",\"enemyCount\":" << dbgEnemyCount
-                  << "},\"timestamp\":" << ms << "}\n";
-            }
-        }
-#endif // ARC_AGENT_NDJSON
-        // #endregion
     }
 }
 

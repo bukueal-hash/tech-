@@ -17,8 +17,6 @@ float EspUserTextScale();
 /** Bukupex-style min(1, 30/d) with far-distance floor (~0.55 at 250m). */
 float EspDistanceScale(float distanceMeters);
 
-float TextScaleFromDistance(float distanceMeters);
-/** Pixel font size for distance-scaled ESP labels. */
 float LabelTextPx(float distanceMeters);
 void DrawScaledLabel(
     ImDrawList* drawList,
@@ -29,7 +27,6 @@ void DrawScaledLabel(
     float distanceMeters,
     bool centerX = true,
     bool aboveAnchor = true);
-void Headline(int width, int height, Vector2 target, int distance);
 
 EspDrawScale ComputeEspScaleFromBox(float boxHeightPx, float distanceMeters = 0.f);
 /** Perspective player height in px: screenH * 180 / (distM * 100), clamped 4–400. */
@@ -37,12 +34,9 @@ float EstimateBoxHeightPx(float distanceMeters, float screenH);
 /** Same grow/shrink as enemies: box height when known, else distance-based estimate. */
 EspDrawScale ComputeEspScaleUnified(float boxHeightPx, float distanceMeters, float screenHeightPx);
 EspDrawScale ComputeEspScaleFromDistance(float distanceMeters);
-EspDrawScale ComputeEspScaleFromLootMarker(float markerScreenHeightPx);
 
 void DrawScaledText(const char* text, float centerX, float y, const EspDrawScale& scale, ImU32 color);
 ImVec2 CalcScaledTextSize(const char* text, float textPx);
-
-void SnapLinesDouble(const Vector3& start, const Vector3& end, ImColor color, float thickness);
 
 struct HumanSilhouetteInput {
     ImVec2 head{};
@@ -99,7 +93,6 @@ void DrawHumanSilhouetteFilled(
     bool softFill = true);
 void Names(const std::string& name, float center_x, float top_y, const EspDrawScale& scale, ImColor color);
 void HealthBar(float min_x, float min_y, float max_y, float health, const EspDrawScale& scale, const ImColor* fillOverride = nullptr);
-ImColor HealthColorFromPct(float hpPct);
 void DrawHealthBar(
     ImDrawList* dl,
     float x,
@@ -127,7 +120,6 @@ float HealthShieldBarsAboveHead(
     const EspDrawScale& scale,
     ImDrawList* drawList = nullptr);
 void Box(const Vector3& headScreenPos, const Vector3& feetScreenPos, bool visible, ImU32 color, int boxType, const EspDrawScale& scale);
-void BoxScreenRect(float x, float y, float w, float h, ImU32 color, const EspDrawScale& scale);
 void DrawCorneredBox(float X, float Y, float W, float H, const ImU32& color, float thickness);
 void FovCircle(float aimbotFovDegrees, float gameFovDegrees);
 float AimbotFovRadiusPx(float aimbotFovDegrees, float gameFovDegrees, float screenW);

@@ -288,35 +288,13 @@ static bool ResolvePcmForEspFrame(
     pawn = eng.AcknowledgedPawn;
     root = eng.RootComponent;
     pcm = eng.PlayerCameraManager;
-
-    auto IsPcmValid = [&](uintptr_t p) {
-        if (!p || !eng.IsValidPointer(p))
-            return false;
-        const float f = Memory::read<float>(p + Offsets::DefaultFOV);
-        return f > 1.0f && f < 179.0f;
-    };
-
-    if (pc && !IsPcmValid(pcm))
-        pcm = Memory::read<uintptr_t>(pc + Offsets::APlayerCameraManager);
-    // LP may be 0 — still recover PCM via FName / PCOwner scan.
-    if (!IsPcmValid(pcm))
-        pcm = eng.GetCameraManagerFromActors();
-    if (!IsPcmValid(pcm)) {
-        const uintptr_t level = eng.PersistentLevel;
-        const uintptr_t actors = eng.Actors;
-        if (level && actors) {
-            uintptr_t pcmPc = pc;
-            uintptr_t pcmPawn = pawn;
-            uintptr_t foundPcm = pcm;
-            if (eng.ResolvePcFromLevelCameraManager(level, actors, pcmPc, pcmPawn, foundPcm)) {
-                pcm = foundPcm;
-                pc = pcmPc;
-                pawn = pcmPawn;
-            }
-        }
-    }
-
-    return pcm && eng.IsValidPointer(pcm);
+    return eng.ResolvePlayerCameraManagerLadder(
+        pc,
+        pawn,
+        pcm,
+        eng.PersistentLevel,
+        eng.Actors,
+        /*nocacheFov=*/false);
 }
 
 static bool CameraOkForEsp(const Engine::CameraCache& cam)
@@ -462,18 +440,6 @@ static ImU32 BotEspColor(bool visible, bool isBreaked = false)
     return EspDraw::ColorFromRGBA(c);
 }
 
-static ImU32 WeaponTierColor(int quality)
-{
-    switch (quality) {
-    case 1: return IM_COL32(180, 180, 180, 255);
-    case 2: return IM_COL32(100, 200, 100, 255);
-    case 3: return IM_COL32(80, 140, 220, 255);
-    case 4: return IM_COL32(160, 80, 200, 255);
-    case 5: return IM_COL32(220, 180, 60, 255);
-    default: return IM_COL32(220, 220, 220, 255);
-    }
-}
-
 static float LabelTextHeight(const char* text, float distanceM)
 {
     if (!text || !text[0])
@@ -545,7 +511,7 @@ static void DrawWeaponLabel(
     // Active weapon — centered on head X (same as name/distance).
     if (!active.empty()) {
         const ImU32 wColor = (active != "Unarmed" && actor.weaponQuality > 0)
-            ? WeaponTierColor(actor.weaponQuality)
+            ? static_cast<ImU32>(RarityTierColor(actor.weaponQuality))
             : IM_COL32(220, 220, 220, 255);
         EspDraw::DrawLabelEsp(
             drawList,
@@ -870,18 +836,15 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         if (s_lastFrameDmaLog.time_since_epoch().count() == 0
             || nowLog - s_lastFrameDmaLog >= std::chrono::seconds(2)) {
             s_lastFrameDmaLog = nowLog;
-            std::ofstream f("F:/Test/ARCs/debug-5681af.log", std::ios::app);
-            if (f) {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                f << "{\"sessionId\":\"5681af\",\"runId\":\"post-fix\",\"hypothesisId\":\"H1\""
-                  << ",\"location\":\"Esp.cpp:CollectEspRenderFrame\",\"message\":\"frame_cam_only\""
-                  << ",\"data\":{\"players\":" << out.players.size()
-                  << ",\"bots\":" << out.robots.size()
-                  << ",\"world\":" << out.world.size()
-                  << ",\"entityPosScatter\":0}"
-                  << ",\"timestamp\":" << ms << "}\n";
-            }
+            ArcAgentLog5681af(
+                "post-fix",
+                "H1",
+                "Esp.cpp:CollectEspRenderFrame",
+                "frame_cam_only",
+                std::string("{\"players\":") + std::to_string(out.players.size())
+                    + ",\"bots\":" + std::to_string(out.robots.size())
+                    + ",\"world\":" + std::to_string(out.world.size())
+                    + ",\"entityPosScatter\":0}");
         }
     }
 #endif // ARC_AGENT_NDJSON
@@ -1171,42 +1134,6 @@ static void RenderPlayerEspFromFrame(
     DrawPlayerEspList(actors, frameCam);
 }
 
-void Engine::RenderPlayerEspFromCache(const CameraCache& renderCam)
-{
-    if (!var::enableesp)
-        return;
-
-    static thread_local std::vector<PlayerCacheEntry> drawEntries;
-    drawEntries.clear();
-
-    {
-        std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
-        drawEntries.reserve(playerCache.size());
-        for (const auto& [key, entry] : playerCache) {
-            (void)key;
-            if (!entry.Drawing)
-                continue;
-            if (!ShouldDrawPlayerEsp(entry))
-                continue;
-            drawEntries.push_back(entry);
-        }
-    }
-
-    std::sort(
-        drawEntries.begin(),
-        drawEntries.end(),
-        [](const PlayerCacheEntry& a, const PlayerCacheEntry& b) {
-            return a.Distance > b.Distance;
-        });
-
-    std::vector<const PlayerCacheEntry*> actors;
-    actors.reserve(drawEntries.size());
-    for (const PlayerCacheEntry& entry : drawEntries)
-        actors.push_back(&entry);
-
-    DrawPlayerEspList(actors, renderCam);
-}
-
 static void RenderRobotEspFromFrame(
     const std::vector<Engine::EspFrameWorld>& robots,
     const Engine::CameraCache& frameCam)
@@ -1372,7 +1299,7 @@ static void RenderRobotEspFromFrame(
 
         // Bot health bar + heart
         float botLabelY = head.y;
-        if (robot.maxhealth > 0.f && robot.health > 0.f) {
+        if (robot.maxhealth > 0.f) {
             botLabelY = Visuals::HealthShieldBarsAboveHead(
                 head.x, head.y, boxH * 0.65f,
                 robot.health, robot.maxhealth,

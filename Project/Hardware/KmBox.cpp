@@ -178,7 +178,15 @@ void KmboxController::Initialize() {
         kmboxConfig.initialized = true;
         kmNet_monitor(1);
     } else {
-        return;
+        LOG_WARN("[KmBox] Unsupported type \"", kmboxConfig.type,
+                 "\" — only MAKCU and Net are supported; remapping to MAKCU");
+        kmboxConfig.type = "MAKCU";
+        MyMakcu::SetComPort(kmboxConfig.comPort);
+        if (!MyMakcu::Initialize()) {
+            kmboxConfig.initialized = false;
+            return;
+        }
+        kmboxConfig.initialized = true;
     }
 
     AutoConfig_MarkDirty();
@@ -363,15 +371,17 @@ bool KmboxController::LoadKmboxConfig() {
         TrimInPlace(val);
 
         if (key == "typeName") {
-            if (val == "BPro" || val == "Net" || val == "MAKCU")
+            // Legacy BPro was never implemented — treat as MAKCU.
+            if (val == "BPro")
+                kmboxConfig.type = "MAKCU";
+            else if (val == "Net" || val == "MAKCU")
                 kmboxConfig.type = val;
         } else if (key == "type") {
+            // Legacy: 0=BPro(unimplemented)→MAKCU, 1=Net, 2=MAKCU.
             const int type = std::atoi(val.c_str());
-            if (type == 0)
-                kmboxConfig.type = "BPro";
-            else if (type == 1)
+            if (type == 1)
                 kmboxConfig.type = "Net";
-            else if (type == 2)
+            else
                 kmboxConfig.type = "MAKCU";
         } else if (key == "comPort") {
             kmboxConfig.comPort = val;
@@ -428,30 +438,6 @@ void KmboxController::MoveBlocking(int x, int y) {
         kmNet_mouse_move(static_cast<short>(x), static_cast<short>(y));
     if (kmboxConfig.minDelay > 0)
         Sleep(static_cast<DWORD>(kmboxConfig.minDelay));
-}
-
-void KmboxController::MoveSmooth(int x, int y, uint32_t segments) {
-    if (!kmboxConfig.initialized)
-        return;
-    if (kmboxConfig.type == "MAKCU") {
-        MyMakcu::MoveSmooth(x, y, segments);
-    } else if (kmboxConfig.type == "Net") {
-        const int ms = static_cast<int>(segments > 0 ? segments * 4u : 16u);
-        kmNet_mouse_move_auto(static_cast<int>(x), static_cast<int>(y), ms);
-    }
-}
-
-void KmboxController::MoveBezier(int x, int y, uint32_t segments, int32_t ctrl_x, int32_t ctrl_y) {
-    if (!kmboxConfig.initialized)
-        return;
-    if (kmboxConfig.type == "MAKCU") {
-        MyMakcu::MoveBezier(x, y, segments, ctrl_x, ctrl_y);
-    } else if (kmboxConfig.type == "Net") {
-        const int ms = static_cast<int>(segments > 0 ? segments * 4u : 16u);
-        kmNet_mouse_move_beizer(
-            static_cast<int>(x), static_cast<int>(y), ms,
-            static_cast<int>(ctrl_x), static_cast<int>(ctrl_y), 0, 0);
-    }
 }
 
 void KmboxController::moveTest() {

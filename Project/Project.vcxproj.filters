@@ -99,12 +99,6 @@
     <ClCompile Include="Interface\Overlay\MenuSidebar.cpp">
       <Filter>Interface</Filter>
     </ClCompile>
-    <ClCompile Include="Interface\OverlayDisplay.cpp">
-      <Filter>Interface</Filter>
-    </ClCompile>
-    <ClCompile Include="Interface\OverlayMode.cpp">
-      <Filter>Interface</Filter>
-    </ClCompile>
     <ClCompile Include="Interface\Render.cpp">
       <Filter>Interface</Filter>
     </ClCompile>
@@ -192,12 +186,6 @@
     <ClInclude Include="Interface\Overlay\MenuTheme.h">
       <Filter>Interface</Filter>
     </ClInclude>
-    <ClInclude Include="Interface\OverlayDisplay.h">
-      <Filter>Interface</Filter>
-    </ClInclude>
-    <ClInclude Include="Interface\OverlayMode.h">
-      <Filter>Interface</Filter>
-    </ClInclude>
     <ClInclude Include="Interface\Render.h">
       <Filter>Interface</Filter>
     </ClInclude>
@@ -205,9 +193,6 @@
       <Filter>Interface</Filter>
     </ClInclude>
     <ClInclude Include="Interface\Utils\Variables\index.h">
-      <Filter>Interface</Filter>
-    </ClInclude>
-    <ClInclude Include="Interface\Utils\Helper\motorsynergy.h">
       <Filter>Interface</Filter>
     </ClInclude>
     <ClInclude Include="Interface\Utils\Visuals\visuals.hpp">

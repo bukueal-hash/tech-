@@ -61,11 +61,6 @@ float Visuals::EspDistanceScale(float distanceMeters)
     return std::max(kEspScaleMin, distScale);
 }
 
-float Visuals::TextScaleFromDistance(float distanceMeters)
-{
-    return EspDistanceScale(distanceMeters) * EspUserTextScale();
-}
-
 float Visuals::LabelTextPx(float distanceMeters)
 {
     return MakeScale(EspDistanceScale(distanceMeters)).textPx;
@@ -100,27 +95,6 @@ void Visuals::DrawScaledLabel(
     drawList->AddText(font, fontSize, ImVec2(x, y - outline), outlineColor, text);
     drawList->AddText(font, fontSize, ImVec2(x, y + outline), outlineColor, text);
     drawList->AddText(font, fontSize, ImVec2(x, y), color, text);
-}
-
-void Visuals::Headline(int width, int height, Vector2 target, int distance)
-{
-    auto vList = ImGui::GetForegroundDrawList();
-    const auto start = ImVec2(width * 0.5f, height * 0.5f);
-    const auto end = ImVec2(static_cast<float>(target.x), static_cast<float>(target.y));
-
-    float radius = 8.0f * EspDistanceScale(static_cast<float>(distance));
-    radius = std::clamp(radius, 2.0f, 8.0f);
-
-    ImColor color;
-    if (distance < 5)
-        color = ImColor(255, 100, 100, 255);
-    else if (distance < 10)
-        color = ImColor(255, 200, 100, 255);
-    else
-        color = ImColor(255, 255, 255, 255);
-
-    vList->AddCircleFilled(end, radius, color);
-    vList->AddLine(start, end, IM_COL32(255, 255, 255, 120), 1.0f);
 }
 
 float Visuals::EspUserTextScale()
@@ -160,14 +134,6 @@ Visuals::EspDrawScale Visuals::ComputeEspScaleUnified(
 Visuals::EspDrawScale Visuals::ComputeEspScaleFromDistance(float distanceMeters)
 {
     return ComputeEspScaleUnified(0.f, distanceMeters, 1080.f);
-}
-
-Visuals::EspDrawScale Visuals::ComputeEspScaleFromLootMarker(float markerScreenHeightPx)
-{
-    const float estDistM = markerScreenHeightPx > 1.f
-        ? std::clamp(180.f * 1080.f / (markerScreenHeightPx * 100.f), 1.f, 250.f)
-        : kEspDistRefM;
-    return ComputeEspScaleFromDistance(estDistM);
 }
 
 ImVec2 Visuals::CalcScaledTextSize(const char* text, float textPx)
@@ -221,15 +187,6 @@ void Visuals::FovCircle(float aimbotFovDegrees, float gameFovDegrees)
         IM_COL32(255, 255, 255, 220),
         64,
         2.0f);
-}
-
-void Visuals::SnapLinesDouble(const Vector3& start, const Vector3& end, ImColor color, float thickness)
-{
-    ImGui::GetForegroundDrawList()->AddLine(
-        ImVec2(static_cast<float>(start.x), static_cast<float>(start.y)),
-        ImVec2(static_cast<float>(end.x), static_cast<float>(end.y)),
-        color,
-        thickness);
 }
 
 namespace {
@@ -637,14 +594,6 @@ void Visuals::Names(const std::string& name, float center_x, float top_y, const 
     dl->AddText(font, scale.textPx, ImVec2(text_x, text_y), color, name.c_str());
 }
 
-ImColor Visuals::HealthColorFromPct(float hpPct)
-{
-    const float t = std::clamp(1.f - hpPct, 0.f, 1.f);
-    const int r = static_cast<int>(255.f * t);
-    const int g = static_cast<int>(255.f * (1.f - t));
-    return ImColor(r, g, 0, 255);
-}
-
 namespace {
 
 int SnapShieldTierMax(int maxShield)
@@ -823,17 +772,4 @@ void Visuals::Box(const Vector3& headScreenPos, const Vector3& feetScreenPos, bo
     const float outlineW = std::max(1.0f, scale.lineThickness * 0.5f);
     DrawCorneredBox(startPosX - outlineW, startPosY - outlineW, boxWidth + outlineW * 2.f, boxHeight + outlineW * 2.f, IM_COL32(0, 0, 0, 180), outlineW);
     DrawCorneredBox(startPosX, startPosY, boxWidth, boxHeight, color, scale.lineThickness);
-}
-
-void Visuals::BoxScreenRect(float x, float y, float w, float h, ImU32 color, const EspDrawScale& scale)
-{
-    if (w < 1.f || h < 1.f)
-        return;
-    if (x != x || y != y)
-        return;
-    // Black outline for crisp contrast against any background
-    auto dl = ImGui::GetForegroundDrawList();
-    const float outlineW = std::max(1.0f, scale.lineThickness * 0.5f);
-    DrawCorneredBox(x - outlineW, y - outlineW, w + outlineW * 2.f, h + outlineW * 2.f, IM_COL32(0, 0, 0, 180), outlineW);
-    DrawCorneredBox(x, y, w, h, color, scale.lineThickness);
 }

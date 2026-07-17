@@ -42,41 +42,16 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     ImGui_ImplWin32_EnableDpiAwareness();
     float main_scale = ImGui_ImplWin32_GetDpiScaleForMonitor(::MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY));
 
-    system("color e");
-
-    if (AllocConsole())
-    {
-        FILE* Dummy;
-        freopen_s(&Dummy, "CONOUT$", "w", stdout);
-        freopen_s(&Dummy, "CONIN$", "r", stdin);
-    }
-
-    std::cout << "=========================\n";
-    std::cout << "    Arc Raiders Test    \n";
-    std::cout << "=========================\n";
-
+    // No AllocConsole — Release is Windows subsystem; keep overlay-only (no black console).
     ArcAsyncLog_Start();
 
-    std::cout << "[*] Initializing DMA for PioneerGame..." << std::endl;
-
     while (!Memory::InitializeGame()) {
-        std::cout << "[!] DMA init failed (need PioneerGame-e or -d), retrying in 2s..." << std::endl;
         Sleep(2000);
     }
     g_pid = static_cast<DWORD>(Memory::getProcessID());
-    const char* attachedExe = Memory::GetAttachedGameExe();
-    std::cout << "[+] DMA connected"
-        << (attachedExe ? (std::string(" (") + attachedExe + ")") : "")
-        << " PID: " << g_pid << " Base: 0x"
-        << std::hex << Memory::getBaseAddress() << std::dec << std::endl;
 
-    std::cout << "[*] Loading auto-config..." << std::endl;
     AutoConfig_Load();
-
-    std::cout << "[*] Loading asset names / loot meta..." << std::endl;
     AssetNamesInit();
-
-    std::cout << "[*] Initializing KmBox/MAKCU..." << std::endl;
     g_kmbox.InitializeFirst();
     g_kmbox.LogStatus();
 

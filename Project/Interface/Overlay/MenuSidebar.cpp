@@ -314,12 +314,6 @@ void DrawArcEspTab()
     ArcMenuHoverTooltip("Master switch for player ESP. Colors: visible (left), invisible (right).");
     ArcMenuLayout::SliderFloat("ESP distance", "##esp_distance", &var::esp_distance, 50.f, var::kMaxDistanceSliderM, "%.0f m");
     ArcMenuHoverTooltip("Maximum distance for player ESP rendering.");
-    if (ArcMenuLayout::Checkbox("Visible check", &var::visiblecheck)) {
-        (void)0;
-    }
-    ArcMenuHoverTooltip(
-        "ON: UC encrypted render-time decrypt (mesh+0x488, CL-1315578 / UC pg185 #3689); "
-        "legacy plain fallback @ mesh+0x4C4. OFF: treat all as visible.");
     ImGui::BeginDisabled(!var::enableesp);
     ArcMenuLayout::Checkbox("Box", &var::box);
     ArcMenuHoverTooltip("Draw box around tracked players.");
@@ -408,7 +402,9 @@ void DrawArcLootTab()
     ArcMenuHoverTooltip("Loot container ESP settings.");
     if (ArcMenuLayout::Checkbox("Show loot", &var::showLoot))
         RequestArcSlowCache();
-    ArcMenuHoverTooltip("Display loot container positions on screen.");
+    ArcMenuHoverTooltip(
+        "Master switch for loot/container ESP draw. Off = hide all world loot labels. "
+        "On = each Container types row below filters what is shown.");
     ImGui::BeginDisabled(!var::showLoot);
     ArcMenuLayout::Checkbox("Color loot by rarity", &var::loot_rarity_color);
     ArcMenuHoverTooltip("Color dropped pickup labels by item rarity tier.");
@@ -456,12 +452,11 @@ void DrawArcLootTab()
     ArcMenuLayout::SliderFloat(
         "SP", "##container_distance_sp", &var::container_distance_sp, 20.f, var::kMaxDistanceSliderM, "%.0f m");
     ArcMenuHoverTooltip("Extended draw distance. Used only when SP is checked on that row.");
-    ImGui::EndDisabled();
 
     ImGui::Separator();
     ImGui::Text("Container types");
     ArcMenuHoverTooltip(
-        "Each row: SP unchecked = Loot distance. SP checked = SP distance. No other rules.");
+        "Each row: SP unchecked = Loot distance. SP checked = SP distance. Requires Show loot on.");
     DrawContainerTypeHeaderRow();
     ContainerTypeRow("Dropped items", &var::droppedItems, var::color_dropped_items, "##col_dropped",
         WorldItemCategory::DroppedPickup);
@@ -499,6 +494,7 @@ void DrawArcLootTab()
     ContainerTypeRow("Safe", &var::show_world_safe, var::color_world_safe, "##col_w_safe", WorldItemCategory::Safe);
     ContainerTypeRow("Buried", &var::show_world_buried, var::color_world_buried, "##col_w_buried", WorldItemCategory::Buried);
     ContainerTypeRow("Dead drop", &var::show_world_deaddrop, var::color_world_deaddrop, "##col_w_deaddrop", WorldItemCategory::DeadDrop);
+    ImGui::EndDisabled();
 }
 
 void DrawArcRadarTab()
@@ -562,9 +558,6 @@ void DrawArcAimbotTab()
     ArcMenuHoverTooltip("Stop moving when target is within this many pixels of crosshair.");
     ArcMenuLayout::Checkbox("Humanizer", &var::humanizer);
     ArcMenuHoverTooltip("Adds subtle motion variation on the rotation path.");
-    ArcMenuLayout::Checkbox("Visibility check", &var::visiblecheck);
-    ArcMenuHoverTooltip(
-        "Mesh render-time visibility; optional Obstruction LOS (ESP tab) adds static-mesh wall checks.");
     ArcMenuLayout::Checkbox("Bullet prediction", &var::predict);
     ArcMenuHoverTooltip("Lead moving targets by travel time (uses cached velocity).");
     ArcMenuLayout::SliderFloat(
@@ -652,7 +645,7 @@ void DrawArcAimbotTab()
         ImGui::TextDisabled("KMBox connected — hardware aim active (read-only DMA, no memory writes).");
 
     ImGui::Separator();
-    ImGui::Keybind("Aim hotkey", &var::aim_hold_key, nullptr, false);
+    ImGui::Keybind("Aim hotkey", &var::aim_hold_key);
     ArcMenuHoverTooltip("Hold to run aim assist.");
 }
 
@@ -754,13 +747,6 @@ void DrawArcDebugTab()
     ImGui::Text("Aim hotkey held: %s", KeyBindIsHeld(aimKey) ? "yes" : "no");
     ImGui::Text("KmBox ready: %s", g_kmbox.kmboxConfig.initialized ? "yes" : "no");
     ImGui::Separator();
-    ImGui::TextWrapped(
-        "Visible check: UC encrypted decrypt (mesh+0x488, CL-1315578 / UC pg185 #3689); "
-        "legacy plain fallback @ mesh+0x4C4.");
-    if (var::visiblecheck)
-        ImGui::TextColored(ImVec4(0.45f, 1.0f, 0.55f, 1.0f), "Visible check: ON");
-    else
-        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "Visible check: OFF");
 
     Engine::CameraCache cam{};
     {
@@ -788,6 +774,10 @@ void DrawArcDebugTab()
     ArcMenuLayout::Checkbox("Show offset validation", &var::show_debug_overlay);
     ArcMenuHoverTooltip(
         "Pointer chain status. Close menu to see overlay.");
+    ArcMenuLayout::Checkbox("Near loot HUD", &var::show_near_loot_hud);
+    ArcMenuHoverTooltip(
+        "List nearby ground pickups on-screen. Press F7 to mark the nearest as picked "
+        "(hides it via sticky so ESP does not blink it back).");
 }
 
 void DrawArcHelpTab()
@@ -798,64 +788,69 @@ void DrawArcHelpTab()
 
     ImGui::TextWrapped("Visuals — Player ESP:");
     WrappedBulletText("Enable ESP + visible/invisible colors, distance slider.");
+    WrappedBulletText("Box, health/shield bar, names, weapon (guns tint by tier), snaplines.");
     WrappedBulletText(
-        "Visible check: UC encrypted render-time decrypt (mesh+0x488, CL-1315578 / UC pg185 #3689); "
-        "legacy plain fallback @ mesh+0x4C4.");
-    WrappedBulletText("Box, health/shield bar, names, weapon tier color, snaplines.");
-    WrappedBulletText("Silhouette fill within max m; skeleton beyond that when both enabled.");
+        "Silhouette fill within max m (0 = 25 m default); past that, skeleton only when both are on.");
+    WrappedBulletText("Hide allies removes teammate ESP.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Visuals — Bot ESP:");
-    WrappedBulletText("Show robots + bot visible/invisible colors, bot distance.");
-    WrappedBulletText("Box, names, snaplines, distance, dead bot wrecks + color.");
-    WrappedBulletText("Heart toggle: pulsating marker at box center; robot Center aim uses the same point.");
+    WrappedBulletText("Show robots + bot colors, bot distance, box/names/snaplines/distance.");
+    WrappedBulletText("Dead bot wrecks + color when enabled.");
+    WrappedBulletText(
+        "Heart: pulsating marker at box center; Robot aim Center uses the same point.");
+    WrappedBulletText("Bot HP bars are not available yet (no working reader).");
 
     ImGui::Spacing();
-    ImGui::TextWrapped("Visuals — World / loot:");
-    WrappedBulletText("World ESP: corpses, dropped items, raider stock, ARC entities + per-type colors.");
-    WrappedBulletText("Loot: containers, open-container color, rarity color, value/rarity distance tiers (never hide), distances.");
-    WrappedBulletText("Container types: per-category toggles, colors, SP = SP distance else loot distance.");
+    ImGui::TextWrapped("Visuals — World:");
+    WrappedBulletText("Enable world ESP: corpses, dropped items, raider stock, ARC entities + colors.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Loot tab:");
-    WrappedBulletText("Show loot, open-container color, rarity color, loot label color, show value on label.");
-    WrappedBulletText("Min value/rarity + SP only choose close vs far — never hide pickups or containers.");
-    WrappedBulletText("Container types: per-category toggles, colors, SP checkboxes.");
+    WrappedBulletText(
+        "Show loot is the master draw gate — category rows are disabled while it is off.");
+    WrappedBulletText(
+        "Open-container color, rarity tint, loot label color, value on label.");
+    WrappedBulletText(
+        "Min value/rarity + SP only pick close vs far distance — they never hide loot.");
+    WrappedBulletText(
+        "Per-container toggles/colors; SP unchecked = Loot distance, checked = SP distance.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Radar tab:");
     WrappedBulletText("Enable radar; hidden while menu is open. Drag to move when menu closed.");
-    WrappedBulletText("Circle or square shape, size, world range.");
-    WrappedBulletText("Blips use Visuals ESP colors (players/bots); rare loot + SP containers on radar.");
+    WrappedBulletText("Circle or square, size, world range.");
+    WrappedBulletText("Blips use Visuals colors; Special = rare loot + SP containers.");
     WrappedBulletText("Works without Enemy ESP enabled.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Aimbot tab:");
-    WrappedBulletText("Enable aimbot (KmBox/MAKCU/Net) + Robot aim (bots without Show robots).");
-    WrappedBulletText("Robot aim: dead center of bot + small in-box shake (on target, not miss spread).");
-    WrappedBulletText("Dbg KmBox: FOV, max distance, smoothness, aim hotkey.");
+    WrappedBulletText("Enable aimbot (MAKCU or Net mouse) + Robot aim (bots even without Show robots).");
+    WrappedBulletText("Robot aim: dead center of bot + small in-box shake.");
+    WrappedBulletText("FOV, max distance, smoothness, hardware speed, aim hotkey (hold).");
     WrappedBulletText(
-        "Advanced sections (hard lock, humanization, hitboxes, delay) each have their own enable checkbox.");
+        "Sticky lock, loss-of-sight grace, humanizer, prediction, random bone — each optional.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Settings tab:");
-    WrappedBulletText("DMA controller status, re-init controller / KmBox.");
-    WrappedBulletText("Overlay monitor picker; KmBox/MAKCU type, COM or Net, device settings.");
+    WrappedBulletText("DMA controller status; re-init controller / KmBox.");
+    WrappedBulletText("Overlay monitor; MAKCU (COM) or Net (IP/UUID) device settings.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Debug tab:");
-    WrappedBulletText("KmBox/config status, gamepad status, debug log/world toggles.");
-    WrappedBulletText("Worker camera, cache counts, visible-check status + overlay toggles.");
-    WrappedBulletText("Live GWorld / camera readout for offset debugging.");
+    WrappedBulletText("Show offset validation — console tags [debugPlayer/Robot/Item/Container/Aim].");
+    WrappedBulletText(
+        "Near loot HUD — on-screen ground pickups; F7 marks the nearest as picked.");
+    WrappedBulletText("KmBox/config + gamepad status; worker/camera/cache readouts.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Other:");
-    WrappedBulletText("DMA attach to PioneerGame-d before overlay; auto_config.ini save/load.");
+    WrappedBulletText("DMA attach to PioneerGame before overlay; auto_config.ini auto save/load.");
     WrappedBulletText("Close tab exits the application.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Keys:");
-    WrappedBulletText("INSERT — toggle menu. END — exit overlay.");
+    WrappedBulletText("INSERT — toggle menu. END — exit overlay. F7 — mark nearest ground loot picked (Near loot HUD).");
 }
 
 } // namespace arc_ui

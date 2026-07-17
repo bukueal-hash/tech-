@@ -32,13 +32,6 @@ inline bool AnyContainerEspEnabled()
         var::show_world_open_container);
 }
 
-std::string ToLowerCopy(std::string s)
-{
-    for (char& c : s)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return s;
-}
-
 bool QuickContainerCandidate(
     uint32_t maskedType,
     bool classChest,
@@ -231,17 +224,13 @@ static constexpr uint8_t kContainerPosMissEvict = 12;
 
 static bool ContainerPosMissShouldEvict(uintptr_t key, bool posOk)
 {
-    if (posOk) {
-        s_containerPosMisses.erase(key);
-        return false;
-    }
-    const uint8_t misses = ++s_containerPosMisses[key];
-    return misses >= kContainerPosMissEvict;
+    return WorldScan::MissCounterShouldEvict(
+        s_containerPosMisses, key, posOk, kContainerPosMissEvict);
 }
 
 static void ClearContainerPosMiss(uintptr_t key)
 {
-    s_containerPosMisses.erase(key);
+    WorldScan::MissCounterClear(s_containerPosMisses, key);
 }
 
 static void ClearContainerListStaticMaps()
@@ -836,29 +825,16 @@ void Engine::ContainerList()
             // #region agent log
 #if ARC_AGENT_NDJSON
             {
-                static std::mutex s_nameLogMu;
-                std::lock_guard<std::mutex> lk(s_nameLogMu);
-                std::ofstream f("F:/Test/ARCs/debug-5681af.log", std::ios::app);
-                if (f) {
-                    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    auto esc = [](std::string s) {
-                        std::string o;
-                        for (char c : s) {
-                            if (c == '"' || c == '\\') o.push_back('\\');
-                            if (static_cast<unsigned char>(c) >= 32) o.push_back(c);
-                        }
-                        return o;
-                    };
-                    f << "{\"sessionId\":\"5681af\",\"runId\":\"names\",\"hypothesisId\":\"N\""
-                      << ",\"location\":\"ContainerList.cpp:containerName\",\"message\":\"container_label\""
-                      << ",\"data\":{\"fname\":\"" << esc(entry.ActorName)
-                      << "\",\"class\":\"" << esc(classFname)
-                      << "\",\"actorFname\":\"" << esc(actorFnameLive)
-                      << "\",\"dataAsset\":\"" << esc(GetActorDataAssetFName(actorKey))
-                      << "\",\"label\":\"" << esc(entry.ItemDisplayName) << "\"}"
-                      << ",\"timestamp\":" << ms << "}\n";
-                }
+                ArcAgentLog5681af(
+                    "names",
+                    "N",
+                    "ContainerList.cpp:containerName",
+                    "container_label",
+                    std::string("{\"fname\":\"") + ArcAgentLogJsonEscape(entry.ActorName)
+                        + "\",\"class\":\"" + ArcAgentLogJsonEscape(classFname)
+                        + "\",\"actorFname\":\"" + ArcAgentLogJsonEscape(actorFnameLive)
+                        + "\",\"dataAsset\":\"" + ArcAgentLogJsonEscape(GetActorDataAssetFName(actorKey))
+                        + "\",\"label\":\"" + ArcAgentLogJsonEscape(entry.ItemDisplayName) + "\"}");
             }
 #endif // ARC_AGENT_NDJSON
             // #endregion
@@ -881,7 +857,6 @@ void Engine::ContainerList()
             << " cache=" << containerCache.size()
             << " lootDist=" << static_cast<int>(var::loot_distance)
             << " spDist=" << static_cast<int>(var::container_distance_sp)
-            << " worldDist=" << static_cast<int>(var::world_distance)
             << std::endl;
 
     }

@@ -22,6 +22,13 @@
 #include <unordered_set>
 #include <vector>
 
+std::string ToLowerCopy(std::string s)
+{
+    for (char& ch : s)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return s;
+}
+
 namespace {
 
 std::unordered_map<std::string, std::string> g_assetByName;
@@ -321,13 +328,6 @@ std::string TrimCopy(std::string s)
     auto notSpace = [](unsigned char c) { return !std::isspace(c); };
     s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
     s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
-    return s;
-}
-
-std::string ToLowerCopy(std::string s)
-{
-    for (char& ch : s)
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
     return s;
 }
 

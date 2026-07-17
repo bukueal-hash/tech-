@@ -2499,76 +2499,67 @@ WorldItemCategory InferLootWorldCategory(
     return WorldItemCategory::Invalid;
 }
 
-namespace {
-
-ImU32 ColorFromPicker(const float rgba[4])
-{
-    return EspDraw::ColorFromRGBA(rgba);
-}
-
-} // namespace
-
 uint32_t WorldCategoryLabelColor(WorldItemCategory cat)
 {
     switch (cat) {
     case WorldItemCategory::DroppedPickup:
-        return ColorFromPicker(var::color_dropped_items);
+        return EspDraw::ColorFromRGBA(var::color_dropped_items);
     case WorldItemCategory::Items:
-        return ColorFromPicker(var::color_world_items);
+        return EspDraw::ColorFromRGBA(var::color_world_items);
     case WorldItemCategory::Ammo:
-        return ColorFromPicker(var::color_world_ammo);
+        return EspDraw::ColorFromRGBA(var::color_world_ammo);
     case WorldItemCategory::ArcLoot:
-        return ColorFromPicker(var::color_world_arc_loot);
+        return EspDraw::ColorFromRGBA(var::color_world_arc_loot);
     case WorldItemCategory::Backpack:
-        return ColorFromPicker(var::color_world_backpack);
+        return EspDraw::ColorFromRGBA(var::color_world_backpack);
     case WorldItemCategory::Crate:
-        return ColorFromPicker(var::color_world_crate);
+        return EspDraw::ColorFromRGBA(var::color_world_crate);
     case WorldItemCategory::Furniture:
-        return ColorFromPicker(var::color_world_furniture);
+        return EspDraw::ColorFromRGBA(var::color_world_furniture);
     case WorldItemCategory::Grenade:
-        return ColorFromPicker(var::color_world_grenade);
+        return EspDraw::ColorFromRGBA(var::color_world_grenade);
     case WorldItemCategory::Harvestable:
-        return ColorFromPicker(var::color_world_harvestable);
+        return EspDraw::ColorFromRGBA(var::color_world_harvestable);
     case WorldItemCategory::Industrial:
-        return ColorFromPicker(var::color_world_industrial);
+        return EspDraw::ColorFromRGBA(var::color_world_industrial);
     case WorldItemCategory::Medical:
-        return ColorFromPicker(var::color_world_medical);
+        return EspDraw::ColorFromRGBA(var::color_world_medical);
     case WorldItemCategory::Other:
-        return ColorFromPicker(var::color_world_other);
+        return EspDraw::ColorFromRGBA(var::color_world_other);
     case WorldItemCategory::Probe:
-        return ColorFromPicker(var::color_world_probe);
+        return EspDraw::ColorFromRGBA(var::color_world_probe);
     case WorldItemCategory::RaiderCache:
-        return ColorFromPicker(var::color_raider_stock);
+        return EspDraw::ColorFromRGBA(var::color_raider_stock);
     case WorldItemCategory::Vehicles:
-        return ColorFromPicker(var::color_world_vehicles);
+        return EspDraw::ColorFromRGBA(var::color_world_vehicles);
     case WorldItemCategory::WeaponCase:
-        return ColorFromPicker(var::color_world_weapon_case);
+        return EspDraw::ColorFromRGBA(var::color_world_weapon_case);
     case WorldItemCategory::FieldCrate:
-        return ColorFromPicker(var::color_world_field_crate);
+        return EspDraw::ColorFromRGBA(var::color_world_field_crate);
     case WorldItemCategory::SupplyCallStation:
-        return ColorFromPicker(var::color_world_supply_station);
+        return EspDraw::ColorFromRGBA(var::color_world_supply_station);
     case WorldItemCategory::Corpse:
-        return ColorFromPicker(var::color_world_corpses);
+        return EspDraw::ColorFromRGBA(var::color_world_corpses);
     case WorldItemCategory::RaiderStock:
-        return ColorFromPicker(var::color_raider_stock);
+        return EspDraw::ColorFromRGBA(var::color_raider_stock);
     case WorldItemCategory::ArcCargoship:
-        return ColorFromPicker(var::color_arc_entities);
+        return EspDraw::ColorFromRGBA(var::color_arc_entities);
     case WorldItemCategory::Keys:
-        return ColorFromPicker(var::color_world_keys);
+        return EspDraw::ColorFromRGBA(var::color_world_keys);
     case WorldItemCategory::Locker:
-        return ColorFromPicker(var::color_world_locker);
+        return EspDraw::ColorFromRGBA(var::color_world_locker);
     case WorldItemCategory::Trash:
-        return ColorFromPicker(var::color_world_trash);
+        return EspDraw::ColorFromRGBA(var::color_world_trash);
     case WorldItemCategory::Safe:
-        return ColorFromPicker(var::color_world_safe);
+        return EspDraw::ColorFromRGBA(var::color_world_safe);
     case WorldItemCategory::Buried:
-        return ColorFromPicker(var::color_world_buried);
+        return EspDraw::ColorFromRGBA(var::color_world_buried);
     case WorldItemCategory::DeadDrop:
-        return ColorFromPicker(var::color_world_deaddrop);
+        return EspDraw::ColorFromRGBA(var::color_world_deaddrop);
     case WorldItemCategory::OpenedContainer:
-        return ColorFromPicker(var::color_world_open_container);
+        return EspDraw::ColorFromRGBA(var::color_world_open_container);
     default:
-        return ColorFromPicker(var::color_loot);
+        return EspDraw::ColorFromRGBA(var::color_loot);
     }
 }
 
@@ -2586,7 +2577,7 @@ uint32_t RarityTierColor(int lootTier)
     case 5:
         return IM_COL32(220, 180, 60, 255);
     default:
-        return ColorFromPicker(var::color_loot);
+        return EspDraw::ColorFromRGBA(var::color_loot);
     }
 }
 
@@ -2595,7 +2586,7 @@ uint32_t WorldLootLabelColor(WorldItemCategory cat, int lootTier, bool isPickup)
     if (isPickup) {
         if (var::loot_rarity_color && lootTier > 0)
             return RarityTierColor(lootTier);
-        return ColorFromPicker(var::color_loot);
+        return EspDraw::ColorFromRGBA(var::color_loot);
     }
     return WorldCategoryLabelColor(cat);
 }
@@ -2635,66 +2626,69 @@ bool WorldCategoryEnabled(int category)
         && WorldCategoryUsesSpContainerRange(cat)) {
         return true;
     }
+    // showLoot is the master draw switch; category toggles filter while it is on.
+    if (!var::showLoot)
+        return false;
     switch (cat) {
     case WorldItemCategory::DroppedPickup:
-        return var::droppedItems || var::show_world_items || var::showLoot;
+        return var::droppedItems || var::show_world_items;
     case WorldItemCategory::Items:
-        return var::show_world_items || var::droppedItems || var::showLoot;
+        return var::show_world_items || var::droppedItems;
     case WorldItemCategory::Ammo:
-        return var::show_world_ammo || var::showLoot;
+        return var::show_world_ammo;
     case WorldItemCategory::ArcLoot:
-        return var::show_world_arc_loot || var::showLoot;
+        return var::show_world_arc_loot;
     case WorldItemCategory::Backpack:
-        return var::show_world_backpack || var::showLoot;
+        return var::show_world_backpack;
     case WorldItemCategory::Crate:
-        return var::show_world_crate || var::showLoot;
+        return var::show_world_crate;
     case WorldItemCategory::Furniture:
-        return var::show_world_furniture || var::showLoot;
+        return var::show_world_furniture;
     case WorldItemCategory::Grenade:
-        return var::show_world_grenade || var::showLoot;
+        return var::show_world_grenade;
     case WorldItemCategory::Harvestable:
         // Items/Dropped toggles also cover world plants so Prickly Pear etc.
         // aren't invisible when only loot/items ESP is on.
         return var::show_world_harvestable || var::droppedItems
-            || var::show_world_items || var::showLoot;
+            || var::show_world_items;
     case WorldItemCategory::Industrial:
-        return var::show_world_industrial || var::showLoot;
+        return var::show_world_industrial;
     case WorldItemCategory::Medical:
-        return var::show_world_medical || var::showLoot;
+        return var::show_world_medical;
     case WorldItemCategory::Other:
-        return var::show_world_other || var::showLoot;
+        return var::show_world_other;
     case WorldItemCategory::Probe:
-        return var::show_world_probe || var::showLoot;
+        return var::show_world_probe;
     case WorldItemCategory::RaiderCache:
-        return var::raiderStock || var::showLoot;
+        return var::raiderStock;
     case WorldItemCategory::Vehicles:
-        return var::show_world_vehicles || var::showLoot;
+        return var::show_world_vehicles;
     case WorldItemCategory::WeaponCase:
-        return var::show_world_weapon_case || var::showLoot;
+        return var::show_world_weapon_case;
     case WorldItemCategory::FieldCrate:
-        return var::show_world_field_crate || var::showLoot;
+        return var::show_world_field_crate;
     case WorldItemCategory::SupplyCallStation:
-        return var::show_world_supply_station || var::showLoot;
+        return var::show_world_supply_station;
     case WorldItemCategory::Corpse:
-        return var::showDeadPlayers || var::showLoot;
+        return var::showDeadPlayers;
     case WorldItemCategory::RaiderStock:
-        return var::raiderStock || var::showLoot;
+        return var::raiderStock;
     case WorldItemCategory::ArcCargoship:
-        return var::showArc || var::showLoot;
+        return var::showArc;
     case WorldItemCategory::Keys:
-        return var::show_world_keys || var::droppedItems || var::showLoot;
+        return var::show_world_keys || var::droppedItems;
     case WorldItemCategory::Locker:
-        return var::show_world_locker || var::showLoot;
+        return var::show_world_locker;
     case WorldItemCategory::Trash:
-        return var::show_world_trash || var::showLoot;
+        return var::show_world_trash;
     case WorldItemCategory::Safe:
-        return var::show_world_safe || var::showLoot;
+        return var::show_world_safe;
     case WorldItemCategory::Buried:
-        return var::show_world_buried || var::showLoot;
+        return var::show_world_buried;
     case WorldItemCategory::DeadDrop:
-        return var::show_world_deaddrop || var::showLoot;
+        return var::show_world_deaddrop;
     case WorldItemCategory::OpenedContainer:
-        return var::show_world_open_container || var::showLoot;
+        return var::show_world_open_container;
     default:
         return false;
     }

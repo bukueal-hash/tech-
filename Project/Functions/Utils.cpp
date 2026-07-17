@@ -13,6 +13,7 @@
 
 
 #include "../Core/AssetNames.h"
+#include "../Core/AgentLog.h"
 #include "../Functions/RobotList.h"
 #include "WorldScanCommon.h"
 #include "../Core/Cache.hpp"
@@ -28,15 +29,6 @@ namespace {
 
 std::atomic<float> g_projViewportW{ 1920.f };
 std::atomic<float> g_projViewportH{ 1080.f };
-
-bool PovMatchesPawnView(const Engine::FVector3d& pov, const Vector3& pawn)
-{
-	const double dx = std::fabs(pov.x - static_cast<double>(pawn.x));
-	const double dy = std::fabs(pov.y - static_cast<double>(pawn.y));
-	const double dz = std::fabs(pov.z - static_cast<double>(pawn.z));
-	// Third-person camera stays within ~40m of pawn on each axis.
-	return dx < 4000.0 && dy < 4000.0 && dz < 4000.0;
-}
 
 bool IsPlausibleWorldPosD(const Engine::FVector3d& p)
 {
@@ -226,6 +218,41 @@ bool Engine::BuildCameraCacheFromPovReads(
     return true;
 }
 
+bool Engine::ResolvePlayerCameraManagerLadder(
+	uintptr_t& pc,
+	uintptr_t& pawn,
+	uintptr_t& pcm,
+	uintptr_t level,
+	uintptr_t actors,
+	bool nocacheFov)
+{
+	auto IsPcmValid = [&](uintptr_t p) {
+		if (!p || !IsValidPointer(p))
+			return false;
+		const float f = nocacheFov
+			? Memory::read_nocache<float>(p + Offsets::DefaultFOV)
+			: Memory::read<float>(p + Offsets::DefaultFOV);
+		return f > 1.0f && f < 179.0f;
+	};
+
+	// LP may be 0 — still recover PCM via FName / PCOwner scan.
+	if (pc && !IsPcmValid(pcm))
+		pcm = Memory::read<uintptr_t>(pc + Offsets::APlayerCameraManager);
+	if (!IsPcmValid(pcm))
+		pcm = GetCameraManagerFromActors();
+	if (!IsPcmValid(pcm) && level && actors) {
+		uintptr_t pcmPc = pc;
+		uintptr_t pcmPawn = pawn;
+		uintptr_t foundPcm = pcm;
+		if (ResolvePcFromLevelCameraManager(level, actors, pcmPc, pcmPawn, foundPcm)) {
+			pcm = foundPcm;
+			pc = pcmPc;
+			pawn = pcmPawn;
+		}
+	}
+	return pcm && IsValidPointer(pcm);
+}
+
 bool Engine::RefreshCameraFromViewTarget()
 {
 	uintptr_t pc = 0;
@@ -241,41 +268,19 @@ bool Engine::RefreshCameraFromViewTarget()
 	}
 
 	const uintptr_t pcmStored = pcm;
-	auto IsPcmValid = [&](uintptr_t p) {
-		if (!p || !IsValidPointer(p)) return false;
-        const float f = Memory::read_nocache<float>(p + Offsets::DefaultFOV);
-		return f > 1.0f && f < 179.0f;
-	};
-
-	// LP may be 0 (encrypted GI→LP). Prefer PCM FName → PCOwner → AckPawn
-	// (help/esp.txt Step 4–5); never require LocalPlayer for camera.
-	if (pc && !IsPcmValid(pcm))
-		pcm = Memory::read<uintptr_t>(pc + Offsets::APlayerCameraManager);
-	if (!IsPcmValid(pcm))
-		pcm = GetCameraManagerFromActors();
-	if (!IsPcmValid(pcm)) {
-		uintptr_t level = 0;
-		uintptr_t actors = 0;
-		{
-			std::shared_lock<std::shared_mutex> lock(m_stateMutex);
-			level = PersistentLevel;
-			actors = Actors;
-		}
-		if (level && actors) {
-			uintptr_t pcmPc = pc;
-			uintptr_t pcmPawn = pawn;
-			uintptr_t foundPcm = pcm;
-			if (ResolvePcFromLevelCameraManager(level, actors, pcmPc, pcmPawn, foundPcm)) {
-				pcm = foundPcm;
-				if (pcmPc && (!pc || pcmPc != pc)) {
-					std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-					PlayerController = pcmPc;
-					AcknowledgedPawn = pcmPawn;
-					pc = pcmPc;
-					pawn = pcmPawn;
-				}
-			}
-		}
+	const uintptr_t pcBeforeLadder = pc;
+	uintptr_t level = 0;
+	uintptr_t actors = 0;
+	{
+		std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+		level = PersistentLevel;
+		actors = Actors;
+	}
+	ResolvePlayerCameraManagerLadder(pc, pawn, pcm, level, actors, /*nocacheFov=*/true);
+	if (pc && (!pcBeforeLadder || pc != pcBeforeLadder)) {
+		std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+		PlayerController = pc;
+		AcknowledgedPawn = pawn;
 	}
 
 	const bool pcmOk = pcm && IsValidPointer(pcm);
@@ -500,16 +505,6 @@ bool Engine::ProjectWorldLocationToScreen(
 		cameraInfo = g_Camera;
 	}
 	return ProjectWorldLocationToScreen(WorldLocation, screen, cameraInfo);
-}
-
-bool Engine::Has(const std::string& s, const char* sub)
-{
-    return s.find(sub) != std::string::npos;
-}
-
-std::uintptr_t Engine::GetBoneArrayDecrypt(std::uintptr_t skeletalmesh)
-{
-    return steam_decrypt::GetBoneArrayDecrypt(skeletalmesh);
 }
 
 static bool PawnHasWorldPosition(uint64_t pawn);
@@ -1130,6 +1125,8 @@ namespace {
 std::string StripWeaponAssetName(std::string name)
 {
     static const char* kPrefixes[] = {
+        "WeaponVisuals_",
+        "WeaponVisuals",
         "DA_WeaponItem_",
         "DA_ItemDataAsset_",
         "BP_WeaponActor_",
@@ -1152,8 +1149,18 @@ std::string StripWeaponAssetName(std::string name)
             break;
         }
     }
+    // Blueprint / visual variant suffixes: _C, _A, _B, _01_A → drop trailing _X
+    // (single letter) after optional blueprint _C.
     if (name.size() > 2 && name.compare(name.size() - 2, 2, "_C") == 0)
         name.resize(name.size() - 2);
+    if (name.size() > 2) {
+        const size_t us = name.rfind('_');
+        if (us != std::string::npos && us + 2 == name.size()) {
+            const char letter = name[us + 1];
+            if ((letter >= 'A' && letter <= 'Z') || (letter >= 'a' && letter <= 'z'))
+                name.resize(us);
+        }
+    }
     return name;
 }
 
@@ -1187,6 +1194,8 @@ std::string Engine::GetWeaponName(const std::string& internal_name) {
         { "LeverAction_01",                    "Renegade" },
         { "AssaultRifle_Bullpup_01",           "Arpeggio" },
         { "Launcher_AntiArc_Medium_01_C",      "Hullcracker" },
+        { "Launcher_AntiArc_Medium_01",        "Hullcracker" },
+        { "Launcher_AntiArc_SingleShot_01",    "Rascal" },
         { "LMG_Medium_01",                     "Torrente" },
         { "Special_BeamRifle_01",              "Equalizer" },
         { "Beam_01",                           "Equalizer"},
@@ -1258,8 +1267,15 @@ std::string Engine::GetWeaponName(const std::string& internal_name) {
 
     std::string human = stripped;
     std::replace(human.begin(), human.end(), '_', ' ');
-    if (!human.empty())
+    if (!human.empty()) {
+        // Never ship unresolved WeaponVisuals_* as ESP text.
+        std::string humanLower = human;
+        for (char& c : humanLower)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (humanLower.find("weaponvisuals") != std::string::npos)
+            return {};
         return human;
+    }
 
     return {};
 }
@@ -1274,6 +1290,10 @@ bool Engine::IsPlayerWeaponEspLabel(const std::string& label)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 
     if (lower == "unarmed")
+        return false;
+
+    // Never show unresolved visual-asset labels on ESP.
+    if (lower.find("weaponvisuals") != std::string::npos)
         return false;
 
     static const char* kJunk[] = {

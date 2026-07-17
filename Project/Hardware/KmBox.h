@@ -9,7 +9,6 @@ public:
     bool rememberKmboxInfo = false;
     const std::string CONFIG_FILE = "kmbox_config.ini";
     bool LoadKmboxConfig();
-    bool GetRememberConfig() const { return rememberKmboxInfo; }
     void SetRememberConfig(bool remember) { rememberKmboxInfo = remember; }
 
     struct KMBoxConfig {
@@ -36,8 +35,6 @@ public:
     void MoveAim(int x, int y);
     /** Blocking move with device ACK (init / UI test). */
     void MoveBlocking(int x, int y);
-    void MoveSmooth(int x, int y, uint32_t segments);
-    void MoveBezier(int x, int y, uint32_t segments, int32_t ctrl_x, int32_t ctrl_y);
     void LeftClick();
     void moveTest();
     void fireTest();

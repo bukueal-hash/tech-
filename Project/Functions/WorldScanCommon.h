@@ -107,4 +107,26 @@ inline void BlendCachedVelocity(Vector3& cachedVelocity, const Vector3& newVel)
     }
 }
 
+/** Shared miss-streak eviction for item/container/bot scanners. */
+inline bool MissCounterShouldEvict(
+    std::unordered_map<uintptr_t, uint8_t>& misses,
+    uintptr_t key,
+    bool ok,
+    uint8_t limit)
+{
+    if (ok) {
+        misses.erase(key);
+        return false;
+    }
+    const uint8_t n = ++misses[key];
+    return n >= limit;
+}
+
+inline void MissCounterClear(
+    std::unordered_map<uintptr_t, uint8_t>& misses,
+    uintptr_t key)
+{
+    misses.erase(key);
+}
+
 } // namespace WorldScan

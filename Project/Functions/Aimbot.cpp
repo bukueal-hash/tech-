@@ -650,7 +650,6 @@ void Engine::AimAssistPlayer(
 
     auto consider = [&](uintptr_t key, const PlayerCacheEntry& actor) {
         if (!actor.Drawing) return;
-        if (var::visiblecheck && !actor.isVisible) return;
         if (actor.Distance > var::aimbot_distance) return;
 
         Vector3 aimPos{};
@@ -1085,47 +1084,45 @@ static void WriteAimTrackNdjson(const AimDebugSnapshot& d, bool suppress)
         && now - s_last < std::chrono::milliseconds(200))
         return;
     s_last = now;
-    std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-    if (!f)
-        return;
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    f << "{\"sessionId\":\"c190fb\",\"runId\":\"post-fix4\",\"hypothesisId\":\"H-smooth\""
-      << ",\"location\":\"Aimbot.cpp:AimAssistence\",\"message\":\"aim_speed_track\""
-      << ",\"data\":{\"candidates\":" << d.candidates
-      << ",\"locked\":" << d.locked
-      << ",\"inCand\":" << d.lockedInCand
-      << ",\"dx\":" << d.lastDx
-      << ",\"dy\":" << d.lastDy
-      << ",\"distPx\":" << d.distPx
-      << ",\"gain\":" << d.lastGain
-      << ",\"remX\":" << d.remX
-      << ",\"remY\":" << d.remY
-      << ",\"moveMag\":" << d.moveMag
-      << ",\"tickMs\":" << d.tickMs
-      << ",\"pxPerMouse\":" << d.pxPerMouse
-      << ",\"closeFrac\":" << d.closeFrac
-      << ",\"fastPath\":" << d.fastPath
-      << ",\"kmbox\":" << d.kmbox
-      << ",\"grace\":" << d.grace
-      << ",\"drop\":" << d.dropReason
-      << ",\"isRobot\":" << d.isRobot
-      << ",\"velMag\":" << d.velMag
-      << ",\"worldAgeMs\":" << d.worldAgeMs
-      << ",\"posSrc\":" << static_cast<int>(d.posSrc)
-      << ",\"sticky\":" << (var::sticky_target_lock ? 1 : 0)
-      << ",\"stickyFovPx\":" << d.stickyFov
-      << ",\"predict\":" << (var::predict ? 1 : 0)
-      << ",\"smooth\":" << var::smoothness
-      << ",\"hwSpeed\":" << var::aim_hardware_speed
-      << ",\"sens\":" << var::aim_sensitivity
-      << ",\"algo\":" << static_cast<int>(var::aim_algorithm)
-      << ",\"fovDeg\":" << var::aimbot_fov
-      << ",\"graceMs\":" << var::aim_loss_of_sight_grace_ms
-      << ",\"suppress\":" << (suppress ? 1 : 0)
-      << ",\"viewShakeDeg\":" << d.viewShakeDeg
-      << ",\"pullScale\":" << d.pullScale
-      << "},\"timestamp\":" << ms << "}\n";
+    ArcAgentLog(
+        "post-fix4",
+        "H-smooth",
+        "Aimbot.cpp:AimAssistence",
+        "aim_speed_track",
+        std::string("{\"candidates\":") + std::to_string(d.candidates)
+            + ",\"locked\":" + std::to_string(d.locked)
+            + ",\"inCand\":" + std::to_string(d.lockedInCand)
+            + ",\"dx\":" + std::to_string(d.lastDx)
+            + ",\"dy\":" + std::to_string(d.lastDy)
+            + ",\"distPx\":" + std::to_string(d.distPx)
+            + ",\"gain\":" + std::to_string(d.lastGain)
+            + ",\"remX\":" + std::to_string(d.remX)
+            + ",\"remY\":" + std::to_string(d.remY)
+            + ",\"moveMag\":" + std::to_string(d.moveMag)
+            + ",\"tickMs\":" + std::to_string(d.tickMs)
+            + ",\"pxPerMouse\":" + std::to_string(d.pxPerMouse)
+            + ",\"closeFrac\":" + std::to_string(d.closeFrac)
+            + ",\"fastPath\":" + std::to_string(d.fastPath)
+            + ",\"kmbox\":" + std::to_string(d.kmbox)
+            + ",\"grace\":" + std::to_string(d.grace)
+            + ",\"drop\":" + std::to_string(d.dropReason)
+            + ",\"isRobot\":" + std::to_string(d.isRobot)
+            + ",\"velMag\":" + std::to_string(d.velMag)
+            + ",\"worldAgeMs\":" + std::to_string(d.worldAgeMs)
+            + ",\"posSrc\":" + std::to_string(static_cast<int>(d.posSrc))
+            + ",\"sticky\":" + (var::sticky_target_lock ? "1" : "0")
+            + ",\"stickyFovPx\":" + std::to_string(d.stickyFov)
+            + ",\"predict\":" + (var::predict ? "1" : "0")
+            + ",\"smooth\":" + std::to_string(var::smoothness)
+            + ",\"hwSpeed\":" + std::to_string(var::aim_hardware_speed)
+            + ",\"sens\":" + std::to_string(var::aim_sensitivity)
+            + ",\"algo\":" + std::to_string(static_cast<int>(var::aim_algorithm))
+            + ",\"fovDeg\":" + std::to_string(var::aimbot_fov)
+            + ",\"graceMs\":" + std::to_string(var::aim_loss_of_sight_grace_ms)
+            + ",\"suppress\":" + (suppress ? "1" : "0")
+            + ",\"viewShakeDeg\":" + std::to_string(d.viewShakeDeg)
+            + ",\"pullScale\":" + std::to_string(d.pullScale)
+            + "}");
 }
 #endif // ARC_AGENT_NDJSON
 // #endregion
@@ -1529,29 +1526,27 @@ void Engine::AimAssistence()
                 || nowSelectLog - s_lastSelectLog >= std::chrono::milliseconds(300)
                 || chosePlayerOverCloserRobot)) {
             s_lastSelectLog = nowSelectLog;
-            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-            if (f) {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                f << "{\"sessionId\":\"c190fb\",\"runId\":\"target-select\",\"hypothesisId\":\"SEL\""
-                  << ",\"location\":\"Aimbot.cpp:selectTarget\",\"message\":\"aim_target_select\""
-                  << ",\"data\":{\"players\":" << playerCand
-                  << ",\"robots\":" << robotCand
-                  << ",\"chosenRobot\":" << (bestTarget && bestTarget->isRobot ? 1 : 0)
-                  << ",\"chosenDist\":" << (bestTarget ? bestTarget->distToCenter : -1.f)
-                  << ",\"chosenScore\":" << (bestTarget ? bestTarget->score : -1.f)
-                  << ",\"bestPlayerDist\":" << (bestPlayerDist == FLT_MAX ? -1.f : bestPlayerDist)
-                  << ",\"bestPlayerScore\":" << (bestPlayerScore == -FLT_MAX ? -1.f : bestPlayerScore)
-                  << ",\"bestRobotDist\":" << (bestRobotDist == FLT_MAX ? -1.f : bestRobotDist)
-                  << ",\"bestRobotScore\":" << (bestRobotScore == -FLT_MAX ? -1.f : bestRobotScore)
-                  << ",\"closestIsRobot\":" << (closestIsRobot ? 1 : 0)
-                  << ",\"chosePlayerOverCloserRobot\":" << (chosePlayerOverCloserRobot ? 1 : 0)
-                  << ",\"lockedCandidate\":" << (lockedCandidateKey != 0 ? 1 : 0)
-                  << ",\"sticky\":" << (var::sticky_target_lock ? 1 : 0)
-                  << ",\"priority\":" << static_cast<int>(var::aimbot_priority)
-                  << ",\"fovDeg\":" << var::aimbot_fov
-                  << "},\"timestamp\":" << ms << "}\n";
-            }
+            ArcAgentLog(
+                "target-select",
+                "SEL",
+                "Aimbot.cpp:selectTarget",
+                "aim_target_select",
+                std::string("{\"players\":") + std::to_string(playerCand)
+                    + ",\"robots\":" + std::to_string(robotCand)
+                    + ",\"chosenRobot\":" + (bestTarget && bestTarget->isRobot ? "1" : "0")
+                    + ",\"chosenDist\":" + std::to_string(bestTarget ? bestTarget->distToCenter : -1.f)
+                    + ",\"chosenScore\":" + std::to_string(bestTarget ? bestTarget->score : -1.f)
+                    + ",\"bestPlayerDist\":" + std::to_string(bestPlayerDist == FLT_MAX ? -1.f : bestPlayerDist)
+                    + ",\"bestPlayerScore\":" + std::to_string(bestPlayerScore == -FLT_MAX ? -1.f : bestPlayerScore)
+                    + ",\"bestRobotDist\":" + std::to_string(bestRobotDist == FLT_MAX ? -1.f : bestRobotDist)
+                    + ",\"bestRobotScore\":" + std::to_string(bestRobotScore == -FLT_MAX ? -1.f : bestRobotScore)
+                    + ",\"closestIsRobot\":" + (closestIsRobot ? "1" : "0")
+                    + ",\"chosePlayerOverCloserRobot\":" + (chosePlayerOverCloserRobot ? "1" : "0")
+                    + ",\"lockedCandidate\":" + (lockedCandidateKey != 0 ? "1" : "0")
+                    + ",\"sticky\":" + (var::sticky_target_lock ? "1" : "0")
+                    + ",\"priority\":" + std::to_string(static_cast<int>(var::aimbot_priority))
+                    + ",\"fovDeg\":" + std::to_string(var::aimbot_fov)
+                    + "}");
         }
     }
 #endif // ARC_AGENT_NDJSON

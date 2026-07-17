@@ -37,7 +37,7 @@ namespace var {
     extern bool silhouette;
     /** Soft translucent silhouette fill (child of silhouette). */
     extern bool silhouette_soft_fill;
-    /** Silhouette fill max range (m); 0 = use esp_distance. */
+    /** Silhouette fill max range (m); 0 = default 25 m (not esp_distance). */
     extern float silhouette_max_distance_m;
     extern bool show_distance;
     extern bool hide_allies;
@@ -66,7 +66,6 @@ namespace var {
     extern bool robotAimEnabled;
     extern int aim_hold_key;
     extern AimBoneMode aim_bone_mode;
-    extern bool visiblecheck;
     extern bool predict;
     extern bool humanizer;
     extern bool randombone;
@@ -123,7 +122,6 @@ namespace var {
     extern bool show_world_buried;
     extern bool show_world_deaddrop;
     extern bool show_world_open_container;
-    extern float world_distance;
     extern float color_dropped_items[4];
     extern float color_raider_stock[4];
     extern float color_arc_entities[4];
@@ -154,6 +152,8 @@ namespace var {
 
     /* Loot */
     extern bool showLoot;
+    /** On-screen list of nearby ground pickups; F7 marks nearest as picked. */
+    extern bool show_near_loot_hud;
     extern float loot_distance;
     extern float container_distance_sp;
     extern float color_loot[4];

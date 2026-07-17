@@ -72,23 +72,6 @@ void MyMakcu::Move(int x, int y) {
     g_device.mouseMove(ClampMoveDelta(x), ClampMoveDelta(y));
 }
 
-void MyMakcu::MoveSmooth(int x, int y, uint32_t segments) {
-    if (!g_device.isConnected())
-        return;
-    if (segments < 1u)
-        segments = 1u;
-    g_device.mouseMoveSmooth(ClampMoveDelta(x), ClampMoveDelta(y), segments);
-}
-
-void MyMakcu::MoveBezier(int x, int y, uint32_t segments, int32_t ctrl_x, int32_t ctrl_y) {
-    if (!g_device.isConnected())
-        return;
-    if (segments < 1u)
-        segments = 1u;
-    g_device.mouseMoveBezier(ClampMoveDelta(x), ClampMoveDelta(y), segments, ClampMoveDelta(static_cast<int>(ctrl_x)),
-        ClampMoveDelta(static_cast<int>(ctrl_y)));
-}
-
 void MyMakcu::LeftClick() {
     if (!g_device.isConnected())
         return;

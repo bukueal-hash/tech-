@@ -174,21 +174,4 @@ bool ReadRaw(DmaPadRaw& out) {
 		VMMDLL_FLAG_NOCACHE) && cbRead == sizeof(out);
 }
 
-bool ReadState(XINPUT_STATE& out) {
-	memset(&out, 0, sizeof(out));
-	DmaPadRaw raw{};
-	if (!ReadRaw(raw))
-		return false;
-
-	++out.dwPacketNumber;
-	out.wButtons = raw.buttons;
-	out.bLeftTrigger = raw.lt;
-	out.bRightTrigger = raw.rt;
-	out.sThumbLX = raw.lx;
-	out.sThumbLY = raw.ly;
-	out.sThumbRX = raw.rx;
-	out.sThumbRY = raw.ry;
-	return true;
-}
-
 } // namespace DmaGamepad

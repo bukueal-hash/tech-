@@ -132,11 +132,6 @@ bool InputBindCodeIsGamepad(int code)
     return MaskForBindCode(code) != 0u;
 }
 
-uint32_t InputBindCodeToControllerMask(int code)
-{
-    return MaskForBindCode(code);
-}
-
 bool InputBindIsDown(int code)
 {
     if (code == 0)
@@ -151,11 +146,6 @@ bool InputBindIsDown(int code)
         return true;
 
     return false;
-}
-
-bool InputBindIsEitherDown(int primaryCode, int secondaryCode)
-{
-    return InputBindIsDown(primaryCode) || InputBindIsDown(secondaryCode);
 }
 
 const char* InputBindCodeLabel(int code)
@@ -173,17 +163,4 @@ const char* InputBindCodeLabel(int code)
         }
     }
     return "?";
-}
-
-int InputBindNormalizeBindCode(int code)
-{
-    for (const auto& e : kLegacyGp) {
-        if (e.legacy != code)
-            continue;
-        for (const auto& b : kGpBinds) {
-            if (b.mask == e.mask)
-                return b.code;
-        }
-    }
-    return code;
 }
