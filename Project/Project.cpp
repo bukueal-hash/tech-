@@ -20,7 +20,6 @@
 #include "Interface/Utils/AutoConfig.h"
 #include "Interface/Render.h"
 #include "Core/AssetNames.h"
-#include "Core/AgentLog.h"
 
 static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
@@ -43,7 +42,6 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     float main_scale = ImGui_ImplWin32_GetDpiScaleForMonitor(::MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY));
 
     // No AllocConsole — Release is Windows subsystem; keep overlay-only (no black console).
-    ArcAsyncLog_Start();
 
     while (!Memory::InitializeGame()) {
         Sleep(2000);
@@ -209,28 +207,12 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        // #region agent log
-#if ARC_AGENT_NDJSON
-        // H8/H9/H11: split main-loop hitch — Render vs Present(vsync) vs AutoConfig.
-        const auto tFrame0 = std::chrono::steady_clock::now();
-#endif // ARC_AGENT_NDJSON
-        // #endregion
 
         Render(hwnd);
 
-        // #region agent log
-#if ARC_AGENT_NDJSON
-        const auto tAfterRender = std::chrono::steady_clock::now();
-#endif // ARC_AGENT_NDJSON
-        // #endregion
 
         AutoConfig_Tick();
 
-        // #region agent log
-#if ARC_AGENT_NDJSON
-        const auto tAfterCfg = std::chrono::steady_clock::now();
-#endif // ARC_AGENT_NDJSON
-        // #endregion
 
         if (GetAsyncKeyState(VK_END) & 0x1)
             SendMessage(hwnd, WM_CLOSE, 0, 0);
@@ -250,46 +232,10 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color_with_alpha);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-        // #region agent log
-#if ARC_AGENT_NDJSON
-        const auto tBeforePresent = std::chrono::steady_clock::now();
-#endif // ARC_AGENT_NDJSON
-        // #endregion
 
         HRESULT hr = g_pSwapChain->Present(1, 0);
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
 
-        // #region agent log
-#if ARC_AGENT_NDJSON
-        {
-            const auto tAfterPresent = std::chrono::steady_clock::now();
-            const auto msOf = [](auto a, auto b) {
-                return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
-            };
-            const int64_t renderMs = msOf(tFrame0, tAfterRender);
-            const int64_t cfgMs = msOf(tAfterRender, tAfterCfg);
-            const int64_t presentMs = msOf(tBeforePresent, tAfterPresent);
-            const int64_t totalMs = msOf(tFrame0, tAfterPresent);
-            if (renderMs > 50 || cfgMs > 50 || presentMs > 50 || totalMs > 100) {
-                static auto s_last = std::chrono::steady_clock::time_point{};
-                if (s_last.time_since_epoch().count() == 0
-                    || tAfterPresent - s_last >= std::chrono::milliseconds(200)) {
-                    s_last = tAfterPresent;
-                    ArcAgentLog(
-                        "flicker2",
-                        "H8",
-                        "Project.cpp:main",
-                        "frame_phases",
-                        std::string("{\"renderMs\":") + std::to_string(renderMs)
-                            + ",\"cfgMs\":" + std::to_string(cfgMs)
-                            + ",\"presentMs\":" + std::to_string(presentMs)
-                            + ",\"totalMs\":" + std::to_string(totalMs)
-                            + ",\"vsync\":1}");
-                }
-            }
-        }
-#endif // ARC_AGENT_NDJSON
-        // #endregion
     }
 
     AutoConfig_SaveNow();
@@ -297,7 +243,6 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     engine.StopWorkerThreads();
-    ArcAsyncLog_Stop();
     ImGui::DestroyContext();
 
     CleanupDeviceD3D();

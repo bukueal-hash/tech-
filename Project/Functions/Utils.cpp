@@ -13,7 +13,6 @@
 
 
 #include "../Core/AssetNames.h"
-#include "../Core/AgentLog.h"
 #include "../Functions/RobotList.h"
 #include "WorldScanCommon.h"
 #include "../Core/Cache.hpp"

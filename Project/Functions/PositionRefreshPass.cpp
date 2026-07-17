@@ -7,7 +7,6 @@
 #include <fstream>
 #include <unordered_map>
 #include <vector>
-#include "../Core/AgentLog.h"
 
 namespace {
 
@@ -63,34 +62,6 @@ void Engine::PositionRefreshPass()
     if (work.empty())
         return;
 
-    // #region agent log
-#if ARC_AGENT_NDJSON
-    {
-        static auto s_lastPosLog = std::chrono::steady_clock::time_point{};
-        const auto nowLog = std::chrono::steady_clock::now();
-        if (s_lastPosLog.time_since_epoch().count() == 0
-            || nowLog - s_lastPosLog >= std::chrono::seconds(2)) {
-            s_lastPosLog = nowLog;
-            int nPlayer = 0, nBot = 0;
-            for (const PosRefreshWork& w : work) {
-                if (w.key.kind == PosRefreshKey::CacheKind::Player)
-                    ++nPlayer;
-                else if (w.key.kind == PosRefreshKey::CacheKind::Robot)
-                    ++nBot;
-            }
-            ArcAgentLog5681af(
-                "post-fix",
-                "H2",
-                "PositionRefreshPass.cpp",
-                "pos_work",
-                std::string("{\"total\":") + std::to_string(work.size())
-                    + ",\"players\":" + std::to_string(nPlayer)
-                    + ",\"bots\":" + std::to_string(nBot)
-                    + ",\"world\":0,\"cachedScatter\":0}");
-        }
-    }
-#endif // ARC_AGENT_NDJSON
-    // #endregion
 
     // NOCACHE — cached VMM pages froze bot WorldPos (boxes stuck at spawn footprint).
     // Same class of bug EntityList fixed for players with read_nocache.

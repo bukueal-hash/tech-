@@ -16,7 +16,6 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
-#include "../Core/AgentLog.h"
 
 namespace {
 
@@ -449,24 +448,6 @@ void Engine::ContainerList()
             if (!classChest && !actorTypeChest && !fnameIsContainer)
             {
                 ++dbgPreSkip;
-                // #region agent log
-#if ARC_AGENT_NDJSON
-                {
-                    const std::string fl = ToLowerCopy(fname);
-                    const std::string cl = ToLowerCopy(classFname);
-                    const bool hint = fl.find("locker") != std::string::npos
-                        || fl.find("crate") != std::string::npos
-                        || fl.find("drawer") != std::string::npos
-                        || fl.find("cabinet") != std::string::npos
-                        || fl.find("probe") != std::string::npos
-                        || cl.find("locker") != std::string::npos
-                        || cl.find("crate") != std::string::npos
-                        || cl.find("drawer") != std::string::npos
-                        || cl.find("cabinet") != std::string::npos
-                        || cl.find("probe") != std::string::npos;
-                    }
-#endif // ARC_AGENT_NDJSON
-                // #endregion
                 continue;
             }
         }
@@ -822,22 +803,6 @@ void Engine::ContainerList()
                 << " label=\"" << entry.ItemDisplayName << "\""
                 << std::endl;
 
-            // #region agent log
-#if ARC_AGENT_NDJSON
-            {
-                ArcAgentLog5681af(
-                    "names",
-                    "N",
-                    "ContainerList.cpp:containerName",
-                    "container_label",
-                    std::string("{\"fname\":\"") + ArcAgentLogJsonEscape(entry.ActorName)
-                        + "\",\"class\":\"" + ArcAgentLogJsonEscape(classFname)
-                        + "\",\"actorFname\":\"" + ArcAgentLogJsonEscape(actorFnameLive)
-                        + "\",\"dataAsset\":\"" + ArcAgentLogJsonEscape(GetActorDataAssetFName(actorKey))
-                        + "\",\"label\":\"" + ArcAgentLogJsonEscape(entry.ItemDisplayName) + "\"}");
-            }
-#endif // ARC_AGENT_NDJSON
-            // #endregion
         }
         std::cout << "[debugContainer] scanned=" << dbgScanned
             << " admitted=" << dbgAdmitted

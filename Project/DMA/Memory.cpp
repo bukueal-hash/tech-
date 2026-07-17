@@ -12,7 +12,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-#include "../Core/AgentLog.h"
 #include "../Core/Engine.h"
 
 static std::string WideToUtf8(const std::wstring& w) {
@@ -566,29 +565,12 @@ bool PCIMemory::FullRefresh()
     if (!hVMM)
         return false;
 
-    // #region agent log
-#if ARC_AGENT_NDJSON
-    const auto t0 = std::chrono::steady_clock::now();
-#endif // ARC_AGENT_NDJSON
-    // #endregion
 
     // Cooldown: back-to-back world flaps must not double-flush the VMM bus.
     static auto s_lastRefresh = std::chrono::steady_clock::time_point{};
     const auto now = std::chrono::steady_clock::now();
     if (s_lastRefresh.time_since_epoch().count() != 0
         && now - s_lastRefresh < std::chrono::seconds(5)) {
-        // #region agent log
-#if ARC_AGENT_NDJSON
-        {
-            ArcAgentLog5681af(
-                "post-fix",
-                "H3",
-                "Memory.cpp:FullRefresh",
-                "full_refresh",
-                "{\"durMs\":0,\"mode\":\"cooldown_skip\",\"ok\":1}");
-        }
-#endif // ARC_AGENT_NDJSON
-        // #endregion
         return true;
     }
     s_lastRefresh = now;
@@ -598,21 +580,6 @@ bool PCIMemory::FullRefresh()
     const BOOL mem = VMMDLL_ConfigSet(hVMM, VMMDLL_OPT_REFRESH_FREQ_MEM, 1);
     const bool ok = tlb != FALSE && mem != FALSE;
 
-    // #region agent log
-#if ARC_AGENT_NDJSON
-    {
-        const auto msDur = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - t0).count();
-        ArcAgentLog5681af(
-            "post-fix",
-            "H3",
-            "Memory.cpp:FullRefresh",
-            "full_refresh",
-            std::string("{\"durMs\":") + std::to_string(msDur)
-                + ",\"mode\":\"tlb_mem\",\"ok\":" + (ok ? "1" : "0") + "}");
-    }
-#endif // ARC_AGENT_NDJSON
-    // #endregion
 
     return ok;
 }

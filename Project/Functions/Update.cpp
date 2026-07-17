@@ -14,23 +14,9 @@
 #include <mutex>
 #include <sstream>
 #include <string>
-#include "../Core/AgentLog.h"
 
 namespace {
 
-// #region agent log
-#if ARC_AGENT_NDJSON
-inline void RaidDbgLog(const char* event, const std::string& dataJson)
-{
-	ArcAgentLog5681af(
-		"raid-gate",
-		"R",
-		"Update.cpp:TickRaidGate",
-		event,
-		dataJson);
-}
-#endif // ARC_AGENT_NDJSON
-// #endregion
 
 uintptr_t ReadWorldFromSlot(uint64_t base, std::ptrdiff_t slotOff)
 {
@@ -387,7 +373,6 @@ void Engine::Update() {
 		ResolveLevelActors(tPersistentLevel, tActors, actorCount);
 
 	// Resolve PC via actor scan (backup: Pioneer PC owns PCM @ PC+0x48).
-	// [debugPcChain] path tags: none / cached / actor_scan / cam_mgr
 	const char* pcPath = "none";
 	float dbgPcmFov = 0.f;
 	uintptr_t dbgPcmPtr = 0;
@@ -668,38 +653,6 @@ void Engine::Update() {
 		AGameStateBase = ResolveGameStateFromWorld(tGWorld);
 	}
 
-	if (var::show_debug_overlay) {
-		static int s_framesSincePcOk = 0;
-		static IntervalTimer pcChainTimer(1000);
-		if (tPlayerController)
-			s_framesSincePcOk = 0;
-		else
-			++s_framesSincePcOk;
-
-		if ((!dbgPcmPtr || dbgPcmFov <= 0.f) && tPlayerController) {
-			dbgPcmPtr = tPCM ? tPCM
-				: Memory::read<uintptr_t>(tPlayerController + Offsets::APlayerCameraManager);
-			if (dbgPcmPtr && Memory::IsValidPtrFast2(dbgPcmPtr))
-				dbgPcmFov = Memory::read<float>(dbgPcmPtr + Offsets::DefaultFOV);
-		}
-
-		if (pcChainTimer.fire()) {
-			std::cout << "[debugPcChain] path=" << pcPath
-				<< " pc=" << (void*)tPlayerController
-				<< " pawn=" << (void*)tAcknowledgedPawn
-				<< " gi=" << (void*)tGameInstance
-				<< " lp=" << (void*)tLocalPlayer
-				<< " pcm=" << (void*)dbgPcmPtr
-				<< " fov=" << dbgPcmFov
-				<< " framesSincePcOk=" << s_framesSincePcOk
-				<< " cacheDrop=" << (cacheInvalidatedThisFrame ? 1 : 0)
-				<< " dropReason=" << cacheInvalidateReason
-				<< " raidRaw=" << (m_raidRaw.load(std::memory_order_relaxed) ? 1 : 0)
-				<< " actors=" << actorCount
-				<< std::endl;
-		}
-	}
-
 	{
 		static int s_dmaUpdates = 0;
 		static auto s_lastFpsTime = std::chrono::steady_clock::now();
@@ -873,11 +826,6 @@ void Engine::HandleWorldLost()
 	ResetRaidTransitionState();
 	ClearEspCaches();
 	std::cout << "[raid] world_lost" << std::endl;
-	// #region agent log
-#if ARC_AGENT_NDJSON
-	RaidDbgLog("world_lost", "{}");
-#endif // ARC_AGENT_NDJSON
-	// #endregion
 }
 
 void Engine::CheckWorldTransition(uintptr_t newWorld, uintptr_t newPersistentLevel)
@@ -970,16 +918,6 @@ void Engine::TickEspCacheReadiness()
 			<< " bots=" << bots
 			<< " world=" << world
 			<< std::endl;
-		// #region agent log
-#if ARC_AGENT_NDJSON
-		{
-			std::ostringstream d;
-			d << "{\"players\":" << players << ",\"bots\":" << bots
-			  << ",\"world\":" << world << ",\"mode\":\"hard\"}";
-			RaidDbgLog("caches_ready", d.str());
-		}
-#endif // ARC_AGENT_NDJSON
-		// #endregion
 		return;
 	}
 
@@ -999,16 +937,6 @@ void Engine::TickEspCacheReadiness()
 		<< " bots=" << bots
 		<< " world=" << world
 		<< std::endl;
-	// #region agent log
-#if ARC_AGENT_NDJSON
-	{
-		std::ostringstream d;
-		d << "{\"players\":" << players << ",\"bots\":" << bots
-		  << ",\"world\":" << world << ",\"mode\":\"soft\"}";
-		RaidDbgLog("caches_ready_soft", d.str());
-	}
-#endif // ARC_AGENT_NDJSON
-	// #endregion
 }
 
 void Engine::TickRaidGate()
@@ -1036,53 +964,6 @@ void Engine::TickRaidGate()
 	const char* rawReason = DiagnoseRaidRawReason(
 		gw, pl, actors, pawn, pc, root, active);
 
-	// #region agent log
-#if ARC_AGENT_NDJSON
-	{
-		static bool s_lastRaw = false;
-		static bool s_lastActive = false;
-		static bool s_lastDraw = false;
-		static uintptr_t s_lastGw = 0;
-		static std::chrono::steady_clock::time_point s_lastHb{};
-		const bool changed = (raw != s_lastRaw) || (active != s_lastActive)
-			|| (drawReady != s_lastDraw) || (gw != s_lastGw);
-		const bool due = s_lastHb.time_since_epoch().count() == 0
-			|| now - s_lastHb >= std::chrono::seconds(2);
-		if (changed || due) {
-			s_lastHb = now;
-			s_lastRaw = raw;
-			s_lastActive = active;
-			s_lastDraw = drawReady;
-			s_lastGw = gw;
-			const std::string worldFn = PeekObjFName(gw);
-			const std::string levelFn = PeekObjFName(pl);
-			const std::string pawnFn = PeekObjFName(pawn);
-			const char* hubTok = MatchHubToken(gw, pl);
-			const uintptr_t gsWorld = TryWorldFromGameStateGlobal(Memory::getBaseAddress());
-			const std::string gsFn = PeekObjFName(gsWorld);
-			std::ostringstream d;
-			d << "{\"raw\":" << (raw ? 1 : 0)
-			  << ",\"esp\":" << (active ? 1 : 0)
-			  << ",\"draw\":" << (drawReady ? 1 : 0)
-			  << ",\"reason\":\"" << rawReason << "\""
-			  << ",\"hubTok\":\"" << hubTok << "\""
-			  << ",\"world\":\"" << RaidJsonEscape(worldFn) << "\""
-			  << ",\"level\":\"" << RaidJsonEscape(levelFn) << "\""
-			  << ",\"pawnName\":\"" << RaidJsonEscape(pawnFn) << "\""
-			  << ",\"gsWorld\":\"" << RaidJsonEscape(gsFn) << "\""
-			  << ",\"gsPtr\":\"" << std::hex << gsWorld << std::dec << "\""
-			  << ",\"party\":" << partyCount
-			  << ",\"actors\":" << actorCount
-			  << ",\"partyPend\":" << (m_partyEnterPending ? 1 : 0)
-			  << ",\"enterPend\":" << (m_raidEnterPending ? 1 : 0)
-			  << ",\"gw\":\"" << std::hex << gw
-			  << "\",\"pc\":\"" << pc
-			  << "\",\"pawn\":\"" << pawn << std::dec << "\"}";
-			RaidDbgLog(changed ? "raid_state_change" : "raid_heartbeat", d.str());
-		}
-	}
-#endif // ARC_AGENT_NDJSON
-	// #endregion
 
 	if (!raw) {
 		m_raidEnterPending = false;
@@ -1120,15 +1001,6 @@ void Engine::TickRaidGate()
 		ResetRaidTransitionState();
 		ClearEspCaches();
 		std::cout << "[raid] left" << std::endl;
-		// #region agent log
-#if ARC_AGENT_NDJSON
-		{
-			std::ostringstream d;
-			d << "{\"reason\":\"" << rawReason << "\",\"party\":" << partyCount << "}";
-			RaidDbgLog("left", d.str());
-		}
-#endif // ARC_AGENT_NDJSON
-		// #endregion
 		return;
 	}
 
@@ -1142,16 +1014,6 @@ void Engine::TickRaidGate()
 			m_partyDebSince = now;
 			m_raidEnterPending = false;
 			std::cout << "[raid] party_wait players=" << partyCount << std::endl;
-			// #region agent log
-#if ARC_AGENT_NDJSON
-			{
-				std::ostringstream d;
-				d << "{\"party\":" << partyCount
-				  << ",\"delayMs\":" << kPartyEnterDelayMs.count() << "}";
-				RaidDbgLog("party_wait", d.str());
-			}
-#endif // ARC_AGENT_NDJSON
-			// #endregion
 			return;
 		}
 		if (now - m_partyDebSince < kPartyEnterDelayMs)
@@ -1164,16 +1026,6 @@ void Engine::TickRaidGate()
 		m_raidEnterPending = true;
 		m_raidDebSince = now;
 		std::cout << "[raid] enter_wait players=" << partyCount << std::endl;
-		// #region agent log
-#if ARC_AGENT_NDJSON
-		{
-			std::ostringstream d;
-			d << "{\"party\":" << partyCount
-			  << ",\"delayMs\":" << kRaidEnterDelayMs.count() << "}";
-			RaidDbgLog("enter_wait", d.str());
-		}
-#endif // ARC_AGENT_NDJSON
-		// #endregion
 		return;
 	}
 
@@ -1189,15 +1041,4 @@ void Engine::TickRaidGate()
 	m_espRaidActive.store(true, std::memory_order_release);
 	m_worldGeneration.fetch_add(1, std::memory_order_release);
 	std::cout << "[raid] entered players=" << partyCount << std::endl;
-	// #region agent log
-#if ARC_AGENT_NDJSON
-	{
-		std::ostringstream d;
-		d << "{\"party\":" << partyCount
-		  << ",\"actors\":" << actorCount
-		  << ",\"reason\":\"" << rawReason << "\"}";
-		RaidDbgLog("entered", d.str());
-	}
-#endif // ARC_AGENT_NDJSON
-	// #endregion
 }

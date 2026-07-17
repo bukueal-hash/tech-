@@ -21,7 +21,6 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
-#include "../Core/AgentLog.h"
 
 extern Engine engine;
 
@@ -483,30 +482,6 @@ static void DrawWeaponLabel(
     if (active == stowed1)
         stowed1.clear();
 
-    // #region agent log
-#if ARC_AGENT_NDJSON
-    {
-        static auto s_lastWeaponLog = std::chrono::steady_clock::time_point{};
-        const auto now = std::chrono::steady_clock::now();
-        if (now - s_lastWeaponLog > std::chrono::milliseconds(1500)) {
-            s_lastWeaponLog = now;
-            ArcAgentLog(
-                "weapon-label",
-                "H1",
-                "Esp.cpp:DrawWeaponLabel",
-                "player weapon stack",
-                std::string("{\"rawActive\":\"") + ArcAgentLogJsonEscape(actor.weaponName)
-                    + "\",\"rawS0\":\"" + ArcAgentLogJsonEscape(actor.stowedWeapon0)
-                    + "\",\"rawS1\":\"" + ArcAgentLogJsonEscape(actor.stowedWeapon1)
-                    + "\",\"drawActive\":\"" + ArcAgentLogJsonEscape(active)
-                    + "\",\"drawS0\":\"" + ArcAgentLogJsonEscape(stowed0)
-                    + "\",\"drawS1\":\"" + ArcAgentLogJsonEscape(stowed1)
-                    + "\",\"anchorX\":" + std::to_string(anchorX)
-                    + "}");
-        }
-    }
-#endif // ARC_AGENT_NDJSON
-    // #endregion
 
     // Active weapon — centered on head X (same as name/distance).
     if (!active.empty()) {
@@ -828,27 +803,6 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
     if (!g_scatter.execute())
         return false;
 
-    // #region agent log
-#if ARC_AGENT_NDJSON
-    {
-        static auto s_lastFrameDmaLog = std::chrono::steady_clock::time_point{};
-        const auto nowLog = std::chrono::steady_clock::now();
-        if (s_lastFrameDmaLog.time_since_epoch().count() == 0
-            || nowLog - s_lastFrameDmaLog >= std::chrono::seconds(2)) {
-            s_lastFrameDmaLog = nowLog;
-            ArcAgentLog5681af(
-                "post-fix",
-                "H1",
-                "Esp.cpp:CollectEspRenderFrame",
-                "frame_cam_only",
-                std::string("{\"players\":") + std::to_string(out.players.size())
-                    + ",\"bots\":" + std::to_string(out.robots.size())
-                    + ",\"world\":" + std::to_string(out.world.size())
-                    + ",\"entityPosScatter\":0}");
-        }
-    }
-#endif // ARC_AGENT_NDJSON
-    // #endregion
 
     Vector3 pawnPos = Engine::ToVector3(pawnWorld);
     if (!IsPlausibleWorldPos(pawnPos) && rootComp && IsValidPointer(rootComp))
@@ -1196,28 +1150,6 @@ static void RenderRobotEspFromFrame(
         Vector3 feetWorld{};
         if (!EspDraw::ResolveBotHeadFeetWorld(drawEntry, headWorld, feetWorld)) {
             ++dbgRobotHeadFeetFail;
-            // #region agent log
-#if ARC_AGENT_NDJSON
-            if (nearBot) {
-                static auto s_lastHf = std::chrono::steady_clock::time_point{};
-                const auto nowHf = std::chrono::steady_clock::now();
-                if (s_lastHf.time_since_epoch().count() == 0
-                    || nowHf - s_lastHf >= std::chrono::milliseconds(250)) {
-                    s_lastHf = nowHf;
-                    ArcAgentLog(
-                        "bot-missing",
-                        "B4",
-                        "Esp.cpp:RenderRobot",
-                        "near_bot_headfeet_fail",
-                        std::string("{\"key\":") + std::to_string(key)
-                            + ",\"distM\":" + std::to_string(distM)
-                            + ",\"drawing\":" + (robot.Drawing ? "1" : "0")
-                            + ",\"name\":\"" + ArcAgentLogJsonEscape(robot.ActorName)
-                            + "\"}");
-                }
-            }
-#endif // ARC_AGENT_NDJSON
-            // #endregion
             continue;
         }
 
@@ -1225,28 +1157,6 @@ static void RenderRobotEspFromFrame(
         ImVec2 feet{};
         if (!EspDraw::WorldToScreenBox(engine, frameCam, headWorld, feetWorld, head, feet)) {
             ++dbgRobotW2sFail;
-            // #region agent log
-#if ARC_AGENT_NDJSON
-            if (nearBot) {
-                static auto s_lastW2s = std::chrono::steady_clock::time_point{};
-                const auto nowW2s = std::chrono::steady_clock::now();
-                if (s_lastW2s.time_since_epoch().count() == 0
-                    || nowW2s - s_lastW2s >= std::chrono::milliseconds(250)) {
-                    s_lastW2s = nowW2s;
-                    ArcAgentLog(
-                        "bot-missing",
-                        "B4",
-                        "Esp.cpp:RenderRobot",
-                        "near_bot_w2s_fail",
-                        std::string("{\"key\":") + std::to_string(key)
-                            + ",\"distM\":" + std::to_string(distM)
-                            + ",\"camFov\":" + std::to_string(frameCam.FOV)
-                            + ",\"name\":\"" + ArcAgentLogJsonEscape(robot.ActorName)
-                            + "\"}");
-                }
-            }
-#endif // ARC_AGENT_NDJSON
-            // #endregion
             continue;
         }
 
@@ -1267,29 +1177,6 @@ static void RenderRobotEspFromFrame(
         if (botLabel.empty() || !IsAcceptedBotEspLabel(engine, botLabel, fname)) {
             RecordBotDrawLabelMiss();
             ++dbgRobotLabelSkip;
-            // #region agent log
-#if ARC_AGENT_NDJSON
-            if (nearBot) {
-                static auto s_lastLbl = std::chrono::steady_clock::time_point{};
-                const auto nowLbl = std::chrono::steady_clock::now();
-                if (s_lastLbl.time_since_epoch().count() == 0
-                    || nowLbl - s_lastLbl >= std::chrono::milliseconds(250)) {
-                    s_lastLbl = nowLbl;
-                    ArcAgentLog(
-                        "bot-missing",
-                        "B5",
-                        "Esp.cpp:RenderRobot",
-                        "near_bot_label_skip",
-                        std::string("{\"key\":") + std::to_string(key)
-                            + ",\"distM\":" + std::to_string(distM)
-                            + ",\"actorName\":\"" + ArcAgentLogJsonEscape(robot.ActorName)
-                            + "\",\"fname\":\"" + ArcAgentLogJsonEscape(fname)
-                            + "\",\"anyBot\":" + (ArcActorType::IsAnyBotActor(key) ? "1" : "0")
-                            + "}");
-                }
-            }
-#endif // ARC_AGENT_NDJSON
-            // #endregion
             continue;
         }
         if (!EspDraw::IsEspBoxOnScreen(head, feet)) {
@@ -1349,44 +1236,6 @@ static void RenderRobotEspFromFrame(
             ++dbgNearRendered;
     }
 
-    // #region agent log
-#if ARC_AGENT_NDJSON
-    if (var::show_debug_overlay) {
-        static auto s_lastRobotRenderSummary = std::chrono::steady_clock::time_point{};
-        const auto nowRobotRenderSummary = std::chrono::steady_clock::now();
-        if (s_lastRobotRenderSummary.time_since_epoch().count() == 0
-            || nowRobotRenderSummary - s_lastRobotRenderSummary >= std::chrono::seconds(1)) {
-            s_lastRobotRenderSummary = nowRobotRenderSummary;
-            ArcAgentLog(
-                "bot-missing",
-                "B4-B5",
-                "Esp.cpp:RenderRobot",
-                "robot_render_summary",
-                std::string("{\"frame\":") + std::to_string(dbgRobotFrame)
-                    + ",\"rendered\":" + std::to_string(dbgRobotRendered)
-                    + ",\"nearFrame\":" + std::to_string(dbgNearFrame)
-                    + ",\"nearRendered\":" + std::to_string(dbgNearRendered)
-                    + ",\"distSkip\":" + std::to_string(dbgRobotDistSkip)
-                    + ",\"headFeetFail\":" + std::to_string(dbgRobotHeadFeetFail)
-                    + ",\"w2sFail\":" + std::to_string(dbgRobotW2sFail)
-                    + ",\"labelSkip\":" + std::to_string(dbgRobotLabelSkip)
-                    + ",\"offscreen\":" + std::to_string(dbgRobotOffscreen)
-                    + ",\"showRobots\":" + (var::showRobots ? "1" : "0")
-                    + "}");
-        }
-    }
-#else
-    (void)dbgRobotFrame;
-    (void)dbgRobotRendered;
-    (void)dbgRobotDistSkip;
-    (void)dbgRobotHeadFeetFail;
-    (void)dbgRobotW2sFail;
-    (void)dbgRobotLabelSkip;
-    (void)dbgRobotOffscreen;
-    (void)dbgNearFrame;
-    (void)dbgNearRendered;
-#endif // ARC_AGENT_NDJSON
-    // #endregion
 }
 
 void Engine::RenderEsp()

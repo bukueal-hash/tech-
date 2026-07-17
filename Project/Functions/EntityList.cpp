@@ -12,7 +12,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include "../Core/AgentLog.h"
 
 namespace {
 
@@ -700,43 +699,6 @@ void Engine::EntityList()
         actor.shield = static_cast<float>(get_armor(key));
         actor.maxshield = static_cast<float>(get_maxarmor(key));
 
-        // #region agent log
-#if ARC_AGENT_NDJSON
-        {
-            static auto s_lastHpLog = std::chrono::steady_clock::time_point{};
-            static uintptr_t s_lastHpKey = 0;
-            const auto nowHp = std::chrono::steady_clock::now();
-            const bool forceKey = (key != s_lastHpKey);
-            if (actor.Drawing
-                && (forceKey
-                    || s_lastHpLog.time_since_epoch().count() == 0
-                    || nowHp - s_lastHpLog >= std::chrono::milliseconds(400))) {
-                s_lastHpLog = nowHp;
-                s_lastHpKey = key;
-                const uintptr_t hc = Memory::read_nocache<uintptr_t>(
-                    key + Offsets::HealthComponent);
-                float pct = -1.f;
-                if (actor.maxhealth >= 1.f)
-                    pct = 100.f * (actor.health / actor.maxhealth);
-                ArcAgentLog(
-                    "hp-nocache",
-                    "HP1",
-                    "EntityList.cpp:health",
-                    "player_health",
-                    std::string("{\"pawn\":") + std::to_string(key)
-                        + ",\"hc\":" + std::to_string(hc)
-                        + ",\"hcOk\":" + ((hc && Memory::IsValidPtrFast2(hc)) ? "1" : "0")
-                        + ",\"hp\":" + std::to_string(actor.health)
-                        + ",\"maxHp\":" + std::to_string(actor.maxhealth)
-                        + ",\"armor\":" + std::to_string(actor.shield)
-                        + ",\"maxArmor\":" + std::to_string(actor.maxshield)
-                        + ",\"pct\":" + std::to_string(pct)
-                        + ",\"dist\":" + std::to_string(actor.Distance)
-                        + "}");
-            }
-        }
-#endif // ARC_AGENT_NDJSON
-        // #endregion
 
         // Read weapon system from InventoryComponent (stowed slots + equipped + armor)
         std::string invWeapon, invStowed0, invStowed1;
@@ -826,43 +788,6 @@ void Engine::EntityList()
         playerCache = std::move(localCache);
     }
 
-    // #region agent log
-#if ARC_AGENT_NDJSON
-    {
-        static auto s_lastPlayerLog = std::chrono::steady_clock::time_point{};
-        const auto nowLog = std::chrono::steady_clock::now();
-        if (s_lastPlayerLog.time_since_epoch().count() == 0
-            || nowLog - s_lastPlayerLog >= std::chrono::seconds(1)) {
-            s_lastPlayerLog = nowLog;
-            size_t cacheN = 0;
-            {
-                std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
-                cacheN = playerCache.size();
-            }
-            ArcAgentLog(
-                "player-gs-gate",
-                "H2",
-                "EntityList.cpp:EntityList",
-                "player_admit",
-                std::string("{\"scanned\":") + std::to_string(dbgScanned)
-                    + ",\"admitted\":" + std::to_string(dbgAdmitted)
-                    + ",\"preAdmit\":" + std::to_string(dbgPreAdmit)
-                    + ",\"cache\":" + std::to_string(cacheN)
-                    + ",\"drawing\":" + std::to_string(dbgDrawing)
-                    + ",\"gsArray\":" + std::to_string(dbgGsArray)
-                    + ",\"gsEvict\":" + std::to_string(dbgGsEvict)
-                    + ",\"gsPawnHit\":" + std::to_string(dbgGsPawnHit)
-                    + ",\"gsPawnMiss\":" + std::to_string(dbgGsPawnMiss)
-                    + ",\"gsPawnNull\":" + std::to_string(dbgGsPawnNull)
-                    + ",\"psSkip\":" + std::to_string(dbgPsSkip)
-                    + ",\"posEvict\":" + std::to_string(dbgPosEvict)
-                    + ",\"ghostEvict\":" + std::to_string(dbgGhostEvict)
-                    + ",\"actorTypeAdmit\":" + std::to_string(dbgActorTypeAdmit)
-                    + ",\"lpGate\":0}");
-        }
-    }
-#endif // ARC_AGENT_NDJSON
-    // #endregion
 
     if (var::show_debug_overlay) {
         static IntervalTimer playerDebugTimer(500);
