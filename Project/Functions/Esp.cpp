@@ -26,11 +26,7 @@ extern Engine engine;
 
 namespace {
 
-constexpr size_t kMaxEspFramePosReads = 768;
 constexpr size_t kMaxEspFrameBoneReads = 16;
-constexpr size_t kReservedPlayerPosReads = 48;
-
-namespace {
 
 struct WorldEspDebugStats {
     int frameEntries = 0;
@@ -152,8 +148,6 @@ static std::string ResolveContainerEspDrawLabel(
         return AppendContainerOpenSuffix(std::move(baseLabel));
     return FormatEspDisplayLabel(baseLabel);
 }
-
-} // namespace
 
 bool IsGroundLootEspCategory(WorldItemCategory cat)
 {
@@ -1508,6 +1502,163 @@ void Engine::RenderFovCircle()
         gameFov = g_Camera.FOV;
     }
     Visuals::FovCircle(var::aimbot_fov, gameFov);
+}
+
+namespace {
+
+constexpr float kCrosshairPi = 3.14159265358979323846f;
+
+ImVec2 CrosshairRotateOffset(float x, float y, float cosA, float sinA)
+{
+    return ImVec2(x * cosA - y * sinA, x * sinA + y * cosA);
+}
+
+void CrosshairDrawRotatedLine(
+    ImDrawList* drawList,
+    const ImVec2& center,
+    float x1,
+    float y1,
+    float x2,
+    float y2,
+    float cosA,
+    float sinA,
+    ImU32 color,
+    float thickness)
+{
+    if (!drawList)
+        return;
+    const ImVec2 o1 = CrosshairRotateOffset(x1, y1, cosA, sinA);
+    const ImVec2 o2 = CrosshairRotateOffset(x2, y2, cosA, sinA);
+    drawList->AddLine(
+        ImVec2(center.x + o1.x, center.y + o1.y),
+        ImVec2(center.x + o2.x, center.y + o2.y),
+        color,
+        thickness);
+}
+
+void CrosshairDrawPlus(
+    ImDrawList* drawList,
+    const ImVec2& center,
+    float size,
+    float gap,
+    float thickness,
+    ImU32 color,
+    float angleRad)
+{
+    const float cosA = std::cos(angleRad);
+    const float sinA = std::sin(angleRad);
+    const float g = (std::max)(0.f, gap);
+    CrosshairDrawRotatedLine(drawList, center, -size, 0.f, -g, 0.f, cosA, sinA, color, thickness);
+    CrosshairDrawRotatedLine(drawList, center, g, 0.f, size, 0.f, cosA, sinA, color, thickness);
+    CrosshairDrawRotatedLine(drawList, center, 0.f, -size, 0.f, -g, cosA, sinA, color, thickness);
+    CrosshairDrawRotatedLine(drawList, center, 0.f, g, 0.f, size, cosA, sinA, color, thickness);
+}
+
+void CrosshairDrawCenterDot(
+    ImDrawList* drawList,
+    const ImVec2& center,
+    float radius,
+    ImU32 color)
+{
+    if (!drawList || radius <= 0.f)
+        return;
+    drawList->AddCircleFilled(center, radius, color);
+}
+
+void CrosshairDrawInvertedT(
+    ImDrawList* drawList,
+    const ImVec2& center,
+    float size,
+    float thickness,
+    ImU32 color,
+    float angleRad)
+{
+    const float cosA = std::cos(angleRad);
+    const float sinA = std::sin(angleRad);
+    const float barY = -size * 0.5f;
+    CrosshairDrawRotatedLine(drawList, center, -size, barY, size, barY, cosA, sinA, color, thickness);
+    CrosshairDrawRotatedLine(drawList, center, 0.f, barY, 0.f, size, cosA, sinA, color, thickness);
+}
+
+void CrosshairDrawTriangle(
+    ImDrawList* drawList,
+    const ImVec2& center,
+    float size,
+    float thickness,
+    ImU32 color,
+    float angleRad)
+{
+    if (!drawList)
+        return;
+    constexpr float kTwoPi = kCrosshairPi * 2.f;
+    constexpr float kThird = kTwoPi / 3.f;
+    ImVec2 pts[3]{};
+    for (int i = 0; i < 3; ++i) {
+        const float a = angleRad - kCrosshairPi * 0.5f + static_cast<float>(i) * kThird;
+        pts[i] = ImVec2(
+            center.x + std::cos(a) * size,
+            center.y + std::sin(a) * size);
+    }
+    for (int i = 0; i < 3; ++i)
+        drawList->AddLine(pts[i], pts[(i + 1) % 3], color, thickness);
+}
+
+} // namespace
+
+void Engine::RenderOverlayCrosshair()
+{
+    if (!var::show_crosshair)
+        return;
+
+    ImDrawList* drawList = ImGui::GetForegroundDrawList();
+    if (!drawList)
+        return;
+
+    const ImVec2 disp = ImGui::GetIO().DisplaySize;
+    if (disp.x <= 0.f || disp.y <= 0.f)
+        return;
+
+    const ImVec2 center(disp.x * 0.5f, disp.y * 0.5f);
+    const ImU32 color = EspDraw::ColorFromRGBA(var::crosshair_color);
+    const float size = (std::max)(1.f, var::crosshair_size);
+    const float thickness = (std::max)(0.5f, var::crosshair_thickness);
+    const float gap = (std::max)(0.f, var::crosshair_gap);
+    const float spinRadPerSec =
+        var::crosshair_spin_rpm * (kCrosshairPi * 2.f / 60.f);
+    const float angleRad = static_cast<float>(ImGui::GetTime()) * spinRadPerSec;
+
+    switch (var::crosshair_style) {
+    case 0: // Classic
+        CrosshairDrawPlus(drawList, center, size, gap, thickness, color, 0.f);
+        CrosshairDrawCenterDot(drawList, center, thickness * 0.5f + 0.5f, color);
+        break;
+    case 1: // Dot
+        CrosshairDrawCenterDot(drawList, center, size * 0.5f, color);
+        break;
+    case 2: // Tight
+        CrosshairDrawPlus(drawList, center, size * 0.65f, 0.f, thickness, color, 0.f);
+        break;
+    case 3: // Circle
+        drawList->AddCircle(center, size, color, 0, thickness);
+        CrosshairDrawPlus(drawList, center, size * 0.35f, 0.f, thickness, color, 0.f);
+        break;
+    case 4: // T static
+        CrosshairDrawInvertedT(drawList, center, size, thickness, color, 0.f);
+        break;
+    case 5: // T spin
+        CrosshairDrawInvertedT(drawList, center, size, thickness, color, angleRad);
+        break;
+    case 6: // Cross spin
+        CrosshairDrawPlus(drawList, center, size, gap, thickness, color, angleRad);
+        break;
+    case 7: // Tri spin
+        CrosshairDrawTriangle(drawList, center, size, thickness, color, angleRad);
+        break;
+    default:
+        CrosshairDrawPlus(drawList, center, size, gap, thickness, color, 0.f);
+        CrosshairDrawCenterDot(drawList, center, thickness * 0.5f + 0.5f, color);
+        break;
+    }
 }
 
 void Engine::RenderRadar(bool interactive)

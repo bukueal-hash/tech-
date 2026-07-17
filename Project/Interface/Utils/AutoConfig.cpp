@@ -123,6 +123,13 @@ struct Snapshot {
     float aimbot_fov{};
     int aimbot_priority{};
     bool show_fov{};
+    bool show_crosshair{};
+    int crosshair_style{};
+    float crosshair_color[4]{};
+    float crosshair_size{};
+    float crosshair_thickness{};
+    float crosshair_gap{};
+    float crosshair_spin_rpm{};
     float aimbot_distance{};
     float smoothness{};
     int aim_algorithm{};
@@ -306,6 +313,13 @@ Snapshot CaptureSnapshot()
     s.aimbot_fov = var::aimbot_fov;
     s.aimbot_priority = static_cast<int>(var::aimbot_priority);
     s.show_fov = var::show_fov;
+    s.show_crosshair = var::show_crosshair;
+    s.crosshair_style = var::crosshair_style;
+    std::memcpy(s.crosshair_color, var::crosshair_color, sizeof(s.crosshair_color));
+    s.crosshair_size = var::crosshair_size;
+    s.crosshair_thickness = var::crosshair_thickness;
+    s.crosshair_gap = var::crosshair_gap;
+    s.crosshair_spin_rpm = var::crosshair_spin_rpm;
     s.aimbot_distance = var::aimbot_distance;
     s.smoothness = var::smoothness;
     s.aim_algorithm = static_cast<int>(var::aim_algorithm);
@@ -447,6 +461,13 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.aimbot_fov == b.aimbot_fov &&
         a.aimbot_priority == b.aimbot_priority &&
         a.show_fov == b.show_fov &&
+        a.show_crosshair == b.show_crosshair &&
+        a.crosshair_style == b.crosshair_style &&
+        ColorsEqual(a.crosshair_color, b.crosshair_color) &&
+        a.crosshair_size == b.crosshair_size &&
+        a.crosshair_thickness == b.crosshair_thickness &&
+        a.crosshair_gap == b.crosshair_gap &&
+        a.crosshair_spin_rpm == b.crosshair_spin_rpm &&
         a.aimbot_distance == b.aimbot_distance &&
         a.smoothness == b.smoothness &&
         a.aim_algorithm == b.aim_algorithm &&
@@ -764,6 +785,26 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
         var::aimbot_priority = static_cast<AimbotPriority>(prio);
     }
     else if (key == "show_fov") var::show_fov = ParseBool(val, var::show_fov);
+    else if (key == "vis_enabled") var::vis_enabled = ParseBool(val, var::vis_enabled);
+    else if (key == "vis_max_range_m") var::vis_max_range_m = static_cast<float>(std::atof(val.c_str()));
+    else if (key == "vis_use_player_esp_dist") var::vis_use_player_esp_dist = ParseBool(val, var::vis_use_player_esp_dist);
+    else if (key == "vis_use_bot_esp_dist") var::vis_use_bot_esp_dist = ParseBool(val, var::vis_use_bot_esp_dist);
+    else if (key == "vis_use_esp_colors") var::vis_use_esp_colors = ParseBool(val, var::vis_use_esp_colors);
+    else if (key == "vis_use_aim") var::vis_use_aim = ParseBool(val, var::vis_use_aim);
+    else if (key == "vis_multi_bone") var::vis_multi_bone = ParseBool(val, var::vis_multi_bone);
+    else if (key == "vis_hysteresis_frames") var::vis_hysteresis_frames = std::atoi(val.c_str());
+    else if (key == "vis_debug") var::vis_debug = ParseBool(val, var::vis_debug);
+    else if (key == "vis_debug_rays") var::vis_debug_rays = ParseBool(val, var::vis_debug_rays);
+    else if (key == "vis_debug_tris") var::vis_debug_tris = ParseBool(val, var::vis_debug_tris);
+    else if (key == "show_crosshair") var::show_crosshair = ParseBool(val, var::show_crosshair);
+    else if (key == "crosshair_style") {
+        var::crosshair_style = std::clamp(std::atoi(val.c_str()), 0, 7);
+    }
+    else if (key == "crosshair_color") ParseColor4(val, var::crosshair_color);
+    else if (key == "crosshair_size") var::crosshair_size = static_cast<float>(std::atof(val.c_str()));
+    else if (key == "crosshair_thickness") var::crosshair_thickness = static_cast<float>(std::atof(val.c_str()));
+    else if (key == "crosshair_gap") var::crosshair_gap = static_cast<float>(std::atof(val.c_str()));
+    else if (key == "crosshair_spin_rpm") var::crosshair_spin_rpm = static_cast<float>(std::atof(val.c_str()));
     else if (key == "aimbot_distance") {
         var::aimbot_distance = static_cast<float>(std::atof(val.c_str()));
         var::aimbot_distance = std::clamp(var::aimbot_distance, 0.f, var::kMaxDistanceSliderM);
@@ -891,6 +932,24 @@ void WriteIni()
     file << "aimbot_fov=" << var::aimbot_fov << '\n';
     file << "aimbot_priority=" << static_cast<int>(var::aimbot_priority) << '\n';
     file << "show_fov=" << (var::show_fov ? 1 : 0) << '\n';
+    file << "vis_enabled=" << (var::vis_enabled ? 1 : 0) << '\n';
+    file << "vis_max_range_m=" << var::vis_max_range_m << '\n';
+    file << "vis_use_player_esp_dist=" << (var::vis_use_player_esp_dist ? 1 : 0) << '\n';
+    file << "vis_use_bot_esp_dist=" << (var::vis_use_bot_esp_dist ? 1 : 0) << '\n';
+    file << "vis_use_esp_colors=" << (var::vis_use_esp_colors ? 1 : 0) << '\n';
+    file << "vis_use_aim=" << (var::vis_use_aim ? 1 : 0) << '\n';
+    file << "vis_multi_bone=" << (var::vis_multi_bone ? 1 : 0) << '\n';
+    file << "vis_hysteresis_frames=" << var::vis_hysteresis_frames << '\n';
+    file << "vis_debug=" << (var::vis_debug ? 1 : 0) << '\n';
+    file << "vis_debug_rays=" << (var::vis_debug_rays ? 1 : 0) << '\n';
+    file << "vis_debug_tris=" << (var::vis_debug_tris ? 1 : 0) << '\n';
+    file << "show_crosshair=" << (var::show_crosshair ? 1 : 0) << '\n';
+    file << "crosshair_style=" << var::crosshair_style << '\n';
+    WriteColor4(file, "crosshair_color", var::crosshair_color);
+    file << "crosshair_size=" << var::crosshair_size << '\n';
+    file << "crosshair_thickness=" << var::crosshair_thickness << '\n';
+    file << "crosshair_gap=" << var::crosshair_gap << '\n';
+    file << "crosshair_spin_rpm=" << var::crosshair_spin_rpm << '\n';
     file << "aimbot_distance=" << var::aimbot_distance << '\n';
     file << "smoothness=" << var::smoothness << '\n';
     file << "aim_algorithm=" << static_cast<int>(var::aim_algorithm) << '\n';

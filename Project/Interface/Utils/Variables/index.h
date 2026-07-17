@@ -72,6 +72,13 @@ namespace var {
     extern float aimbot_fov;
     extern AimbotPriority aimbot_priority;
     extern bool show_fov;
+    extern bool show_crosshair;
+    extern int crosshair_style;
+    extern float crosshair_color[4];
+    extern float crosshair_size;
+    extern float crosshair_thickness;
+    extern float crosshair_gap;
+    extern float crosshair_spin_rpm;
     extern float aimbot_distance;
     extern float aim_deadzone_px;
     /** Aim smoothing. 1 = instant snap. Higher = smoother. Range [1, 20]. */
@@ -170,6 +177,19 @@ namespace var {
 
     /* Debug */
     extern bool show_debug_overlay;
+
+    /* Vis / collision LOS (gates default off) */
+    extern bool vis_enabled;
+    extern float vis_max_range_m;
+    extern bool vis_use_player_esp_dist;
+    extern bool vis_use_bot_esp_dist;
+    extern bool vis_use_esp_colors;
+    extern bool vis_use_aim;
+    extern bool vis_multi_bone;
+    extern int vis_hysteresis_frames;
+    extern bool vis_debug;
+    extern bool vis_debug_rays;
+    extern bool vis_debug_tris;
 
     /* Radar */
     extern bool show_radar;

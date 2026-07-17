@@ -39,6 +39,13 @@ namespace var {
     float aimbot_fov = 50.f;
     AimbotPriority aimbot_priority = AimbotPriority::Fov;
     bool show_fov = true;
+    bool show_crosshair = true;
+    int crosshair_style = 0;
+    float crosshair_color[4] = { 0.f, 1.f, 0.f, 1.f };
+    float crosshair_size = 8.f;
+    float crosshair_thickness = 1.5f;
+    float crosshair_gap = 3.f;
+    float crosshair_spin_rpm = 20.f;
     float aimbot_distance = 500.f;
     float aim_deadzone_px = 0.f;
     float smoothness = 3.f;
@@ -130,6 +137,19 @@ namespace var {
 
     /* Debug */
     bool show_debug_overlay = false;
+
+    /* Vis / collision LOS */
+    bool vis_enabled = false;
+    float vis_max_range_m = 200.f;
+    bool vis_use_player_esp_dist = true;
+    bool vis_use_bot_esp_dist = true;
+    bool vis_use_esp_colors = false;
+    bool vis_use_aim = false;
+    bool vis_multi_bone = true;
+    int vis_hysteresis_frames = 3;
+    bool vis_debug = false;
+    bool vis_debug_rays = true;
+    bool vis_debug_tris = false;
 
     /* Radar */
     bool show_radar = false;

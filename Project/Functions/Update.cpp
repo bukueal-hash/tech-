@@ -946,7 +946,6 @@ void Engine::TickRaidGate()
 
 	const auto now = std::chrono::steady_clock::now();
 	const bool active = m_espRaidActive.load(std::memory_order_acquire);
-	const bool drawReady = m_espDrawReady.load(std::memory_order_acquire);
 
 	uintptr_t gw = 0, pl = 0, actors = 0, pc = 0, pawn = 0, root = 0;
 	{
@@ -959,11 +958,8 @@ void Engine::TickRaidGate()
 		root = RootComponent;
 	}
 	const int partyCount = CountGameStatePlayerArray();
-	const int actorCount = (pl && Memory::IsValidPtrFast2(pl))
-		? Memory::read<int>(pl + Offsets::ActorsCount) : -1;
 	const char* rawReason = DiagnoseRaidRawReason(
 		gw, pl, actors, pawn, pc, root, active);
-
 
 	if (!raw) {
 		m_raidEnterPending = false;

@@ -1,5 +1,7 @@
 #include "../Core/Engine.h"
 #include "../../DMA/Memory.h"
+#include "CollisionVis.h"
+#include "../Interface/Utils/Variables/index.h"
 
 extern bool showmenu;
 
@@ -36,7 +38,13 @@ void Engine::StartWorkerThreads()
         if (!IsEspRaidActive())
             return;
         BuildEspRenderFrameWorker();
+        CollisionVis::ApplyVisToEspCaches(*this);
     }, 12);
+    m_visThread = std::make_unique<SyncedThread>([this] {
+        if (!IsEspRaidActive() || !var::vis_enabled)
+            return;
+        CollisionVis::TickRebuild(*this);
+    }, 80);
     m_aimThread = std::make_unique<SyncedThread>([this] {
         if (!IsEspRaidActive() || showmenu)
             return;
@@ -50,6 +58,7 @@ void Engine::StopWorkerThreads()
         return;
 
     m_aimThread.reset();
+    m_visThread.reset();
     m_frameBuilderThread.reset();
     m_positionThread.reset();
     m_robotEspThread.reset();

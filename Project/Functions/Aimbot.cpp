@@ -8,6 +8,7 @@
 #include "../Interface/Utils/Visuals/visuals.hpp"
 #include "../Core/IntervalTimer.h"
 #include "../Interface/Utils/Variables/index.h"
+#include "../Functions/CollisionVis.h"
 #include "../ThirdParty/ImGui/imgui.h"
 #include <iostream>
 #include <fstream>
@@ -639,10 +640,7 @@ void Engine::AimAssistPlayer(
     float currentTime,
     std::vector<AimTarget>& targets)
 {
-    std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
-
-    // Locked fast path: only refresh the locked pawn most ticks (post-fix3
-    // tickMs 40–80ms scanning every Drawing player + DMA vel).
+    // Prefer EspRenderFrame.players (same snapshot as paint). Cache fallback only.
     static int s_playerFullScan = 0;
     const bool wantFull = (g_playerAimLockedKey == 0) || ((++s_playerFullScan % 4) == 0);
     g_aimFastPath = wantFull ? 0 : 1;
@@ -665,8 +663,6 @@ void Engine::AimAssistPlayer(
         ExtrapolatePlayerAimWorldToNow(
             worldPos, actor.cachedVelocity, actor.lastVelocityUpdate);
 
-        // Prefer PositionRefresh velocity — DMA GetActorVelocity every aim tick
-        // was a major tickMs cost.
         Vector3 velocity = actor.cachedVelocity;
 
         if (var::predict)
@@ -710,6 +706,21 @@ void Engine::AimAssistPlayer(
         targets.push_back(target);
     };
 
+    if (g_aimEspFrame && g_aimEspFrame->valid && !g_aimEspFrame->players.empty()) {
+        if (!wantFull && g_playerAimLockedKey != 0) {
+            for (const EspFramePlayer& fp : g_aimEspFrame->players) {
+                if (fp.actorKey == static_cast<uintptr_t>(g_playerAimLockedKey)) {
+                    consider(fp.actorKey, fp.entry);
+                    return;
+                }
+            }
+        }
+        for (const EspFramePlayer& fp : g_aimEspFrame->players)
+            consider(fp.actorKey, fp.entry);
+        return;
+    }
+
+    std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
     if (!wantFull && g_playerAimLockedKey != 0) {
         if (const auto it = playerCache.find(static_cast<uintptr_t>(g_playerAimLockedKey));
             it != playerCache.end())
@@ -1151,8 +1162,16 @@ void Engine::AimAssistence()
 
     EspRenderFrame espFrame{};
     {
-        std::shared_lock<std::shared_mutex> lock(m_espFrameMutex);
-        espFrame = m_lastEspFrame;
+        // Never block publish — same try_lock + last-good policy as paint.
+        static EspRenderFrame s_lastGoodAimFrame{};
+        std::shared_lock<std::shared_mutex> lock(m_espFrameMutex, std::try_to_lock);
+        if (lock.owns_lock()) {
+            if (m_lastEspFrame.valid)
+                s_lastGoodAimFrame = m_lastEspFrame;
+            espFrame = s_lastGoodAimFrame;
+        } else {
+            espFrame = s_lastGoodAimFrame;
+        }
     }
 
     CameraCache aimProjCam = aimCam;
@@ -1452,6 +1471,12 @@ void Engine::AimAssistence()
     }
 
     // Reload / flinch moves the view — skip hardware pull for this tick (keep lock).
+    if (!suppressAimOutput) {
+        if (var::vis_use_aim && var::vis_enabled) {
+            if (!CollisionVis::AimLosAllows(aimProjCam.Location, bestTarget->worldPos))
+                suppressAimOutput = true;
+        }
+    }
     if (!suppressAimOutput)
         s_aimDbg.lastGain = SendKmAimDelta(dx, dy, pullScale, &s_aimDbg.lastGain);
 
@@ -1483,6 +1508,13 @@ void Engine::AimAssistence()
                 << " worldAgeMs=" << s_aimDbg.worldAgeMs
                 << " camFov=" << aimProjCam.FOV
                 << " frameValid=" << (espFrame.valid ? 1 : 0)
+                << std::endl;
+
+            uint64_t dmaExec = 0, dmaPrep = 0, dmaLast = 0;
+            DmaScatterStats_Get(dmaExec, dmaPrep, dmaLast);
+            std::cout << "[debugDma] exec=" << dmaExec
+                << " prep=" << dmaPrep
+                << " lastBatch=" << dmaLast
                 << std::endl;
         }
     }

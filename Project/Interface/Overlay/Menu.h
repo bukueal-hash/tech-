@@ -18,6 +18,7 @@ void DrawArcEspTab();
 void DrawArcLootTab();
 void DrawArcRadarTab();
 void DrawArcAimbotTab();
+void DrawArcVisTab();
 void DrawArcSettingsTab();
 void DrawArcDebugTab();
 void DrawArcHelpTab();

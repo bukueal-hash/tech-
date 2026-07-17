@@ -9,6 +9,20 @@
 
 #include "../DMA/Memory.h"
 
+#include <atomic>
+
+// Global scatter telemetry for DMA governor overlay ([debugDma]).
+inline std::atomic<uint64_t> g_dmaScatterPrepares{ 0 };
+inline std::atomic<uint64_t> g_dmaScatterExecutes{ 0 };
+inline std::atomic<uint64_t> g_dmaScatterLastBatch{ 0 };
+
+inline void DmaScatterStats_Get(uint64_t& executes, uint64_t& prepares, uint64_t& lastBatch)
+{
+    executes = g_dmaScatterExecutes.load(std::memory_order_relaxed);
+    prepares = g_dmaScatterPrepares.load(std::memory_order_relaxed);
+    lastBatch = g_dmaScatterLastBatch.load(std::memory_order_relaxed);
+}
+
 // Reused scatter handle (MarvelRivals-DMA style) — one init, clear after each execute.
 class PersistentScatter {
 public:
@@ -80,7 +94,11 @@ public:
     bool prepare(uintptr_t address, void* buffer, size_t size) {
         if (!m_handle || !buffer || size == 0)
             return false;
-        return g_mem.RequestReadScatter(m_handle, address, buffer, size);
+        if (!g_mem.RequestReadScatter(m_handle, address, buffer, size))
+            return false;
+        ++m_prepared;
+        g_dmaScatterPrepares.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
 
     template <typename T>
@@ -91,14 +109,21 @@ public:
     bool execute() {
         if (!m_handle)
             return false;
-        return m_cached
+        const bool ok = m_cached
             ? g_mem.ExecuteReadScatterCached(m_handle)
             : g_mem.ExecuteReadScatter(m_handle);
+        if (ok) {
+            g_dmaScatterExecutes.fetch_add(1, std::memory_order_relaxed);
+            g_dmaScatterLastBatch.store(m_prepared, std::memory_order_relaxed);
+        }
+        m_prepared = 0;
+        return ok;
     }
 
     void clear() {
         if (!m_handle)
             return;
+        m_prepared = 0;
         if (m_cached)
             g_mem.ClearScatterHandleCached(m_handle);
         else
@@ -110,11 +135,13 @@ public:
             g_mem.CloseScatterHandle(m_handle);
             m_handle = nullptr;
         }
+        m_prepared = 0;
     }
 
 private:
     void* m_handle = nullptr;
     bool m_cached = false;
+    uint64_t m_prepared = 0;
 };
 
 class Memory

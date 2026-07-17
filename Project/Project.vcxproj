@@ -170,6 +170,7 @@
     <ClCompile Include="Functions\RobotList.cpp" />
     <ClCompile Include="Functions\World.cpp" />
     <ClCompile Include="Functions\BoneList.cpp" />
+    <ClCompile Include="Functions\CollisionVis.cpp" />
     <ClCompile Include="Functions\Esp.cpp" />
     <ClCompile Include="Functions\Aimbot.cpp" />
     <ClCompile Include="Core\AssetNames.cpp" />

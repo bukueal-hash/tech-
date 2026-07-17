@@ -93,6 +93,7 @@ private:
     std::unique_ptr<SyncedThread> m_aimThread;
     std::unique_ptr<SyncedThread> m_positionThread;
     std::unique_ptr<SyncedThread> m_frameBuilderThread;
+    std::unique_ptr<SyncedThread> m_visThread;
 
 public:
     // Thread synchronization (paint debug overlay uses try_lock on these)
@@ -180,6 +181,7 @@ public:
 
     void RenderEsp();
     void RenderFovCircle();
+    void RenderOverlayCrosshair();
     void RenderRadar(bool interactive = false);
 
     struct EspFramePlayer;

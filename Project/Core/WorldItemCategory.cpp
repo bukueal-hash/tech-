@@ -1081,9 +1081,19 @@ bool LootItemLooksLikePickup(const WorldLootFilterView& loot)
 
 bool PassesLootPickupFilters(const WorldLootFilterView& loot)
 {
-    // Intentional no-op: never hide pickups. Value/rarity + SP only choose close vs far
-    // draw distance (WorldLootPickupMaxDrawMeters). Call sites keep this gate for wiring (#102).
-    (void)loot;
+    if (var::loot_min_rarity > 0 && loot.lootRarityTier > 0
+        && loot.lootRarityTier < var::loot_min_rarity)
+        return false;
+    if (var::loot_min_value > 0.f && loot.lootValue > 0
+        && static_cast<float>(loot.lootValue) < var::loot_min_value)
+        return false;
+    // SP variants: when enabled, apply same floors (shared vars already drive SP meters).
+    if (var::loot_min_rar_sp && var::loot_min_rarity > 0 && loot.lootRarityTier > 0
+        && loot.lootRarityTier < var::loot_min_rarity)
+        return false;
+    if (var::loot_min_val_sp && var::loot_min_value > 0.f && loot.lootValue > 0
+        && static_cast<float>(loot.lootValue) < var::loot_min_value)
+        return false;
     return true;
 }
 
@@ -1099,7 +1109,7 @@ std::string ResolveWorldDrawLabel(
 
     WorldLootFilterView view{ worldCategory, actorName, itemDisplayName, 0, 0 };
     if (LootItemLooksLikePickup(view))
-        return "Loot";
+        return {}; // no placeholder "Loot"/"Pickup"/"Item"
 
     if (WorldCategoryIsContainerProp(cat)
         && cat != WorldItemCategory::DroppedPickup
@@ -1430,7 +1440,7 @@ bool IsGenericWorldEspLabel(const std::string& label)
     if (label == "Loot Item" || label == "World Item" || label == "WorldItem"
         || label == "Invalid" || label == "Other" || label == "Items" || label == "Item"
         || label == "Unknown" || label == "Loot" || label == "Dropped Pickup"
-        || label == "Dropped pickup"
+        || label == "Dropped pickup" || label == "Pickup"
         || label == "CHEST" || label == "LOOT"
         || label == "Container" || label == "Crate"
         || label == "Generic Container"

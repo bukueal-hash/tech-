@@ -22,6 +22,7 @@
 #include "../../Input/KeyBind.h"
 #include "ImGuiKeybind.h"
 #include "../../Core/WorldItemCategory.h"
+#include "../../Functions/CollisionVis.h"
 
 namespace {
 
@@ -208,12 +209,13 @@ namespace arc_ui {
 
 void DrawMainMenu()
 {
-    const char* tabs[] = { "Visuals", "Loot", "Radar", "Aimbot", "Settings", "Debug", "Help", "Close" };
+    const char* tabs[] = { "Visuals", "Loot", "Radar", "Aimbot", "Vis", "Settings", "Debug", "Help", "Close" };
     const char* tabTips[] = {
         "Visual controls: player ESP and world ESP toggles.",
         "Loot container ESP: distance, value/rarity filters, per-type SP checkboxes.",
         "Mini-map: enable, size, and world range.",
         "Aimbot controls: FOV, distance, smoothness, and hotkey.",
+        "Collision VisCheck: raycast LOS, distance gates, debug rays.",
         "Runtime settings: controller, KmBox, and overlay monitor.",
         "Live camera, ESP, and bone diagnostics.",
         "Project disclaimer and high-level feature list.",
@@ -429,11 +431,11 @@ void DrawArcLootTab()
             5000.f,
             "%.0f c",
             &var::loot_min_val_sp,
-            "Distance only — never hides. SP checked = far for pickups at/above min value."))
+            "Hides pickups below min value. SP checked = far for pickups at/above min value."))
         RequestArcSlowCache();
     ArcMenuHoverTooltip(
-        "Never hides. Pickups at/above min value use SP distance when checked, "
-        "loot/category distance when unchecked. Below-threshold pickups stay at close distance. 0 = off.");
+        "Hard-hides pickups below min value. At/above threshold: SP distance when checked, "
+        "loot/category distance when unchecked. 0 = off.");
     if (LootFilterComboWithSp(
             "Min rarity",
             "##loot_min_rarity",
@@ -441,11 +443,11 @@ void DrawArcLootTab()
             kMinRarityLabels,
             IM_ARRAYSIZE(kMinRarityLabels),
             &var::loot_min_rar_sp,
-            "Distance only — never hides. SP checked = far for pickups at/above min rarity."))
+            "Hides pickups below min rarity. SP checked = far for pickups at/above min rarity."))
         RequestArcSlowCache();
     ArcMenuHoverTooltip(
-        "Never hides. Pickups at/above min rarity use SP distance when checked, "
-        "loot/category distance when unchecked. Below-threshold pickups stay at close distance. Any = off.");
+        "Hard-hides pickups below min rarity. At/above threshold: SP distance when checked, "
+        "loot/category distance when unchecked. Any = off.");
     ArcMenuLayout::SliderFloat(
         "Loot distance", "##loot_distance", &var::loot_distance, 20.f, var::kMaxDistanceSliderM, "%.0f m");
     ArcMenuHoverTooltip("Default loot draw distance. Used whenever SP is unchecked on that row.");
@@ -529,6 +531,32 @@ void DrawArcRadarTab()
 
 void DrawArcAimbotTab()
 {
+    ArcMenuLayout::Checkbox("Show crosshair", &var::show_crosshair);
+    ArcMenuHoverTooltip("Paint-only screen-center crosshair overlay (independent of aimbot).");
+    static const char* kCrosshairStyleLabels[] = {
+        "Classic", "Dot", "Tight", "Circle", "T static", "T spin", "Cross spin", "Tri spin"
+    };
+    int crosshairStyle = var::crosshair_style;
+    if (ArcMenuLayout::Combo(
+            "Style",
+            "##crosshair_style",
+            &crosshairStyle,
+            kCrosshairStyleLabels,
+            IM_ARRAYSIZE(kCrosshairStyleLabels)))
+        var::crosshair_style = crosshairStyle;
+    ArcMenuLayout::Label("Crosshair color");
+    ArcMenuLayout::ColorEditAtColumn("##crosshair_color", var::crosshair_color);
+    ArcMenuLayout::SliderFloat(
+        "Crosshair size", "##crosshair_size", &var::crosshair_size, 2.f, 32.f, "%.1f");
+    ArcMenuLayout::SliderFloat(
+        "Crosshair thickness", "##crosshair_thickness", &var::crosshair_thickness, 0.5f, 6.f, "%.1f");
+    ArcMenuLayout::SliderFloat(
+        "Crosshair gap", "##crosshair_gap", &var::crosshair_gap, 0.f, 16.f, "%.1f");
+    ArcMenuLayout::SliderFloat(
+        "Crosshair spin RPM", "##crosshair_spin_rpm", &var::crosshair_spin_rpm, 1.f, 120.f, "%.0f");
+    ArcMenuHoverTooltip("Spin rate for T spin, Cross spin, and Tri spin styles.");
+
+    ImGui::Separator();
     ArcMenuLayout::Checkbox("Enable Aimbot", &var::enable_aimbot);
     ArcMenuHoverTooltip("KmBox hardware aim — requires MAKCU or Net device connected.");
     if (ArcMenuLayout::Checkbox("Robot aim", &var::robotAimEnabled))
@@ -711,6 +739,33 @@ void DrawArcSettingsTab()
     g_kmbox.renderKmboxSettings();
 }
 
+void DrawArcVisTab()
+{
+    ArcMenuLayout::Checkbox("Enable VisCheck", &var::vis_enabled);
+    ArcMenuHoverTooltip("Collision raycast LOS rebuild. Gates off by default — enable colors/aim separately after proving debug rays.");
+    ArcMenuLayout::SliderFloat("Vis max range (m)", "##vis_max", &var::vis_max_range_m, 25.f, var::kMaxDistanceSliderM, "%.0f");
+    ArcMenuLayout::Checkbox("Use player ESP distance", &var::vis_use_player_esp_dist);
+    ArcMenuLayout::Checkbox("Use bot ESP distance", &var::vis_use_bot_esp_dist);
+    ImGui::Separator();
+    ArcMenuLayout::Checkbox("Use for ESP colors", &var::vis_use_esp_colors);
+    ArcMenuHoverTooltip("When on, sets player/bot isVisible from raycasts (fail-open + hysteresis). Keep off until mid-raid proof.");
+    ArcMenuLayout::Checkbox("Use for aim", &var::vis_use_aim);
+    ArcMenuLayout::Checkbox("Multi-bone peek", &var::vis_multi_bone);
+    ImGui::SliderInt("Hysteresis frames", &var::vis_hysteresis_frames, 1, 8);
+    ImGui::Separator();
+    ArcMenuLayout::Checkbox("Debug Vis", &var::vis_debug);
+    ArcMenuLayout::Checkbox("Debug rays", &var::vis_debug_rays);
+    ArcMenuLayout::Checkbox("Debug tris (reserved)", &var::vis_debug_tris);
+    ImGui::Separator();
+    const CollisionVis::Stats st = CollisionVis::GetStats();
+    const char* probe = st.probe == CollisionVis::ProbeStatus::Green ? "GREEN"
+        : (st.probe == CollisionVis::ProbeStatus::Yellow ? "YELLOW" : "RED");
+    ImGui::Text("Probe: %s", probe);
+    ImGui::Text("smc=%d tris=%d rebuilding=%d rebuildMs=%d", st.smc, st.tris, st.rebuilding, st.rebuildMs);
+    ImGui::Text("queries=%d hits=%d clears=%d failOpen=%d", st.queries, st.hits, st.clears, st.failOpen);
+    ImGui::TextWrapped("Fail-open: empty tree / probe RED / disabled → treat as visible. Rays only within ESP distances.");
+}
+
 void DrawArcDebugTab()
 {
     ImGui::Text("KmBox type: %s", g_kmbox.kmboxConfig.type.c_str());
@@ -825,6 +880,8 @@ void DrawArcHelpTab()
 
     ImGui::Spacing();
     ImGui::TextWrapped("Aimbot tab:");
+    WrappedBulletText(
+        "Overlay crosshair — screen-center paint-only reticle; style, color, size, gap, and spin RPM.");
     WrappedBulletText("Enable aimbot (MAKCU or Net mouse) + Robot aim (bots even without Show robots).");
     WrappedBulletText("Robot aim: dead center of bot + small in-box shake.");
     WrappedBulletText("FOV, max distance, smoothness, hardware speed, aim hotkey (hold).");
@@ -962,9 +1019,10 @@ void DrawArcSidebar(bool& menuOpen, bool& requestExit)
         case 1: arc_ui::DrawArcLootTab(); break;
         case 2: arc_ui::DrawArcRadarTab(); break;
         case 3: arc_ui::DrawArcAimbotTab(); break;
-        case 4: arc_ui::DrawArcSettingsTab(); break;
-        case 5: arc_ui::DrawArcDebugTab(); break;
-        case 6: arc_ui::DrawArcHelpTab(); break;
+        case 4: arc_ui::DrawArcVisTab(); break;
+        case 5: arc_ui::DrawArcSettingsTab(); break;
+        case 6: arc_ui::DrawArcDebugTab(); break;
+        case 7: arc_ui::DrawArcHelpTab(); break;
         default: break;
         }
     }

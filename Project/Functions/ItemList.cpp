@@ -456,23 +456,16 @@ void Engine::ItemList()
                     && !IsJunkWorldEspLabel(classHuman) && IsPlausibleEspLabel(classHuman))
                     displayName = classHuman;
             }
-            if (displayName.empty()) {
-                if (fnameIsPickup || classGroundLoot) displayName = "Pickup";
-                else displayName = "Item";
-            }
+            if (displayName.empty())
+                continue;
         }
 
         displayName = FormatEspDisplayLabel(displayName);
         if (displayName.empty() || IsJunkWorldEspLabel(displayName)
             || IsGarbledEspLabel(displayName)
-            || IsGenericWorldEspLabel(displayName)) {
-            // "Pickup" is intentionally not in IsGenericWorldEspLabel so the render
-            // path won't loop-replace it; use it rather than "Dropped Pickup".
-            if (fnameIsPickup || classGroundLoot)
-                displayName = "Pickup";
-            else
-                displayName = "Item";
-        }
+            || IsGenericWorldEspLabel(displayName)
+            || displayName == "Pickup" || displayName == "Item" || displayName == "Loot")
+            continue;
         if (displayName.empty())
             continue;
 
@@ -584,12 +577,12 @@ void Engine::ItemList()
             if (fixed.empty() || IsJunkWorldEspLabel(fixed)
                 || IsGarbledEspLabel(fixed) || !IsPlausibleEspLabel(fixed))
                 fixed.clear();
-            if (fixed.empty()) {
-                const bool fnameIsPickup = FnameLooksLikeDroppedPickup(retainFname)
-                    || FnameLooksLikeDroppedPickup(retainClass);
-                fixed = fnameIsPickup ? "Pickup" : "Item";
-            }
+            if (fixed.empty())
+                continue;
             fixed = FormatEspDisplayLabel(fixed);
+            if (fixed.empty() || fixed == "Pickup" || fixed == "Item" || fixed == "Loot"
+                || IsGenericWorldEspLabel(fixed))
+                continue;
             if (!fixed.empty()) {
                 it->second.ItemDisplayName = fixed;
                 it->second.ItemType = fixed;
