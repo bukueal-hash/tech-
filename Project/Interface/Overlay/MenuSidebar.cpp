@@ -826,9 +826,9 @@ void DrawArcDebugTab()
 
     ImGui::Separator();
     ImGui::Text("Debug overlay");
-    ArcMenuLayout::Checkbox("Show console debug tags", &var::show_debug_overlay);
+    ArcMenuLayout::Checkbox("Show offset validation", &var::show_debug_overlay);
     ArcMenuHoverTooltip(
-        "Pointer chain status. Close menu to see overlay.");
+        "On-screen CORE/PLAYER/COMPONENT offset panel + console [debug*] tags. Close menu to see overlay.");
     ArcMenuLayout::Checkbox("Near loot HUD", &var::show_near_loot_hud);
     ArcMenuHoverTooltip(
         "List nearby ground pickups on-screen. Press F7 to mark the nearest as picked "
@@ -895,7 +895,7 @@ void DrawArcHelpTab()
 
     ImGui::Spacing();
     ImGui::TextWrapped("Debug tab:");
-    WrappedBulletText("Show console debug tags — [debugPlayer/Robot/Item/Container/Aim/Cam/WorldEsp].");
+    WrappedBulletText("Show offset validation — on-screen offset panel + [debugPlayer/Robot/Item/Container/Aim/Cam/WorldEsp].");
     WrappedBulletText(
         "Near loot HUD — on-screen ground pickups; F7 marks the nearest as picked.");
     WrappedBulletText("KmBox/config + gamepad status; worker/camera/cache readouts.");

@@ -707,15 +707,12 @@ bool Engine::IsInRaidRaw() const
 
 	// Stay path: once ESP raid is active, only lose raid on world loss or hub.
 	// Do not require PC/pawn/root/combat — mid-raid DMA flakes were firing [raid] left.
+	// Do NOT use "pawn gone + party<=1": solo raids always have partyCount==1, so a
+	// brief null pawn read falsely dropped EspRaid and forced a slow re-arm.
 	if (m_espRaidActive.load(std::memory_order_acquire)) {
 		if (LooksLikeStrictHubWorld(sGWorld, sPersistentLevel))
 			return false;
 		if (sAcknowledgedPawn && PawnLooksLikeHubCharacter(sAcknowledgedPawn))
-			return false;
-		// Menu with undecryptable hub FName kept raid "on" forever: local pawn
-		// gone AND GameState player array drained to <=1 means we left the
-		// match server. Brief DMA flakes are absorbed by kRaidRawFalseGraceMs.
-		if (!sAcknowledgedPawn && CountGameStatePlayerArray() <= 1)
 			return false;
 		return true;
 	}
@@ -1030,7 +1027,8 @@ void Engine::TickRaidGate()
 
 	m_raidEnterPending = false;
 	m_partyEnterPending = false;
-	ResetRaidTransitionState();
+	// World transitions already ResetRaidTransitionState. Re-reset here wiped
+	// FName/decrypt tables and camera every arm → ESP looked "broken" for seconds.
 	ClearEspCaches();
 	m_espDrawReady.store(false, std::memory_order_release);
 	m_raidArmedSince = now;
