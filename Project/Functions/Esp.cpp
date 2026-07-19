@@ -533,6 +533,16 @@ static void DrawWeaponLabel(
     }
 }
 
+static ImU32 SquadColor(uint8_t idx)
+{
+    switch (idx) {
+    case 1: return IM_COL32(255, 60, 60, 255);
+    case 2: return IM_COL32(255, 200, 60, 255);
+    case 3: return IM_COL32(60, 200, 255, 255);
+    default: return IM_COL32(200, 200, 200, 255);
+    }
+}
+
 static float StackPlayerLabels(
     ImDrawList* drawList,
     const Engine::PlayerCacheEntry& actor,
@@ -540,6 +550,17 @@ static float StackPlayerLabels(
     float& labelStackY,
     const Visuals::EspDrawScale& scale)
 {
+    if (var::show_squad_idx && !actor.isAlly && actor.squadIdx > 0) {
+        char tagBuf[16]{};
+        snprintf(tagBuf, sizeof(tagBuf), "@%u", (unsigned)actor.squadIdx);
+        EspDraw::DrawLabelEsp(
+            drawList,
+            ImVec2(headX, labelStackY),
+            tagBuf,
+            SquadColor(actor.squadIdx),
+            actor.Distance);
+        labelStackY -= LabelTextHeight(tagBuf, actor.Distance) + 2.f;
+    }
     if (var::names) {
         const char* nameLabel = actor.ActorName.empty() ? "Raider" : actor.ActorName.c_str();
         Visuals::Names(
@@ -2002,7 +2023,23 @@ void Engine::RenderRadar(bool interactive)
             const ImU32 color = actor.isVisible
                 ? pickerColor(var::esp_color_visible)
                 : pickerColor(var::esp_color_invisible);
-            drawBlip(rx, ry, color, actor.Distance);
+            if (actor.isAlly && var::radar_ally_arrows) {
+                const float playerYawRad = static_cast<float>(
+                    engine.DegToRad(static_cast<double>(actor.facingYaw)));
+                const float relAngle = playerYawRad - yawRad;
+                const float arrowLen = 8.f;
+                const float baseSpread = 2.3f;
+                float tipX = rx + sinf(relAngle) * arrowLen;
+                float tipY = ry - cosf(relAngle) * arrowLen;
+                float lx = rx + sinf(relAngle + baseSpread) * arrowLen * 0.4f;
+                float ly = ry - cosf(relAngle + baseSpread) * arrowLen * 0.4f;
+                float rx2 = rx + sinf(relAngle - baseSpread) * arrowLen * 0.4f;
+                float ry2 = ry - cosf(relAngle - baseSpread) * arrowLen * 0.4f;
+                drawList->AddTriangleFilled(
+                    ImVec2(tipX, tipY), ImVec2(lx, ly), ImVec2(rx2, ry2), color);
+            } else {
+                drawBlip(rx, ry, color, actor.Distance);
+            }
         }
     }
 

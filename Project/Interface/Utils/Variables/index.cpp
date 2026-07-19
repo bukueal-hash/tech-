@@ -13,6 +13,7 @@ namespace var {
     bool silhouette_soft_fill = true;
     float silhouette_max_distance_m = 25.f;
     bool show_distance = false;
+    bool show_squad_idx = true;
     bool hide_allies = true;
     float esp_distance = 500.f;
     float esp_color_visible[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
@@ -169,4 +170,5 @@ namespace var {
     int radar_loot_min_rarity = 0;
     bool show_radar_special = false;
     bool radar_shape_circle = true;
+    bool radar_ally_arrows = true;
 }

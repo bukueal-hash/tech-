@@ -355,6 +355,8 @@ void DrawArcEspTab()
             if (ArcMenuLayout::Checkbox("Hide allies", &var::hide_allies))
                 RequestArcSlowCache();
             ArcMenuHoverTooltip("No ESP or radar on teammates (box, skeleton, silhouette, names, etc.).");
+            ArcMenuLayout::Checkbox("Squad tags", &var::show_squad_idx);
+            ArcMenuHoverTooltip("Show @1 / @2 / @3 on enemies to identify which squad they belong to.");
             ImGui::EndDisabled();
 
             ImGui::Separator();
@@ -567,6 +569,8 @@ void DrawArcRadarTab()
     ArcMenuLayout::Checkbox("Special", &var::show_radar_special);
     ArcMenuHoverTooltip(
         "Show container types with SP checked under Visuals on the radar (within world range).");
+    ArcMenuLayout::Checkbox("Ally arrows", &var::radar_ally_arrows);
+    ArcMenuHoverTooltip("Show teammates as arrows pointing their facing direction instead of dots.");
     ImGui::Separator();
     ImGui::TextWrapped("While this menu is open, click and drag the radar to move it. Position saves automatically when you close the menu.");
     ImGui::TextWrapped("Players/bots use Visuals ESP colors; rare loot uses rarity colors; SP containers use their type colors.");
@@ -1008,7 +1012,7 @@ void DrawArcSidebar(bool& menuOpen, bool& requestExit)
     ui.headerColor = kTabDarkRed;
     ImGuiStyle& style = ImGui::GetStyle();
     const ImVec4 darkBg(0.16f, 0.16f, 0.16f, 0.95f);
-    const ImVec4 logoBg(0.12f, 0.12f, 0.12f, 1.0f);
+    const ImVec4 logoBg(0.22f, 0.22f, 0.22f, 1.0f);
     const ImVec4 tabRed = kTabRed;
     const ImVec4 tabBorder = kTabDarkRed;
 
@@ -1048,7 +1052,7 @@ void DrawArcSidebar(bool& menuOpen, bool& requestExit)
         // Dark grey background behind image
         ImVec2 imgMin = ImGui::GetCursorScreenPos();
         ImVec2 imgMax(imgMin.x + drawW, imgMin.y + drawH);
-        ImGui::GetWindowDrawList()->AddRectFilled(imgMin, imgMax, IM_COL32(30, 30, 30, 255));
+        ImGui::GetWindowDrawList()->AddRectFilled(imgMin, imgMax, IM_COL32(55, 55, 55, 255));
 
         ImGui::Image(ui.logoTexture, ImVec2(drawW, drawH));
         ImGui::Spacing();

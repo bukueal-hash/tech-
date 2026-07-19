@@ -368,6 +368,9 @@ public: // PlayerCache
         bool Drawing = false;
         float Distance = 0.f;
         bool isAlly = false;
+        uint8_t enemyTeamId = 0;
+        uint8_t squadIdx = 0;
+        float facingYaw = 0.f;
 
         float health;
         float maxhealth;

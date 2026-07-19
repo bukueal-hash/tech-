@@ -87,6 +87,7 @@ struct Snapshot {
     bool silhouette_soft_fill{};
     float silhouette_max_distance_m{};
     bool show_distance{};
+    bool show_squad_idx{};
     bool hide_allies{};
     bool show_radar{};
     bool show_debug_overlay{};
@@ -98,6 +99,7 @@ struct Snapshot {
     int radar_loot_min_rarity{};
     bool show_radar_special{};
     bool radar_shape_circle{};
+    bool radar_ally_arrows{};
     float esp_distance{};
     float esp_color_visible[4]{};
     float esp_color_invisible[4]{};
@@ -287,6 +289,7 @@ Snapshot CaptureSnapshot()
     s.silhouette_soft_fill = var::silhouette_soft_fill;
     s.silhouette_max_distance_m = var::silhouette_max_distance_m;
     s.show_distance = var::show_distance;
+    s.show_squad_idx = var::show_squad_idx;
     s.hide_allies = var::hide_allies;
     s.show_radar = var::show_radar;
     s.show_debug_overlay = var::show_debug_overlay;
@@ -298,6 +301,7 @@ Snapshot CaptureSnapshot()
     s.radar_loot_min_rarity = var::radar_loot_min_rarity;
     s.show_radar_special = var::show_radar_special;
     s.radar_shape_circle = var::radar_shape_circle;
+    s.radar_ally_arrows = var::radar_ally_arrows;
     s.esp_distance = var::esp_distance;
     std::memcpy(s.esp_color_visible, var::esp_color_visible, sizeof(s.esp_color_visible));
     std::memcpy(s.esp_color_invisible, var::esp_color_invisible, sizeof(s.esp_color_invisible));
@@ -444,6 +448,7 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.silhouette_soft_fill == b.silhouette_soft_fill &&
         a.silhouette_max_distance_m == b.silhouette_max_distance_m &&
         a.show_distance == b.show_distance &&
+        a.show_squad_idx == b.show_squad_idx &&
         a.hide_allies == b.hide_allies &&
         a.show_radar == b.show_radar &&
         a.show_debug_overlay == b.show_debug_overlay &&
@@ -455,6 +460,7 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.radar_loot_min_rarity == b.radar_loot_min_rarity &&
         a.show_radar_special == b.show_radar_special &&
         a.radar_shape_circle == b.radar_shape_circle &&
+        a.radar_ally_arrows == b.radar_ally_arrows &&
         a.esp_distance == b.esp_distance &&
         ColorsEqual(a.esp_color_visible, b.esp_color_visible) &&
         ColorsEqual(a.esp_color_invisible, b.esp_color_invisible) &&
@@ -792,6 +798,7 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
         var::silhouette_max_distance_m = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.f, var::kMaxDistanceSliderM);
     }
     else if (key == "show_distance") var::show_distance = ParseBool(val, var::show_distance);
+    else if (key == "show_squad_idx") var::show_squad_idx = ParseBool(val, var::show_squad_idx);
     else if (key == "hide_allies") var::hide_allies = ParseBool(val, var::hide_allies);
     else if (key == "show_radar") var::show_radar = ParseBool(val, var::show_radar);
     else if (key == "show_debug_overlay") var::show_debug_overlay = ParseBool(val, var::show_debug_overlay);
@@ -805,6 +812,7 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     else if (key == "radar_loot_min_rarity") var::radar_loot_min_rarity = std::atoi(val.c_str());
     else if (key == "show_radar_special") var::show_radar_special = ParseBool(val, var::show_radar_special);
     else if (key == "radar_shape_circle") var::radar_shape_circle = ParseBool(val, var::radar_shape_circle);
+    else if (key == "radar_ally_arrows") var::radar_ally_arrows = ParseBool(val, var::radar_ally_arrows);
     else if (key == "esp_distance") {
         var::esp_distance = std::clamp(static_cast<float>(std::atof(val.c_str())), 50.f, var::kMaxDistanceSliderM);
     }
@@ -950,6 +958,7 @@ void WriteIni()
     file << "silhouette_soft_fill=" << (var::silhouette_soft_fill ? 1 : 0) << '\n';
     file << "silhouette_max_distance_m=" << var::silhouette_max_distance_m << '\n';
     file << "show_distance=" << (var::show_distance ? 1 : 0) << '\n';
+    file << "show_squad_idx=" << (var::show_squad_idx ? 1 : 0) << '\n';
     file << "hide_allies=" << (var::hide_allies ? 1 : 0) << '\n';
     file << "show_radar=" << (var::show_radar ? 1 : 0) << '\n';
     file << "show_debug_overlay=" << (var::show_debug_overlay ? 1 : 0) << '\n';
@@ -961,6 +970,7 @@ void WriteIni()
     file << "radar_loot_min_rarity=" << var::radar_loot_min_rarity << '\n';
     file << "show_radar_special=" << (var::show_radar_special ? 1 : 0) << '\n';
     file << "radar_shape_circle=" << (var::radar_shape_circle ? 1 : 0) << '\n';
+    file << "radar_ally_arrows=" << (var::radar_ally_arrows ? 1 : 0) << '\n';
     file << "esp_distance=" << var::esp_distance << '\n';
     WriteColor4(file, "esp_color_visible", var::esp_color_visible);
     WriteColor4(file, "esp_color_invisible", var::esp_color_invisible);

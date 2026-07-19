@@ -2,7 +2,7 @@
 <Project>
   <ProjectOutputs>
     <ProjectOutput>
-      <FullPath>F:\Test\ARCs\Build\ArcRaiders.exe</FullPath>
+      <FullPath>f:\Test\ARCs\Build\ArcRaiders.exe</FullPath>
     </ProjectOutput>
   </ProjectOutputs>
   <ContentFiles />

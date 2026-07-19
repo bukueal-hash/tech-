@@ -861,7 +861,11 @@ void Engine::EntityList()
         WorldScan::MissCounterClear(s_playerRootMisses, key);
         actor.rootComponent = freshRoot;
 
+        actor.facingYaw = static_cast<float>(
+            Memory::read<double>(freshRoot + Offsets::RelativeRotation + 8));
+
         const uint8_t enemyTeamId = Memory::read<uint8_t>(key + Offsets::TeamID);
+        actor.enemyTeamId = enemyTeamId;
         actor.isAlly = (myTeamId != 0 && myTeamId == enemyTeamId);
         if (actor.isAlly && var::hide_allies) {
             ++dbgTeamEvict;
@@ -1086,6 +1090,24 @@ void Engine::EntityList()
     {
         std::unique_lock<std::shared_mutex> lock(m_playerCacheMutex);
         playerCache = std::move(localCache);
+    }
+
+    // Map unique enemy TeamIDs to squad indices (1-based, sorted ascending)
+    {
+        std::vector<uint8_t> uniqueTeams;
+        for (const auto& [key, entry] : playerCache) {
+            if (!entry.isAlly && entry.enemyTeamId != 0)
+                uniqueTeams.push_back(entry.enemyTeamId);
+        }
+        std::sort(uniqueTeams.begin(), uniqueTeams.end());
+        uniqueTeams.erase(std::unique(uniqueTeams.begin(), uniqueTeams.end()), uniqueTeams.end());
+        for (auto& [key, entry] : playerCache) {
+            if (!entry.isAlly && entry.enemyTeamId != 0) {
+                auto it = std::find(uniqueTeams.begin(), uniqueTeams.end(), entry.enemyTeamId);
+                if (it != uniqueTeams.end())
+                    entry.squadIdx = static_cast<uint8_t>(std::distance(uniqueTeams.begin(), it) + 1);
+            }
+        }
     }
 
     // P7: advance ring only after successful gen-matched writeback so an

@@ -40,6 +40,7 @@ namespace var {
     /** Silhouette fill max range (m); 0 = default 25 m (not esp_distance). */
     extern float silhouette_max_distance_m;
     extern bool show_distance;
+    extern bool show_squad_idx;
     extern bool hide_allies;
     extern float esp_distance;
     inline float EffectiveSilhouetteMaxM()
@@ -209,6 +210,7 @@ namespace var {
     extern int radar_loot_min_rarity;
     extern bool show_radar_special;
     extern bool radar_shape_circle;
+    extern bool radar_ally_arrows;
 }
 
 bool WorldCategoryEnabled(int category);
