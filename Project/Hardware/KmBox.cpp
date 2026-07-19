@@ -475,4 +475,40 @@ void KmboxController::LeftClick() {
         Sleep(static_cast<DWORD>(kmboxConfig.minDelay));
 }
 
+void KmboxController::Click(int holdMs) {
+    if (!kmboxConfig.initialized)
+        return;
+    if (holdMs < 1)
+        holdMs = 1;
+    if (kmboxConfig.type == "MAKCU") {
+        MyMakcu::MouseDown();
+        Sleep(static_cast<DWORD>(holdMs));
+        MyMakcu::MouseUp();
+    } else if (kmboxConfig.type == "Net") {
+        kmNet_mouse_left(1);
+        Sleep(static_cast<DWORD>(holdMs));
+        kmNet_mouse_left(0);
+    }
+}
+
+void KmboxController::HoldStart() {
+    if (!kmboxConfig.initialized)
+        return;
+    if (kmboxConfig.type == "MAKCU") {
+        MyMakcu::MouseDown();
+    } else if (kmboxConfig.type == "Net") {
+        kmNet_mouse_left(1);
+    }
+}
+
+void KmboxController::HoldEnd() {
+    if (!kmboxConfig.initialized)
+        return;
+    if (kmboxConfig.type == "MAKCU") {
+        MyMakcu::MouseUp();
+    } else if (kmboxConfig.type == "Net") {
+        kmNet_mouse_left(0);
+    }
+}
+
 KmboxController g_kmbox;

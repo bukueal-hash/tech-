@@ -143,6 +143,15 @@ struct Snapshot {
 
     float aim_bullet_speed_cm_s{};
 
+    /* Triggerbot */
+    bool enable_triggerbot{};
+    int trigger_hold_mode{};
+    int trigger_hold_key{};
+    float trigger_deadzone_px{};
+    int trigger_fire_delay_ms{};
+    bool trigger_auto_hold{};
+    bool trigger_vis_check{};
+
     bool enable_world{};
     bool droppedItems{};
     bool raiderStock{};
@@ -332,6 +341,14 @@ Snapshot CaptureSnapshot()
     s.aim_loss_of_sight_grace_enabled = var::aim_loss_of_sight_grace_enabled;
     s.aim_bullet_speed_cm_s = var::aim_bullet_speed_cm_s;
 
+    s.enable_triggerbot = var::enable_triggerbot;
+    s.trigger_hold_mode = var::trigger_hold_mode;
+    s.trigger_hold_key = var::trigger_hold_key;
+    s.trigger_deadzone_px = var::trigger_deadzone_px;
+    s.trigger_fire_delay_ms = var::trigger_fire_delay_ms;
+    s.trigger_auto_hold = var::trigger_auto_hold;
+    s.trigger_vis_check = var::trigger_vis_check;
+
     s.enable_world = var::enable_world;
     s.droppedItems = var::droppedItems;
     s.raiderStock = var::raiderStock;
@@ -479,6 +496,13 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.aim_loss_of_sight_grace_ms == b.aim_loss_of_sight_grace_ms &&
         a.aim_loss_of_sight_grace_enabled == b.aim_loss_of_sight_grace_enabled &&
         a.aim_bullet_speed_cm_s == b.aim_bullet_speed_cm_s &&
+        a.enable_triggerbot == b.enable_triggerbot &&
+        a.trigger_hold_mode == b.trigger_hold_mode &&
+        a.trigger_hold_key == b.trigger_hold_key &&
+        a.trigger_deadzone_px == b.trigger_deadzone_px &&
+        a.trigger_fire_delay_ms == b.trigger_fire_delay_ms &&
+        a.trigger_auto_hold == b.trigger_auto_hold &&
+        a.trigger_vis_check == b.trigger_vis_check &&
         a.enable_world == b.enable_world &&
         a.droppedItems == b.droppedItems &&
         a.raiderStock == b.raiderStock &&
@@ -614,6 +638,35 @@ static bool ApplyAimbotConfigKey(const std::string& key, const std::string& val)
     if (key == "aim_bullet_speed_cm_s") {
         var::aim_bullet_speed_cm_s = static_cast<float>(std::atof(val.c_str()));
         var::aim_bullet_speed_cm_s = std::clamp(var::aim_bullet_speed_cm_s, 10000.f, 200000.f);
+        return true;
+    }
+    /* Triggerbot */
+    if (key == "enable_triggerbot") {
+        var::enable_triggerbot = ParseBool(val, var::enable_triggerbot);
+        return true;
+    }
+    if (key == "trigger_hold_mode") {
+        var::trigger_hold_mode = std::clamp(static_cast<int>(std::atoi(val.c_str())), 0, 2);
+        return true;
+    }
+    if (key == "trigger_hold_key") {
+        var::trigger_hold_key = static_cast<int>(std::atoi(val.c_str()));
+        return true;
+    }
+    if (key == "trigger_deadzone_px") {
+        var::trigger_deadzone_px = std::clamp(static_cast<float>(std::atof(val.c_str())), 1.f, 50.f);
+        return true;
+    }
+    if (key == "trigger_fire_delay_ms") {
+        var::trigger_fire_delay_ms = std::clamp(static_cast<int>(std::atoi(val.c_str())), 0, 500);
+        return true;
+    }
+    if (key == "trigger_auto_hold") {
+        var::trigger_auto_hold = ParseBool(val, var::trigger_auto_hold);
+        return true;
+    }
+    if (key == "trigger_vis_check") {
+        var::trigger_vis_check = ParseBool(val, var::trigger_vis_check);
         return true;
     }
     if (key == "aim_deadzone_px") {
@@ -961,6 +1014,13 @@ void WriteIni()
     file << "aim_loss_of_sight_grace_ms=" << var::aim_loss_of_sight_grace_ms << '\n';
     file << "aim_loss_of_sight_grace_enabled=" << (var::aim_loss_of_sight_grace_enabled ? 1 : 0) << '\n';
     file << "aim_bullet_speed_cm_s=" << var::aim_bullet_speed_cm_s << '\n';
+    file << "enable_triggerbot=" << (var::enable_triggerbot ? 1 : 0) << '\n';
+    file << "trigger_hold_mode=" << var::trigger_hold_mode << '\n';
+    file << "trigger_hold_key=" << var::trigger_hold_key << '\n';
+    file << "trigger_deadzone_px=" << var::trigger_deadzone_px << '\n';
+    file << "trigger_fire_delay_ms=" << var::trigger_fire_delay_ms << '\n';
+    file << "trigger_auto_hold=" << (var::trigger_auto_hold ? 1 : 0) << '\n';
+    file << "trigger_vis_check=" << (var::trigger_vis_check ? 1 : 0) << '\n';
 
     file << "enable_world=" << (var::enable_world ? 1 : 0) << '\n';
     file << "droppedItems=" << (var::droppedItems ? 1 : 0) << '\n';

@@ -58,6 +58,15 @@ namespace var {
     bool aim_loss_of_sight_grace_enabled = true;
     float aim_bullet_speed_cm_s = 80000.f;
 
+    /* Triggerbot */
+    bool enable_triggerbot = false;
+    int trigger_hold_mode = 0; // Hold
+    int trigger_hold_key = 0x10; // VK_SHIFT
+    float trigger_deadzone_px = 3.f;
+    int trigger_fire_delay_ms = 30;
+    bool trigger_auto_hold = false;
+    bool trigger_vis_check = false;
+
     /* World */
     bool enable_world = true;
     bool droppedItems = true;

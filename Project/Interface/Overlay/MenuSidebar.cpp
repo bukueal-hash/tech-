@@ -209,15 +209,12 @@ namespace arc_ui {
 
 void DrawMainMenu()
 {
-    const char* tabs[] = { "Visuals", "Loot", "Radar", "Aimbot", "Vis", "Settings", "Debug", "Help", "Close" };
+    const char* tabs[] = { "ESP", "Radar", "Aimbot", "Settings", "Help", "Close" };
     const char* tabTips[] = {
-        "Visual controls: player ESP and world ESP toggles.",
-        "Loot container ESP: distance, value/rarity filters, per-type SP checkboxes.",
+        "ESP sub-tab: player/bot ESP. VisCheck sub-tab: raycast LOS. Loot sub-tab: container/loot ESP.",
         "Mini-map: enable, size, and world range.",
         "Aimbot controls: FOV, distance, smoothness, and hotkey.",
-        "Collision VisCheck: raycast LOS, distance gates, debug rays.",
-        "Runtime settings: controller, KmBox, and overlay monitor.",
-        "Live camera, ESP, and bone diagnostics.",
+        "General settings: controller, KmBox, overlay. Debug: diagnostics, caches, camera.",
         "Project disclaimer and high-level feature list.",
         "Exit ARC completely (same as END key)."
     };
@@ -306,93 +303,140 @@ namespace arc_ui {
 
 void DrawArcEspTab()
 {
-    ArcMenuLayout::CheckboxWithDualColorRow(
-        "Enable ESP",
-        &var::enableesp,
-        var::esp_color_visible,
-        "##esp_vis",
-        var::esp_color_invisible,
-        "##esp_invis");
-    ArcMenuHoverTooltip("Master switch for player ESP. Colors: visible (left), invisible (right).");
-    ArcMenuLayout::SliderFloat("ESP distance", "##esp_distance", &var::esp_distance, 50.f, var::kMaxDistanceSliderM, "%.0f m");
-    ArcMenuHoverTooltip("Maximum distance for player ESP rendering.");
-    ImGui::BeginDisabled(!var::enableesp);
-    ArcMenuLayout::Checkbox("Box", &var::box);
-    ArcMenuHoverTooltip("Draw box around tracked players.");
-    ArcMenuLayout::Checkbox("Health", &var::health);
-    ArcMenuHoverTooltip("HP and shield bar above the player's head.");
-    ArcMenuLayout::Checkbox("Names", &var::names);
-    ArcMenuHoverTooltip("Display player name labels.");
-    ArcMenuLayout::Checkbox("Weapon", &var::show_weapon);
-    ArcMenuHoverTooltip(
-        "Held item in hand — gun, bandage, shield recharger, grenade, defibrillator, etc. "
-        "Guns tint by tier; other items use a neutral color.");
-    ArcMenuLayout::Checkbox("Snaplines", &var::snaplines);
-    ArcMenuHoverTooltip("Draw lines from screen bottom to players.");
-    ArcMenuLayout::Checkbox("Skeleton", &var::skeleton);
-    ArcMenuHoverTooltip("Draw bone skeleton lines on players.");
-    ArcMenuLayout::Checkbox("Silhouette", &var::silhouette);
-    ArcMenuHoverTooltip(
-        "Filled body within max distance. Beyond that, skeleton only (when both are on).");
-    ImGui::Indent(16.f);
-    ImGui::BeginDisabled(!var::silhouette);
-    ArcMenuLayout::Checkbox("Soft fill", &var::silhouette_soft_fill);
-    ArcMenuHoverTooltip("Translucent body fill instead of solid chalk.");
-    ArcMenuLayout::SliderFloat(
-        "Silhouette max (m, 0=25)",
-        "##silhouette_max_distance_m",
-        &var::silhouette_max_distance_m,
-        0.f,
-        var::kMaxDistanceSliderM,
-        "%.0f");
-    ArcMenuHoverTooltip(
-        "Close: silhouette. Past this range: skeleton lines only. 0 defaults to 25 m.");
-    ImGui::EndDisabled();
-    ImGui::Unindent(16.f);
-    ArcMenuLayout::Checkbox("Distance", &var::show_distance);
-    ArcMenuHoverTooltip("Show distance in meters below each player.");
-    if (ArcMenuLayout::Checkbox("Hide allies", &var::hide_allies))
-        RequestArcSlowCache();
-    ArcMenuHoverTooltip("No ESP or radar on teammates (box, skeleton, silhouette, names, etc.).");
-    ImGui::EndDisabled();
+    if (ImGui::BeginTabBar("##visuals_tabs", ImGuiTabBarFlags_None))
+    {
+        if (ImGui::BeginTabItem("ESP"))
+        {
+            ArcMenuLayout::CheckboxWithDualColorRow(
+                "Enable ESP",
+                &var::enableesp,
+                var::esp_color_visible,
+                "##esp_vis",
+                var::esp_color_invisible,
+                "##esp_invis");
+            ArcMenuHoverTooltip("Master switch for player ESP. Colors: visible (left), invisible (right).");
+            ArcMenuLayout::SliderFloat("ESP distance", "##esp_distance", &var::esp_distance, 50.f, var::kMaxDistanceSliderM, "%.0f m");
+            ArcMenuHoverTooltip("Maximum distance for player ESP rendering.");
+            ImGui::BeginDisabled(!var::enableesp);
+            ArcMenuLayout::Checkbox("Box", &var::box);
+            ArcMenuHoverTooltip("Draw box around tracked players.");
+            ArcMenuLayout::Checkbox("Health", &var::health);
+            ArcMenuHoverTooltip("HP and shield bar above the player's head.");
+            ArcMenuLayout::Checkbox("Names", &var::names);
+            ArcMenuHoverTooltip("Display player name labels.");
+            ArcMenuLayout::Checkbox("Weapon", &var::show_weapon);
+            ArcMenuHoverTooltip(
+                "Held item in hand — gun, bandage, shield recharger, grenade, defibrillator, etc. "
+                "Guns tint by tier; other items use a neutral color.");
+            ArcMenuLayout::Checkbox("Snaplines", &var::snaplines);
+            ArcMenuHoverTooltip("Draw lines from screen bottom to players.");
+            ArcMenuLayout::Checkbox("Skeleton", &var::skeleton);
+            ArcMenuHoverTooltip("Draw bone skeleton lines on players.");
+            ArcMenuLayout::Checkbox("Silhouette", &var::silhouette);
+            ArcMenuHoverTooltip(
+                "Filled body within max distance. Beyond that, skeleton only (when both are on).");
+            ImGui::Indent(16.f);
+            ImGui::BeginDisabled(!var::silhouette);
+            ArcMenuLayout::Checkbox("Soft fill", &var::silhouette_soft_fill);
+            ArcMenuHoverTooltip("Translucent body fill instead of solid chalk.");
+            ArcMenuLayout::SliderFloat(
+                "Silhouette max (m, 0=25)",
+                "##silhouette_max_distance_m",
+                &var::silhouette_max_distance_m,
+                0.f,
+                var::kMaxDistanceSliderM,
+                "%.0f");
+            ArcMenuHoverTooltip(
+                "Close: silhouette. Past this range: skeleton lines only. 0 defaults to 25 m.");
+            ImGui::EndDisabled();
+            ImGui::Unindent(16.f);
+            ArcMenuLayout::Checkbox("Distance", &var::show_distance);
+            ArcMenuHoverTooltip("Show distance in meters below each player.");
+            if (ArcMenuLayout::Checkbox("Hide allies", &var::hide_allies))
+                RequestArcSlowCache();
+            ArcMenuHoverTooltip("No ESP or radar on teammates (box, skeleton, silhouette, names, etc.).");
+            ImGui::EndDisabled();
 
-    ImGui::Separator();
-    ImGui::Text("Bot ESP");
-    ArcMenuHoverTooltip("ARC robot ESP — separate from player ESP toggles above.");
-    if (ArcMenuLayout::CheckboxWithDualColorRow(
-            "Show robots",
-            &var::showRobots,
-            var::bot_color_visible,
-            "##bot_vis",
-            var::bot_color_invisible,
-            "##bot_invis"))
-        RequestArcSlowCache();
-    ArcMenuHoverTooltip("Draw ARC robots. Colors: visible (left), invisible (right).");
-    ArcMenuLayout::SliderFloat(
-        "Bot ESP distance", "##bot_esp_distance", &var::bot_esp_distance, 50.f, var::kMaxDistanceSliderM, "%.0f m");
-    ArcMenuHoverTooltip("Maximum distance for robot ESP rendering.");
-    ImGui::BeginDisabled(!var::showRobots);
-    ArcMenuLayout::Checkbox("Box##bot", &var::bot_box);
-    ArcMenuHoverTooltip("Draw box around tracked robots.");
-    ArcMenuLayout::Checkbox("Names##bot", &var::bot_names);
-    ArcMenuHoverTooltip("Display robot name labels.");
-    ArcMenuLayout::Checkbox("Snaplines##bot", &var::bot_snaplines);
-    ArcMenuHoverTooltip("Draw lines from screen bottom to robots.");
-    ArcMenuLayout::Checkbox("Distance##bot", &var::bot_show_distance);
-    ArcMenuHoverTooltip("Show distance in meters below each robot.");
-    ArcMenuLayout::Checkbox("Heart", &var::bot_heart);
-    ArcMenuHoverTooltip("Pulsating heart at box center; robot aim targets the same point.");
-    if (ArcMenuLayout::CheckboxWithColorRow(
-            "Dead bot bodies",
-            &var::show_dead_bots,
-            var::color_dead_bots,
-            "##col_dead_bots"))
-        RequestArcSlowCache();
-    ArcMenuHoverTooltip("Show destroyed/broken robot wrecks; color applies to dead bot ESP and radar.");
-    ImGui::EndDisabled();
+            ImGui::Separator();
+            ImGui::Text("Bot ESP");
+            ArcMenuHoverTooltip("ARC robot ESP — separate from player ESP toggles above.");
+            if (ArcMenuLayout::CheckboxWithDualColorRow(
+                    "Show robots",
+                    &var::showRobots,
+                    var::bot_color_visible,
+                    "##bot_vis",
+                    var::bot_color_invisible,
+                    "##bot_invis"))
+                RequestArcSlowCache();
+            ArcMenuHoverTooltip("Draw ARC robots. Colors: visible (left), invisible (right).");
+            ArcMenuLayout::SliderFloat(
+                "Bot ESP distance", "##bot_esp_distance", &var::bot_esp_distance, 50.f, var::kMaxDistanceSliderM, "%.0f m");
+            ArcMenuHoverTooltip("Maximum distance for robot ESP rendering.");
+            ImGui::BeginDisabled(!var::showRobots);
+            ArcMenuLayout::Checkbox("Box##bot", &var::bot_box);
+            ArcMenuHoverTooltip("Draw box around tracked robots.");
+            ArcMenuLayout::Checkbox("Names##bot", &var::bot_names);
+            ArcMenuHoverTooltip("Display robot name labels.");
+            ArcMenuLayout::Checkbox("Snaplines##bot", &var::bot_snaplines);
+            ArcMenuHoverTooltip("Draw lines from screen bottom to robots.");
+            ArcMenuLayout::Checkbox("Distance##bot", &var::bot_show_distance);
+            ArcMenuHoverTooltip("Show distance in meters below each robot.");
+            ArcMenuLayout::Checkbox("Heart", &var::bot_heart);
+            ArcMenuHoverTooltip("Pulsating heart at box center; robot aim targets the same point.");
+            if (ArcMenuLayout::CheckboxWithColorRow(
+                    "Dead bot bodies",
+                    &var::show_dead_bots,
+                    var::color_dead_bots,
+                    "##col_dead_bots"))
+                RequestArcSlowCache();
+            ArcMenuHoverTooltip("Show destroyed/broken robot wrecks; color applies to dead bot ESP and radar.");
+            ImGui::EndDisabled();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("VisCheck"))
+        {
+            DrawArcVisCheckContent();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Loot"))
+        {
+            DrawArcLootContent();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
 }
 
-void DrawArcLootTab()
+void DrawArcVisCheckContent()
+{
+    ArcMenuLayout::Checkbox("Enable VisCheck", &var::vis_enabled);
+    ArcMenuHoverTooltip("Collision raycast LOS rebuild. Gates off by default — enable colors/aim separately after proving debug rays.");
+    ArcMenuLayout::SliderFloat("Vis max range (m)", "##vis_max", &var::vis_max_range_m, 25.f, var::kMaxDistanceSliderM, "%.0f");
+    ArcMenuLayout::Checkbox("Use player ESP distance", &var::vis_use_player_esp_dist);
+    ArcMenuLayout::Checkbox("Use bot ESP distance", &var::vis_use_bot_esp_dist);
+    ImGui::Separator();
+    ArcMenuLayout::Checkbox("Use for ESP colors", &var::vis_use_esp_colors);
+    ArcMenuHoverTooltip("When on, sets player/bot isVisible from raycasts (fail-open + hysteresis). Keep off until mid-raid proof.");
+    ArcMenuLayout::Checkbox("Use for aim", &var::vis_use_aim);
+    ArcMenuLayout::Checkbox("Multi-bone peek", &var::vis_multi_bone);
+    ImGui::SliderInt("Hysteresis frames", &var::vis_hysteresis_frames, 1, 8);
+    ImGui::Separator();
+    ArcMenuLayout::Checkbox("Debug Vis", &var::vis_debug);
+    ArcMenuLayout::Checkbox("Debug rays", &var::vis_debug_rays);
+    ArcMenuLayout::Checkbox("Debug tris", &var::vis_debug_tris);
+    ArcMenuHoverTooltip("Wireframe of collision triangles used for LOS (wall=white, door=orange, tree=green, other=gray). Cap 50m.");
+    ImGui::Separator();
+    const CollisionVis::Stats st = CollisionVis::GetStats();
+    const char* probe = st.probe == CollisionVis::ProbeStatus::Green ? "GREEN"
+        : (st.probe == CollisionVis::ProbeStatus::Yellow ? "YELLOW" : "RED");
+    ImGui::Text("Probe: %s", probe);
+    ImGui::Text("smc=%d tris=%d rebuilding=%d rebuildMs=%d", st.smc, st.tris, st.rebuilding, st.rebuildMs);
+    ImGui::Text("wall=%d door=%d tree=%d other=%d", st.wallSmc, st.doorSmc, st.treeSmc, st.otherSmc);
+    ImGui::Text("queries=%d hits=%d clears=%d failOpen=%d", st.queries, st.hits, st.clears, st.failOpen);
+    ImGui::TextWrapped("Fail-open: empty tree / probe RED / disabled → treat as visible. Rebuild hard-capped at 50m. Keep ESP colors/aim off until tris look right.");
+}
+
+void DrawArcLootContent()
 {
     if (ArcMenuLayout::Checkbox("Enable world ESP", &var::enable_world))
         RequestArcSlowCache();
@@ -529,10 +573,42 @@ void DrawArcRadarTab()
     ImGui::EndDisabled();
 }
 
+void DrawArcTriggerbotContent()
+{
+    ArcMenuLayout::Checkbox("Enable Triggerbot", &var::enable_triggerbot);
+    ArcMenuHoverTooltip("Auto-fire when target is within deadzone. Requires KmBox connected.");
+
+    ImGui::Separator();
+    static const char* kHoldModeLabels[] = { "Hold key", "Toggle", "Always on" };
+    int holdMode = var::trigger_hold_mode;
+    if (ArcMenuLayout::Combo("Activation", "##trigger_hold_mode", &holdMode, kHoldModeLabels, IM_ARRAYSIZE(kHoldModeLabels)))
+        var::trigger_hold_mode = holdMode;
+    ArcMenuHoverTooltip("Hold key = fire while key is held. Toggle = press once to enable, press again to disable. Always on = fires whenever target is in deadzone.");
+
+    ImGui::BeginDisabled(var::trigger_hold_mode == 2);
+    ImGui::Keybind("Trigger hotkey", &var::trigger_hold_key);
+    ArcMenuHoverTooltip("Key binding for triggerbot activation. Ignored in Always on mode.");
+    ImGui::EndDisabled();
+
+    ImGui::Separator();
+    ArcMenuLayout::SliderFloat("Deadzone (px)", "##trigger_deadzone", &var::trigger_deadzone_px, 1.f, 50.f, "%.0f");
+    ArcMenuHoverTooltip("Max pixel distance from crosshair to fire. Lower = more precise.");
+    ImGui::SliderInt("Fire delay (ms)", &var::trigger_fire_delay_ms, 0, 500, "%d ms");
+    ArcMenuHoverTooltip("Min time between shots. 0 = no limit. 30-50 for semi-auto, 0 for full-auto.");
+    ArcMenuLayout::Checkbox("Auto hold (full-auto)", &var::trigger_auto_hold);
+    ArcMenuHoverTooltip("Hold fire button while target is in deadzone instead of clicking repeatedly.");
+    ArcMenuLayout::Checkbox("Line-of-sight check", &var::trigger_vis_check);
+    ArcMenuHoverTooltip("Only fire when raycast LOS is clear (requires VisCheck enabled).");
+}
+
 void DrawArcAimbotTab()
 {
-    ArcMenuLayout::Checkbox("Show crosshair", &var::show_crosshair);
-    ArcMenuHoverTooltip("Paint-only screen-center crosshair overlay (independent of aimbot).");
+    if (ImGui::BeginTabBar("##aimbot_tabs", ImGuiTabBarFlags_None))
+    {
+        if (ImGui::BeginTabItem("Aimbot"))
+        {
+            ArcMenuLayout::Checkbox("Show crosshair", &var::show_crosshair);
+            ArcMenuHoverTooltip("Paint-only screen-center crosshair overlay (independent of aimbot).");
     static const char* kCrosshairStyleLabels[] = {
         "Classic", "Dot", "Tight", "Circle", "T static", "T spin", "Cross spin", "Tri spin"
     };
@@ -675,100 +751,93 @@ void DrawArcAimbotTab()
     ImGui::Separator();
     ImGui::Keybind("Aim hotkey", &var::aim_hold_key);
     ArcMenuHoverTooltip("Hold to run aim assist.");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Triggerbot"))
+        {
+            DrawArcTriggerbotContent();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
 }
 
 void DrawArcSettingsTab()
 {
-    const bool ctrlOk = g_controller.IsReady();
-    if (ctrlOk)
-        ImGui::TextColored(ImVec4(0.f, 1.f, 0.f, 1.f), "Controller: connected");
-    else
-        ImGui::TextColored(ImVec4(1.f, 0.f, 0.f, 1.f), "Controller: not connected");
-    ArcMenuHoverTooltip("xusb22 kernel read. Pad must be plugged into the TARGET (game) PC.");
-    ImGui::Separator();
+    if (ImGui::BeginTabBar("##settings_tabs", ImGuiTabBarFlags_None))
+    {
+        if (ImGui::BeginTabItem("General"))
+        {
+            const bool ctrlOk = g_controller.IsReady();
+            if (ctrlOk)
+                ImGui::TextColored(ImVec4(0.f, 1.f, 0.f, 1.f), "Controller: connected");
+            else
+                ImGui::TextColored(ImVec4(1.f, 0.f, 0.f, 1.f), "Controller: not connected");
+            ArcMenuHoverTooltip("xusb22 kernel read. Pad must be plugged into the TARGET (game) PC.");
+            ImGui::Separator();
 
-    if (ImGui::Button("Connect controller"))
-        ArcMenuResetController();
-    ArcMenuHoverTooltip("Retry xusb22 connect (~10s). Wiggle sticks on target PC.");
-    if (ImGui::Button("Re-init KmBox"))
-        ArcMenuResetKmBox();
-    ArcMenuHoverTooltip("Reconnect hardware mouse device (KmBox/MAKCU).");
-    ImGui::Separator();
+            if (ImGui::Button("Connect controller"))
+                ArcMenuResetController();
+            ArcMenuHoverTooltip("Retry xusb22 connect (~10s). Wiggle sticks on target PC.");
+            if (ImGui::Button("Re-init KmBox"))
+                ArcMenuResetKmBox();
+            ArcMenuHoverTooltip("Reconnect hardware mouse device (KmBox/MAKCU).");
+            ImGui::Separator();
 
-    const int monitorCount = OverlayDisplay_GetMonitorCount();
-    int selected = OverlayDisplay_GetSelectedMonitor();
-    if (selected < 0)
-        selected = 0;
-    if (selected >= monitorCount)
-        selected = monitorCount > 0 ? monitorCount - 1 : 0;
+            const int monitorCount = OverlayDisplay_GetMonitorCount();
+            int selected = OverlayDisplay_GetSelectedMonitor();
+            if (selected < 0)
+                selected = 0;
+            if (selected >= monitorCount)
+                selected = monitorCount > 0 ? monitorCount - 1 : 0;
 
-    const char* selectedLabel = (monitorCount <= 0)
-        ? "No monitors"
-        : OverlayDisplay_GetMonitorLabel(selected).c_str();
-    ImGui::TextWrapped("Overlay monitor");
-    if (ImGui::BeginCombo("##overlay_monitor", selectedLabel)) {
-        for (int i = 0; i < monitorCount; ++i) {
-            const bool isSelected = (i == selected);
-            if (ImGui::Selectable(OverlayDisplay_GetMonitorLabel(i).c_str(), isSelected)) {
-                OverlayDisplay_SetSelectedMonitor(i);
-                g_kmbox.kmboxConfig.monitorIndex = i;
-                OverlayDisplay_ApplySelectedMonitor();
+            const char* selectedLabel = (monitorCount <= 0)
+                ? "No monitors"
+                : OverlayDisplay_GetMonitorLabel(selected).c_str();
+            ImGui::TextWrapped("Overlay monitor");
+            if (ImGui::BeginCombo("##overlay_monitor", selectedLabel)) {
+                for (int i = 0; i < monitorCount; ++i) {
+                    const bool isSelected = (i == selected);
+                    if (ImGui::Selectable(OverlayDisplay_GetMonitorLabel(i).c_str(), isSelected)) {
+                        OverlayDisplay_SetSelectedMonitor(i);
+                        g_kmbox.kmboxConfig.monitorIndex = i;
+                        OverlayDisplay_ApplySelectedMonitor();
+                        AutoConfig_MarkDirty();
+                    }
+                    if (isSelected)
+                        ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ArcMenuHoverTooltip("Choose which monitor displays the overlay.");
+
+            ImGui::TextWrapped("Monitors detected: %d", ArcGetMonitorCount());
+            ArcMenuHoverTooltip("Number of displays currently detected.");
+            ImGui::Separator();
+            if (ArcMenuLayout::SliderFloat(
+                    "Text Size",
+                    "##esp_text_scale",
+                    &var::esp_text_scale,
+                    0.5f,
+                    3.0f,
+                    "%.2fx")) {
+                var::esp_text_scale = (std::max)(0.5f, (std::min)(var::esp_text_scale, 3.0f));
                 AutoConfig_MarkDirty();
             }
-            if (isSelected)
-                ImGui::SetItemDefaultFocus();
+            ArcMenuHoverTooltip("Global multiplier for all in-game ESP text (player/bot names, weapons, distance, container & item labels). Applies on top of distance scaling. Menu text is unchanged.");
+            g_kmbox.renderKmboxSettings();
+            ImGui::EndTabItem();
         }
-        ImGui::EndCombo();
+        if (ImGui::BeginTabItem("Debug"))
+        {
+            DrawArcDebugContent();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
     }
-    ArcMenuHoverTooltip("Choose which monitor displays the overlay.");
-
-    ImGui::TextWrapped("Monitors detected: %d", ArcGetMonitorCount());
-    ArcMenuHoverTooltip("Number of displays currently detected.");
-    ImGui::Separator();
-    if (ArcMenuLayout::SliderFloat(
-            "Text Size",
-            "##esp_text_scale",
-            &var::esp_text_scale,
-            0.5f,
-            3.0f,
-            "%.2fx")) {
-        var::esp_text_scale = (std::max)(0.5f, (std::min)(var::esp_text_scale, 3.0f));
-        AutoConfig_MarkDirty();
-    }
-    ArcMenuHoverTooltip("Global multiplier for all in-game ESP text (player/bot names, weapons, distance, container & item labels). Applies on top of distance scaling. Menu text is unchanged.");
-    g_kmbox.renderKmboxSettings();
 }
 
-void DrawArcVisTab()
-{
-    ArcMenuLayout::Checkbox("Enable VisCheck", &var::vis_enabled);
-    ArcMenuHoverTooltip("Collision raycast LOS rebuild. Gates off by default — enable colors/aim separately after proving debug rays.");
-    ArcMenuLayout::SliderFloat("Vis max range (m)", "##vis_max", &var::vis_max_range_m, 25.f, var::kMaxDistanceSliderM, "%.0f");
-    ArcMenuLayout::Checkbox("Use player ESP distance", &var::vis_use_player_esp_dist);
-    ArcMenuLayout::Checkbox("Use bot ESP distance", &var::vis_use_bot_esp_dist);
-    ImGui::Separator();
-    ArcMenuLayout::Checkbox("Use for ESP colors", &var::vis_use_esp_colors);
-    ArcMenuHoverTooltip("When on, sets player/bot isVisible from raycasts (fail-open + hysteresis). Keep off until mid-raid proof.");
-    ArcMenuLayout::Checkbox("Use for aim", &var::vis_use_aim);
-    ArcMenuLayout::Checkbox("Multi-bone peek", &var::vis_multi_bone);
-    ImGui::SliderInt("Hysteresis frames", &var::vis_hysteresis_frames, 1, 8);
-    ImGui::Separator();
-    ArcMenuLayout::Checkbox("Debug Vis", &var::vis_debug);
-    ArcMenuLayout::Checkbox("Debug rays", &var::vis_debug_rays);
-    ArcMenuLayout::Checkbox("Debug tris", &var::vis_debug_tris);
-    ArcMenuHoverTooltip("Wireframe of collision triangles used for LOS (wall=white, door=orange, tree=green, other=gray). Cap 50m.");
-    ImGui::Separator();
-    const CollisionVis::Stats st = CollisionVis::GetStats();
-    const char* probe = st.probe == CollisionVis::ProbeStatus::Green ? "GREEN"
-        : (st.probe == CollisionVis::ProbeStatus::Yellow ? "YELLOW" : "RED");
-    ImGui::Text("Probe: %s", probe);
-    ImGui::Text("smc=%d tris=%d rebuilding=%d rebuildMs=%d", st.smc, st.tris, st.rebuilding, st.rebuildMs);
-    ImGui::Text("wall=%d door=%d tree=%d other=%d", st.wallSmc, st.doorSmc, st.treeSmc, st.otherSmc);
-    ImGui::Text("queries=%d hits=%d clears=%d failOpen=%d", st.queries, st.hits, st.clears, st.failOpen);
-    ImGui::TextWrapped("Fail-open: empty tree / probe RED / disabled → treat as visible. Rebuild hard-capped at 50m. Keep ESP colors/aim off until tris look right.");
-}
-
-void DrawArcDebugTab()
+void DrawArcDebugContent()
 {
     ImGui::Text("KmBox type: %s", g_kmbox.kmboxConfig.type.c_str());
     if (g_kmbox.kmboxConfig.type == "MAKCU")
@@ -805,26 +874,28 @@ void DrawArcDebugTab()
     ImGui::Text("KmBox ready: %s", g_kmbox.kmboxConfig.initialized ? "yes" : "no");
     ImGui::Separator();
 
-    Engine::CameraCache cam{};
     {
-        std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
-        cam = engine.g_Camera;
-    }
-    const bool fovOk = cam.FOV > 1.0f && cam.FOV <= 179.0f && ArcIsSaneLocation(cam.Location);
-    ImGui::Separator();
-    ImGui::TextWrapped("Camera (engine cache)");
-    if (!fovOk) {
-        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "Status: bad or missing");
-    } else {
-        ImGui::TextColored(ImVec4(0.45f, 1.0f, 0.55f, 1.0f), "Status: OK");
-        ImGui::Text("Location: %.1f, %.1f, %.1f", cam.Location.x, cam.Location.y, cam.Location.z);
-        ImGui::Text("Rotation: %.2f, %.2f, %.2f", cam.Rotation.x, cam.Rotation.y, cam.Rotation.z);
-        ImGui::Text("FOV: %.2f", cam.FOV);
+        Engine::CameraCache cam{};
+        {
+            std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
+            cam = engine.g_Camera;
+        }
+        const bool fovOk = cam.FOV > 1.0f && cam.FOV <= 179.0f && ArcIsSaneLocation(cam.Location);
+        ImGui::Separator();
+        ImGui::TextWrapped("Camera (engine cache)");
+        if (!fovOk) {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "Status: bad or missing");
+        } else {
+            ImGui::TextColored(ImVec4(0.45f, 1.0f, 0.55f, 1.0f), "Status: OK");
+            ImGui::Text("Location: %.1f, %.1f, %.1f", cam.Location.x, cam.Location.y, cam.Location.z);
+            ImGui::Text("Rotation: %.2f, %.2f, %.2f", cam.Rotation.x, cam.Rotation.y, cam.Rotation.z);
+            ImGui::Text("FOV: %.2f", cam.FOV);
+        }
     }
 
     if (const char* attached = Memory::GetAttachedGameExe())
         ImGui::Text("Attached: %s", attached);
-  ImGui::Text("GWorld: 0x%llX", static_cast<unsigned long long>(engine.GWorld));
+    ImGui::Text("GWorld: 0x%llX", static_cast<unsigned long long>(engine.GWorld));
 
     ImGui::Separator();
     ImGui::Text("Debug overlay");
@@ -843,7 +914,7 @@ void DrawArcHelpTab()
     WrappedBulletText("Educational use only. Not for sale. Owner use only.");
     ImGui::Spacing();
 
-    ImGui::TextWrapped("Visuals — Player ESP:");
+    ImGui::TextWrapped("ESP tab — Player ESP:");
     WrappedBulletText("Enable ESP + visible/invisible colors, distance slider.");
     WrappedBulletText("Box, health/shield bar, names, weapon (guns tint by tier), snaplines.");
     WrappedBulletText(
@@ -851,7 +922,7 @@ void DrawArcHelpTab()
     WrappedBulletText("Hide allies removes teammate ESP.");
 
     ImGui::Spacing();
-    ImGui::TextWrapped("Visuals — Bot ESP:");
+    ImGui::TextWrapped("ESP tab — Bot ESP:");
     WrappedBulletText("Show robots + bot colors, bot distance, box/names/snaplines/distance.");
     WrappedBulletText("Dead bot wrecks + color when enabled.");
     WrappedBulletText(
@@ -859,11 +930,11 @@ void DrawArcHelpTab()
     WrappedBulletText("Bot HP bars are not available yet (no working reader).");
 
     ImGui::Spacing();
-    ImGui::TextWrapped("Visuals — World:");
+    ImGui::TextWrapped("ESP tab — World:");
     WrappedBulletText("Enable world ESP: corpses, dropped items, raider stock, ARC entities + colors.");
 
     ImGui::Spacing();
-    ImGui::TextWrapped("Loot tab:");
+    ImGui::TextWrapped("ESP tab — Loot sub-tab:");
     WrappedBulletText(
         "Show loot is the master draw gate — category rows are disabled while it is off.");
     WrappedBulletText(
@@ -889,18 +960,13 @@ void DrawArcHelpTab()
     WrappedBulletText("FOV, max distance, smoothness, hardware speed, aim hotkey (hold).");
     WrappedBulletText(
         "Sticky lock, loss-of-sight grace, humanizer, prediction, random bone — each optional.");
+    WrappedBulletText("Triggerbot sub-tab: auto-fire on target, deadzone, fire delay, hold/toggle modes, LOS check.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Settings tab:");
-    WrappedBulletText("DMA controller status; re-init controller / KmBox.");
-    WrappedBulletText("Overlay monitor; MAKCU (COM) or Net (IP/UUID) device settings.");
-
-    ImGui::Spacing();
-    ImGui::TextWrapped("Debug tab:");
-    WrappedBulletText("Show offset validation — on-screen offset panel + [debugPlayer/Robot/Item/Container/Aim/Cam/WorldEsp].");
-    WrappedBulletText(
-        "Near loot HUD — on-screen ground pickups; F7 marks the nearest as picked.");
-    WrappedBulletText("KmBox/config + gamepad status; worker/camera/cache readouts.");
+    WrappedBulletText("General sub-tab: DMA controller status; re-init controller / KmBox; overlay monitor; MAKCU (COM) or Net (IP/UUID) device settings.");
+    WrappedBulletText("Debug sub-tab: offset validation, near loot HUD, KmBox/config/gamepad status, engine cache/Aimbot runtime/Camera readouts.");
+    WrappedBulletText("VisCheck sub-tab (inside ESP tab): collision raycast LOS, use for ESP colors/aim, debug rays/tris, probe stats.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Other:");
@@ -1018,13 +1084,10 @@ void DrawArcSidebar(bool& menuOpen, bool& requestExit)
     } else {
         switch (g_selectedTab) {
         case 0: arc_ui::DrawArcEspTab(); break;
-        case 1: arc_ui::DrawArcLootTab(); break;
-        case 2: arc_ui::DrawArcRadarTab(); break;
-        case 3: arc_ui::DrawArcAimbotTab(); break;
-        case 4: arc_ui::DrawArcVisTab(); break;
-        case 5: arc_ui::DrawArcSettingsTab(); break;
-        case 6: arc_ui::DrawArcDebugTab(); break;
-        case 7: arc_ui::DrawArcHelpTab(); break;
+        case 1: arc_ui::DrawArcRadarTab(); break;
+        case 2: arc_ui::DrawArcAimbotTab(); break;
+        case 3: arc_ui::DrawArcSettingsTab(); break;
+        case 4: arc_ui::DrawArcHelpTab(); break;
         default: break;
         }
     }

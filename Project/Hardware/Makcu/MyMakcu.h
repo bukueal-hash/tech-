@@ -10,4 +10,6 @@ struct MyMakcu {
     static bool Initialize();
     static void Move(int x, int y);
     static void LeftClick();
+    static void MouseDown();
+    static void MouseUp();
 };

@@ -99,6 +99,15 @@ namespace var {
     /** Bullet speed for lead prediction (cm/s). */
     extern float aim_bullet_speed_cm_s;
 
+    /* Triggerbot */
+    extern bool enable_triggerbot;
+    extern int trigger_hold_mode; // 0=Hold, 1=Toggle, 2=Always
+    extern int trigger_hold_key;
+    extern float trigger_deadzone_px;
+    extern int trigger_fire_delay_ms;
+    extern bool trigger_auto_hold;
+    extern bool trigger_vis_check;
+
     /* World */
     extern bool enable_world;
     extern bool droppedItems;

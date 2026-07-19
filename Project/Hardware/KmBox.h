@@ -36,6 +36,12 @@ public:
     /** Blocking move with device ACK (init / UI test). */
     void MoveBlocking(int x, int y);
     void LeftClick();
+    /** Fire click with configurable hold duration in ms. For triggerbot semi-auto mode. */
+    void Click(int holdMs);
+    /** Press left mouse and keep held. For triggerbot auto-hold mode. */
+    void HoldStart();
+    /** Release left mouse. For triggerbot auto-hold mode. */
+    void HoldEnd();
     void moveTest();
     void fireTest();
 

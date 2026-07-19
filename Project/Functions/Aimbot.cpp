@@ -1480,6 +1480,85 @@ void Engine::AimAssistence()
     if (!suppressAimOutput)
         s_aimDbg.lastGain = SendKmAimDelta(dx, dy, pullScale, &s_aimDbg.lastGain);
 
+    // ============================================
+    // TRIGGERBOT
+    // ============================================
+    {
+        static uint64_t s_lastFireMs = 0;
+        static bool s_isHolding = false;
+
+        const bool trigEnabled = var::enable_triggerbot;
+        const bool aimLocked = (lockedTarget != 0);
+
+        // Hotkey check
+        bool trigKeyActive = false;
+        if (var::trigger_hold_mode == 2) {
+            trigKeyActive = true; // Always on
+        } else {
+            const int bindTrig = var::trigger_hold_key ? var::trigger_hold_key : VK_SHIFT;
+            if (var::trigger_hold_mode == 1) {
+                // Toggle
+                static bool trigToggled = false;
+                static bool trigPrevHeld = false;
+                const bool trigNowHeld = KeyBindIsHeld(bindTrig);
+                if (trigNowHeld && !trigPrevHeld)
+                    trigToggled = !trigToggled;
+                trigPrevHeld = trigNowHeld;
+                trigKeyActive = trigToggled;
+            } else {
+                // Hold
+                trigKeyActive = KeyBindIsHeld(bindTrig);
+            }
+        }
+
+        if (trigEnabled && aimLocked && trigKeyActive && !suppressAimOutput) {
+            const float trigDistPx = hypotf(
+                static_cast<float>(bestTarget->aimPos.x - screenCenter.x),
+                static_cast<float>(bestTarget->aimPos.y - screenCenter.y));
+
+            if (trigDistPx <= var::trigger_deadzone_px) {
+                // Optional LOS check
+                bool losClear = true;
+                if (var::trigger_vis_check && var::vis_enabled) {
+                    Vector3 camPos{};
+                    {
+                        std::shared_lock<std::shared_mutex> lock(m_cameraMutex);
+                        camPos = g_Camera.Location;
+                    }
+                    losClear = CollisionVis::AimLosAllows(camPos, bestTarget->worldPos);
+                }
+
+                if (losClear) {
+                    const uint64_t nowMsTrig = NowMs();
+                    if (var::trigger_auto_hold) {
+                        if (!s_isHolding) {
+                            g_kmbox.HoldStart();
+                            s_isHolding = true;
+                        }
+                    } else {
+                        if (nowMsTrig - s_lastFireMs >= static_cast<uint64_t>(var::trigger_fire_delay_ms)) {
+                            const int holdMs = (var::trigger_fire_delay_ms > 0 && var::trigger_fire_delay_ms < 50)
+                                ? var::trigger_fire_delay_ms
+                                : 22;
+                            g_kmbox.Click(holdMs);
+                            s_lastFireMs = nowMsTrig;
+                        }
+                    }
+                }
+            } else {
+                if (s_isHolding) {
+                    g_kmbox.HoldEnd();
+                    s_isHolding = false;
+                }
+            }
+        } else {
+            if (s_isHolding) {
+                g_kmbox.HoldEnd();
+                s_isHolding = false;
+            }
+        }
+    }
+
     if (var::show_debug_overlay) {
         static IntervalTimer aimDebugTimer(500);
         if (aimDebugTimer.fire()) {

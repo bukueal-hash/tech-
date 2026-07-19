@@ -75,8 +75,19 @@ void MyMakcu::Move(int x, int y) {
 void MyMakcu::LeftClick() {
     if (!g_device.isConnected())
         return;
-    // Manual KmBox settings test only; aimbot has no auto-fire path.
     g_device.mouseDown(makcu::MouseButton::LEFT);
     std::this_thread::sleep_for(std::chrono::milliseconds(22));
+    g_device.mouseUp(makcu::MouseButton::LEFT);
+}
+
+void MyMakcu::MouseDown() {
+    if (!g_device.isConnected())
+        return;
+    g_device.mouseDown(makcu::MouseButton::LEFT);
+}
+
+void MyMakcu::MouseUp() {
+    if (!g_device.isConnected())
+        return;
     g_device.mouseUp(makcu::MouseButton::LEFT);
 }
