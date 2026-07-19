@@ -431,11 +431,11 @@ void DrawArcLootTab()
             5000.f,
             "%.0f c",
             &var::loot_min_val_sp,
-            "Hides pickups below min value. SP checked = far for pickups at/above min value."))
+            "Never hides. SP checked = far distance for pickups at/above min value."))
         RequestArcSlowCache();
     ArcMenuHoverTooltip(
-        "Hard-hides pickups below min value. At/above threshold: SP distance when checked, "
-        "loot/category distance when unchecked. 0 = off.");
+        "Does not hide loot. At/above threshold: SP distance when checked, "
+        "loot/category distance when unchecked. Below threshold: loot/category distance. 0 = off.");
     if (LootFilterComboWithSp(
             "Min rarity",
             "##loot_min_rarity",
@@ -443,11 +443,11 @@ void DrawArcLootTab()
             kMinRarityLabels,
             IM_ARRAYSIZE(kMinRarityLabels),
             &var::loot_min_rar_sp,
-            "Hides pickups below min rarity. SP checked = far for pickups at/above min rarity."))
+            "Never hides. SP checked = far distance for pickups at/above min rarity."))
         RequestArcSlowCache();
     ArcMenuHoverTooltip(
-        "Hard-hides pickups below min rarity. At/above threshold: SP distance when checked, "
-        "loot/category distance when unchecked. Any = off.");
+        "Does not hide loot. At/above threshold: SP distance when checked, "
+        "loot/category distance when unchecked. Below threshold: loot/category distance. Any = off.");
     ArcMenuLayout::SliderFloat(
         "Loot distance", "##loot_distance", &var::loot_distance, 20.f, var::kMaxDistanceSliderM, "%.0f m");
     ArcMenuHoverTooltip("Default loot draw distance. Used whenever SP is unchecked on that row.");
@@ -755,15 +755,17 @@ void DrawArcVisTab()
     ImGui::Separator();
     ArcMenuLayout::Checkbox("Debug Vis", &var::vis_debug);
     ArcMenuLayout::Checkbox("Debug rays", &var::vis_debug_rays);
-    ArcMenuLayout::Checkbox("Debug tris (reserved)", &var::vis_debug_tris);
+    ArcMenuLayout::Checkbox("Debug tris", &var::vis_debug_tris);
+    ArcMenuHoverTooltip("Wireframe of collision triangles used for LOS (wall=white, door=orange, tree=green, other=gray). Cap 50m.");
     ImGui::Separator();
     const CollisionVis::Stats st = CollisionVis::GetStats();
     const char* probe = st.probe == CollisionVis::ProbeStatus::Green ? "GREEN"
         : (st.probe == CollisionVis::ProbeStatus::Yellow ? "YELLOW" : "RED");
     ImGui::Text("Probe: %s", probe);
     ImGui::Text("smc=%d tris=%d rebuilding=%d rebuildMs=%d", st.smc, st.tris, st.rebuilding, st.rebuildMs);
+    ImGui::Text("wall=%d door=%d tree=%d other=%d", st.wallSmc, st.doorSmc, st.treeSmc, st.otherSmc);
     ImGui::Text("queries=%d hits=%d clears=%d failOpen=%d", st.queries, st.hits, st.clears, st.failOpen);
-    ImGui::TextWrapped("Fail-open: empty tree / probe RED / disabled → treat as visible. Rays only within ESP distances.");
+    ImGui::TextWrapped("Fail-open: empty tree / probe RED / disabled → treat as visible. Rebuild hard-capped at 50m. Keep ESP colors/aim off until tris look right.");
 }
 
 void DrawArcDebugTab()

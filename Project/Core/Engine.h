@@ -92,6 +92,7 @@ private:
     std::unique_ptr<SyncedThread> m_robotEspThread;
     std::unique_ptr<SyncedThread> m_aimThread;
     std::unique_ptr<SyncedThread> m_positionThread;
+    std::unique_ptr<SyncedThread> m_cameraThread;
     std::unique_ptr<SyncedThread> m_frameBuilderThread;
     std::unique_ptr<SyncedThread> m_visThread;
 
@@ -119,7 +120,8 @@ private:
      *  Was 5s+5s — log proof (raid-gate TheDam_02_P): raw/ok_enter already true
      *  at party_wait, so ESP sat idle ~10s after the map was ready. */
     static constexpr std::chrono::milliseconds kPartyEnterDelayMs{ 500 };
-    static constexpr std::chrono::milliseconds kRaidEnterDelayMs{ 500 };
+    /** User spec: map found -> wait 10s before ESP scanning starts. */
+    static constexpr std::chrono::milliseconds kRaidEnterDelayMs{ 10000 };
     static constexpr std::chrono::milliseconds kRaidRawFalseGraceMs{ 5000 };
     /** Soft draw-ready if not all three caches fill (solo / empty pocket). */
     static constexpr std::chrono::milliseconds kEspCacheReadySoftMs{ 12000 };

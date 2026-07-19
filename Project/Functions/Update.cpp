@@ -115,7 +115,9 @@ uintptr_t PickValidWorld(uintptr_t slot)
 	if (ResolvePersistentLevelHelp(slot))
 		return slot;
 	// Some builds store GWorld** (slot → UWorld*). Accept only if PL validates.
-	const uintptr_t inner = Memory::read<uintptr_t>(slot);
+	// NOCACHE: cached deref froze the world (log gwSrc:2 — MainMenu served
+	// mid-raid, TheDam served on home screen). Must track live memory.
+	const uintptr_t inner = Memory::read_nocache<uintptr_t>(slot);
 	if (Engine::IsPlausibleObjPtr(inner) && ResolvePersistentLevelHelp(inner))
 		return inner;
 	return 0;
@@ -239,6 +241,28 @@ static bool PawnHasRaidCombatComponents(uintptr_t pawn)
 	return invComp && Memory::IsValidPtrFast2(invComp);
 }
 
+static std::string PeekObjFName(uintptr_t obj)
+{
+	if (!obj || !Memory::IsValidPtrFast2(obj))
+		return {};
+	return steam_decrypt::GetActorFNameString(obj);
+}
+
+// Map-name raid signal (user model: "in a map = in a raid").
+// Raid persistent levels follow UE naming: TheDam_02_P, Spaceport_01_P, ...
+// Hub/menu worlds (MainMenu, EndofRound, Disco*, Sprocket) never end in _P.
+static bool WorldNameLooksLikeRaidMap(uintptr_t world, uintptr_t level)
+{
+	if (LooksLikeStrictHubWorld(world, level))
+		return false;
+	std::string n = PeekObjFName(world);
+	if (n.size() < 4)
+		return false;
+	for (char& c : n)
+		c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	return n.compare(n.size() - 2, 2, "_p") == 0;
+}
+
 /** Human-readable reason for IsInRaidRaw==false (diagnostics only — does not change gates). */
 static const char* DiagnoseRaidRawReason(
 	uintptr_t gw, uintptr_t pl, uintptr_t actors, uintptr_t pawn,
@@ -246,9 +270,11 @@ static const char* DiagnoseRaidRawReason(
 {
 	if (!gw || !pl)
 		return "no_world";
+	if (LooksLikeStrictHubWorld(gw, pl))
+		return "hub_world";
+	if (WorldNameLooksLikeRaidMap(gw, pl))
+		return "raid_map";
 	if (espActive) {
-		if (LooksLikeStrictHubWorld(gw, pl))
-			return "strict_hub_world";
 		if (pawn && PawnLooksLikeHubCharacter(pawn))
 			return "hub_pawn";
 		return "ok_stay";
@@ -274,8 +300,6 @@ static const char* DiagnoseRaidRawReason(
 		pos = Engine::ReadSceneWorldPos(r);
 	if (!IsPlausibleWorldPos(pos))
 		return "bad_pos";
-	if (LooksLikeHubWorld(gw, pl))
-		return "hub_world";
 	if (PawnLooksLikeHubCharacter(pawn))
 		return "hub_pawn";
 	if (!PawnHasRaidCombatComponents(pawn))
@@ -297,13 +321,6 @@ static std::string RaidJsonEscape(std::string s)
 	return o;
 }
 
-static std::string PeekObjFName(uintptr_t obj)
-{
-	if (!obj || !Memory::IsValidPtrFast2(obj))
-		return {};
-	return steam_decrypt::GetActorFNameString(obj);
-}
-
 static const char* MatchHubToken(uintptr_t world, uintptr_t level)
 {
 	for (int i = 0; i < kStrictHubTokenCount; ++i) {
@@ -313,6 +330,30 @@ static const char* MatchHubToken(uintptr_t world, uintptr_t level)
 	}
 	return "";
 }
+
+// One-shot backup rescan 5s after ESP arms (user spec).
+static bool s_backupScanPending = false;
+
+// #region agent log
+// GWorld source tag: 0=none, 1=slot direct, 2=slot inner deref, 3=game-state fallback.
+static std::atomic<int> g_gworldSrc{ 0 };
+static void AgentRaidLog(
+	const char* hypothesisId,
+	const char* location,
+	const char* message,
+	const std::string& dataJson)
+{
+	std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+	if (!f)
+		return;
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::system_clock::now().time_since_epoch()).count();
+	f << "{\"sessionId\":\"c190fb\",\"runId\":\"pre-fix\",\"hypothesisId\":\""
+		<< hypothesisId << "\",\"location\":\"" << location
+		<< "\",\"message\":\"" << message << "\",\"data\":" << dataJson
+		<< ",\"timestamp\":" << ms << "}\n";
+}
+// #endregion
 
 } // namespace
 
@@ -328,8 +369,16 @@ uintptr_t Engine::ResolveBestGWorld(uint64_t base)
 	m_gWorldRaw.store(slot, std::memory_order_relaxed);
 
 	uintptr_t world = PickValidWorld(slot);
-	if (!world)
+	// #region agent log
+	g_gworldSrc.store(world ? (world == slot ? 1 : 2) : 0, std::memory_order_relaxed);
+	// #endregion
+	if (!world) {
 		world = TryWorldFromGameStateGlobal(base);
+		// #region agent log
+		if (world)
+			g_gworldSrc.store(3, std::memory_order_relaxed);
+		// #endregion
+	}
 
 	if (world && ResolvePersistentLevelHelp(world)) {
 		m_gWorldFailStep.store(0, std::memory_order_relaxed);
@@ -705,19 +754,24 @@ bool Engine::IsInRaidRaw() const
 	if (!sGWorld || !sPersistentLevel)
 		return false;
 
+	// Primary signal (user model): the loaded map IS the raid state.
+	// Raid map loaded (TheDam_02_P etc.) => in raid. Hub world => out.
+	if (LooksLikeStrictHubWorld(sGWorld, sPersistentLevel))
+		return false;
+	if (WorldNameLooksLikeRaidMap(sGWorld, sPersistentLevel))
+		return true;
+
 	// Stay path: once ESP raid is active, only lose raid on world loss or hub.
 	// Do not require PC/pawn/root/combat — mid-raid DMA flakes were firing [raid] left.
 	// Do NOT use "pawn gone + party<=1": solo raids always have partyCount==1, so a
 	// brief null pawn read falsely dropped EspRaid and forced a slow re-arm.
 	if (m_espRaidActive.load(std::memory_order_acquire)) {
-		if (LooksLikeStrictHubWorld(sGWorld, sPersistentLevel))
-			return false;
 		if (sAcknowledgedPawn && PawnLooksLikeHubCharacter(sAcknowledgedPawn))
 			return false;
 		return true;
 	}
 
-	// Enter / cold path — stricter.
+	// Fallback enter path — map name unreadable; use pawn/controller heuristics.
 	if (!sActors || !sAcknowledgedPawn || !sPlayerController)
 		return false;
 
@@ -739,8 +793,6 @@ bool Engine::IsInRaidRaw() const
 	if (!IsPlausibleWorldPos(pos))
 		return false;
 
-	if (LooksLikeHubWorld(sGWorld, sPersistentLevel))
-		return false;
 	if (PawnLooksLikeHubCharacter(sAcknowledgedPawn))
 		return false;
 	if (!PawnHasRaidCombatComponents(sAcknowledgedPawn))
@@ -813,6 +865,7 @@ void Engine::HandleWorldLost()
 		AGameStateBase = 0;
 	}
 
+	const bool wasActive = m_espRaidActive.load(std::memory_order_acquire);
 	m_lastWorldPtr = 0;
 	m_lastPersistentLevel = 0;
 	m_espRaidActive.store(false, std::memory_order_release);
@@ -823,6 +876,13 @@ void Engine::HandleWorldLost()
 	ResetRaidTransitionState();
 	ClearEspCaches();
 	std::cout << "[raid] world_lost" << std::endl;
+	// #region agent log
+	{
+		std::ostringstream d;
+		d << "{\"wasActive\":" << (wasActive ? 1 : 0) << "}";
+		AgentRaidLog("H2", "Update.cpp:HandleWorldLost", "world_lost", d.str());
+	}
+	// #endregion
 }
 
 void Engine::CheckWorldTransition(uintptr_t newWorld, uintptr_t newPersistentLevel)
@@ -833,6 +893,12 @@ void Engine::CheckWorldTransition(uintptr_t newWorld, uintptr_t newPersistentLev
 	// Drop VMM page/TLB/VAD caches so freshly-allocated raid memory is visible
 	// immediately (otherwise READCACHE/PROCCACHE TTLs can stall until restart).
 	PCIMemory::FullRefresh();
+
+	const bool wasActive = m_espRaidActive.load(std::memory_order_acquire);
+	const std::string oldName = PeekObjFName(m_lastWorldPtr);
+	const std::string newName = PeekObjFName(newWorld);
+	const std::string newLevel = PeekObjFName(newPersistentLevel);
+	const char* hubTok = MatchHubToken(newWorld, newPersistentLevel);
 
 	ResetRaidTransitionState();
 	ClearEspCaches();
@@ -845,6 +911,20 @@ void Engine::CheckWorldTransition(uintptr_t newWorld, uintptr_t newPersistentLev
 	m_raidEnterPending = false;
 	m_partyEnterPending = false;
 	m_raidFalseSince = {};
+
+	// #region agent log
+	{
+		std::ostringstream d;
+		d << "{\"wasActive\":" << (wasActive ? 1 : 0)
+			<< ",\"oldName\":\"" << RaidJsonEscape(oldName) << "\""
+			<< ",\"newName\":\"" << RaidJsonEscape(newName) << "\""
+			<< ",\"newLevel\":\"" << RaidJsonEscape(newLevel) << "\""
+			<< ",\"hubTok\":\"" << hubTok << "\""
+			<< ",\"newWorld\":" << newWorld
+			<< "}";
+		AgentRaidLog("H2", "Update.cpp:CheckWorldTransition", "world_change", d.str());
+	}
+	// #endregion
 }
 
 void Engine::ClearEspCaches()
@@ -955,8 +1035,53 @@ void Engine::TickRaidGate()
 		root = RootComponent;
 	}
 	const int partyCount = CountGameStatePlayerArray();
+	const int actorCount = (pl && Memory::IsValidPtrFast2(pl))
+		? Memory::read<int>(pl + Offsets::ActorsCount) : -1;
 	const char* rawReason = DiagnoseRaidRawReason(
 		gw, pl, actors, pawn, pc, root, active);
+	const bool combat = pawn && PawnHasRaidCombatComponents(pawn);
+
+	// #region agent log
+	{
+		static std::chrono::steady_clock::time_point s_lastHb{};
+		static bool s_prevRaw = false;
+		static bool s_prevActive = false;
+		static std::string s_prevReason;
+		const bool reasonChanged = s_prevReason != rawReason;
+		const bool edge = (raw != s_prevRaw) || (active != s_prevActive) || reasonChanged;
+		if (edge || s_lastHb.time_since_epoch().count() == 0
+			|| now - s_lastHb >= std::chrono::seconds(1)) {
+			s_lastHb = now;
+			s_prevRaw = raw;
+			s_prevActive = active;
+			s_prevReason = rawReason;
+			std::ostringstream d;
+			d << "{\"raw\":" << (raw ? 1 : 0)
+				<< ",\"active\":" << (active ? 1 : 0)
+				<< ",\"reason\":\"" << rawReason << "\""
+				<< ",\"party\":" << partyCount
+				<< ",\"actors\":" << actorCount
+				<< ",\"hasPawn\":" << (pawn ? 1 : 0)
+				<< ",\"hasPc\":" << (pc ? 1 : 0)
+				<< ",\"hasActors\":" << (actors ? 1 : 0)
+				<< ",\"combat\":" << (combat ? 1 : 0)
+				<< ",\"partyPend\":" << (m_partyEnterPending ? 1 : 0)
+				<< ",\"raidPend\":" << (m_raidEnterPending ? 1 : 0)
+				<< ",\"hubTok\":\"" << MatchHubToken(gw, pl) << "\""
+				<< ",\"wName\":\"" << RaidJsonEscape(PeekObjFName(gw)) << "\"";
+			// G1/G2/G3: which resolver produced GWorld + live slot value/name.
+			const uintptr_t slotRaw = m_gWorldRaw.load(std::memory_order_relaxed);
+			d << ",\"gw\":" << gw
+				<< ",\"gwRaw\":" << slotRaw
+				<< ",\"gwSrc\":" << g_gworldSrc.load(std::memory_order_relaxed);
+			if (slotRaw && slotRaw != gw)
+				d << ",\"slotName\":\"" << RaidJsonEscape(PeekObjFName(slotRaw)) << "\"";
+			d << "}";
+			AgentRaidLog(edge ? "R" : "R", "Update.cpp:TickRaidGate",
+				edge ? "raid_edge" : "raid_hb", d.str());
+		}
+	}
+	// #endregion
 
 	if (!raw) {
 		m_raidEnterPending = false;
@@ -994,12 +1119,31 @@ void Engine::TickRaidGate()
 		ResetRaidTransitionState();
 		ClearEspCaches();
 		std::cout << "[raid] left" << std::endl;
+		// #region agent log
+		AgentRaidLog("R", "Update.cpp:TickRaidGate", "raid_left",
+			std::string("{\"reason\":\"") + rawReason + "\"}");
+		// #endregion
 		return;
 	}
 
 	m_raidFalseSince = {};
-	if (active)
+	if (active) {
+		// User spec: one backup rescan 5s after ESP arms, in case the first
+		// scan ran against a half-loaded map. Flush VMM cache + clear caches
+		// once; scanners repopulate immediately.
+		if (s_backupScanPending
+			&& m_raidArmedSince.time_since_epoch().count() != 0
+			&& now - m_raidArmedSince >= std::chrono::seconds(5)) {
+			s_backupScanPending = false;
+			PCIMemory::FullRefresh();
+			ClearEspCaches();
+			std::cout << "[raid] backup_rescan" << std::endl;
+			// #region agent log
+			AgentRaidLog("H3", "Update.cpp:TickRaidGate", "backup_rescan", "{}");
+			// #endregion
+		}
 		return;
+	}
 
 	if (partyCount >= kPartyMinPlayers) {
 		if (!m_partyEnterPending) {
@@ -1007,6 +1151,13 @@ void Engine::TickRaidGate()
 			m_partyDebSince = now;
 			m_raidEnterPending = false;
 			std::cout << "[raid] party_wait players=" << partyCount << std::endl;
+			// #region agent log
+			{
+				std::ostringstream d;
+				d << "{\"party\":" << partyCount << "}";
+				AgentRaidLog("R", "Update.cpp:TickRaidGate", "party_wait", d.str());
+			}
+			// #endregion
 			return;
 		}
 		if (now - m_partyDebSince < kPartyEnterDelayMs)
@@ -1019,6 +1170,13 @@ void Engine::TickRaidGate()
 		m_raidEnterPending = true;
 		m_raidDebSince = now;
 		std::cout << "[raid] enter_wait players=" << partyCount << std::endl;
+		// #region agent log
+		{
+			std::ostringstream d;
+			d << "{\"party\":" << partyCount << ",\"reason\":\"" << rawReason << "\"}";
+			AgentRaidLog("R", "Update.cpp:TickRaidGate", "enter_wait", d.str());
+		}
+		// #endregion
 		return;
 	}
 
@@ -1032,7 +1190,20 @@ void Engine::TickRaidGate()
 	ClearEspCaches();
 	m_espDrawReady.store(false, std::memory_order_release);
 	m_raidArmedSince = now;
+	s_backupScanPending = true;
 	m_espRaidActive.store(true, std::memory_order_release);
 	m_worldGeneration.fetch_add(1, std::memory_order_release);
 	std::cout << "[raid] entered players=" << partyCount << std::endl;
+	// #region agent log
+	{
+		std::ostringstream d;
+		d << "{\"party\":" << partyCount
+			<< ",\"reason\":\"" << rawReason << "\""
+			<< ",\"wName\":\"" << RaidJsonEscape(PeekObjFName(gw)) << "\""
+			<< ",\"hubTok\":\"" << MatchHubToken(gw, pl) << "\""
+			<< ",\"combat\":" << (combat ? 1 : 0)
+			<< "}";
+		AgentRaidLog("H3", "Update.cpp:TickRaidGate", "raid_entered", d.str());
+	}
+	// #endregion
 }

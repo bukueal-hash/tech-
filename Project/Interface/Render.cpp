@@ -5,6 +5,9 @@
 #include <cfloat>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iostream>
+#include <shared_mutex>
 #include <vector>
 #include "../ThirdParty/ImGui/imgui.h"
 #include "../ThirdParty/ImGui/imgui_impl_win32.h"
@@ -17,6 +20,7 @@
 #include "Utils/AutoConfig.h"
 #include "Utils/Visuals/visuals.hpp"
 #include "../Functions/CollisionVis.h"
+#include "../Functions/WorldScanCommon.h"
 #include "../Core/Offsets.h"
 
 bool showmenu = false;
@@ -49,26 +53,27 @@ void Render(HWND hwnd)
         ApplyOverlayMode(hwnd, false);
     }
 
-    // ESP/FOV/crosshair stay live under the open menu (raid gate only).
-    if (engine.IsEspRaidActive()) {
+    const bool raidActive = engine.IsEspRaidActive();
+    // ESP/FOV/crosshair hide while the menu is open (menu readability).
+    if (raidActive && !showmenu) {
         engine.RenderFovCircle();
         engine.RenderOverlayCrosshair();
         engine.RenderEsp();
     }
 
-    if (engine.IsEspRaidActive()) {
+    if (raidActive) {
         const ImVec2 ds = ImGui::GetIO().DisplaySize;
         if (ds.x > 0.f && ds.y > 0.f)
             engine.SetProjectionViewport(ds.x, ds.y);
     }
 
-    if (engine.IsEspRaidActive() && var::show_radar)
+    if (raidActive && !showmenu && var::show_radar)
         engine.RenderRadar(showmenu);
 
-    if (engine.IsEspRaidActive() && !showmenu && var::show_near_loot_hud)
+    if (raidActive && !showmenu && var::show_near_loot_hud)
         DrawNearLootHud(engine);
 
-    if (engine.IsEspRaidActive() && !showmenu && var::vis_debug && var::vis_debug_rays) {
+    if (raidActive && !showmenu && var::vis_enabled && var::vis_debug && var::vis_debug_rays) {
         std::vector<CollisionVis::DebugRay> rays;
         CollisionVis::CopyDebugRays(rays);
         ImDrawList* dl = ImGui::GetForegroundDrawList();
@@ -85,8 +90,90 @@ void Render(HWND hwnd)
         }
     }
 
+    if (raidActive && !showmenu && var::vis_enabled && var::vis_debug && var::vis_debug_tris) {
+        std::vector<CollisionVis::DebugTri> tris;
+        CollisionVis::CopyDebugTris(tris);
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        if (dl) {
+            Engine::CameraCache cam{};
+            {
+                std::shared_lock<std::shared_mutex> camLock(engine.m_cameraMutex);
+                cam = engine.g_Camera;
+            }
+            const float maxDistCm = CollisionVis::RebuildRadiusM() * 100.f;
+            const float maxDist2 = maxDistCm * maxDistCm;
+            int drawn = 0;
+            auto classColor = [](CollisionVis::BlockerClass c) -> ImU32 {
+                switch (c) {
+                case CollisionVis::BlockerClass::Wall: return IM_COL32(240, 240, 240, 160);
+                case CollisionVis::BlockerClass::Door: return IM_COL32(255, 160, 40, 180);
+                case CollisionVis::BlockerClass::Tree: return IM_COL32(60, 200, 80, 150);
+                default: return IM_COL32(140, 140, 140, 120);
+                }
+            };
+            auto edge = [&](const Vector3& a, const Vector3& b, ImU32 col) {
+                Vector3 sa{}, sb{};
+                if (!engine.ProjectWorldLocationToScreen(a, sa))
+                    return;
+                if (!engine.ProjectWorldLocationToScreen(b, sb))
+                    return;
+                dl->AddLine(ImVec2((float)sa.x, (float)sa.y), ImVec2((float)sb.x, (float)sb.y), col, 1.0f);
+            };
+            for (const auto& t : tris) {
+                const double mx = (t.p0.x + t.p1.x + t.p2.x) / 3.0;
+                const double my = (t.p0.y + t.p1.y + t.p2.y) / 3.0;
+                const double mz = (t.p0.z + t.p1.z + t.p2.z) / 3.0;
+                const double dx = mx - cam.Location.x;
+                const double dy = my - cam.Location.y;
+                const double dz = mz - cam.Location.z;
+                if (dx * dx + dy * dy + dz * dz > maxDist2)
+                    continue;
+                const ImU32 col = classColor(t.cls);
+                edge(t.p0, t.p1, col);
+                edge(t.p1, t.p2, col);
+                edge(t.p2, t.p0, col);
+                ++drawn;
+            }
+            // #region agent log
+            {
+                static auto s_lastDraw = std::chrono::steady_clock::time_point{};
+                const auto now = std::chrono::steady_clock::now();
+                if (s_lastDraw.time_since_epoch().count() == 0
+                    || now - s_lastDraw >= std::chrono::seconds(2)) {
+                    s_lastDraw = now;
+                    std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+                    if (f) {
+                        const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"vis\",\"hypothesisId\":\"VD\","
+                          << "\"location\":\"Render.cpp:Render\",\"message\":\"vis_draw_tris\","
+                          << "\"data\":{\"copied\":" << (int)tris.size()
+                          << ",\"drawn\":" << drawn
+                          << "},\"timestamp\":" << ts << "}\n";
+                    }
+                }
+            }
+            // #endregion
+        }
+    }
+
     if (var::show_debug_overlay && !showmenu)
         DrawDebugOffsetValidation(engine);
+
+    // #region agent log
+    // Autonomous flicker-fix loop: always show Fix #N in the corner so the
+    // player knows which iteration is live without opening the menu.
+    {
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        if (dl) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "Fix #%d", WorldScan::GetFlickerFixIteration());
+            const ImVec2 pos(12.f, 12.f);
+            dl->AddText(ImVec2(pos.x + 1.f, pos.y + 1.f), IM_COL32(0, 0, 0, 180), buf);
+            dl->AddText(pos, IM_COL32(255, 220, 80, 230), buf);
+        }
+    }
+    // #endregion
 
     if (requestExit) {
         AutoConfig_SaveNow();

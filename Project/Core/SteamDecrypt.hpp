@@ -7,13 +7,17 @@
 #include "Cache.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <immintrin.h>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <Windows.h>
 
@@ -531,16 +535,47 @@ inline bool IsPlausibleArcPlayerName(const std::string& name)
 		return false;
 
 	int printable = 0;
+	int vowels = 0;
+	int letters = 0;
+	int consonantRun = 0;
+	int maxConsonantRun = 0;
+
 	for (unsigned char c : name) {
 		if (c == 0)
 			break;
-		if ((c >= 'a' && c <= 'z')
-			|| (c >= 'A' && c <= 'Z')
-			|| (c >= '0' && c <= '9')
-			|| c == '_' || c == '-')
+		const bool isAlpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+		const bool isDigit = (c >= '0' && c <= '9');
+		if (isAlpha || isDigit || c == '_' || c == '-')
 			++printable;
+
+		if (isAlpha) {
+			++letters;
+			const unsigned char lc = static_cast<unsigned char>(std::tolower(c));
+			if (lc == 'a' || lc == 'e' || lc == 'i' || lc == 'o' || lc == 'u') {
+				++vowels;
+				consonantRun = 0;
+			} else {
+				++consonantRun;
+				if (consonantRun > maxConsonantRun)
+					maxConsonantRun = consonantRun;
+			}
+		} else if (isDigit || c == '_' || c == '-') {
+			consonantRun = 0;
+		}
 	}
-	return printable >= static_cast<int>(name.size()) / 2;
+
+	if (printable < static_cast<int>(name.size()) / 2)
+		return false;
+
+	// Reject decrypt garbage: long consonant clusters or vowel-starved strings.
+	if (maxConsonantRun >= 5)
+		return false;
+	if (letters >= 4 && vowels == 0)
+		return false;
+	if (letters >= 6 && vowels * 4 < letters)
+		return false;
+
+	return true;
 }
 
 inline std::string WideCharsToPlayerName(const std::vector<uint16_t>& chars, int charLen)
@@ -622,8 +657,9 @@ inline std::string ReadPlayerNameFromPlayerState(uintptr_t playerStateAddr)
 
 	for (std::ptrdiff_t off : kNameOffsets) {
 		if (const std::string name = ReadPlayerNameFromFString(playerStateAddr + off);
-			!name.empty())
+			!name.empty()) {
 			return name;
+		}
 	}
 	return {};
 }
@@ -633,8 +669,9 @@ inline std::string ResolvePlayerDisplayName(uintptr_t pawnAddr, uintptr_t player
 	if (pawnAddr && ValidPtr(pawnAddr)) {
 		if (const std::string direct =
 				ReadPlayerNameFromFString(pawnAddr + Offsets::PlayerNameOnPawn);
-			!direct.empty())
+			!direct.empty()) {
 			return direct;
+		}
 	}
 
 	if (!playerStateAddr || !ValidPtr(playerStateAddr)) {

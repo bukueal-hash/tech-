@@ -7,7 +7,6 @@
 #include <dwmapi.h>
 #include <iostream>
 #include <chrono>
-#include <fstream>
 
 #include "Core/Memory.h"
 #include "DMA/Memory.h"

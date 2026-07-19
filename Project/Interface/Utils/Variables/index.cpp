@@ -140,7 +140,7 @@ namespace var {
 
     /* Vis / collision LOS */
     bool vis_enabled = false;
-    float vis_max_range_m = 200.f;
+    float vis_max_range_m = 50.f;
     bool vis_use_player_esp_dist = true;
     bool vis_use_bot_esp_dist = true;
     bool vis_use_esp_colors = false;

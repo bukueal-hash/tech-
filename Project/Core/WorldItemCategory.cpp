@@ -868,8 +868,26 @@ void InitContainerRangeDefaults()
     if (initialized)
         return;
     initialized = true;
-    // All rows default SP off → loot_distance. User checks SP per row for far range.
     g_containerRangeSp.fill(0);
+    const WorldItemCategory spOn[] = {
+        WorldItemCategory::Crate,
+        WorldItemCategory::Locker,
+        WorldItemCategory::Safe,
+        WorldItemCategory::Furniture,
+        WorldItemCategory::FieldCrate,
+        WorldItemCategory::WeaponCase,
+        WorldItemCategory::Industrial,
+        WorldItemCategory::Probe,
+        WorldItemCategory::SupplyCallStation,
+        WorldItemCategory::Buried,
+        WorldItemCategory::DeadDrop,
+        WorldItemCategory::Keys,
+        WorldItemCategory::Trash,
+        WorldItemCategory::Vehicles,
+        WorldItemCategory::OpenedContainer,
+    };
+    for (WorldItemCategory cat : spOn)
+        g_containerRangeSp[static_cast<size_t>(cat)] = 1;
 }
 
 } // namespace
@@ -1081,19 +1099,10 @@ bool LootItemLooksLikePickup(const WorldLootFilterView& loot)
 
 bool PassesLootPickupFilters(const WorldLootFilterView& loot)
 {
-    if (var::loot_min_rarity > 0 && loot.lootRarityTier > 0
-        && loot.lootRarityTier < var::loot_min_rarity)
-        return false;
-    if (var::loot_min_value > 0.f && loot.lootValue > 0
-        && static_cast<float>(loot.lootValue) < var::loot_min_value)
-        return false;
-    // SP variants: when enabled, apply same floors (shared vars already drive SP meters).
-    if (var::loot_min_rar_sp && var::loot_min_rarity > 0 && loot.lootRarityTier > 0
-        && loot.lootRarityTier < var::loot_min_rarity)
-        return false;
-    if (var::loot_min_val_sp && var::loot_min_value > 0.f && loot.lootValue > 0
-        && static_cast<float>(loot.lootValue) < var::loot_min_value)
-        return false;
+    // Min value / rarity never hard-hide. They only select draw distance
+    // (loot_distance vs SP) in WorldLootPickupMaxDrawMeters. Hiding low-tier
+    // loot left 2m pickups blank while filters sat at Epic+/1068 in config.
+    (void)loot;
     return true;
 }
 
@@ -1398,6 +1407,13 @@ bool FnameLooksLikeEngineSubobjectClass(const std::string& fname)
 
     if (lower.size() >= 9
         && lower.compare(lower.size() - 9, 9, "component") == 0)
+        return true;
+
+    // Widget blueprints are UI, never world actors (debug-c190fb: class-fname
+    // fallback drew "WBP Main Menu Carousel Backend Announcement Entry" as loot).
+    if (lower.rfind("wbp_", 0) == 0 || lower.rfind("wbp ", 0) == 0
+        || lower.find("_wbp_") != std::string::npos
+        || lower.find("widgetblueprint") != std::string::npos)
         return true;
 
     static const char* kBlocked[] = {
@@ -1719,6 +1735,9 @@ bool FnameExcludedFromContainerEsp(const std::string& fnameLower)
         "scenecomponent",
         "actorcomponent",
         "embarkplayer",
+        "embarksquad",
+        "squadembark",
+        "embarkstation",
         "playerstatus",
         "embarkplayerstatus",
         "statuscomponent",
@@ -1744,6 +1763,63 @@ bool FnameExcludedFromContainerEsp(const std::string& fnameLower)
         // "F Window Style" ESP with no mesh (debug-5681af runId=names).
         "pointofinterest",
         "windowstyle",
+        // Phase 2A baseline (debug-c190fb): these were admitted as containers and
+        // labeled Crate/Door/junk via soft loot-pointer / LooksLikeContainerActor.
+        "ddgivolume",
+        "ddgi",
+        "ambiencevolume",
+        "indoorsvolume",
+        "outdoorsvolume",
+        "blockingvolume",
+        "runtimevirtualtexture",
+        "levelbounds",
+        "staticmeshactor",
+        "bp_staticspawner",
+        "snapstaticspawner",
+        "bp_snapstaticspawner",
+        "sm_world_",
+        "backdropisland",
+        "waterprocessing",
+        "processingbuilding",
+        "embarkworldsettings",
+        "defaultambience",
+        "visualizerdummy",
+        // debug-c190fb runId=crates: map-boundary volume admitted as cat-6
+        // container with garbled label "Playable Area Limiter Salvageter
+        // Treatment"; churned admit/evict every scan at 500-790m.
+        "playablearealimiter",
+        // debug-c190fb post-fix run: POI volumes / quest interactables / UI
+        // widgets admitted as cat-6 containers ("buildings named as items").
+        "wbp_",
+        "questinteractable",
+        "guideberm",
+        "guide_berm",
+        "processingfacilit",
+        "researchfacilit",
+        "fueldepot",
+        "ventilationshaft",
+        "playablespacevolume",
+        // debug-c190fb runId=crates name_trace_world: these were admitted as
+        // containers labeled "Crate" (Ruins12/15, AudioComponentManager,
+        // StaticSpawner, BP_ParticleExclusionVolume_C) or as POI buildings
+        // (SpillwayGates, CollapsedSpillway, WirelessElectricityTower4).
+        "particleexclusion",
+        "audiocomponentmanager",
+        "staticspawner",
+        "ruins",
+        "spillway",
+        "electricitytower",
+        // debug-c190fb run 2 name_trace_world: underscore variant slipped the
+        // "questinteractable" token (BP_Quest_Interactable_TheDam_Wheat1_1_C);
+        // plus map regions (Area_SarnosVeins -> "Scene Root"), ping markers,
+        // quest gadgets, and the generic carryable base class.
+        "quest_interactable",
+        "friendifier",
+        "inworldping",
+        "pingobject",
+        "gateelevator",
+        "carryable_object",
+        "area_",
     };
     for (const char* token : kBlocked) {
         if (fnameLower.find(token) != std::string::npos)
@@ -1755,6 +1831,13 @@ bool FnameExcludedFromContainerEsp(const std::string& fnameLower)
         && (fnameLower.find("_hud") != std::string::npos
             || fnameLower.find("hud_") != std::string::npos
             || fnameLower.rfind("hud", fnameLower.size() - 3) != std::string::npos))
+        return true;
+
+    // debug-c190fb run 2: GeneratorAdministrationBuilding admitted as container
+    // "Generator". Whole buildings are never containers (item scan already has
+    // the same suffix rule).
+    if (fnameLower.size() >= 8
+        && fnameLower.compare(fnameLower.size() - 8, 8, "building") == 0)
         return true;
 
     return false;
@@ -1805,6 +1888,14 @@ bool IsJunkWorldEspLabel(const std::string& label)
     const std::string lower = ToLowerLocal(label);
 
     static const char* kBlocked[] = {
+        // Widget blueprints leaked as labels via humanized class fnames
+        // ("WBP Main Menu Carousel Backend Announcement Entry", debug-c190fb).
+        "wbp ",
+        "wbp_",
+        "widget blueprint",
+        "main menu",
+        "carousel",
+        "announcement",
         "player controller",
         "pioneer player",
         "camera manager",
@@ -1824,6 +1915,9 @@ bool IsJunkWorldEspLabel(const std::string& label)
         "game hud",
         "player hud",
         "embark player",
+        "embark squad",
+        "squad embark",
+        "embark station",
         "player status",
         "embark status",
         "wall panel",
@@ -1895,6 +1989,30 @@ bool IsJunkWorldEspLabel(const std::string& label)
         "vision cone",
         "niagara",
         "gameplay cue",
+        // Phase 2A baseline: SoftObject/loc misreads on volumes/spawners.
+        "laser fire",
+        "dialogue",
+        "disco player",
+        "squad wiped",
+        "visualizer dummy",
+        "peppermint lower",
+        "hind cannon",
+        // debug-c190fb item_evict: VFX + traversal actors reached the item
+        // cache ("NS Bullet Trail Ribbon Launcher", "Actor Zipline") and
+        // engine replication/audio actors reached bot discovery.
+        "bullet trail",
+        "ribbon launcher",
+        "zipline",
+        "effect cue",
+        "replicator",
+        "interpolator",
+        "audio manager",
+        "spot audio",
+        // debug-c190fb run 2: Area_SarnosVeins drew as "Scene Root";
+        // BP_InWorldPingObject_C drew as "In Ping Object".
+        "scene root",
+        "ping object",
+        "friendifier",
     };
     for (const char* token : kBlocked) {
         if (lower.find(token) != std::string::npos)

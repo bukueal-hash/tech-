@@ -5,6 +5,7 @@
 #include "EspDraw.h"
 #include "WorldScanCommon.h"
 
+#include <algorithm>
 #include <iostream>
 #include <chrono>
 #include <fstream>
@@ -19,6 +20,60 @@ namespace {
 // scans before clearing Drawing (stops ESP blink at esp_distance boundary).
 static std::unordered_map<uintptr_t, uint8_t> s_playerDistMisses;
 static constexpr uint8_t kPlayerDistMissClearDrawing = 3;
+
+static std::unordered_map<uintptr_t, uint8_t> s_playerRootMisses;
+static std::unordered_map<uintptr_t, uint8_t> s_playerPosMisses;
+static std::unordered_map<uintptr_t, uint8_t> s_playerHealthZeroMisses;
+static constexpr uint8_t kPlayerGhostEvict = 10;
+
+static void ClearPlayerGhostMisses(uintptr_t key)
+{
+    WorldScan::MissCounterClear(s_playerRootMisses, key);
+    WorldScan::MissCounterClear(s_playerPosMisses, key);
+    WorldScan::MissCounterClear(s_playerHealthZeroMisses, key);
+}
+
+// P7: negative memo for actors that failed both PS chase and pioneer-class
+// backup. Staggered TTL so late-decrypting remotes still get re-checked.
+static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point>
+    s_playerScanNeg;
+
+// P7: 4-slice rotating admission ring over secondary + U8 actor walks.
+// GameState PlayerArray admission stays every-pass (cheap, primary path).
+// Positions stay hot via PositionRefreshPass @16ms.
+static constexpr size_t kPlayerAdmitSlices = 4;
+static constexpr size_t kPlayerAdmitPrioNewMax = 64;
+static size_t s_playerAdmitSliceCursor = 0;
+static uint64_t s_playerAdmitRingGen = 0;
+static uintptr_t s_playerAdmitRingActorsPtr = 0;
+static size_t s_playerAdmitRingActorCount = 0;
+static size_t s_playerAdmitRingEpoch = 0;
+static uint64_t s_playerAdmitCoveredMask = 0;
+static int s_playerAdmitRingResets = 0;
+static int s_playerAdmitLastCycleMs = 0;
+static std::chrono::steady_clock::time_point s_playerAdmitCycleStart{};
+static std::unordered_set<uintptr_t> s_playerAdmitPrevActors;
+
+static bool PlayerScanNegMemoHit(uintptr_t actor, int& outMemoSkip)
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (const auto it = s_playerScanNeg.find(actor); it != s_playerScanNeg.end()) {
+        const auto ttl = std::chrono::seconds(8 + static_cast<int>((actor >> 4) & 7));
+        if (now - it->second < ttl) {
+            ++outMemoSkip;
+            return true;
+        }
+        s_playerScanNeg.erase(it);
+    }
+    return false;
+}
+
+static void PlayerScanNegMemoize(uintptr_t actor)
+{
+    if (s_playerScanNeg.size() > 16384)
+        s_playerScanNeg.clear();
+    s_playerScanNeg[actor] = std::chrono::steady_clock::now();
+}
 
 // help FrostDumper 2026-07-12:
 // Prefer root RelativeLocation 0x218, then scene CompToWorld, then net snapshots.
@@ -448,90 +503,269 @@ void Engine::EntityList()
         }
     }
 
-    // Secondary: level actor scan (local PS chase / ActorType) for any missed.
-    for (uint64_t actor : currentActors)
-    {
-        if (!actor || actor == sAcknowledgedPawn || localCache.contains(actor))
-            continue;
+    // P7: secondary PS chase + U8 pioneer-class backup, banded into a 4-slice
+    // rotating ring. GameState PlayerArray above remains the every-pass primary.
+    int dbgAdmitChecked = 0;
+    int dbgAdmitMemoSkip = 0;
+    int dbgAdmitPrioNew = 0;
+    int dbgAdmitSliceActors = 0;
+    int dbgAdmitScatterExecs = 0;
+    int dbgAdmitFnameChecked = 0;
+    size_t dbgAdmitSlice = 0;
+    size_t dbgAdmitN = 0;
+    bool admitRingAdvanceOk = false;
 
-        uintptr_t playerState = 0;
-        bool viaActorType = false;
-        if (!TryResolvePlayerStateAny(actor, playerState, viaActorType)) {
-            ++dbgPsSkip;
-            continue;
-        }
-        if (viaActorType)
-            ++dbgActorTypeAdmit;
-
-        if (localPlayerState && playerState == localPlayerState) {
-            ++dbgGhostEvict;
-            continue;
-        }
-
-        if (PlayerStateIsBot(playerState)) {
-            ++dbgGsBot;
-            continue;
-        }
-
-        // Do NOT gate secondary admit on gsPlayerStates membership.
-        // Stale/wrong PlayerArray allowlists were zeroing PlayerCache (gsEvict)
-        // even when pawn→PS chase succeeded — keep gsArray diagnostic-only.
-        if (!gsPlayerStates.empty() && !gsPlayerStates.contains(playerState))
-            ++dbgGsEvict; // count only — still admit
-
-        const float health = ReadPawnHealthForAdmit(actor);
-        if (health < 1.0f) {
-            ++dbgHealthSkip;
-            // Soft: count only — GS path already admits; do not hard-skip (#28).
-        }
-
-        const uintptr_t root =
-            Memory::read<uintptr_t>(actor + Offsets::RootComponent);
-        if (!root) {
-            ++dbgRootSkip;
-            continue;
-        }
-
-        const uintptr_t mesh =
-            Memory::read<uintptr_t>(actor + Offsets::USkeletalMeshComponent);
-        const uintptr_t charMesh = ResolvePlayerSkeletalMesh(actor);
-        if (!charMesh && !mesh) {
-            ++dbgMeshSkip;
-            continue;
-        }
-
-        const std::string playerName = GetPlayerName(playerState, actor);
-        auto [it, inserted] = localCache.emplace(
-            actor,
-            PlayerCacheEntry(playerName.c_str(), root, actor, charMesh ? charMesh : mesh));
-        if (inserted) {
-            it->second.actorState = playerState;
-            ++dbgAdmitted;
-        }
+    // Prune negative memos for actors that left the world.
+    for (auto it = s_playerScanNeg.begin(); it != s_playerScanNeg.end(); ) {
+        if (!currentActorSet.contains(it->first))
+            it = s_playerScanNeg.erase(it);
+        else
+            ++it;
     }
 
-    // U8: all-Levels BP_PioneerCharacter_C class FName backup when GS/PS chase missed.
+    // Cheap CPU index of valid non-local actors. DMA only hits the slice.
+    std::vector<uintptr_t> admitIndex;
+    admitIndex.reserve(currentActors.size());
     for (uint64_t actorU64 : currentActors) {
         const uintptr_t actor = static_cast<uintptr_t>(actorU64);
-        if (!actor || actor == sAcknowledgedPawn || localCache.contains(actor))
+        if (!actor || !IsValidPointer(actor))
             continue;
+        if (actor == sAcknowledgedPawn)
+            continue;
+        admitIndex.push_back(actor);
+    }
+
+    const size_t N = admitIndex.size();
+    dbgAdmitN = N;
+
+    bool ringReset = false;
+    if (s_playerAdmitRingGen != gen) {
+        ringReset = true;
+    } else if (sActors != 0 && s_playerAdmitRingActorsPtr != 0
+        && sActors != s_playerAdmitRingActorsPtr) {
+        ringReset = true;
+    } else if (s_playerAdmitRingActorCount != 0) {
+        const size_t delta = (N > s_playerAdmitRingActorCount)
+            ? (N - s_playerAdmitRingActorCount)
+            : (s_playerAdmitRingActorCount - N);
+        const size_t thresh = (std::max)(static_cast<size_t>(64), N / 8);
+        if (delta > thresh)
+            ringReset = true;
+    }
+    if (ringReset) {
+        s_playerAdmitSliceCursor = 0;
+        s_playerAdmitCoveredMask = 0;
+        s_playerAdmitPrevActors.clear();
+        s_playerAdmitCycleStart = std::chrono::steady_clock::now();
+        s_playerAdmitLastCycleMs = 0;
+        ++s_playerAdmitRingEpoch;
+        ++s_playerAdmitRingResets;
+        s_playerScanNeg.clear();
+    }
+    s_playerAdmitRingGen = gen;
+    s_playerAdmitRingActorsPtr = sActors;
+    s_playerAdmitRingActorCount = N;
+    if (s_playerAdmitCycleStart.time_since_epoch().count() == 0)
+        s_playerAdmitCycleStart = std::chrono::steady_clock::now();
+
+    const size_t slice = s_playerAdmitSliceCursor % kPlayerAdmitSlices;
+    const size_t sliceBase = (N * slice) / kPlayerAdmitSlices;
+    const size_t sliceEnd = (N * (slice + 1)) / kPlayerAdmitSlices;
+    dbgAdmitSlice = slice;
+
+    std::unordered_set<uintptr_t> probeSet;
+    probeSet.reserve((sliceEnd - sliceBase) + kPlayerAdmitPrioNewMax + 8);
+    for (size_t i = sliceBase; i < sliceEnd; ++i) {
+        const uintptr_t actor = admitIndex[i];
+        if (localCache.contains(actor))
+            continue;
+        probeSet.insert(actor);
+    }
+    dbgAdmitSliceActors = static_cast<int>(probeSet.size());
+
+    size_t prioAdded = 0;
+    for (uintptr_t actor : admitIndex) {
+        if (prioAdded >= kPlayerAdmitPrioNewMax)
+            break;
+        if (s_playerAdmitPrevActors.contains(actor))
+            continue;
+        if (localCache.contains(actor))
+            continue;
+        if (probeSet.insert(actor).second)
+            ++prioAdded;
+    }
+    dbgAdmitPrioNew = static_cast<int>(prioAdded);
+
+    // P7b: batched pre-gate (mirrors RobotList P6b). One scatter exec reads
+    // PlayerState@0x3C0 + ActorTypeId for the whole band; serial PS-chase and
+    // class-fname work only runs on actors that show a player-like signal.
+    std::ptrdiff_t typeOff = ArcActorType::RuntimeActorTypeOffset();
+    if (typeOff < 0) {
+        for (size_t i = 0; i < admitIndex.size() && typeOff < 0; ++i) {
+            (void)ArcActorType::ReadActorTypeId(admitIndex[i]);
+            typeOff = ArcActorType::RuntimeActorTypeOffset();
+        }
+        if (typeOff < 0)
+            typeOff = Offsets::ActorTypeId;
+    }
+
+    struct PlayerProbeRow {
+        uintptr_t actor = 0;
+        uint64_t ps = 0;
+        uint32_t typeId = 0;
+    };
+    std::vector<PlayerProbeRow> probeRows;
+    probeRows.reserve(probeSet.size());
+    for (uintptr_t actor : probeSet) {
+        if (localCache.contains(actor))
+            continue;
+        if (PlayerScanNegMemoHit(actor, dbgAdmitMemoSkip))
+            continue;
+        PlayerProbeRow row;
+        row.actor = actor;
+        probeRows.push_back(row);
+    }
+
+    constexpr size_t kPlayerAdmitChunk = 512;
+    for (size_t base = 0; base < probeRows.size(); base += kPlayerAdmitChunk) {
+        const size_t chunkEnd = (std::min)(base + kPlayerAdmitChunk, probeRows.size());
+        ScatterSession scatter;
+        if (!scatter.isValid())
+            break;
+        bool prepOk = true;
+        for (size_t i = base; i < chunkEnd; ++i) {
+            PlayerProbeRow& r = probeRows[i];
+            prepOk = scatter.prepare(r.actor + kPawnPlayerState, r.ps) && prepOk;
+            prepOk = scatter.prepare(r.actor + typeOff, r.typeId) && prepOk;
+        }
+        if (prepOk && scatter.execute())
+            ++dbgAdmitScatterExecs;
+    }
+
+    for (const PlayerProbeRow& row : probeRows) {
+        const uintptr_t actor = row.actor;
+        const uint32_t masked = ArcActorType::MaskActorTypeId(row.typeId);
+        const bool gate = (row.ps != 0
+                              && Memory::IsValidPtrFast2(static_cast<uintptr_t>(row.ps)))
+            || ArcActorType::IsPlayerClassId(masked);
+
+        if (!gate) {
+            // No PS pointer and not a player class id — pioneer check via fname
+            // memo (instance fname embeds class for BP actors). Serial reads run
+            // once per TTL window, then the memo holds.
+            ++dbgAdmitFnameChecked;
+            std::string fn = GetActorFNameStringCached(actor);
+            if (fn.empty())
+                fn = GetActorFNameString(actor);
+            std::string classFn;
+            if (fn.empty())
+                classFn = GetActorClassFName(actor);
+
+            auto containsPioneer = [](const std::string& s) -> bool {
+                if (s.empty())
+                    return false;
+                std::string low = s;
+                for (char& c : low)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                return low.find("pioneercharacter") != std::string::npos;
+            };
+
+            if (!containsPioneer(fn) && !containsPioneer(classFn)) {
+                // Memoize only when a name decoded; undecrypted actors retry
+                // next ring pass so late spawns are never permanently skipped.
+                if (!fn.empty() || !classFn.empty())
+                    PlayerScanNegMemoize(actor);
+                continue;
+            }
+            // Pioneer-looking without gate signal — fall through to full check.
+        }
+
+        ++dbgAdmitChecked;
+
+        // Secondary: local PS chase / ActorType for any GameState misses.
+        uintptr_t playerState = 0;
+        bool viaActorType = false;
+        if (TryResolvePlayerStateAny(actor, playerState, viaActorType)) {
+            if (viaActorType)
+                ++dbgActorTypeAdmit;
+
+            if (localPlayerState && playerState == localPlayerState) {
+                ++dbgGhostEvict;
+                continue;
+            }
+
+            if (PlayerStateIsBot(playerState)) {
+                ++dbgGsBot;
+                // Bots never become players — memoize so their PS chase does
+                // not repeat serially every ring pass (TTL still re-checks).
+                PlayerScanNegMemoize(actor);
+                continue;
+            }
+
+            // Do NOT gate secondary admit on gsPlayerStates membership.
+            // Stale/wrong PlayerArray allowlists were zeroing PlayerCache (gsEvict)
+            // even when pawn→PS chase succeeded — keep gsArray diagnostic-only.
+            if (!gsPlayerStates.empty() && !gsPlayerStates.contains(playerState))
+                ++dbgGsEvict; // count only — still admit
+
+            const float health = ReadPawnHealthForAdmit(actor);
+            if (health < 1.0f) {
+                ++dbgHealthSkip;
+                // Soft: count only — GS path already admits; do not hard-skip (#28).
+            }
+
+            const uintptr_t root =
+                Memory::read<uintptr_t>(actor + Offsets::RootComponent);
+            if (!root) {
+                ++dbgRootSkip;
+                continue;
+            }
+
+            const uintptr_t mesh =
+                Memory::read<uintptr_t>(actor + Offsets::USkeletalMeshComponent);
+            const uintptr_t charMesh = ResolvePlayerSkeletalMesh(actor);
+            if (!charMesh && !mesh) {
+                ++dbgMeshSkip;
+                continue;
+            }
+
+            const std::string playerName = GetPlayerName(playerState, actor);
+            auto [it, inserted] = localCache.emplace(
+                actor,
+                PlayerCacheEntry(
+                    playerName.c_str(), root, actor, charMesh ? charMesh : mesh));
+            if (inserted) {
+                it->second.actorState = playerState;
+                ++dbgAdmitted;
+            }
+            continue;
+        }
+
+        ++dbgPsSkip;
+
+        // U8: BP_PioneerCharacter_C class FName backup when PS chase missed.
         const std::string classFname = GetActorClassFName(actor);
         if (classFname.empty())
-            continue;
+            continue; // undecrypted — retry next ring pass, do not memoize
+
         std::string cl = classFname;
         for (char& c : cl)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         if (cl.find("pioneercharacter") == std::string::npos
-            && cl.find("bp_pioneercharacter") == std::string::npos)
+            && cl.find("bp_pioneercharacter") == std::string::npos) {
+            PlayerScanNegMemoize(actor);
             continue;
+        }
 
-        uintptr_t playerState = 0;
-        bool viaActorType = false;
+        playerState = 0;
+        viaActorType = false;
         TryResolvePlayerStateAny(actor, playerState, viaActorType);
         if (localPlayerState && playerState == localPlayerState)
             continue;
-        if (playerState && PlayerStateIsBot(playerState))
+        if (playerState && PlayerStateIsBot(playerState)) {
+            PlayerScanNegMemoize(actor);
             continue;
+        }
 
         const uintptr_t root =
             Memory::read<uintptr_t>(actor + Offsets::RootComponent);
@@ -555,6 +789,10 @@ void Engine::EntityList()
             ++dbgActorTypeAdmit;
         }
     }
+
+    s_playerAdmitPrevActors.clear();
+    s_playerAdmitPrevActors.insert(admitIndex.begin(), admitIndex.end());
+    admitRingAdvanceOk = true;
 
     dbgPreAdmit = static_cast<int>(localCache.size());
 
@@ -608,10 +846,19 @@ void Engine::EntityList()
             Memory::read<uintptr_t>(key + Offsets::RootComponent);
         if (!freshRoot || !IsValidPointer(freshRoot)) {
             ++dbgRootStale;
-            WorldScan::MissCounterClear(s_playerDistMisses, key);
-            it = localCache.erase(it);
+            if (WorldScan::MissCounterShouldEvict(
+                    s_playerRootMisses, key, false, kPlayerGhostEvict)) {
+                ClearPlayerGhostMisses(key);
+                WorldScan::MissCounterClear(s_playerDistMisses, key);
+                ++dbgGhostEvict;
+                it = localCache.erase(it);
+            } else {
+                actor.Drawing = false;
+                ++it;
+            }
             continue;
         }
+        WorldScan::MissCounterClear(s_playerRootMisses, key);
         actor.rootComponent = freshRoot;
 
         const uint8_t enemyTeamId = Memory::read<uint8_t>(key + Offsets::TeamID);
@@ -668,10 +915,19 @@ void Engine::EntityList()
         if (!IsPlausibleWorldPos(actor.WorldPos))
         {
             ++dbgPosEvict;
-            WorldScan::MissCounterClear(s_playerDistMisses, key);
-            it = localCache.erase(it);
+            if (WorldScan::MissCounterShouldEvict(
+                    s_playerPosMisses, key, false, kPlayerGhostEvict)) {
+                ClearPlayerGhostMisses(key);
+                WorldScan::MissCounterClear(s_playerDistMisses, key);
+                ++dbgGhostEvict;
+                it = localCache.erase(it);
+            } else {
+                actor.Drawing = false;
+                ++it;
+            }
             continue;
         }
+        WorldScan::MissCounterClear(s_playerPosMisses, key);
 
         const Vector3 delta = actor.WorldPos - cam.Location;
         const float distanceSq = static_cast<float>(
@@ -698,6 +954,20 @@ void Engine::EntityList()
         actor.maxhealth = static_cast<float>(get_maxhealth(key));
         actor.shield = static_cast<float>(get_armor(key));
         actor.maxshield = static_cast<float>(get_maxarmor(key));
+
+        if (actor.health < 1.0f) {
+            ++dbgHealthSkip;
+            if (WorldScan::MissCounterShouldEvict(
+                    s_playerHealthZeroMisses, key, false, kPlayerGhostEvict)) {
+                ClearPlayerGhostMisses(key);
+                WorldScan::MissCounterClear(s_playerDistMisses, key);
+                ++dbgGhostEvict;
+                it = localCache.erase(it);
+                continue;
+            }
+        } else {
+            WorldScan::MissCounterClear(s_playerHealthZeroMisses, key);
+        }
 
 
         // Read weapon system from InventoryComponent (stowed slots + equipped + armor)
@@ -769,7 +1039,7 @@ void Engine::EntityList()
 
         actor.isVisible = true;
 
-        actor.Drawing = true;
+        actor.Drawing = actor.health >= 1.0f;
         ++it;
         entityStarted.store(true, std::memory_order_release);
     }
@@ -780,6 +1050,36 @@ void Engine::EntityList()
         (void)key;
     }
 
+    // #region agent log
+    {
+        static std::unordered_set<uintptr_t> s_prevPlayerKeys;
+        std::unordered_set<uintptr_t> curKeys;
+        curKeys.reserve(localCache.size());
+        for (const auto& [key, actor] : localCache) {
+            curKeys.insert(key);
+            WorldScan::FlickerCause cause = WorldScan::FlickerCause::Other;
+            if (!actor.Drawing) {
+                if (!IsPlausibleWorldPos(actor.WorldPos))
+                    cause = WorldScan::FlickerCause::PosFail;
+                else if (actor.Distance > var::esp_distance)
+                    cause = WorldScan::FlickerCause::DistEdge;
+                else if (actor.health < 1.0f)
+                    cause = WorldScan::FlickerCause::Other;
+                else
+                    cause = WorldScan::FlickerCause::VisMiss;
+            }
+            WorldScan::NoteFlickerDrawing(
+                WorldScan::FlickerChannel::Player, key, actor.Drawing, cause);
+        }
+        for (uintptr_t prev : s_prevPlayerKeys) {
+            if (!curKeys.contains(prev))
+                WorldScan::NoteFlickerGone(WorldScan::FlickerChannel::Player, prev);
+        }
+        s_prevPlayerKeys = std::move(curKeys);
+        WorldScan::MaybeFlushFlickerScore();
+    }
+    // #endregion
+
     if (m_worldGeneration.load(std::memory_order_acquire) != gen)
         return;
 
@@ -788,6 +1088,22 @@ void Engine::EntityList()
         playerCache = std::move(localCache);
     }
 
+    // P7: advance ring only after successful gen-matched writeback so an
+    // aborted pass never skips a slice band.
+    if (admitRingAdvanceOk) {
+        s_playerAdmitCoveredMask |= (1ull << (dbgAdmitSlice % kPlayerAdmitSlices));
+        s_playerAdmitSliceCursor = (dbgAdmitSlice + 1) % kPlayerAdmitSlices;
+        if (s_playerAdmitSliceCursor == 0) {
+            const auto nowCycle = std::chrono::steady_clock::now();
+            if (s_playerAdmitCycleStart.time_since_epoch().count() != 0) {
+                s_playerAdmitLastCycleMs = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        nowCycle - s_playerAdmitCycleStart).count());
+            }
+            s_playerAdmitCycleStart = nowCycle;
+            s_playerAdmitCoveredMask = 0;
+        }
+    }
 
     if (var::show_debug_overlay) {
         static IntervalTimer playerDebugTimer(500);
@@ -820,6 +1136,17 @@ void Engine::EntityList()
                 << " fwdMismatch=" << dbgFwdMismatch
                 << " actorTypeAdmit=" << dbgActorTypeAdmit
                 << " gsBot=" << dbgGsBot
+                << " slice=" << dbgAdmitSlice << "/" << kPlayerAdmitSlices
+                << " sliceActors=" << dbgAdmitSliceActors
+                << " prioNew=" << dbgAdmitPrioNew
+                << " checked=" << dbgAdmitChecked
+                << " fnameChecked=" << dbgAdmitFnameChecked
+                << " scatterExecs=" << dbgAdmitScatterExecs
+                << " memoSkip=" << dbgAdmitMemoSkip
+                << " memoSize=" << s_playerScanNeg.size()
+                << " cycleMs=" << s_playerAdmitLastCycleMs
+                << " cover=0x" << std::hex << s_playerAdmitCoveredMask << std::dec
+                << " ringResets=" << s_playerAdmitRingResets
                 << std::endl;
         }
     }

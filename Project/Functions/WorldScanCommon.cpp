@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <fstream>
 #include <mutex>
 #include <unordered_set>
 #include <vector>
@@ -864,5 +865,175 @@ void DedupeWorldCacheByRoot(std::unordered_map<uintptr_t, Engine::WorldCacheEntr
     for (uintptr_t key : losers)
         cache.erase(key);
 }
+
+// #region agent log
+namespace {
+
+constexpr int kFlickerFixIteration = 14;
+constexpr int kFlickerChannels = 6;
+constexpr int kFlickerCauses = 7;
+
+struct FlickerTrack {
+    bool has = false;
+    bool drawing = false;
+    FlickerCause lastOffCause = FlickerCause::Other;
+    std::chrono::steady_clock::time_point lastOff{};
+};
+
+struct FlickerBucket {
+    std::unordered_map<uintptr_t, FlickerTrack> tracks;
+    int causeCounts[kFlickerCauses]{};
+};
+
+FlickerBucket g_flickerBuckets[kFlickerChannels];
+std::mutex g_flickerMu;
+std::chrono::steady_clock::time_point g_flickerWindowStart{};
+int g_flickerWindowTotals[kFlickerChannels]{};
+
+// FREEZE1 (Fix #5): this used to open + write the log file while holding
+// g_flickerMu. The 240fps paint thread takes the same mutex in
+// NoteFlickerDrawing, so every 10s flush parked the render thread behind
+// file I/O — visible as "ESP freezes, then picks back up". Now: snapshot
+// counters under the lock, write the file with the lock RELEASED.
+struct FlickerScoreSnapshot {
+    int totals[kFlickerChannels]{};
+    int byCause[kFlickerCauses]{};
+};
+
+FlickerScoreSnapshot TakeFlickerSnapshotLocked(
+    const std::chrono::steady_clock::time_point& now)
+{
+    FlickerScoreSnapshot snap{};
+    for (int ch = 0; ch < kFlickerChannels; ++ch) {
+        snap.totals[ch] = g_flickerWindowTotals[ch];
+        for (int c = 0; c < kFlickerCauses; ++c)
+            snap.byCause[c] += g_flickerBuckets[ch].causeCounts[c];
+        for (int c = 0; c < kFlickerCauses; ++c)
+            g_flickerBuckets[ch].causeCounts[c] = 0;
+        g_flickerWindowTotals[ch] = 0;
+        if (g_flickerBuckets[ch].tracks.size() > 8192)
+            g_flickerBuckets[ch].tracks.clear();
+    }
+    g_flickerWindowStart = now;
+    return snap;
+}
+
+void WriteFlickerScoreUnlocked(const FlickerScoreSnapshot& snap)
+{
+    std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+    if (!f)
+        return;
+    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker-loop\",\"hypothesisId\":\"F0\","
+      << "\"location\":\"WorldScanCommon.cpp\",\"message\":\"flicker_score\","
+      << "\"data\":{\"bots\":" << snap.totals[0]
+      << ",\"players\":" << snap.totals[1]
+      << ",\"world\":" << snap.totals[2]
+      << ",\"posFail\":" << snap.byCause[0]
+      << ",\"visMiss\":" << snap.byCause[1]
+      << ",\"evictReadmit\":" << snap.byCause[2]
+      << ",\"distEdge\":" << snap.byCause[3]
+      << ",\"other\":" << snap.byCause[4]
+      << ",\"projFail\":" << snap.byCause[5]
+      << ",\"labelMiss\":" << snap.byCause[6]
+      << ",\"paintBots\":" << snap.totals[3]
+      << ",\"paintPlayers\":" << snap.totals[4]
+      << ",\"paintWorld\":" << snap.totals[5]
+      << ",\"fixN\":" << kFlickerFixIteration
+      << "},\"timestamp\":" << ts << "}\n";
+}
+
+} // namespace
+
+void NoteFlickerDrawing(
+    FlickerChannel channel,
+    uintptr_t key,
+    bool drawing,
+    FlickerCause cause)
+{
+    if (!key)
+        return;
+    const int ch = static_cast<int>(channel);
+    if (ch < 0 || ch >= kFlickerChannels)
+        return;
+
+    const auto now = std::chrono::steady_clock::now();
+    // FREEZE1: the paint thread (channels 3-5) must NEVER block on this
+    // mutex — a missed sample is harmless, a parked render thread is a
+    // visible freeze. Scanner channels may still wait (they're off-frame).
+    std::unique_lock<std::mutex> lock(g_flickerMu, std::defer_lock);
+    if (ch >= 3) {
+        if (!lock.try_lock())
+            return;
+    } else {
+        lock.lock();
+    }
+    if (g_flickerWindowStart.time_since_epoch().count() == 0)
+        g_flickerWindowStart = now;
+
+    FlickerTrack& t = g_flickerBuckets[ch].tracks[key];
+    if (!t.has) {
+        t.has = true;
+        t.drawing = drawing;
+        return;
+    }
+    if (t.drawing == drawing)
+        return;
+
+    if (t.drawing && !drawing) {
+        t.lastOff = now;
+        t.lastOffCause = cause;
+        t.drawing = false;
+        return;
+    }
+
+    // false -> true
+    t.drawing = true;
+    if (t.lastOff.time_since_epoch().count() != 0
+        && now - t.lastOff <= std::chrono::seconds(2)) {
+        // Paint channels run at ~240fps; a 1-2 frame gap (<48ms) is invisible
+        // to the eye and would flood the score with try_lock frame swaps.
+        const bool paintChannel = ch >= 3;
+        if (paintChannel && now - t.lastOff < std::chrono::milliseconds(48))
+            return;
+        const int causeIdx = static_cast<int>(t.lastOffCause);
+        if (causeIdx >= 0 && causeIdx < kFlickerCauses)
+            ++g_flickerBuckets[ch].causeCounts[causeIdx];
+        ++g_flickerWindowTotals[ch];
+    }
+}
+
+void NoteFlickerGone(FlickerChannel channel, uintptr_t key)
+{
+    NoteFlickerDrawing(channel, key, false, FlickerCause::EvictReadmit);
+}
+
+void MaybeFlushFlickerScore()
+{
+    const auto now = std::chrono::steady_clock::now();
+    FlickerScoreSnapshot snap{};
+    bool shouldWrite = false;
+    {
+        std::lock_guard<std::mutex> lock(g_flickerMu);
+        if (g_flickerWindowStart.time_since_epoch().count() == 0) {
+            g_flickerWindowStart = now;
+            return;
+        }
+        if (now - g_flickerWindowStart < std::chrono::seconds(10))
+            return;
+        snap = TakeFlickerSnapshotLocked(now);
+        shouldWrite = true;
+    }
+    // File I/O strictly outside the mutex (FREEZE1).
+    if (shouldWrite)
+        WriteFlickerScoreUnlocked(snap);
+}
+
+int GetFlickerFixIteration()
+{
+    return kFlickerFixIteration;
+}
+// #endregion
 
 } // namespace WorldScan

@@ -16,7 +16,6 @@
 #include <cmath>
 #include <cfloat>
 #include <cstdio>
-#include <fstream>
 #include <iostream>
 #include <unordered_set>
 #include <unordered_map>
@@ -35,6 +34,7 @@ struct WorldEspDebugStats {
     int skipPos = 0;
     int skipDist = 0;
     int skipProj = 0;
+    int skipPickedUp = 0;
 };
 
 WorldEspDebugStats g_worldEspDbg{};
@@ -144,8 +144,14 @@ static std::string ResolveContainerEspDrawLabel(
         baseLabel = ContainerCategoryFallbackLabel(
             isOpened ? WorldItemCategory::OpenedContainer : cat);
 
-    if (isOpened)
-        return AppendContainerOpenSuffix(std::move(baseLabel));
+    if (isOpened) {
+        if (IsJunkWorldEspLabel(baseLabel) || IsGarbledEspLabel(baseLabel)
+            || !IsPlausibleEspLabel(baseLabel))
+            baseLabel = ContainerCategoryFallbackEspLabel(WorldItemCategory::OpenedContainer);
+        if (!IsJunkWorldEspLabel(baseLabel) && !IsGarbledEspLabel(baseLabel))
+            return AppendContainerOpenSuffix(std::move(baseLabel));
+        return FormatEspDisplayLabel(baseLabel);
+    }
     return FormatEspDisplayLabel(baseLabel);
 }
 
@@ -174,22 +180,16 @@ inline float EffectiveRadarRangeM()
 
 inline float PlayerCollectMaxM()
 {
-    float maxM = 0.f;
     if (var::enableesp)
-        maxM = (std::max)(maxM, var::esp_distance);
-    if (var::show_radar)
-        maxM = (std::max)(maxM, EffectiveRadarRangeM());
-    return maxM;
+        return var::esp_distance;
+    return 0.f;
 }
 
 inline float BotCollectMaxM()
 {
-    float maxM = 0.f;
     if (var::showRobots || var::robotAimEnabled)
-        maxM = (std::max)(maxM, var::bot_esp_distance);
-    if (var::show_radar)
-        maxM = (std::max)(maxM, EffectiveRadarRangeM());
-    return maxM;
+        return var::bot_esp_distance;
+    return 0.f;
 }
 
 void DrawPulsatingHeart(ImDrawList* dl, ImVec2 center, float baseRadius, ImU32 color)
@@ -417,6 +417,34 @@ static bool ProjectWorldEspPoint(
     if (IsUsableCameraFov(liveCam.FOV) && IsPlausibleWorldPos(liveCam.Location))
         return engine.ProjectWorldLocationToScreen(worldPos, outScreen, liveCam);
     return false;
+}
+
+// GHOST1 (Fix #10): the Fix #6/#7 sticky-screen holds repainted labels at
+// their LAST screen coordinates when WorldToScreen failed. If the projection
+// failed because the object left the view (camera rotated past it), that
+// stale coordinate is a random mid-screen spot — a phantom "Locker" flash
+// with nothing there. Only allow the hold while the camera still faces the
+// object's world position; otherwise skip the draw entirely.
+static bool WorldPointRoughlyInView(
+    const Engine::CameraCache& cam, const Vector3& p)
+{
+    const double dx = static_cast<double>(p.x) - cam.Location.x;
+    const double dy = static_cast<double>(p.y) - cam.Location.y;
+    const double dz = static_cast<double>(p.z) - cam.Location.z;
+    const double len = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (len < 1.0)
+        return true;
+    constexpr double kDeg2Rad = 3.14159265358979323846 / 180.0;
+    const double pitch = cam.Rotation.x * kDeg2Rad;
+    const double yaw = cam.Rotation.y * kDeg2Rad;
+    const double fx = std::cos(pitch) * std::cos(yaw);
+    const double fy = std::cos(pitch) * std::sin(yaw);
+    const double fz = std::sin(pitch);
+    const double dot = (dx * fx + dy * fy + dz * fz) / len;
+    const double fovDeg =
+        (cam.FOV > 1.f && cam.FOV < 179.f) ? static_cast<double>(cam.FOV) : 90.0;
+    const double halfCone = (std::min)(fovDeg * 0.75, 85.0);
+    return dot >= std::cos(halfCone * kDeg2Rad);
 }
 
 static ImU32 PlayerEspColor(const Engine::PlayerCacheEntry& actor)
@@ -714,6 +742,10 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             for (const auto& [key, entry] : cache) {
                 if (!ShouldDrawWorldEsp(entry))
                     continue;
+                if (IsGroundPickupGoneSticky(key)) {
+                    ++g_worldEspDbg.skipPickedUp;
+                    continue;
+                }
                 if (!worldKeys.insert(key).second)
                     continue;
 
@@ -931,6 +963,13 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
     }
 
     out.valid = true;
+
+    // #region agent log
+    // Flush only — world Drawing transitions are owned by FinalizeWorldCacheMap
+    // (World.cpp). CollectEspRenderFrame is the render collect path checkpoint.
+    WorldScan::MaybeFlushFlickerScore();
+    // #endregion
+
     return true;
 }
 
@@ -950,27 +989,58 @@ static void DrawPlayerEspList(
     for (const Engine::PlayerCacheEntry* actor : actors) {
         if (!actor->APawn || !engine.IsValidPointer(actor->APawn))
             continue;
-        if (!actor->Drawing)
+        if (!actor->Drawing) {
+            // #region agent log
+            WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintPlayer,
+                actor->APawn, false, WorldScan::FlickerCause::VisMiss);
+            // #endregion
             continue;
+        }
         if (actor->Distance < 2.f)
             continue;
-        if (!IsPlausibleWorldPos(actor->WorldPos))
+        if (!IsPlausibleWorldPos(actor->WorldPos)) {
+            // #region agent log
+            WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintPlayer,
+                actor->APawn, false, WorldScan::FlickerCause::PosFail);
+            // #endregion
             continue;
+        }
 
         // Frame-synced WorldPos (scatter + velocity) — no per-paint live DMA.
         const Engine::PlayerCacheEntry& live = *actor;
 
         Vector3 headWorld{};
         Vector3 feetWorld{};
-        if (!EspDraw::ResolvePlayerHeadFeetWorld(live, headWorld, feetWorld))
+        if (!EspDraw::ResolvePlayerHeadFeetWorld(live, headWorld, feetWorld)) {
+            // #region agent log
+            WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintPlayer,
+                actor->APawn, false, WorldScan::FlickerCause::PosFail);
+            // #endregion
             continue;
+        }
 
         ImVec2 head{};
         ImVec2 feet{};
-        if (!EspDraw::WorldToScreenBox(engine, frameCam, headWorld, feetWorld, head, feet))
+        if (!EspDraw::WorldToScreenBox(engine, frameCam, headWorld, feetWorld, head, feet)) {
+            // PROJ2 (Fix #13): looking away is not flicker — only count when
+            // the player is still roughly in the camera cone.
+            if (WorldPointRoughlyInView(frameCam, headWorld)) {
+                // #region agent log
+                WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintPlayer,
+                    actor->APawn, false, WorldScan::FlickerCause::ProjFail);
+                // #endregion
+            }
             continue;
-        if (!EspDraw::IsEspBoxOnScreen(head, feet))
+        }
+        if (!EspDraw::IsEspBoxOnScreen(head, feet)) {
+            // Looking away is not flicker.
             continue;
+        }
+
+        // #region agent log
+        WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintPlayer,
+            actor->APawn, true, WorldScan::FlickerCause::Other);
+        // #endregion
 
         const ImU32 color = PlayerEspColor(*actor);
         const float boxH = feet.y - head.y;
@@ -1097,18 +1167,25 @@ static void RenderRobotEspFromFrame(
     const Vector3 distRef = engine.ResolveDistanceReference(
         frameCam, stateSnap.acknowledgedPawn);
 
-    int dbgRobotFrame = 0;
-    int dbgRobotRendered = 0;
-    int dbgRobotDistSkip = 0;
-    int dbgRobotHeadFeetFail = 0;
-    int dbgRobotW2sFail = 0;
-    int dbgRobotLabelSkip = 0;
-    int dbgRobotOffscreen = 0;
-    int dbgNearFrame = 0;
-    int dbgNearRendered = 0;
+    // #region agent log
+    // Bots that vanish from the render frame entirely (collect drop) blink
+    // without ever hitting a paint skip branch — diff the frame's key set.
+    {
+        static std::unordered_set<uintptr_t> s_prevPaintBotKeys;
+        std::unordered_set<uintptr_t> cur;
+        cur.reserve(robots.size());
+        for (const Engine::EspFrameWorld& item : robots)
+            cur.insert(item.actorKey);
+        for (uintptr_t prev : s_prevPaintBotKeys) {
+            if (!cur.contains(prev))
+                WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
+                    prev, false, WorldScan::FlickerCause::EvictReadmit);
+        }
+        s_prevPaintBotKeys = std::move(cur);
+    }
+    // #endregion
 
     for (const Engine::EspFrameWorld& item : robots) {
-        ++dbgRobotFrame;
         const uintptr_t key = item.actorKey;
         const Engine::WorldCacheEntry& robot = item.entry;
         if (!key || !engine.IsValidPointer(key))
@@ -1117,8 +1194,13 @@ static void RenderRobotEspFromFrame(
             continue;
         if (robot.IsBreaked && !var::show_dead_bots)
             continue;
-        if (!IsPlausibleWorldPos(robot.WorldPos))
+        if (!IsPlausibleWorldPos(robot.WorldPos)) {
+            // #region agent log
+            WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
+                key, false, WorldScan::FlickerCause::PosFail);
+            // #endregion
             continue;
+        }
         // Container veto already applied in ShouldDrawRobotEsp / collect.
 
         const Vector3& wp = robot.WorldPos;
@@ -1130,11 +1212,11 @@ static void RenderRobotEspFromFrame(
 
         const float botMaxM =
             var::bot_esp_distance > 0.f ? var::bot_esp_distance : var::kMaxDistanceSliderM;
-        const bool nearBot = distM <= 12.f;
-        if (nearBot)
-            ++dbgNearFrame;
         if (distM > botMaxM) {
-            ++dbgRobotDistSkip;
+            // #region agent log
+            WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
+                key, false, WorldScan::FlickerCause::DistEdge);
+            // #endregion
             continue;
         }
 
@@ -1143,15 +1225,56 @@ static void RenderRobotEspFromFrame(
         Vector3 headWorld{};
         Vector3 feetWorld{};
         if (!EspDraw::ResolveBotHeadFeetWorld(drawEntry, headWorld, feetWorld)) {
-            ++dbgRobotHeadFeetFail;
+            // #region agent log
+            WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
+                key, false, WorldScan::FlickerCause::PosFail);
+            // #endregion
             continue;
         }
 
         ImVec2 head{};
         ImVec2 feet{};
+        // PROJ1 (Fix #7): same sticky-screen hold as world labels — a brief
+        // WorldToScreenBox miss must not blank the bot box.
+        static std::unordered_map<uintptr_t, std::pair<ImVec2, ImVec2>> s_botLastScreen;
+        static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> s_botLastScreenWhen;
+        // PROJ2 (Fix #13): 400ms was short during hard turns — bots still in
+        // view briefly flake W2S and blink. Hold a bit longer while the
+        // in-view gate still blocks ghost mid-screen flashes.
+        static constexpr auto kBotScreenFreezeTtl = std::chrono::milliseconds(700);
+        const auto botPaintNow = std::chrono::steady_clock::now();
         if (!EspDraw::WorldToScreenBox(engine, frameCam, headWorld, feetWorld, head, feet)) {
-            ++dbgRobotW2sFail;
-            continue;
+            // GHOST1: same in-view gate as world labels — no stale-coordinate
+            // phantom boxes after camera rotation.
+            const bool stillInView = WorldPointRoughlyInView(frameCam, headWorld);
+            if (stillInView) {
+                if (const auto fit = s_botLastScreenWhen.find(key);
+                    fit != s_botLastScreenWhen.end()
+                    && botPaintNow - fit->second <= kBotScreenFreezeTtl) {
+                    const auto& last = s_botLastScreen[key];
+                    head = last.first;
+                    feet = last.second;
+                } else {
+                    // #region agent log
+                    // PROJ2 (Fix #13): only count projFail while the bot is
+                    // still in the view cone. Looking away used to inflate
+                    // paintBots 8-12 every turn.
+                    WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
+                        key, false, WorldScan::FlickerCause::ProjFail);
+                    // #endregion
+                    continue;
+                }
+            } else {
+                // Looking away — not flicker.
+                continue;
+            }
+        } else {
+            s_botLastScreen[key] = { head, feet };
+            s_botLastScreenWhen[key] = botPaintNow;
+            if (s_botLastScreen.size() > 2048) {
+                s_botLastScreen.clear();
+                s_botLastScreenWhen.clear();
+            }
         }
 
         const ImU32 color = BotEspColor(robot.isVisible, robot.IsBreaked);
@@ -1170,13 +1293,22 @@ static void RenderRobotEspFromFrame(
         // Never use ARC/Bot/Oil placeholders. IsAnyBotActor alone is not enough.
         if (botLabel.empty() || !IsAcceptedBotEspLabel(engine, botLabel, fname)) {
             RecordBotDrawLabelMiss();
-            ++dbgRobotLabelSkip;
+            // #region agent log
+            WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
+                key, false, WorldScan::FlickerCause::LabelMiss);
+            // #endregion
             continue;
         }
         if (!EspDraw::IsEspBoxOnScreen(head, feet)) {
-            ++dbgRobotOffscreen;
+            // Looking away is not flicker — leave the track as-is so return
+            // to screen does not count as an on->off->on blink.
             continue;
         }
+
+        // #region agent log
+        WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
+            key, true, WorldScan::FlickerCause::Other);
+        // #endregion
 
         // Bot health bar + heart
         float botLabelY = head.y;
@@ -1225,11 +1357,7 @@ static void RenderRobotEspFromFrame(
 
         if (var::bot_snaplines && EspDraw::IsEspPointOnScreen(feet))
             EspDraw::DrawSnaplineEsp(drawList, feet, color, distM);
-        ++dbgRobotRendered;
-        if (nearBot)
-            ++dbgNearRendered;
     }
-
 }
 
 void Engine::RenderEsp()
@@ -1266,10 +1394,9 @@ void Engine::RenderEsp()
     if (var::showRobots)
         RenderRobotEspFromFrame(frame.robots, renderCam);
     if (drawWorld) {
-        // Prefer frame.camera for world W2S (positions sampled with frame cam).
-        const Engine::CameraCache& worldCam =
-            CameraOkForEsp(frame.camera) ? frame.camera : renderCam;
-        RenderWorldEspFromFrame(frame.world, worldCam);
+        // Same live POV as players/bots. Using frame.camera here lagged behind
+        // g_Camera during stick rotation and drove paintWorld projFail spikes.
+        RenderWorldEspFromFrame(frame.world, renderCam);
     }
 
     g_renderQueue.endFrame();
@@ -1320,6 +1447,7 @@ void Engine::RenderEsp()
                 << " skipPos=" << g_worldEspDbg.skipPos
                 << " skipDist=" << g_worldEspDbg.skipDist
                 << " skipProj=" << g_worldEspDbg.skipProj
+                << " skipPickedUp=" << g_worldEspDbg.skipPickedUp
                 << std::endl;
             g_worldEspDbg = {};
         }
@@ -1349,8 +1477,16 @@ static void RenderWorldEspFromFrame(
             ++dbg.skipAllow;
             continue;
         }
+        if (IsGroundPickupGoneSticky(item.actorKey)) {
+            ++dbg.skipPickedUp;
+            continue;
+        }
         if (!IsPlausibleWorldPos(entry.WorldPos)) {
             ++dbg.skipPos;
+            // #region agent log
+            WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintWorld,
+                item.actorKey, false, WorldScan::FlickerCause::PosFail);
+            // #endregion
             continue;
         }
 
@@ -1429,8 +1565,13 @@ static void RenderWorldEspFromFrame(
             label = ContainerCategoryFallbackLabel(cat);
 
         label = FormatEspDisplayLabel(label);
-        if (label.empty())
+        if (label.empty()) {
+            // #region agent log
+            WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintWorld,
+                item.actorKey, false, WorldScan::FlickerCause::LabelMiss);
+            // #endregion
             continue;
+        }
 
         int lootValue = entry.lootValue;
         int lootTier = entry.lootRarityTier;
@@ -1450,15 +1591,47 @@ static void RenderWorldEspFromFrame(
         }
         if (distM > WorldLootPickupMaxDrawMeters(cat, &filterView)) {
             ++dbg.skipDist;
+            // #region agent log
+            WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintWorld,
+                item.actorKey, false, WorldScan::FlickerCause::DistEdge);
+            // #endregion
             continue;
         }
 
         const bool isPickup = LootItemLooksLikePickup(filterView);
 
+        // PROJ1 (Fix #6): a single failed WorldToScreen blanked the label for
+        // that frame (paintWorld projFail spikes of 40-50 per 10s). Hold the
+        // last good screen pos briefly so a transient miss no longer blinks.
+        static std::unordered_map<uintptr_t, std::pair<Vector3, std::chrono::steady_clock::time_point>>
+            s_worldLastScreen;
+        static constexpr auto kWorldScreenFreezeTtl = std::chrono::milliseconds(400);
+        const auto paintNow = std::chrono::steady_clock::now();
+
         Vector3 screen{};
-        if (!ProjectWorldEspPoint(worldPos, frameCam, screen)) {
+        bool projected = ProjectWorldEspPoint(worldPos, frameCam, screen);
+        if (projected) {
+            s_worldLastScreen[item.actorKey] = { screen, paintNow };
+            if (s_worldLastScreen.size() > 4096)
+                s_worldLastScreen.clear();
+        } else {
             ++dbg.skipProj;
-            continue;
+            // GHOST1: never repaint a stale screen pos once the camera no
+            // longer faces the object — that painted phantom labels at
+            // random spots after rotation.
+            if (const auto fit = s_worldLastScreen.find(item.actorKey);
+                fit != s_worldLastScreen.end()
+                && paintNow - fit->second.second <= kWorldScreenFreezeTtl
+                && WorldPointRoughlyInView(frameCam, worldPos)) {
+                screen = fit->second.first;
+                projected = true;
+            } else {
+                // #region agent log
+                WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintWorld,
+                    item.actorKey, false, WorldScan::FlickerCause::ProjFail);
+                // #endregion
+                continue;
+            }
         }
 
         const float screenW = ImGui::GetIO().DisplaySize.x;
@@ -1486,6 +1659,10 @@ static void RenderWorldEspFromFrame(
             color,
             distM);
         ++dbg.rendered;
+        // #region agent log
+        WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintWorld,
+            item.actorKey, true, WorldScan::FlickerCause::Other);
+        // #endregion
     }
 
     g_worldEspDbg = dbg;

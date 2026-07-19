@@ -271,6 +271,14 @@ namespace Offsets {
     constexpr std::ptrdiff_t SphylElem_Length = 0x64;
     constexpr std::ptrdiff_t SphylElem_Stride = 0x68;
 
+    // LastRenderTime decrypt probe (UC vis-check; plaintext 0x4C4 path is stale).
+    constexpr std::ptrdiff_t Mesh_LastRenderTimeEnc = 0x480;
+    constexpr std::ptrdiff_t Mesh_LastRenderTimeOnScreenEnc = 0x488;
+    constexpr uint32_t Mesh_LastRenderTimeKey = 0xd22a8cc0u;
+    constexpr uint32_t Mesh_LastRenderTimeOnScreenKey = 0xfa3cbf38u;
+    constexpr std::ptrdiff_t UActorComponent_WorldPrivate = 0x148;
+    constexpr std::ptrdiff_t UWorld_TimeSeconds = 0x950;
+
     constexpr std::ptrdiff_t EmbarkMesh = 0x7d8;
 
     // ── PhysX (help, header-only) ────────────────────────────────────────────

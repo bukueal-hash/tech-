@@ -7,6 +7,7 @@
 #include "WorldScanCommon.h"
 #include "../Interface/Utils/Variables/index.h"
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -29,6 +30,57 @@ inline bool AnyContainerEspEnabled()
         var::show_world_supply_station || var::show_world_locker || var::show_world_trash ||
         var::show_world_safe || var::show_world_buried || var::show_world_deaddrop ||
         var::show_world_open_container);
+}
+
+// C7: container admission ring + negative memo (mirrors bot P6b / player P7).
+// Containers are static world objects, so actors proven non-container are
+// memoized with a long staggered TTL, and only one slice of the actor array
+// gets DMA probes per pass. Newly-seen actors are prioritized so crates that
+// stream in while moving still admit fast.
+// debug-c190fb OV2: ContainerList held the scan gate 400-649ms per turn while
+// sweeping 1/4 of all actors, saturating the DMA bus and spiking the ungated
+// pos/cam/frame passes (~600ms overlay hitch every ~22s). 8 slices halves the
+// per-turn hold; newly-seen crates still admit immediately via the prio path,
+// so responsiveness is unchanged — only the background full-sweep is finer.
+constexpr size_t kContAdmitSlices = 8;
+constexpr size_t kContAdmitPrioNewMax = 64;
+std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> s_containerScanNeg;
+size_t s_contAdmitSliceCursor = 0;
+uint64_t s_contAdmitRingGen = 0;
+size_t s_contAdmitRingActorCount = 0;
+uint64_t s_contAdmitCoveredMask = 0;
+int s_contAdmitRingResets = 0;
+int s_contAdmitLastCycleMs = 0;
+std::chrono::steady_clock::time_point s_contAdmitCycleStart{};
+std::unordered_set<uintptr_t> s_contAdmitPrevActors;
+
+bool ContainerScanNegMemoHit(uintptr_t actor, int& outMemoSkip)
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (const auto it = s_containerScanNeg.find(actor); it != s_containerScanNeg.end()) {
+        const auto ttl = std::chrono::seconds(20 + static_cast<int>((actor >> 4) & 15));
+        if (now - it->second < ttl) {
+            ++outMemoSkip;
+            return true;
+        }
+        s_containerScanNeg.erase(it);
+    }
+    return false;
+}
+
+// C7b probe: remembers every actor that was ever negatively memoized so an
+// eventual admit of that same actor can be logged as a memo lockout.
+std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> s_containerMemoHistory;
+
+void ContainerScanNegMemoize(uintptr_t actor)
+{
+    if (s_containerScanNeg.size() > 16384)
+        s_containerScanNeg.clear();
+    if (s_containerMemoHistory.size() > 16384)
+        s_containerMemoHistory.clear();
+    const auto now = std::chrono::steady_clock::now();
+    s_containerScanNeg[actor] = now;
+    s_containerMemoHistory.emplace(actor, now);
 }
 
 bool QuickContainerCandidate(
@@ -219,7 +271,7 @@ WorldItemCategory ClassifyContainer(
 // Cached actor pointers can lag up to 10s when actor count is stable; admission
 // must scan the fresh level list or containers randomly never appear.
 static std::unordered_map<uintptr_t, uint8_t> s_containerPosMisses;
-static constexpr uint8_t kContainerPosMissEvict = 12;
+static constexpr uint8_t kContainerPosMissEvict = 4;
 
 static bool ContainerPosMissShouldEvict(uintptr_t key, bool posOk)
 {
@@ -236,6 +288,24 @@ static void ClearContainerListStaticMaps()
 {
     s_containerPosMisses.clear();
 }
+
+// #region agent log
+static void AgentCrateLog(
+    const char* hypothesisId,
+    const char* message,
+    const std::string& dataJson)
+{
+    std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+    if (!f)
+        return;
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    f << "{\"sessionId\":\"c190fb\",\"runId\":\"crates\",\"hypothesisId\":\""
+        << hypothesisId << "\",\"location\":\"ContainerList.cpp\",\"message\":\""
+        << message << "\",\"data\":" << dataJson
+        << ",\"timestamp\":" << ms << "}\n";
+}
+// #endregion
 
 } // namespace
 
@@ -319,7 +389,32 @@ void Engine::ContainerList()
     const bool doAdmission = true;
     const bool doMetadata = metadataTimer.fire();
 
+    int dbgMemoSkip = 0;
+    int dbgRingChecked = 0;
+    int dbgRingPrioNew = 0;
+    int dbgRingSliceActors = 0;
+    size_t dbgRingSlice = 0;
+    size_t contN = 0;
+
     if (doAdmission) {
+    // C7: prune memo entries for actors that left the world.
+    for (auto it = s_containerScanNeg.begin(); it != s_containerScanNeg.end(); ) {
+        if (!currentSet.contains(static_cast<uint64_t>(it->first)))
+            it = s_containerScanNeg.erase(it);
+        else
+            ++it;
+    }
+    for (auto it = s_containerMemoHistory.begin(); it != s_containerMemoHistory.end(); ) {
+        if (!currentSet.contains(static_cast<uint64_t>(it->first)))
+            it = s_containerMemoHistory.erase(it);
+        else
+            ++it;
+    }
+
+    // Cheap CPU index of candidates; DMA probes only hit the current slice
+    // plus a bounded set of newly-seen actors.
+    std::vector<uintptr_t> admitIndex;
+    admitIndex.reserve(ctx.currentActors.size());
     for (uint64_t actorU64 : ctx.currentActors) {
         const uintptr_t key = static_cast<uintptr_t>(actorU64);
         if (!key)
@@ -328,21 +423,85 @@ void Engine::ContainerList()
             continue;
         if (occupiedCharacterKeys.contains(key))
             continue;
+        // Cached containers are filtered in the probe loop, not here — dropping
+        // them from the index would shrink contN as the cache fills and falsely
+        // trip the ring-reset delta heuristic every pass.
+        admitIndex.push_back(key);
+    }
+
+    contN = admitIndex.size();
+    bool contRingReset = false;
+    if (s_contAdmitRingGen != genAtStart) {
+        contRingReset = true;
+    } else if (s_contAdmitRingActorCount != 0) {
+        const size_t delta = (contN > s_contAdmitRingActorCount)
+            ? (contN - s_contAdmitRingActorCount)
+            : (s_contAdmitRingActorCount - contN);
+        if (delta > (std::max)(static_cast<size_t>(64), contN / 8))
+            contRingReset = true;
+    }
+    if (contRingReset) {
+        s_contAdmitSliceCursor = 0;
+        s_contAdmitCoveredMask = 0;
+        s_contAdmitPrevActors.clear();
+        s_contAdmitCycleStart = std::chrono::steady_clock::now();
+        s_contAdmitLastCycleMs = 0;
+        ++s_contAdmitRingResets;
+        s_containerScanNeg.clear();
+        s_containerMemoHistory.clear();
+    }
+    s_contAdmitRingGen = genAtStart;
+    s_contAdmitRingActorCount = contN;
+    if (s_contAdmitCycleStart.time_since_epoch().count() == 0)
+        s_contAdmitCycleStart = std::chrono::steady_clock::now();
+
+    const size_t contSlice = s_contAdmitSliceCursor % kContAdmitSlices;
+    const size_t contBase = (contN * contSlice) / kContAdmitSlices;
+    const size_t contSliceEnd = (contN * (contSlice + 1)) / kContAdmitSlices;
+    dbgRingSlice = contSlice;
+
+    std::unordered_set<uintptr_t> probeSet;
+    probeSet.reserve((contSliceEnd - contBase) + kContAdmitPrioNewMax + 8);
+    for (size_t i = contBase; i < contSliceEnd; ++i)
+        probeSet.insert(admitIndex[i]);
+    dbgRingSliceActors = static_cast<int>(probeSet.size());
+
+    size_t prioAdded = 0;
+    for (uintptr_t newKey : admitIndex) {
+        if (prioAdded >= kContAdmitPrioNewMax)
+            break;
+        if (s_contAdmitPrevActors.contains(newKey))
+            continue;
+        if (probeSet.insert(newKey).second)
+            ++prioAdded;
+    }
+    dbgRingPrioNew = static_cast<int>(prioAdded);
+    s_contAdmitPrevActors.clear();
+    s_contAdmitPrevActors.insert(admitIndex.begin(), admitIndex.end());
+
+    for (uintptr_t key : probeSet) {
+        if (localCache.contains(key))
+            continue;
+        if (ContainerScanNegMemoHit(key, dbgMemoSkip))
+            continue;
         if (WorldScan::ShouldExcludeFromWorldCaches(key, localPawn))
             continue;
         if (WorldScan::IsHeldEquipmentActor(key))
             continue;
-        if (localCache.contains(key))
-            continue;
 
         ++dbgScanned;
+        ++dbgRingChecked;
 
         const uint32_t maskedType =
             ArcActorType::MaskActorTypeId(ArcActorType::ReadActorTypeId(key));
-        if (ArcActorType::IsPlayerClassId(maskedType))
+        if (ArcActorType::IsPlayerClassId(maskedType)) {
+            ContainerScanNegMemoize(key);
             continue;
-        if (ArcActorType::IsBotClassId(maskedType))
+        }
+        if (ArcActorType::IsBotClassId(maskedType)) {
+            ContainerScanNegMemoize(key);
             continue;
+        }
 
         const uint32_t classAt70 =
             Memory::read<uint32_t>(key + Offsets::ClassDefaultObject);
@@ -358,10 +517,14 @@ void Engine::ContainerList()
 
         const std::string classFname = GetActorClassFName(key);
         if (!classFname.empty()) {
-            if (FnameLooksLikeEngineSubobjectClass(classFname))
+            if (FnameLooksLikeEngineSubobjectClass(classFname)) {
+                ContainerScanNegMemoize(key);
                 continue;
-            if (FnameExcludedFromContainerEsp(ToLowerCopy(classFname)))
+            }
+            if (FnameExcludedFromContainerEsp(ToLowerCopy(classFname))) {
+                ContainerScanNegMemoize(key);
                 continue;
+            }
         }
 
         if (WorldScan::LooksLikePlayerPawn(key, localPawn))
@@ -417,6 +580,9 @@ void Engine::ContainerList()
 
         // Ground loot never belongs in the container cache — even if a loot
         // interaction pointer is present (caused Oil ESP doubled as Crate).
+        // C7b: no memo on these — the chest/container guards read flaky DMA
+        // pointers, so a real crate can land here on a bad pass and must be
+        // retried next slice instead of being locked out for the memo TTL.
         if ((classGroundLoot || fnameIsPickup)
             && !fnameIsContainer && !classChest && !actorTypeChest)
             continue;
@@ -427,8 +593,10 @@ void Engine::ContainerList()
             && !fnameIsContainer && !classChest && !actorTypeChest)
             continue;
 
-        if (!fname.empty() && FnameExcludedFromContainerEsp(ToLowerCopy(fname)))
+        if (!fname.empty() && FnameExcludedFromContainerEsp(ToLowerCopy(fname))) {
+            ContainerScanNegMemoize(key);
             continue;
+        }
 
         // Only drop clear ground-item actors. Do NOT skip when fname already looks
         // like a container, or when either loot pointer is valid.
@@ -437,8 +605,10 @@ void Engine::ContainerList()
         if (itemDa != 0 && Memory::IsValidPtrFast2(itemDa)
             && !hasContainerLoot && !hasLootInteraction
             && !actorTypeChest && !classChest && !fnameIsContainer
-            && TryReadItemGameAssetIdFromActor(key) != 0)
+            && TryReadItemGameAssetIdFromActor(key) != 0) {
+            ContainerScanNegMemoize(key);
             continue;
+        }
 
         if (!QuickContainerCandidate(
                 maskedType, classChest, actorTypeChest, fname, classFname,
@@ -448,6 +618,8 @@ void Engine::ContainerList()
             if (!classChest && !actorTypeChest && !fnameIsContainer)
             {
                 ++dbgPreSkip;
+                // C7b: no memo — QuickContainerCandidate depends on flaky loot
+                // pointers; a locker flaking here was invisible for the TTL.
                 continue;
             }
         }
@@ -456,6 +628,9 @@ void Engine::ContainerList()
             && !var::show_world_open_container)
             continue;
 
+        // Phase 3E: bare hasLootInteraction/hasContainerLoot alone admitted
+        // volumes/StaticMeshActor as "Crate" (debug-c190fb). Require class/fname/
+        // structural proof; AdmitContainerActor still covers flaky-decrypt lockers.
         const bool looksLikeContainer =
             classChest || actorTypeChest || fnameIsContainer
             || (!classFname.empty()
@@ -463,10 +638,7 @@ void Engine::ContainerList()
                     || IsSalvageContainerActor(classFname, key)
                     || IsRealSocketSalvageContainer(classFname, key)))
             || WorldScan::LooksLikeContainerActor(key, fname)
-            || (hasContainerLoot && fnameIsContainer)
-            // Owned loot-interaction pointer is enough — do not require FName decrypt
-            // (identical lockers were admitting unevenly when one decrypt flaked).
-            || hasLootInteraction || hasContainerLoot;
+            || (hasContainerLoot && fnameIsContainer);
 
         if (!looksLikeContainer) {
             if (!AdmitContainerActor(
@@ -475,6 +647,7 @@ void Engine::ContainerList()
                     hasLootInteraction, hasContainerLoot)) {
                 ++dbgAdmitSkip;
                 ++dbgStructHit;
+                // C7b: no memo — AdmitContainerActor also reads flaky structs.
                 continue;
             }
             ++dbgAdmitGate;
@@ -573,8 +746,10 @@ void Engine::ContainerList()
                 cat = WorldItemCategory::Crate;
         }
 
-        if (cat == WorldItemCategory::Trash)
+        if (cat == WorldItemCategory::Trash) {
+            ContainerScanNegMemoize(key);
             continue;
+        }
 
         if (displayName.empty() || IsGenericWorldEspLabel(displayName)
             || !IsPlausibleEspLabel(displayName) || IsJunkWorldEspLabel(displayName)) {
@@ -589,23 +764,28 @@ void Engine::ContainerList()
 
         if (IsJunkWorldEspLabel(displayName) || IsGarbledEspLabel(displayName)
             || displayName.empty() || !IsPlausibleEspLabel(displayName)) {
+            if (cat == WorldItemCategory::Invalid
+                || cat == WorldItemCategory::Other
+                || cat == WorldItemCategory::Trash)
+                continue;
             const std::string fallback =
                 ContainerCategoryFallbackEspLabel(cat);
             if (!fallback.empty())
                 displayName = fallback;
         }
 
-        // Never silently skip an admitted container — use a generic fallback so
-        // the user always sees SOMETHING and can report the unknown type.
         if (displayName.empty()) {
             const char* catFallback = WorldItemCategoryLabel(cat);
-            displayName = (catFallback && catFallback[0] && std::string(catFallback) != "Unknown")
-                ? std::string(catFallback) : "Container";
+            if (catFallback && catFallback[0] && std::string(catFallback) != "Unknown"
+                && cat != WorldItemCategory::Invalid
+                && cat != WorldItemCategory::Other
+                && cat != WorldItemCategory::Trash)
+                displayName = std::string(catFallback);
         }
 
         displayName = FormatEspDisplayLabel(displayName);
         if (displayName.empty())
-            displayName = "Container";
+            continue;
 
         // Distance/Drawing owned by FinalizeWorldCacheMap (item parity) — do not
         // cull at admit or crates beyond loot_distance never enter cache.
@@ -621,16 +801,82 @@ void Engine::ContainerList()
         entry.WorldPos = worldPos;
         ++dbgAdmitted;
 
+        // #region agent log
+        if (const auto histIt = s_containerMemoHistory.find(key);
+            histIt != s_containerMemoHistory.end()) {
+            const int lockedSec = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - histIt->second).count());
+            char lockBuf[256];
+            snprintf(lockBuf, sizeof(lockBuf),
+                "{\"label\":\"%.48s\",\"lockedSec\":%d,\"key\":%llu}",
+                displayName.c_str(), lockedSec,
+                static_cast<unsigned long long>(key));
+            AgentCrateLog("C7b", "container_memo_lockout", lockBuf);
+            s_containerMemoHistory.erase(histIt);
+        }
+        // #endregion
+
+        // #region agent log
+        {
+            const Vector3 d = worldPos - ctx.camera.Location;
+            const int admitDistM = static_cast<int>(
+                std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z) / 100.0);
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                "{\"label\":\"%.48s\",\"cat\":%d,\"distM\":%d,\"key\":%llu}",
+                displayName.c_str(), static_cast<int>(cat), admitDistM,
+                static_cast<unsigned long long>(key));
+            AgentCrateLog("CA", "container_admit", buf);
+        }
+        // #endregion
+
 
     }
+
+    // C7: advance the ring only after the slice fully ran.
+    s_contAdmitCoveredMask |= (1ull << (dbgRingSlice % kContAdmitSlices));
+    s_contAdmitSliceCursor = (dbgRingSlice + 1) % kContAdmitSlices;
+    if (s_contAdmitSliceCursor == 0) {
+        const auto nowCycle = std::chrono::steady_clock::now();
+        if (s_contAdmitCycleStart.time_since_epoch().count() != 0)
+            s_contAdmitLastCycleMs = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    nowCycle - s_contAdmitCycleStart).count());
+        s_contAdmitCycleStart = nowCycle;
+        s_contAdmitCoveredMask = 0;
+    }
+
+    // #region agent log
+    {
+        static std::chrono::steady_clock::time_point s_lastRingLog{};
+        const auto nowRl = std::chrono::steady_clock::now();
+        if (s_lastRingLog.time_since_epoch().count() == 0
+            || nowRl - s_lastRingLog >= std::chrono::seconds(2)) {
+            s_lastRingLog = nowRl;
+            char buf[320];
+            snprintf(buf, sizeof(buf),
+                "{\"actors\":%zu,\"slice\":%zu,\"sliceActors\":%d,\"prioNew\":%d,"
+                "\"checked\":%d,\"memoSkip\":%d,\"memoSize\":%zu,\"coverMask\":%llu,"
+                "\"cycleMs\":%d,\"ringResets\":%d}",
+                contN, dbgRingSlice, dbgRingSliceActors, dbgRingPrioNew,
+                dbgRingChecked, dbgMemoSkip, s_containerScanNeg.size(),
+                static_cast<unsigned long long>(s_contAdmitCoveredMask),
+                s_contAdmitLastCycleMs, s_contAdmitRingResets);
+            AgentCrateLog("C7", "container_admit_ring", buf);
+        }
+    }
+    // #endregion
     }
 
     WorldScan::DedupeWorldCacheByRoot(localCache);
 
     std::vector<decltype(localCache)::iterator> retainIters;
     std::vector<uintptr_t> retainRoots;
+    std::vector<std::string> retainClassFnames;
     retainIters.reserve(localCache.size());
     retainRoots.reserve(localCache.size());
+    retainClassFnames.reserve(localCache.size());
 
     for (auto it = localCache.begin(); it != localCache.end(); ) {
         const uintptr_t key = it->first;
@@ -673,15 +919,50 @@ void Engine::ContainerList()
             || IsGarbledEspLabel(it->second.ItemDisplayName)
             || it->second.ItemDisplayName.empty()) {
             const auto cat = static_cast<WorldItemCategory>(it->second.worldCategory);
+            if (cat == WorldItemCategory::Invalid
+                || cat == WorldItemCategory::Other
+                || cat == WorldItemCategory::Trash) {
+                it = localCache.erase(it);
+                continue;
+            }
             std::string fixed = ContainerCategoryFallbackEspLabel(cat);
-            if (fixed.empty())
-                fixed = "Container";
-            it->second.ItemDisplayName = fixed;
-            it->second.ItemType = fixed;
+            if (!fixed.empty()) {
+                it->second.ItemDisplayName = fixed;
+                it->second.ItemType = fixed;
+            }
         }
+
+        // Phase 3E retain re-verify REMOVED (debug-c190fb): predicate could not
+        // see classChest/actorTypeChest/AdmitContainerActor proof from admit, so
+        // it evicted real containers every scan (180,588 evicts vs 181,814
+        // admits — Car/Locker/Crate churned each frame). Admission already
+        // verified these entries; junk/excluded checks above handle stale junk.
+        // #region agent log
+        {
+            const bool verifyLooks =
+                WorldScan::LooksLikeContainerActor(key, fname)
+                || (!classFname.empty()
+                    && (FnameLooksLikeWorldContainer(classFname)
+                        || IsSalvageContainerActor(classFname, key)
+                        || IsRealSocketSalvageContainer(classFname, key)))
+                || FnameLooksLikeWorldContainer(fname);
+            if (!verifyLooks) {
+                static std::unordered_set<uintptr_t> s_verifySoftMissSeen;
+                if (s_verifySoftMissSeen.insert(key).second) {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf),
+                        "{\"label\":\"%.48s\",\"fname\":\"%.48s\",\"key\":%llu}",
+                        it->second.ItemDisplayName.c_str(), fname.c_str(),
+                        static_cast<unsigned long long>(key));
+                    AgentCrateLog("G2", "container_verify_softmiss", buf);
+                }
+            }
+        }
+        // #endregion
 
         retainIters.push_back(it);
         retainRoots.push_back(0);
+        retainClassFnames.push_back(classFname);
         ++it;
     }
 
@@ -707,19 +988,259 @@ void Engine::ContainerList()
         }
     }
 
+    struct OpenProbeCand {
+        uintptr_t key = 0;
+        size_t retainIdx = 0;
+        float openDistM = 0.f;
+    };
+    std::vector<OpenProbeCand> openProbeCands;
+    openProbeCands.reserve(4);
+
     for (size_t i = 0; i < retainIters.size(); ++i) {
         const uintptr_t key = retainIters[i]->first;
         const uintptr_t root = retainRoots[i];
         const bool posOk = root && IsValidPointer(root)
             && IsPlausibleWorldPos(retainIters[i]->second.WorldPos);
         if (!posOk) {
+            ++dbgPosSkip;
             if (ContainerPosMissShouldEvict(key, false)) {
                 ClearContainerPosMiss(key);
+                // #region agent log
+                {
+                    char buf[192];
+                    snprintf(buf, sizeof(buf),
+                        "{\"label\":\"%.48s\",\"key\":%llu}",
+                        localCache[key].ItemDisplayName.c_str(),
+                        static_cast<unsigned long long>(key));
+                    AgentCrateLog("CB", "container_pos_evict", buf);
+                }
+                // #endregion
                 localCache.erase(key);
             }
         } else {
             ContainerPosMissShouldEvict(key, true);
+
+            const std::string& retainFname = retainIters[i]->second.ActorName;
+            const std::string& retainClassFname = retainClassFnames[i];
+            const std::string retainFnameLower = ToLowerCopy(
+                retainFname.empty() ? retainClassFname : retainFname);
+            const bool classChest =
+                !retainClassFname.empty()
+                && FnameLooksLikeWorldContainer(retainClassFname);
+            const bool fnameIsContainer =
+                !retainFnameLower.empty()
+                && FnameLooksLikeWorldContainer(retainFnameLower);
+            // CC retain re-verify eviction REMOVED (debug-c190fb post-fix run):
+            // same defect as the G2 one — the retain predicate cannot see the
+            // chest-class / actor-type / loot-pointer proof admission had, so
+            // real Crates/Buttons whose fname flaked at retain were evicted and
+            // re-admitted every ~270ms. Admission stays authoritative.
+            const bool stillContainer =
+                classChest || fnameIsContainer
+                || WorldScan::LooksLikeContainerActor(key, retainFname)
+                || (!retainClassFname.empty()
+                    && (IsSalvageContainerActor(retainClassFname, key)
+                        || IsRealSocketSalvageContainer(retainClassFname, key)));
+            if (!stillContainer) {
+                // #region agent log
+                {
+                    static std::unordered_set<uintptr_t> s_ccSoftMissSeen;
+                    if (s_ccSoftMissSeen.insert(key).second) {
+                        char buf[192];
+                        snprintf(buf, sizeof(buf),
+                            "{\"label\":\"%.48s\",\"key\":%llu}",
+                            retainIters[i]->second.ItemDisplayName.c_str(),
+                            static_cast<unsigned long long>(key));
+                        AgentCrateLog("CC", "container_verify_softmiss", buf);
+                    }
+                }
+                // #endregion
+            }
+
+            // O1: open state was only probed at ADMISSION, so a locker opened
+            // mid-session kept drawing as unopened until app restart (fresh
+            // admission re-probed it). Re-probe cached entries near the player.
+            // O2 regression fix (debug-c190fb: frame_build spiked 46ms -> 282ms
+            // and boxes slid off moving players): probing EVERY container within
+            // 60m on EVERY 16ms pass flooded the DMA bus and starved the frame
+            // builder. Bound it: per-container cooldown + per-pass cap keeps the
+            // flip under ~2s at a fraction of the reads.
+            {
+                static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point>
+                    s_lastOpenProbe;
+                static auto s_lastProbePass = std::chrono::steady_clock::time_point{};
+                constexpr auto kOpenProbeCooldown = std::chrono::milliseconds(1500);
+                constexpr auto kOpenProbePassGap = std::chrono::milliseconds(250);
+                constexpr int kOpenProbeMaxPerPass = 4;
+                static int s_openProbesThisPass = 0;
+                static bool s_probePassAllowed = false;
+                if (i == 0) {
+                    s_openProbesThisPass = 0;
+                    const auto nowPass = std::chrono::steady_clock::now();
+                    s_probePassAllowed =
+                        s_lastProbePass.time_since_epoch().count() == 0
+                        || nowPass - s_lastProbePass >= kOpenProbePassGap;
+                    if (s_probePassAllowed)
+                        s_lastProbePass = nowPass;
+                }
+
+                const Vector3 od = retainIters[i]->second.WorldPos - ctx.camera.Location;
+                const float openDistM = static_cast<float>(std::sqrt(
+                    od.x * od.x + od.y * od.y + od.z * od.z)) / 100.0f;
+                const auto nowProbe = std::chrono::steady_clock::now();
+                bool mayProbe = s_probePassAllowed
+                    && openDistM <= 60.0f
+                    && s_openProbesThisPass < kOpenProbeMaxPerPass;
+                if (mayProbe) {
+                    const auto lastIt = s_lastOpenProbe.find(key);
+                    if (lastIt != s_lastOpenProbe.end()
+                        && nowProbe - lastIt->second < kOpenProbeCooldown)
+                        mayProbe = false;
+                }
+                if (mayProbe) {
+                    ++s_openProbesThisPass;
+                    s_lastOpenProbe[key] = nowProbe;
+                    if (s_lastOpenProbe.size() > 4096)
+                        s_lastOpenProbe.clear();
+                }
+                if (mayProbe) {
+                    OpenProbeCand cand{};
+                    cand.key = key;
+                    cand.retainIdx = i;
+                    cand.openDistM = openDistM;
+                    openProbeCands.push_back(cand);
+                }
+            }
         }
+    }
+
+    // P4: scatter LI pointers + searched bytes for the bounded probe set.
+    if (!openProbeCands.empty()) {
+        struct OpenProbeRow {
+            uintptr_t key = 0;
+            size_t retainIdx = 0;
+            float openDistM = 0.f;
+            uintptr_t liComp = 0;
+            uintptr_t liCont = 0;
+            uintptr_t liSimple = 0;
+            uint8_t searched0 = 0;
+            uint8_t searched1 = 0;
+            uint8_t searched2 = 0;
+        };
+        std::vector<OpenProbeRow> rows;
+        rows.reserve(openProbeCands.size());
+        for (const auto& c : openProbeCands) {
+            OpenProbeRow row{};
+            row.key = c.key;
+            row.retainIdx = c.retainIdx;
+            row.openDistM = c.openDistM;
+            rows.push_back(row);
+        }
+        int scatterExecs = 0;
+        {
+            ScatterSession s1;
+            if (s1.isValid()) {
+                bool ok = true;
+                for (auto& row : rows) {
+                    ok = s1.prepare(
+                             row.key + Offsets::LootInteractionComponent, row.liComp)
+                        && ok;
+                    ok = s1.prepare(
+                             row.key + Offsets::LootInteraction_Container, row.liCont)
+                        && ok;
+                    ok = s1.prepare(
+                             row.key + Offsets::SimpleLootActivity_LootInteraction,
+                             row.liSimple)
+                        && ok;
+                }
+                if (ok && s1.execute())
+                    ++scatterExecs;
+            }
+        }
+        {
+            ScatterSession s2;
+            if (s2.isValid()) {
+                bool ok = true;
+                int prepared = 0;
+                for (auto& row : rows) {
+                    if (row.liComp && Memory::IsValidPtrFast2(row.liComp)) {
+                        ok = s2.prepare(
+                                 row.liComp + Offsets::LootInteraction_Searched,
+                                 row.searched0)
+                            && ok;
+                        ++prepared;
+                    }
+                    if (row.liCont && Memory::IsValidPtrFast2(row.liCont)) {
+                        ok = s2.prepare(
+                                 row.liCont + Offsets::LootInteraction_Searched,
+                                 row.searched1)
+                            && ok;
+                        ++prepared;
+                    }
+                    if (row.liSimple && Memory::IsValidPtrFast2(row.liSimple)) {
+                        ok = s2.prepare(
+                                 row.liSimple + Offsets::LootInteraction_Searched,
+                                 row.searched2)
+                            && ok;
+                        ++prepared;
+                    }
+                }
+                if (prepared > 0 && ok && s2.execute())
+                    ++scatterExecs;
+            }
+        }
+        std::unordered_set<uintptr_t> eraseOpened;
+        for (auto& row : rows) {
+            const bool opened =
+                ((row.liComp && Memory::IsValidPtrFast2(row.liComp)
+                     && (row.searched0 & 0x1) != 0)
+                    || (row.liCont && Memory::IsValidPtrFast2(row.liCont)
+                        && (row.searched1 & 0x1) != 0)
+                    || (row.liSimple && Memory::IsValidPtrFast2(row.liSimple)
+                        && (row.searched2 & 0x1) != 0));
+            if (!opened)
+                continue;
+            // #region agent log
+            {
+                static std::unordered_set<uintptr_t> s_openFlipSeen;
+                if (s_openFlipSeen.insert(row.key).second) {
+                    char buf[224];
+                    const auto& entry = retainIters[row.retainIdx]->second;
+                    snprintf(buf, sizeof(buf),
+                        "{\"label\":\"%.48s\",\"distM\":%d,\"hideOpened\":%d,\"key\":%llu}",
+                        entry.ItemDisplayName.c_str(),
+                        static_cast<int>(row.openDistM),
+                        var::show_world_open_container ? 0 : 1,
+                        static_cast<unsigned long long>(row.key));
+                    AgentCrateLog("O1", "container_open_flip", buf);
+                }
+            }
+            // #endregion
+            if (!var::show_world_open_container)
+                eraseOpened.insert(row.key);
+        }
+        for (uintptr_t key : eraseOpened)
+            localCache.erase(key);
+        // #region agent log
+        {
+            static auto s_lastOpenBatch = std::chrono::steady_clock::time_point{};
+            const auto nowB = std::chrono::steady_clock::now();
+            if (s_lastOpenBatch.time_since_epoch().count() == 0
+                || nowB - s_lastOpenBatch >= std::chrono::seconds(2)) {
+                s_lastOpenBatch = nowB;
+                std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+                if (f) {
+                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"batch\",\"hypothesisId\":\"P4\","
+                      << "\"location\":\"ContainerList.cpp:ContainerList\",\"message\":\"container_open_batch\","
+                      << "\"data\":{\"probed\":" << rows.size()
+                      << ",\"scatterExecs\":" << scatterExecs << "}"
+                      << ",\"timestamp\":" << ts << "}\n";
+                }
+            }
+        }
+        // #endregion
     }
 
     if (doMetadata) {

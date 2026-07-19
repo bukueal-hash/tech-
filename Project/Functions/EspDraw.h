@@ -264,10 +264,20 @@ inline bool IsEspBoxOnScreen(
         && std::fabs(feet.x) < kOriginEps && std::fabs(feet.y) < kOriginEps)
         return false;
 
-    const float cx = (head.x + feet.x) * 0.5f;
-    const float cy = (head.y + feet.y) * 0.5f;
+    // CLOSE1 (Fix #11): center-only test dropped close bots — a Tick at the
+    // player's feet or a bot at 2-3m fills the screen and its box CENTER sits
+    // past the 8px margin, so the whole box was skipped ("bots not displaying
+    // when I get close"). Accept any box whose rect overlaps the screen.
+    const float top = (std::min)(head.y, feet.y);
+    const float bottom = (std::max)(head.y, feet.y);
+    const float boxH = bottom - top;
+    const float halfW = (std::max)(boxH * 0.35f, 12.f);
+    const float left = (std::min)(head.x, feet.x) - halfW;
+    const float right = (std::max)(head.x, feet.x) + halfW;
+
     const ImVec2 disp = ImGui::GetIO().DisplaySize;
-    if (cx < -margin || cy < -margin || cx > disp.x + margin || cy > disp.y + margin)
+    if (right < -margin || left > disp.x + margin
+        || bottom < -margin || top > disp.y + margin)
         return false;
 
     return true;

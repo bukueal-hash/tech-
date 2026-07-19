@@ -17,6 +17,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace {
 
@@ -229,6 +230,21 @@ static bool IsGroundPickupCategory(WorldItemCategory cat)
         || cat == WorldItemCategory::Items
         || cat == WorldItemCategory::Harvestable;
 }
+
+// #region agent log
+static void AgentItemLog(const char* message, const char* hypothesisId, const std::string& dataJson)
+{
+    std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+    if (!f)
+        return;
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    f << "{\"sessionId\":\"c190fb\",\"runId\":\"baseline\",\"hypothesisId\":\""
+        << hypothesisId << "\",\"location\":\"ItemList.cpp\",\"message\":\""
+        << message << "\",\"data\":" << dataJson
+        << ",\"timestamp\":" << ms << "}\n";
+}
+// #endregion
 
 } // namespace
 
@@ -476,7 +492,43 @@ void Engine::ItemList()
 
         int rarityTier = 0;
         int lootValue = 0;
-        ResolveItemMetaForActor(*this, key, fname, displayName, rarityTier, lootValue);
+        const bool metaHit =
+            ResolveItemMetaForActor(*this, key, fname, displayName, rarityTier, lootValue);
+
+        // Positive identification: a ground item must prove what it is from game
+        // data — items_meta/asset tables (metaHit), the game's own hover name,
+        // or a harvestable node. A label that exists only because an engine
+        // fname was prettified is not an item (world_draw_caps farLabel proved
+        // "NS Jetengine Array Light Drone", a Niagara VFX actor, drew as loot).
+        const bool identityProven = metaHit
+            || cat == WorldItemCategory::Harvestable
+            || !GetEnglishItemName(key).empty();
+        if (!identityProven) {
+            // #region agent log
+            {
+                static std::unordered_set<std::string> s_posGateSeen;
+                static int s_posGateDropped = 0;
+                ++s_posGateDropped;
+                if (s_posGateSeen.insert(displayName).second
+                    && s_posGateSeen.size() <= 60) {
+                    std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+                    if (f) {
+                        char lbl[96]{};
+                        snprintf(lbl, sizeof(lbl), "%.80s", displayName.c_str());
+                        const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"post-fix\",\"hypothesisId\":\"P5\","
+                          << "\"location\":\"ItemList.cpp:ItemList\",\"message\":\"item_posgate_drop\","
+                          << "\"data\":{\"label\":\"" << lbl
+                          << "\",\"cat\":" << static_cast<int>(cat)
+                          << ",\"droppedTotal\":" << s_posGateDropped << "}"
+                          << ",\"timestamp\":" << ts << "}\n";
+                    }
+                }
+            }
+            // #endregion
+            continue;
+        }
 
         auto& entry = localCache[key];
         entry.rootComponent = root;
@@ -518,6 +570,16 @@ void Engine::ItemList()
         // can erase the live map mid-scan; without this, localCache writeback
         // restores the ghost (log: liveNear same key after userMark).
         if (IsGroundPickupGoneSticky(key)) {
+            // #region agent log
+            {
+                char buf[192];
+                snprintf(buf, sizeof(buf),
+                    "{\"label\":\"%.48s\",\"reason\":\"sticky\",\"key\":%llu}",
+                    it->second.ItemDisplayName.c_str(),
+                    static_cast<unsigned long long>(key));
+                AgentItemLog("item_evict", "G1", buf);
+            }
+            // #endregion
             ClearItemPosMiss(key);
             it = localCache.erase(it);
             continue;
@@ -543,6 +605,16 @@ void Engine::ItemList()
         const auto retainCat = static_cast<WorldItemCategory>(it->second.worldCategory);
         if (WorldLootCacheEntryDepleted(key, retainFname, retainCat)) {
             ++dbgDepleted;
+            // #region agent log
+            {
+                char buf[192];
+                snprintf(buf, sizeof(buf),
+                    "{\"label\":\"%.48s\",\"reason\":\"deplete\",\"key\":%llu}",
+                    it->second.ItemDisplayName.c_str(),
+                    static_cast<unsigned long long>(key));
+                AgentItemLog("item_evict", "G1", buf);
+            }
+            // #endregion
             if (IsGroundPickupCategory(retainCat)
                 || FnameLooksLikeDroppedPickup(retainFname))
                 MarkGroundPickupGoneSticky(key);
@@ -617,6 +689,16 @@ void Engine::ItemList()
         if (!posOk) {
             ++dbgPosSkip;
             if (ItemPosMissShouldEvict(key, false, pickupLike)) {
+                // #region agent log
+                {
+                    char buf[192];
+                    snprintf(buf, sizeof(buf),
+                        "{\"label\":\"%.48s\",\"reason\":\"pos_miss\",\"key\":%llu}",
+                        retainIters[i]->second.ItemDisplayName.c_str(),
+                        static_cast<unsigned long long>(key));
+                    AgentItemLog("item_evict", "G1", buf);
+                }
+                // #endregion
                 if (pickupLike)
                     MarkGroundPickupGoneSticky(key);
                 ClearItemPosMiss(key);
@@ -647,68 +729,180 @@ void Engine::ItemList()
     // live BP_PickupBase) — clear on 0→1 hid/noCol / HiddenOrDestroyed without
     // waiting for ~15m actorGone (Canister L2258 / Battery L2259: strong=1).
     // Absolute noCol alone false-positives live shells; require prior live sample.
+    // Bukupex P3: batch the fixed-offset shell probes (one scatter for all
+    // pickup retain entries) instead of serial ProbeGroundLootPickupSignals.
     {
-        using S = GroundLootPickupSignal;
         static std::unordered_map<uintptr_t, uint8_t> s_prevShellBits; // 1=hid 2=noCol
         static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> s_recentNearLive;
         constexpr auto kRecentNearTtl = std::chrono::seconds(45);
         const auto nowShell = std::chrono::steady_clock::now();
 
-        for (auto it = localCache.begin(); it != localCache.end(); ) {
-            const uintptr_t key = it->first;
-            auto& entry = it->second;
-            const auto cat = static_cast<WorldItemCategory>(entry.worldCategory);
+        struct ShellBatchRow {
+            uintptr_t key = 0;
+            decltype(localCache.begin()) it{};
+            uintptr_t root = 0;
+            uintptr_t collider = 0;
+            uint8_t actorHidden = 0;
+            uint8_t ddFlags = 0;
+            uint8_t rootHid = 0;
+            uint8_t colliderHid = 0;
+            int hid = 0;
+            int noCol = 0;
+        };
+        std::vector<ShellBatchRow> shellRows;
+        shellRows.reserve(localCache.size());
+        for (auto it = localCache.begin(); it != localCache.end(); ++it) {
+            const auto cat = static_cast<WorldItemCategory>(it->second.worldCategory);
             if (!IsGroundPickupCategory(cat)
-                && !FnameLooksLikeDroppedPickup(entry.ActorName)) {
-                ++it;
+                && !FnameLooksLikeDroppedPickup(it->second.ActorName))
                 continue;
+            ShellBatchRow row{};
+            row.key = it->first;
+            row.it = it;
+            shellRows.push_back(row);
+        }
+
+        int scatterExecs = 0;
+        if (!shellRows.empty()) {
+            {
+                ScatterSession s1;
+                if (s1.isValid()) {
+                    bool ok = true;
+                    for (auto& row : shellRows) {
+                        ok = s1.prepare(row.key + Offsets::RootComponent, row.root) && ok;
+                        ok = s1.prepare(
+                                 row.key + Offsets::Pickup_RootCollider, row.collider)
+                            && ok;
+                        ok = s1.prepare(
+                                 row.key + Offsets::Actor_bHiddenByte, row.actorHidden)
+                            && ok;
+                        ok = s1.prepare(row.key + Offsets::Actor_FlagsDd, row.ddFlags)
+                            && ok;
+                    }
+                    if (ok && s1.execute())
+                        ++scatterExecs;
+                }
             }
+            {
+                ScatterSession s2;
+                if (s2.isValid()) {
+                    bool ok = true;
+                    int prepared = 0;
+                    for (auto& row : shellRows) {
+                        if (row.root && Memory::IsValidPtrFast2(row.root)) {
+                            ok = s2.prepare(
+                                     row.root + Offsets::Scene_bHiddenInGameByte,
+                                     row.rootHid)
+                                && ok;
+                            ++prepared;
+                        }
+                        if (row.collider && Memory::IsValidPtrFast2(row.collider)) {
+                            ok = s2.prepare(
+                                     row.collider + Offsets::Scene_bHiddenInGameByte,
+                                     row.colliderHid)
+                                && ok;
+                            ++prepared;
+                        }
+                    }
+                    if (prepared > 0 && ok && s2.execute())
+                        ++scatterExecs;
+                }
+            }
+            for (auto& row : shellRows) {
+                const bool actorHid =
+                    (row.actorHidden & Offsets::Actor_bHiddenMask) != 0
+                    || (row.ddFlags & Offsets::Actor_bActorIsBeingDestroyedMask) != 0;
+                const bool sceneHid =
+                    (row.root && Memory::IsValidPtrFast2(row.root)
+                        && (row.rootHid & Offsets::Scene_bHiddenInGameMask) != 0)
+                    || (row.collider && Memory::IsValidPtrFast2(row.collider)
+                        && (row.colliderHid & Offsets::Scene_bHiddenInGameMask) != 0);
+                row.hid = (actorHid || sceneHid) ? 1 : 0;
+                row.noCol =
+                    ((row.ddFlags & Offsets::Actor_bActorEnableCollisionMask) == 0)
+                    ? 1
+                    : 0;
+            }
+        }
 
-            const GroundLootPickupSignal sig =
-                ProbeGroundLootPickupSignals(key, entry.ActorName);
-            const int hid = ((sig & S::HiddenOrDestroyed) != S::None) ? 1 : 0;
-            const int noCol = ((sig & S::NoCollision) != S::None) ? 1 : 0;
-            const int strong = GroundLootPickupHasStrongSignal(sig) ? 1 : 0;
+        // #region agent log
+        {
+            static auto s_lastShellLog = std::chrono::steady_clock::time_point{};
+            if (s_lastShellLog.time_since_epoch().count() == 0
+                || nowShell - s_lastShellLog >= std::chrono::seconds(2)) {
+                s_lastShellLog = nowShell;
+                int pickedHidden = 0;
+                for (const auto& row : shellRows)
+                    pickedHidden += row.hid;
+                std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+                if (f) {
+                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"batch\",\"hypothesisId\":\"P3\","
+                      << "\"location\":\"ItemList.cpp:ItemList\",\"message\":\"item_shell_batch\","
+                      << "\"data\":{\"n\":" << shellRows.size()
+                      << ",\"scatterExecs\":" << scatterExecs
+                      << ",\"pickedHidden\":" << pickedHidden << "}"
+                      << ",\"timestamp\":" << ts << "}\n";
+                }
+            }
+        }
+        // #endregion
 
-            // Stamp only when proven live under 6m (both flags clear).
+        std::unordered_set<uintptr_t> eraseKeys;
+        for (const auto& row : shellRows) {
+            auto& entry = row.it->second;
+            const int hid = row.hid;
+            const int noCol = row.noCol;
+
             if (entry.Drawing && entry.Distance >= 0.f && entry.Distance < 6.f
                 && hid == 0 && noCol == 0) {
-                s_recentNearLive[key] = nowShell;
+                s_recentNearLive[row.key] = nowShell;
             }
 
-            const auto nearIt = s_recentNearLive.find(key);
+            const auto nearIt = s_recentNearLive.find(row.key);
             const bool recentNear = nearIt != s_recentNearLive.end()
                 && (nowShell - nearIt->second) <= kRecentNearTtl;
 
-            // First sample: seed prev without clearing (need a live baseline).
-            if (!s_prevShellBits.contains(key)) {
-                s_prevShellBits[key] = static_cast<uint8_t>(
+            if (!s_prevShellBits.contains(row.key)) {
+                s_prevShellBits[row.key] = static_cast<uint8_t>(
                     (hid ? 1u : 0u) | (noCol ? 2u : 0u));
-                ++it;
                 continue;
             }
-            const uint8_t prevBits = s_prevShellBits[key];
+            const uint8_t prevBits = s_prevShellBits[row.key];
             const int prevHid = (prevBits & 1u) ? 1 : 0;
             const int prevNoCol = (prevBits & 2u) ? 1 : 0;
             const bool hidRise = (hid == 1 && prevHid == 0);
             const bool noColRise = (noCol == 1 && prevNoCol == 0);
-            // recentNear stamped only while hid=0&&noCol=0 under 6m → live baseline.
             const bool gate = recentNear && (hidRise || noColRise);
-            s_prevShellBits[key] = static_cast<uint8_t>(
+            s_prevShellBits[row.key] = static_cast<uint8_t>(
                 (hid ? 1u : 0u) | (noCol ? 2u : 0u));
 
-            if (!gate) {
-                ++it;
+            if (!gate)
                 continue;
-            }
 
-            MarkGroundPickupGoneSticky(key);
-            ClearItemPosMiss(key);
-            s_recentNearLive.erase(key);
-            s_prevShellBits.erase(key);
-            it = localCache.erase(it);
+            MarkGroundPickupGoneSticky(row.key);
+            ClearItemPosMiss(row.key);
+            // #region agent log
+            {
+                char buf[192];
+                snprintf(buf, sizeof(buf),
+                    "{\"label\":\"%.48s\",\"reason\":\"shell_gate\",\"key\":%llu}",
+                    entry.ItemDisplayName.c_str(),
+                    static_cast<unsigned long long>(row.key));
+                AgentItemLog("item_evict", "G1", buf);
+            }
+            // #endregion
+            s_recentNearLive.erase(row.key);
+            s_prevShellBits.erase(row.key);
+            eraseKeys.insert(row.key);
         }
+        for (uintptr_t key : eraseKeys)
+            localCache.erase(key);
     }
+
+
+
 
 
 

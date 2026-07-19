@@ -12,11 +12,19 @@ namespace CollisionVis {
 
 enum class ProbeStatus : int { Red = 0, Yellow = 1, Green = 2 };
 
+enum class BlockerClass : uint8_t {
+    Other = 0,
+    Wall = 1,
+    Door = 2,
+    Tree = 3,
+};
+
 struct RayHit {
     bool clear = true; // fail-open default
     float hitT = 1.f;
     Vector3 hitPos{};
     bool valid = false;
+    BlockerClass blocker = BlockerClass::Other;
 };
 
 struct DebugRay {
@@ -24,6 +32,12 @@ struct DebugRay {
     Vector3 to{};
     bool blocked = false;
     Vector3 hitPos{};
+    BlockerClass blocker = BlockerClass::Other;
+};
+
+struct DebugTri {
+    Vector3 p0{}, p1{}, p2{};
+    BlockerClass cls = BlockerClass::Other;
 };
 
 struct Stats {
@@ -36,6 +50,10 @@ struct Stats {
     int failOpen = 0;
     int hits = 0;
     int clears = 0;
+    int wallSmc = 0;
+    int doorSmc = 0;
+    int treeSmc = 0;
+    int otherSmc = 0;
 };
 
 void TickRebuild(Engine& eng);
@@ -47,7 +65,9 @@ float RebuildRadiusM();
 Stats GetStats();
 void CopyDebugRays(std::vector<DebugRay>& out);
 void RecordDebugRay(const DebugRay& ray);
+void CopyDebugTris(std::vector<DebugTri>& out);
 void ApplyVisToEspCaches(Engine& eng);
 bool AimLosAllows(const Vector3& from, const Vector3& aimBoneWorld);
+const char* BlockerClassName(BlockerClass c);
 
 } // namespace CollisionVis

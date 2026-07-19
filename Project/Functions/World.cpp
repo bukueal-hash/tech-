@@ -5,7 +5,10 @@
 #include "../Core/WorldItemCategory.h"
 #include "../Interface/Utils/Variables/index.h"
 
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <fstream>
 
 bool Engine::GatherWorldScanContext(WorldScanContext& ctx)
 {
@@ -48,6 +51,21 @@ void Engine::FinalizeWorldCacheMap(
     int& outDrawing)
 {
     outDrawing = 0;
+    // #region agent log
+    int distSkip = 0;
+    float farDist = 0.f;
+    float farMax = 0.f;
+    float farBase = 0.f;
+    int farCat = -1;
+    int farRadar = 0;
+    int farSp = 0;
+    std::string farLabel;
+    int skipSample = 0;
+    float skipDist = 0.f;
+    float skipMax = 0.f;
+    int skipCat = -1;
+    std::string skipLabel;
+    // #endregion
     for (auto it = cache.begin(); it != cache.end(); ) {
         auto& entry = it->second;
 
@@ -89,15 +107,22 @@ void Engine::FinalizeWorldCacheMap(
         const bool radarVisible = WorldCategoryVisibleOnRadar(filterView);
 
         // Same tier rules as render: row SP checkbox → loot or SP slider.
-        float maxDrawM = WorldLootPickupMaxDrawMeters(cat, &filterView);
-        if (radarVisible) {
-            const float radarRangeM =
-                var::radar_range > 0.f ? var::radar_range : 100.f;
-            maxDrawM = (std::max)(maxDrawM, radarRangeM);
-        }
+        // Do not widen maxDrawM for radar — ESP draw cap stays category/SP distance.
+        const float maxDrawM = WorldLootPickupMaxDrawMeters(cat, &filterView);
+        const float baseMaxM = maxDrawM;
 
         if (entry.Distance > maxDrawM) {
             entry.Drawing = false;
+            // #region agent log
+            ++distSkip;
+            if (skipSample == 0 || entry.Distance < skipDist) {
+                ++skipSample;
+                skipDist = entry.Distance;
+                skipMax = maxDrawM;
+                skipCat = static_cast<int>(cat);
+                skipLabel = entry.ItemDisplayName;
+            }
+            // #endregion
             ++it;
             continue;
         }
@@ -116,7 +141,80 @@ void Engine::FinalizeWorldCacheMap(
 
         entry.Drawing = true;
         ++outDrawing;
+        // #region agent log
+        if (entry.Distance > farDist) {
+            farDist = entry.Distance;
+            farCat = static_cast<int>(cat);
+            farMax = maxDrawM;
+            farBase = baseMaxM;
+            farRadar = 0;
+            farSp = WorldCategoryUsesSpContainerRange(cat) ? 1 : 0;
+            farLabel = entry.ItemDisplayName;
+        }
+        // #endregion
         entityStarted.store(true, std::memory_order_release);
         ++it;
     }
+
+    // #region agent log
+    {
+        // Drawing-only transitions. Do NOT track key disappearance across
+        // FinalizeWorldCacheMap calls — ItemList and ContainerList alternate
+        // through this function with different caches, which falsely counted
+        // every handoff as world evict/re-admit (flicker_score world=106,
+        // all evictReadmit, while bots/players stayed 0).
+        for (const auto& [key, entry] : cache) {
+            WorldScan::FlickerCause cause = WorldScan::FlickerCause::Other;
+            if (!entry.Drawing) {
+                if (!IsPlausibleWorldPos(entry.WorldPos))
+                    cause = WorldScan::FlickerCause::PosFail;
+                else
+                    cause = WorldScan::FlickerCause::DistEdge;
+            }
+            WorldScan::NoteFlickerDrawing(
+                WorldScan::FlickerChannel::World, key, entry.Drawing, cause);
+        }
+        WorldScan::MaybeFlushFlickerScore();
+    }
+    // #endregion
+
+    // #region agent log
+    {
+        thread_local auto s_last = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (s_last.time_since_epoch().count() == 0
+            || now - s_last >= std::chrono::seconds(2)) {
+            s_last = now;
+            std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+            if (f) {
+                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                char farLabelEsc[64]{};
+                snprintf(farLabelEsc, sizeof(farLabelEsc), "%.48s", farLabel.c_str());
+                char skipLabelEsc[64]{};
+                snprintf(skipLabelEsc, sizeof(skipLabelEsc), "%.48s", skipLabel.c_str());
+                f << "{\"sessionId\":\"c190fb\",\"runId\":\"baseline\",\"hypothesisId\":\"H1\","
+                  << "\"location\":\"World.cpp:FinalizeWorldCacheMap\",\"message\":\"world_draw_caps\","
+                  << "\"data\":{\"cache\":" << cache.size()
+                  << ",\"drawing\":" << outDrawing
+                  << ",\"distSkip\":" << distSkip
+                  << ",\"lootDist\":" << static_cast<int>(var::loot_distance)
+                  << ",\"spDist\":" << static_cast<int>(var::container_distance_sp)
+                  << ",\"radar\":" << static_cast<int>(var::radar_range)
+                  << ",\"farDist\":" << static_cast<int>(farDist)
+                  << ",\"farCat\":" << farCat
+                  << ",\"farMax\":" << static_cast<int>(farMax)
+                  << ",\"farBase\":" << static_cast<int>(farBase)
+                  << ",\"farSp\":" << farSp
+                  << ",\"farRadar\":" << farRadar
+                  << ",\"farLabel\":\"" << farLabelEsc << "\""
+                  << ",\"nearestHiddenDist\":" << static_cast<int>(skipDist)
+                  << ",\"nearestHiddenCap\":" << static_cast<int>(skipMax)
+                  << ",\"nearestHiddenCat\":" << skipCat
+                  << ",\"nearestHiddenLabel\":\"" << skipLabelEsc << "\"}"
+                  << ",\"timestamp\":" << ts << "}\n";
+            }
+        }
+    }
+    // #endregion
 }

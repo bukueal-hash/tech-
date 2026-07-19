@@ -1,6 +1,7 @@
 param(
     [switch]$BuildOnly,
-    [switch]$RunOnly
+    [switch]$RunOnly,
+    [switch]$FullRebuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -108,24 +109,27 @@ function Ensure-ElevatedIfNeeded {
         return
     }
 
-    Write-Host "[*] ArcRaiders is running elevated - relaunching this script as admin (approve UAC)..."
+    Write-Host "[*] ArcRaiders is running elevated - relaunching this script as admin (silent when UAC is off)..."
+    Write-Host "[*] Elevated build progress: $root\build-elevated.log"
     $argList = @(
         "-NoProfile",
         "-ExecutionPolicy", "Bypass",
-        "-File", "`"$PSCommandPath`""
+        "-Command",
+        "& '$PSCommandPath' $(if ($BuildOnly) {'-BuildOnly '})$(if ($RunOnly) {'-RunOnly '})$(if ($FullRebuild) {'-FullRebuild '}) *>&1 | Tee-Object -FilePath '$root\build-elevated.log'"
     )
-    if ($BuildOnly) { $argList += "-BuildOnly" }
-    if ($RunOnly) { $argList += "-RunOnly" }
-
     $proc = Start-Process -FilePath "powershell.exe" `
         -ArgumentList $argList `
         -Verb RunAs `
-        -PassThru `
-        -Wait
+        -PassThru
 
     if ($null -eq $proc) {
         Write-Error "Elevated relaunch was cancelled or failed."
     }
+    # NOTE: do NOT use Start-Process -Wait here. PS 5.1 -Wait waits on the whole
+    # process tree, and the elevated child launches ArcRaiders.exe — so -Wait
+    # blocked until the overlay was closed. WaitForExit() waits only on the
+    # elevated PowerShell itself.
+    $proc.WaitForExit()
     exit $proc.ExitCode
 }
 
@@ -147,11 +151,12 @@ if (-not $RunOnly) {
         Write-Error "MSBuild not found: $msbuild"
     }
 
-    Write-Host "[*] Building Release|x64..."
+    $buildTarget = if ($FullRebuild) { "Rebuild" } else { "Build" }
+    Write-Host "[*] Building Release|x64 ($buildTarget, parallel)..."
     if ($launchPath -eq $altExePath) {
-        & $msbuild $sln /p:Configuration=Release /p:Platform=x64 /t:Rebuild /v:minimal /p:TargetName=$altExeName
+        & $msbuild $sln /m /p:Configuration=Release /p:Platform=x64 /t:$buildTarget /v:minimal /p:TargetName=$altExeName
     } else {
-        & $msbuild $sln /p:Configuration=Release /p:Platform=x64 /t:Rebuild /v:minimal
+        & $msbuild $sln /m /p:Configuration=Release /p:Platform=x64 /t:$buildTarget /v:minimal
     }
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE

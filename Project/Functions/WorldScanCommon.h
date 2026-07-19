@@ -129,4 +129,44 @@ inline void MissCounterClear(
     misses.erase(key);
 }
 
+// #region agent log
+/** Autonomous flicker-fix loop: measure on->off->on draw transitions.
+ *  Channels 0-2 sample the scanner Drawing flag (1-2s cadence).
+ *  Channels 3-5 sample the PAINT path (240fps) — what the user actually sees.
+ *  Paint channels only count blinks whose off-gap is >= 48ms (visible). */
+enum class FlickerChannel : uint8_t {
+    Bot = 0,
+    Player = 1,
+    World = 2,
+    PaintBot = 3,
+    PaintPlayer = 4,
+    PaintWorld = 5
+};
+enum class FlickerCause : uint8_t {
+    PosFail = 0,
+    VisMiss = 1,
+    EvictReadmit = 2,
+    DistEdge = 3,
+    Other = 4,
+    ProjFail = 5,
+    LabelMiss = 6
+};
+
+/** Record final Drawing for this pass. Off->on within 2s of an off counts as a flicker. */
+void NoteFlickerDrawing(
+    FlickerChannel channel,
+    uintptr_t key,
+    bool drawing,
+    FlickerCause cause = FlickerCause::Other);
+
+/** Entity left the cache (evict). Treated as Drawing=false with EvictReadmit. */
+void NoteFlickerGone(FlickerChannel channel, uintptr_t key);
+
+/** Emit flicker_score NDJSON at most once per 10s window when counts moved. */
+void MaybeFlushFlickerScore();
+
+/** On-screen Fix #N — bump in WorldScanCommon.cpp each rebuild cycle. */
+int GetFlickerFixIteration();
+// #endregion
+
 } // namespace WorldScan

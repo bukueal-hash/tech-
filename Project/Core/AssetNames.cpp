@@ -894,12 +894,40 @@ std::string LookupBotClassToken(const std::string& actorFName)
     if (fnameNorm.empty())
         return {};
 
+    // Separator-preserving key so short class tokens ("tick", "pop") can
+    // word-boundary match — the min-5 substring rule blocked them entirely
+    // (debug-c190fb: Ticks admitted with no label => no ESP).
+    std::string fnameWords = ToLowerCopy(actorFName);
+    for (char& c : fnameWords) {
+        if (!std::isalnum(static_cast<unsigned char>(c)))
+            c = ' ';
+    }
+    fnameWords = CollapseSpaces(std::move(fnameWords));
+
     std::string best;
     size_t bestLen = 0;
     for (const auto& [token, robotType] : g_botClassTokenMap) {
-        if (token.size() < 5 || token.size() <= bestLen)
+        if (token.size() < 3 || token.size() <= bestLen)
             continue;
-        if (fnameNorm.find(token) == std::string::npos)
+        bool hit = false;
+        if (token.size() >= 5) {
+            hit = fnameNorm.find(token) != std::string::npos;
+        } else {
+            size_t pos = 0;
+            while ((pos = fnameWords.find(token, pos)) != std::string::npos) {
+                const bool leftOk = (pos == 0)
+                    || !std::isalnum(static_cast<unsigned char>(fnameWords[pos - 1]));
+                const size_t end = pos + token.size();
+                const bool rightOk = (end >= fnameWords.size())
+                    || !std::isalnum(static_cast<unsigned char>(fnameWords[end]));
+                if (leftOk && rightOk) {
+                    hit = true;
+                    break;
+                }
+                ++pos;
+            }
+        }
+        if (!hit)
             continue;
         bestLen = token.size();
         best = robotType;
@@ -1176,12 +1204,48 @@ std::string LookupEnemyBotByFName(const std::string& actorFName)
     if (fnameNorm.empty())
         return {};
 
+    // Boundary-preserving key: separators become spaces ("BP_Tick_C" ->
+    // "bp tick c") so short tokens can word-boundary match. NormalizePlainKey
+    // deletes separators outright ("bptickc"), which makes boundaries
+    // meaningless and forced the old min-5 rule that blocked real short bot
+    // names — Ticks were admitted but had no label, so no ESP (debug-c190fb).
+    std::string fnameWords = ToLowerCopy(actorFName);
+    for (char& c : fnameWords) {
+        if (!std::isalnum(static_cast<unsigned char>(c)))
+            c = ' ';
+    }
+    fnameWords = CollapseSpaces(std::move(fnameWords));
+
+    auto tokenMatches = [&](const std::string& token) -> bool {
+        if (token.size() < 3)
+            return false;
+        if (fnameNorm == token)
+            return true;
+        const std::string& haystack = fnameWords;
+        size_t pos = 0;
+        while ((pos = haystack.find(token, pos)) != std::string::npos) {
+            const bool leftOk = (pos == 0)
+                || !std::isalnum(static_cast<unsigned char>(haystack[pos - 1]));
+            const size_t end = pos + token.size();
+            const bool rightOk = (end >= haystack.size())
+                || !std::isalnum(static_cast<unsigned char>(haystack[end]));
+            if (leftOk && rightOk)
+                return true;
+            ++pos;
+        }
+        // Long tokens keep the old separator-free substring match ("bpsocket"
+        // style compound fnames); short tokens require the boundary hit above.
+        if (token.size() >= 5)
+            return fnameNorm.find(token) != std::string::npos;
+        return false;
+    };
+
     std::string best;
     size_t bestLen = 0;
     for (const EnemyBotPattern& pat : g_enemyBotPatterns) {
         if (pat.token.size() < 3)
             continue;
-        if (fnameNorm.find(pat.token) == std::string::npos)
+        if (!tokenMatches(pat.token))
             continue;
         if (pat.token.size() > bestLen) {
             bestLen = pat.token.size();
