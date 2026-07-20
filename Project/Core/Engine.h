@@ -15,10 +15,10 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 #include "../ThirdParty/ImGui/imgui.h"
-#include "../Interface/Utils/Threads/SyncedThread.h"
 #include "../Interface/Utils/Variables/index.h"
 #include <memory>
 
@@ -86,15 +86,10 @@ private:
     std::atomic<bool> entityStarted{ false };
 
     std::atomic<bool> m_workerThreadsStarted{ false };
-    std::unique_ptr<SyncedThread> m_worldThread;
-    std::unique_ptr<SyncedThread> m_entityThread;
-    std::unique_ptr<SyncedThread> m_worldEspThread;
-    std::unique_ptr<SyncedThread> m_robotEspThread;
-    std::unique_ptr<SyncedThread> m_aimThread;
-    std::unique_ptr<SyncedThread> m_positionThread;
-    std::unique_ptr<SyncedThread> m_cameraThread;
-    std::unique_ptr<SyncedThread> m_frameBuilderThread;
-    std::unique_ptr<SyncedThread> m_visThread;
+    std::atomic<bool> m_taskWorkersStop{ false };
+    std::thread m_hotWorker;
+    std::thread m_mainWorker;
+    std::thread m_featuresWorker;
 
 public:
     // Thread synchronization (paint debug overlay uses try_lock on these)
@@ -182,7 +177,7 @@ public:
 
     void StartWorkerThreads();
     void StopWorkerThreads();
-    /** Debug: current DMA scan-gate contention (paint_gap correlation). */
+    /** Debug: legacy scan-gate snapshot (TaskManager: waiters=0, holder=TaskManager). */
     void GetScanGateSnapshot(int& waiters, const char*& holder) const;
 
     void RenderEsp();

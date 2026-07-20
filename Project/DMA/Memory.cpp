@@ -1,4 +1,5 @@
 #include "Memory.h"
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -7,6 +8,7 @@
 #include <locale>
 #include <codecvt>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -279,21 +281,183 @@ uintptr_t PCIMemory::moduleBase = 0;
 DWORD PCIMemory::moduleImageSize = 0;
 bool PCIMemory::s_memMap = false;
 std::string PCIMemory::attachedExe{};
+std::atomic<DmaConnectionState> PCIMemory::s_dmaState{ DmaConnectionState::Disconnected };
+std::atomic<uint64_t> PCIMemory::s_readOps{ 0 };
+std::atomic<uint64_t> PCIMemory::s_writeOps{ 0 };
+std::atomic<uint64_t> PCIMemory::s_readOk{ 0 };
+std::atomic<uint64_t> PCIMemory::s_readFail{ 0 };
+std::atomic<uint64_t> PCIMemory::s_writeOk{ 0 };
+std::atomic<uint64_t> PCIMemory::s_writeFail{ 0 };
+std::atomic<uint64_t> PCIMemory::s_readBytes{ 0 };
+std::atomic<uint64_t> PCIMemory::s_writeBytes{ 0 };
+std::atomic<uint64_t> PCIMemory::s_scatterBatches{ 0 };
+std::atomic<uint64_t> PCIMemory::s_scatterRequests{ 0 };
+
+namespace {
+std::mutex g_trafficSampleMu;
+std::chrono::steady_clock::time_point g_trafficSampleStart{};
+uint64_t g_sampleReadOps0 = 0;
+uint64_t g_sampleReadBytes0 = 0;
+uint64_t g_sampleScatter0 = 0;
+}
+
+void PCIMemory::RecordDirectRead(size_t bytes, bool ok)
+{
+    s_readOps.fetch_add(1, std::memory_order_relaxed);
+    s_readBytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (ok)
+        s_readOk.fetch_add(1, std::memory_order_relaxed);
+    else
+        s_readFail.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PCIMemory::RecordDirectWrite(size_t bytes, bool ok)
+{
+    s_writeOps.fetch_add(1, std::memory_order_relaxed);
+    s_writeBytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (ok)
+        s_writeOk.fetch_add(1, std::memory_order_relaxed);
+    else
+        s_writeFail.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PCIMemory::RecordScatterRequest()
+{
+    s_scatterRequests.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PCIMemory::RecordScatterBatch(bool /*ok*/)
+{
+    s_scatterBatches.fetch_add(1, std::memory_order_relaxed);
+    s_readOps.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PCIMemory::ResetTrafficStats()
+{
+    s_readOps.store(0, std::memory_order_relaxed);
+    s_writeOps.store(0, std::memory_order_relaxed);
+    s_readOk.store(0, std::memory_order_relaxed);
+    s_readFail.store(0, std::memory_order_relaxed);
+    s_writeOk.store(0, std::memory_order_relaxed);
+    s_writeFail.store(0, std::memory_order_relaxed);
+    s_readBytes.store(0, std::memory_order_relaxed);
+    s_writeBytes.store(0, std::memory_order_relaxed);
+    s_scatterBatches.store(0, std::memory_order_relaxed);
+    s_scatterRequests.store(0, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_trafficSampleMu);
+    g_trafficSampleStart = std::chrono::steady_clock::now();
+    g_sampleReadOps0 = 0;
+    g_sampleReadBytes0 = 0;
+    g_sampleScatter0 = 0;
+}
+
+MemoryTrafficStats PCIMemory::GetTrafficStats()
+{
+    MemoryTrafficStats s{};
+    s.readOperations = s_readOps.load(std::memory_order_relaxed);
+    s.writeOperations = s_writeOps.load(std::memory_order_relaxed);
+    s.readSuccesses = s_readOk.load(std::memory_order_relaxed);
+    s.readFailures = s_readFail.load(std::memory_order_relaxed);
+    s.writeSuccesses = s_writeOk.load(std::memory_order_relaxed);
+    s.writeFailures = s_writeFail.load(std::memory_order_relaxed);
+    s.readBytesRequested = s_readBytes.load(std::memory_order_relaxed);
+    s.writeBytesRequested = s_writeBytes.load(std::memory_order_relaxed);
+    s.scatterReadBatches = s_scatterBatches.load(std::memory_order_relaxed);
+    s.scatterReadRequests = s_scatterRequests.load(std::memory_order_relaxed);
+
+    std::lock_guard<std::mutex> lock(g_trafficSampleMu);
+    const auto now = std::chrono::steady_clock::now();
+    if (g_trafficSampleStart.time_since_epoch().count() == 0) {
+        g_trafficSampleStart = now;
+        g_sampleReadOps0 = s.readOperations;
+        g_sampleReadBytes0 = s.readBytesRequested;
+        g_sampleScatter0 = s.scatterReadBatches;
+    }
+    const double secs = std::chrono::duration<double>(now - g_trafficSampleStart).count();
+    s.sampleWindowSeconds = secs;
+    if (secs > 0.25) {
+        s.readOperationsPerSecond = (s.readOperations - g_sampleReadOps0) / secs;
+        s.readBytesRequestedPerSecond = (s.readBytesRequested - g_sampleReadBytes0) / secs;
+        s.scatterReadBatchesPerSecond = (s.scatterReadBatches - g_sampleScatter0) / secs;
+        if (secs > 5.0) {
+            g_trafficSampleStart = now;
+            g_sampleReadOps0 = s.readOperations;
+            g_sampleReadBytes0 = s.readBytesRequested;
+            g_sampleScatter0 = s.scatterReadBatches;
+        }
+    }
+    return s;
+}
+
+MemoryConnectionStats PCIMemory::GetConnectionStats()
+{
+    MemoryConnectionStats c{};
+    c.vmmHandleValid = hVMM != nullptr;
+    c.processInitialized = processId != 0 && moduleBase != 0;
+    c.processId = processId;
+    c.processName = attachedExe;
+    c.targetBaseAddress = moduleBase;
+    c.targetBaseSize = moduleImageSize;
+    c.state = s_dmaState.load(std::memory_order_relaxed);
+    return c;
+}
+
+std::string PCIMemory::GetTrafficStatsString()
+{
+    const auto s = GetTrafficStats();
+    std::ostringstream oss;
+    oss << "reads=" << s.readOperations
+        << " ok=" << s.readSuccesses
+        << " fail=" << s.readFailures
+        << " bytes=" << s.readBytesRequested
+        << " scatterBat=" << s.scatterReadBatches
+        << " scatterReq=" << s.scatterReadRequests
+        << " rps=" << static_cast<int>(s.readOperationsPerSecond)
+        << " bps=" << static_cast<int>(s.readBytesRequestedPerSecond);
+    return oss.str();
+}
+
+bool PCIMemory::ReadChain(uint64_t base, const std::vector<uint64_t>& offsets, uint64_t& out, bool useCache)
+{
+    out = 0;
+    if (!base || offsets.empty())
+        return false;
+    uint64_t cur = base;
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        uint64_t next = 0;
+        if (!TryRead(cur + offsets[i], next, useCache) || !next)
+            return false;
+        cur = next;
+    }
+    out = cur;
+    return true;
+}
+
+uint64_t PCIMemory::ReadChain(uint64_t base, const std::vector<uint64_t>& offsets, bool useCache)
+{
+    uint64_t out = 0;
+    ReadChain(base, offsets, out, useCache);
+    return out;
+}
 
 PCIMemory::~PCIMemory() {
     if (hVMM) {
         VMMDLL_Close(hVMM);
         hVMM = nullptr;
     }
+    s_dmaState.store(DmaConnectionState::Disconnected, std::memory_order_relaxed);
 }
 
 bool PCIMemory::Initialize(const char* gameExe) {
     if (!gameExe || !*gameExe)
         return false;
 
+    s_dmaState.store(DmaConnectionState::Connecting, std::memory_order_relaxed);
+
     auto attachProcess = [&]() -> bool {
         if (!hVMM)
             return false;
+        s_dmaState.store(DmaConnectionState::WaitingForProcess, std::memory_order_relaxed);
         if (!VMMDLL_PidGetFromName(hVMM, gameExe, &processId) || !processId)
             return false;
 
@@ -319,7 +483,11 @@ bool PCIMemory::Initialize(const char* gameExe) {
 
         std::cout << "[+] DMA attached: " << gameExe << " PID: " << processId
             << " Base: 0x" << std::hex << moduleBase << std::dec << std::endl;
-        return moduleBase != 0;
+        if (moduleBase != 0) {
+            s_dmaState.store(DmaConnectionState::Connected, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
     };
 
     if (hVMM && processId && moduleBase) {
@@ -328,6 +496,7 @@ bool PCIMemory::Initialize(const char* gameExe) {
             TryImproveModuleBase(hVMM, processId, gameExe, moduleBase, moduleImageSize);
             vmProcess.dwModBase = moduleBase;
             vmProcess.dwImageSize = moduleImageSize;
+            s_dmaState.store(DmaConnectionState::Connected, std::memory_order_relaxed);
             return true;
         }
     }
@@ -415,6 +584,7 @@ bool PCIMemory::Initialize(const char* gameExe) {
     }
 
     std::cout << "[!] All device types failed. Retrying...\n";
+    s_dmaState.store(DmaConnectionState::Failed, std::memory_order_relaxed);
     return false;
 }
 
@@ -481,6 +651,7 @@ bool PCIMemory::InitializeVmmOnly() {
 }
 
 bool PCIMemory::reconnect(const char* gameExe) {
+    s_dmaState.store(DmaConnectionState::Connecting, std::memory_order_relaxed);
     if (hVMM) {
         VMMDLL_Close(hVMM);
         hVMM = nullptr;
@@ -497,8 +668,11 @@ bool PCIMemory::read(uintptr_t address, void* buffer, size_t size) const {
 
 bool PCIMemory::write(uintptr_t address, const void* buffer, size_t size) {
     if (hVMM && processId) {
-        return VMMDLL_MemWrite(hVMM, processId, address, reinterpret_cast<PBYTE>(const_cast<void*>(buffer)), static_cast<DWORD>(size)) == TRUE;
+        const bool ok = VMMDLL_MemWrite(hVMM, processId, address, reinterpret_cast<PBYTE>(const_cast<void*>(buffer)), static_cast<DWORD>(size)) == TRUE;
+        RecordDirectWrite(size, ok);
+        return ok;
     }
+    RecordDirectWrite(size, false);
     return false;
 }
 
