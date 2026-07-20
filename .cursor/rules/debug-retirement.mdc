@@ -1,0 +1,24 @@
+# Debug channel retirement
+
+When a debug channel is clean across **5–7 completed raids** (RAID_START→RAID_END), **remove that instrumentation** and stop watching it. Keep focus on channels that still fire errors or regressions.
+
+## Rule
+
+1. Every cycle: read **all** debug message types, not only flicker.
+2. Track each channel's clean-raid streak in [`help/DEBUG_CHANNEL_STATUS.md`](help/DEBUG_CHANNEL_STATUS.md).
+3. At **5–7 clean raids** with no junk/errors for that channel → delete its `agent log` / NDJSON emitters in one focused change → rebuild → confirm silence.
+4. Do **not** remove functional gates/fixes — only the debug logging for finished areas.
+5. If a retired area regresses in user reports, re-add a **narrow** probe for that area only.
+
+## Currently active focus (do not retire yet)
+
+- `flicker_score` / paintWorld projFail
+- `perf_spike` / `scan_gate` (pass times still high)
+- `bot_nopos` / `bot_pos_freeze` (Wasps / Vaporizer zero-pos)
+- Overlay `[debugPlayer]` / `[debugRobot]` / `[debugItem]` / `[debugContainer]` counters
+- Container/item/world_draw_caps watch channels
+- `raid_hb` (watcher)
+
+## Retired (do not re-add unless regression)
+
+See status file. Includes naming traces, render timing (`paint_frame` / `home_paint` / `esp_paint` / `frame_build` / `pos_refresh` / `cam_refresh_gap`), player pipeline (`player_collect` / `player_ghost` / `player_admit_ring` / `ally_team_ids`), and steady bot counters (`bot_scan` / `bot_admit_batch` / `bot_retain_*` / `bot_grace` / `bot_verify_fail`).
