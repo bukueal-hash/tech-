@@ -1,0 +1,284 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{355778f2-2b6a-4cd7-b1ec-70d35e4bb738}</ProjectGuid>
+    <RootNamespace>Project</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <ConformanceMode>false</ConformanceMode>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <ArcDmaBinDir>$(MSBuildProjectDirectory)\x64</ArcDmaBinDir>
+    <SolutionDir Condition="'$(SolutionDir)' == '' Or !HasTrailingSlash('$(SolutionDir)')">$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\'))\</SolutionDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <OutDir>$(SolutionDir)\Build\</OutDir>
+    <IntDir>$(SolutionDir)\Build\Intermediate\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <OutDir>$(SolutionDir)\Build\</OutDir>
+    <IntDir>$(SolutionDir)\Build\Intermediate\</IntDir>
+    <TargetName>ArcRaiders</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(SolutionDir)Project;$(ProjectDir)lib\include;$(ProjectDir)ThirdParty;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <DebugInformationFormat>None</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <AdditionalDependencies>d3d11.lib;vmm.lib;leechcore.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)lib;$(ProjectDir)lib\DMA;$(ArcDmaBinDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+    <PostBuildEvent>
+      <Command>if exist "$(ProjectDir)lib\vmm.dll" copy /Y "$(ProjectDir)lib\vmm.dll" "$(OutDir)"&#x0D;&#x0A;if exist "$(ProjectDir)lib\leechcore.dll" copy /Y "$(ProjectDir)lib\leechcore.dll" "$(OutDir)"&#x0D;&#x0A;xcopy /Y /D "$(ArcDmaBinDir)\*.dll" "$(OutDir)" 2&gt;nul&#x0D;&#x0A;if exist "$(ArcDmaBinDir)\info.db" xcopy /Y /D "$(ArcDmaBinDir)\info.db" "$(OutDir)"&#x0D;&#x0A;xcopy /E /I /Y "$(ProjectDir)Data" "$(OutDir)Data"</Command>
+      <Message>Copy DMA runtime from Project\x64 to Build\</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>false</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(SolutionDir)Project;$(ProjectDir)lib\include;$(ProjectDir)ThirdParty;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <DebugInformationFormat>None</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <AdditionalDependencies>d3d11.lib;vmm.lib;leechcore.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)lib;$(ProjectDir)lib\DMA;$(ArcDmaBinDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+    </Link>
+    <PostBuildEvent>
+      <Command>if exist "$(ProjectDir)lib\vmm.dll" copy /Y "$(ProjectDir)lib\vmm.dll" "$(OutDir)"&#x0D;&#x0A;if exist "$(ProjectDir)lib\leechcore.dll" copy /Y "$(ProjectDir)lib\leechcore.dll" "$(OutDir)"&#x0D;&#x0A;xcopy /Y /D "$(ArcDmaBinDir)\*.dll" "$(OutDir)" 2&gt;nul&#x0D;&#x0A;if exist "$(ArcDmaBinDir)\info.db" xcopy /Y /D "$(ArcDmaBinDir)\info.db" "$(OutDir)"&#x0D;&#x0A;xcopy /E /I /Y "$(ProjectDir)Data" "$(OutDir)Data"</Command>
+      <Message>Copy DMA runtime from Project\x64 to Build\</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <!-- DMA -->
+    <ClCompile Include="DMA\DmaKeyboard.cpp" />
+    <ClCompile Include="DMA\Memory.cpp" />
+    <!-- Dumper -->
+    <ClCompile Include="Dumper\Dumper.cpp" />
+    <ClCompile Include="Dumper\DumperPaths.cpp" />
+    <ClCompile Include="Dumper\DumperState.cpp" />
+    <ClCompile Include="Dumper\DumperWorker.cpp" />
+    <ClCompile Include="Dumper\FNameDiscovery.cpp" />
+    <ClCompile Include="Dumper\GlobalDiscovery.cpp" />
+    <ClCompile Include="Dumper\ModuleImageCache.cpp" />
+    <ClCompile Include="Dumper\SdkDumper.cpp" />
+    <ClCompile Include="Dumper\WorldResolveDump.cpp" />
+    <ClCompile Include="Dumper\SigScanner.cpp" />
+    <!-- Functions -->
+    <ClCompile Include="Functions\EngineThreads.cpp" />
+    <ClCompile Include="Functions\EntityList.cpp" />
+    <ClCompile Include="Functions\ContainerList.cpp" />
+    <ClCompile Include="Functions\ItemList.cpp" />
+    <ClCompile Include="Functions\PositionRefreshPass.cpp" />
+    <ClCompile Include="Interface\Render\RenderQueue.cpp" />
+    <ClCompile Include="Functions\WorldScanCommon.cpp" />
+    <ClCompile Include="Functions\RobotList.cpp" />
+    <ClCompile Include="Functions\World.cpp" />
+    <ClCompile Include="Functions\BoneList.cpp" />
+    <ClCompile Include="Functions\CollisionVis.cpp" />
+    <ClCompile Include="Functions\Esp.cpp" />
+    <ClCompile Include="Functions\Aimbot.cpp" />
+    <ClCompile Include="Core\SessionLog.cpp" />
+    <ClCompile Include="Core\AssetNames.cpp" />
+    <ClCompile Include="Core\WorldItemCategory.cpp" />
+    <ClCompile Include="Functions\Update.cpp" />
+    <ClCompile Include="Functions\Utils.cpp" />
+    <!-- Hardware -->
+    <ClCompile Include="Hardware\KmBox.cpp" />
+    <ClCompile Include="Hardware\KmBoxNet.cpp" />
+    <ClCompile Include="Hardware\Makcu\MyMakcu.cpp" />
+    <ClCompile Include="Hardware\Makcu\makcu_vendor\makcu.cpp" />
+    <ClCompile Include="Hardware\Makcu\makcu_vendor\serialport.cpp" />
+    <!-- Input -->
+    <ClCompile Include="Input\Controller.cpp" />
+    <ClCompile Include="Input\DmaGamepad.cpp" />
+    <ClCompile Include="Input\InputBind.cpp" />
+    <ClCompile Include="Input\KeyBind.cpp" />
+    <!-- Interface -->
+    <ClCompile Include="Interface\Overlay\MenuAssets.cpp" />
+    <ClCompile Include="Interface\Overlay\ImGuiKeybind.cpp" />
+    <ClCompile Include="Interface\Overlay\MenuLayout.cpp" />
+    <ClCompile Include="Interface\Overlay\MenuSidebar.cpp" />
+    <ClCompile Include="Interface\OverlayHost.cpp" />
+    <ClCompile Include="Interface\Render.cpp" />
+    <ClCompile Include="Interface\Utils\AutoConfig.cpp" />
+    <ClCompile Include="Interface\Utils\Variables\index.cpp" />
+    <ClCompile Include="Interface\Utils\Visuals\HealthBarDraw.cpp" />
+    <ClCompile Include="Interface\Utils\Visuals\visuals.cpp" />
+    <!-- ThirdParty (ImGui) -->
+    <ClCompile Include="ThirdParty\ImGui\imgui.cpp" />
+    <ClCompile Include="ThirdParty\ImGui\imgui_demo.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="ThirdParty\ImGui\imgui_draw.cpp" />
+    <ClCompile Include="ThirdParty\ImGui\imgui_impl_dx11.cpp" />
+    <ClCompile Include="ThirdParty\ImGui\imgui_impl_win32.cpp" />
+    <ClCompile Include="ThirdParty\ImGui\imgui_tables.cpp" />
+    <ClCompile Include="ThirdParty\ImGui\imgui_widgets.cpp" />
+    <!-- Entry point -->
+    <ClCompile Include="Project.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Core -->
+    <ClInclude Include="Core\AssetNames.h" />
+    <ClInclude Include="Core\Cache.hpp" />
+    <ClInclude Include="Core\Engine.h" />
+    <ClInclude Include="Core\Memory.h" />
+    <ClInclude Include="Core\Offsets.h" />
+    <ClInclude Include="Core\Vector.hpp" />
+    <!-- DMA -->
+    <ClInclude Include="DMA\DmaKeyboard.h" />
+    <ClInclude Include="DMA\DmaVmm.h" />
+    <ClInclude Include="DMA\Memory.h" />
+    <!-- Dumper -->
+    <ClInclude Include="Dumper\Dumper.h" />
+    <ClInclude Include="Dumper\DumperPaths.h" />
+    <ClInclude Include="Dumper\DumperState.h" />
+    <ClInclude Include="Dumper\DumperWorker.h" />
+    <ClInclude Include="Dumper\FNameDiscovery.h" />
+    <ClInclude Include="Dumper\GlobalDiscovery.h" />
+    <ClInclude Include="Dumper\ModuleImageCache.h" />
+    <ClInclude Include="Dumper\SdkDumper.h" />
+    <ClInclude Include="Dumper\WorldResolveDump.h" />
+    <ClInclude Include="Dumper\SigScanner.h" />
+    <!-- Hardware -->
+    <ClInclude Include="Hardware\HidTable.hpp" />
+    <ClInclude Include="Hardware\KmBox.h" />
+    <ClInclude Include="Hardware\KmboxNet.hpp" />
+    <ClInclude Include="Hardware\Makcu\MyMakcu.h" />
+    <ClInclude Include="Hardware\Makcu\makcu_vendor\makcu.h" />
+    <ClInclude Include="Hardware\Makcu\makcu_vendor\serialport.h" />
+    <!-- Input -->
+    <ClInclude Include="Input\Controller.h" />
+    <ClInclude Include="Input\DmaGamepad.h" />
+    <ClInclude Include="Input\InputBind.h" />
+    <ClInclude Include="Input\KeyBind.h" />
+    <!-- Interface -->
+    <ClInclude Include="Interface\Overlay\ImGuiKeybind.h" />
+    <ClInclude Include="Interface\Overlay\Menu.h" />
+    <ClInclude Include="Interface\Overlay\MenuTheme.h" />
+    <ClInclude Include="Interface\OverlayHost.h" />
+    <ClInclude Include="Interface\Render.h" />
+    <ClInclude Include="Interface\Utils\AutoConfig.h" />
+    <ClInclude Include="Interface\Utils\Variables\index.h" />
+    <ClInclude Include="Interface\Utils\Visuals\visuals.hpp" />
+    <!-- ThirdParty (ImGui) -->
+    <ClInclude Include="ThirdParty\ImGui\imconfig.h" />
+    <ClInclude Include="ThirdParty\ImGui\imgui.h" />
+    <ClInclude Include="ThirdParty\ImGui\imgui_impl_dx11.h" />
+    <ClInclude Include="ThirdParty\ImGui\imgui_impl_win32.h" />
+    <ClInclude Include="ThirdParty\ImGui\imgui_internal.h" />
+    <ClInclude Include="ThirdParty\ImGui\imstb_rectpack.h" />
+    <ClInclude Include="ThirdParty\ImGui\imstb_textedit.h" />
+    <ClInclude Include="ThirdParty\ImGui\imstb_truetype.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

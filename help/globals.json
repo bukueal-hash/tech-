@@ -1,0 +1,16 @@
+{
+  "build": "auto",
+  "moduleBase": "0x140000000",
+  "imageSize": 292450304,
+  "globals": {
+    "UWorld": { "rva": "0xE60ACB8", "confidence": "validated", "sig": "48 8B 05 ? ? ? ?" },
+    "GNamePoolRva": { "rva": "0xBD57EBC", "confidence": "validated", "sig": "48 8D 0D ? ? ? ?" },
+    "GUObjectArrayChunksRva": { "rva": "0x0", "confidence": "failed", "sig": "48 8B 05 ? ? ? ?" }
+  },
+  "steamDecrypt": {
+    "FNameKeyTableRva": { "rva": "0xB3850B2", "confidence": "validated" },
+    "FNameBlockMaskRva": { "rva": "0x0", "confidence": "failed" },
+    "FFieldNameKey0Rva": { "rva": "0xB3DB830", "confidence": "candidate" },
+    "FFieldNameKey1Rva": { "rva": "0xB3DB840", "confidence": "candidate" }
+  }
+}

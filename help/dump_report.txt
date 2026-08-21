@@ -1,0 +1,12 @@
+=== Arc Raiders Dumper Report ===
+
+UWorld: 0xE60ACB8 [relaxed]
+GNamePoolRva: 0xBD57EBC [validated]
+GUObjectArrayChunksRva: NOT FOUND [failed]
+FNameKeyTableRva: 0xB3850B2 [validated]
+FNameBlockMaskRva: NOT FOUND [failed] — sig scan miss
+FFieldNameKey0Rva: 0xB3DB830 [candidate]
+FFieldNameKey1Rva: 0xB3DB840 [candidate]
+
+--- SDK dump ---
+FName init failed — check globals / steamDecrypt RVAs
