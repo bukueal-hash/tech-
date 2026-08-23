@@ -1058,16 +1058,23 @@ int64_t TryReadItemGameAssetIdFromActor(uint64_t actor)
         if (assetFname.empty())
             return 0;
 
+        // CSV/JSON asset-id values must never throw from a scan thread:
+        // std::invalid_argument / out_of_range would abort the process.
+        auto safeStoll = [](const std::string& s) -> int64_t {
+            try { return std::stoll(s); }
+            catch (...) { return 0; }
+        };
+
         if (auto it = g_nameToAssetId.find(assetFname); it != g_nameToAssetId.end())
-            return std::stoll(it->second);
+            return safeStoll(it->second);
         for (const char* prefix : { "DA_", "WID_" }) {
             const size_t plen = strlen(prefix);
             if (assetFname.size() > plen && assetFname.compare(0, plen, prefix) == 0) {
                 const std::string stripped = assetFname.substr(plen);
                 if (auto it2 = g_nameToAssetId.find(stripped); it2 != g_nameToAssetId.end())
-                    return std::stoll(it2->second);
+                    return safeStoll(it2->second);
                 if (auto it3 = g_nameToAssetId.find(prefix + stripped); it3 != g_nameToAssetId.end())
-                    return std::stoll(it3->second);
+                    return safeStoll(it3->second);
             }
         }
         return 0;
@@ -1287,25 +1294,25 @@ bool IsAcceptedBotEspLabel(
     if (label == "Bot" || label == "Oil")
         return false;
 
-    if (eng.robotsList.contains(label))
+    if (eng.IsKnownRobotType(label))
         return true;
     if (const std::string fromPat = LookupEnemyBotByFName(label); !fromPat.empty()
-        && eng.robotsList.contains(fromPat))
+        && eng.IsKnownRobotType(fromPat))
         return true;
 
     const std::string mapped = LookupEnemyBotDisplayLabel(label);
-    if (!mapped.empty() && eng.robotsList.contains(mapped))
+    if (!mapped.empty() && eng.IsKnownRobotType(mapped))
         return true;
 
     if (!fnameHint.empty()) {
         const std::string fromEntity = eng.getEntityType(fnameHint);
         if (fromEntity != "Invalid" && fromEntity != "ARC"
-            && fromEntity == label && eng.robotsList.contains(fromEntity))
+            && fromEntity == label && eng.IsKnownRobotType(fromEntity))
             return true;
     }
 
     const std::string normalized = NormalizeBotDisplayName(label);
-    if (normalized != label && eng.robotsList.contains(normalized))
+    if (normalized != label && eng.IsKnownRobotType(normalized))
         return true;
 
     return false;
@@ -1317,10 +1324,10 @@ static std::string MapDisplayToRobotType(Engine& eng, const std::string& display
         return {};
     if (const std::string mapped = LookupEnemyBotDisplayLabel(display); !mapped.empty())
         return mapped;
-    if (eng.robotsList.contains(display))
+    if (eng.IsKnownRobotType(display))
         return display;
     if (const std::string fromPat = LookupEnemyBotByFName(display); !fromPat.empty()
-        && eng.robotsList.contains(fromPat))
+        && eng.IsKnownRobotType(fromPat))
         return fromPat;
     return {};
 }

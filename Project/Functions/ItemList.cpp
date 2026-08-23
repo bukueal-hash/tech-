@@ -235,15 +235,16 @@ static bool IsGroundPickupCategory(WorldItemCategory cat)
 // #region agent log
 static void AgentItemLog(const char* message, const char* hypothesisId, const std::string& dataJson)
 {
-    std::ofstream f(kArcDebugLogPath, std::ios::app);
-    if (!f)
-        return;
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    f << "{\"sessionId\":\"c190fb\",\"runId\":\"baseline\",\"hypothesisId\":\""
-        << hypothesisId << "\",\"location\":\"ItemList.cpp\",\"message\":\""
-        << message << "\",\"data\":" << dataJson
-        << ",\"timestamp\":" << ms << "}\n";
+    std::string line = "{\"sessionId\":\"c190fb\",\"runId\":\"baseline\",\"hypothesisId\":\"";
+    line += hypothesisId;
+    line += "\",\"location\":\"ItemList.cpp\",\"message\":\"";
+    line += message;
+    line += "\",\"data\":";
+    line += dataJson;
+    line += ",\"timestamp\":" + std::to_string(ms) + "}\n";
+    DebugLogAppend(line);
 }
 // #endregion
 
@@ -512,32 +513,8 @@ void Engine::ItemList()
                 && !IsJunkWorldEspLabel(displayName)
                 && !IsFurniturePropLabel(displayName)
                 && IsPlausibleEspLabel(displayName));
-        if (!identityProven) {
-            // #region agent log
-            {
-                static std::unordered_set<std::string> s_posGateSeen;
-                static int s_posGateDropped = 0;
-                ++s_posGateDropped;
-                if (s_posGateSeen.insert(displayName).second
-                    && s_posGateSeen.size() <= 60) {
-                    std::ofstream f(kArcDebugLogPath, std::ios::app);
-                    if (f) {
-                        char lbl[96]{};
-                        snprintf(lbl, sizeof(lbl), "%.80s", displayName.c_str());
-                        const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
-                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"post-fix\",\"hypothesisId\":\"P5\","
-                          << "\"location\":\"ItemList.cpp:ItemList\",\"message\":\"item_posgate_drop\","
-                          << "\"data\":{\"label\":\"" << lbl
-                          << "\",\"cat\":" << static_cast<int>(cat)
-                          << ",\"droppedTotal\":" << s_posGateDropped << "}"
-                          << ",\"timestamp\":" << ts << "}\n";
-                    }
-                }
-            }
-            // #endregion
+        if (!identityProven)
             continue;
-        }
 
         auto& entry = localCache[key];
         entry.rootComponent = root;
@@ -836,25 +813,6 @@ void Engine::ItemList()
 
         // #region agent log
         {
-            static auto s_lastShellLog = std::chrono::steady_clock::time_point{};
-            if (s_lastShellLog.time_since_epoch().count() == 0
-                || nowShell - s_lastShellLog >= std::chrono::seconds(2)) {
-                s_lastShellLog = nowShell;
-                int pickedHidden = 0;
-                for (const auto& row : shellRows)
-                    pickedHidden += row.hid;
-                std::ofstream f(kArcDebugLogPath, std::ios::app);
-                if (f) {
-                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"batch\",\"hypothesisId\":\"P3\","
-                      << "\"location\":\"ItemList.cpp:ItemList\",\"message\":\"item_shell_batch\","
-                      << "\"data\":{\"n\":" << shellRows.size()
-                      << ",\"scatterExecs\":" << scatterExecs
-                      << ",\"pickedHidden\":" << pickedHidden << "}"
-                      << ",\"timestamp\":" << ts << "}\n";
-                }
-            }
         }
         // #endregion
 

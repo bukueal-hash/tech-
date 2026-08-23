@@ -82,6 +82,13 @@ public:
         std::string& outStowed0, int& outStowedQ0,
         std::string& outStowed1, int& outStowedQ1,
         float& outArmorPlates, float& outArmorPerPlate);
+    /** Scatter-batched: invComp already pre-read via scatter-gather, skip first DMA hop. */
+    void ReadPlayerInventoryFast(uintptr_t pawn, uintptr_t invComp,
+        std::string& outWeaponName, int& outWeaponQuality,
+        int& outWeaponClip,
+        std::string& outStowed0, int& outStowedQ0,
+        std::string& outStowed1, int& outStowedQ1,
+        float& outArmorPlates, float& outArmorPerPlate);
 
 private:
     std::atomic<bool> entityStarted{ false };
@@ -508,6 +515,7 @@ public:
         Vector3 ScreenPos;
 
         std::string ActorName;
+        std::string ClassFName;
 
         bool Drawing = false;
         bool isVisible = false;
@@ -553,6 +561,7 @@ public:
     struct EspFrameWorld {
         uintptr_t actorKey = 0;
         WorldCacheEntry entry{};
+        std::string robotLabel;  // pre-resolved in frame builder (DMA ok), used by paint thread
     };
 
     struct EspRenderFrame {
@@ -890,32 +899,18 @@ public:
         return value;
     }
 
-    /** PioneerPlayerState+0x530 is bIsInEncounter — never use as HP. */
-    static double ReadPlayerStatWithHealthFallback(
-        uintptr_t actor,
-        std::ptrdiff_t psOff,
-        std::ptrdiff_t compOff)
-    {
-        (void)psOff;
-        if (!actor)
-            return 0.0;
-
-        const double hcValue = ReadHealthComponentStat(actor, compOff);
-        if (std::isfinite(hcValue) && hcValue >= 0.0 && hcValue < 100000.0)
-            return hcValue;
-        return 0.0;
-    }
-
+    /** Read health directly from the HealthComponent — NaN on read failure so
+     *  callers distinguish "unreadable" from "dead"; the old wrapper returned
+     *  0.0, which made a flaky read look like health 0 and ghost-evicted
+     *  live players. */
     double get_health(uintptr_t actor)
     {
-        return ReadPlayerStatWithHealthFallback(
-            actor, Offsets::PlayerState_Health, Offsets::Health);
+        return ReadHealthComponentStat(actor, Offsets::Health);
     }
 
     double get_maxhealth(uintptr_t actor)
     {
-        return ReadPlayerStatWithHealthFallback(
-            actor, Offsets::PlayerState_MaxHealth, Offsets::MaxHealth);
+        return ReadHealthComponentStat(actor, Offsets::MaxHealth);
     }
 
     double get_armor(uintptr_t actor)
@@ -991,6 +986,19 @@ public:
 
 public:
     std::unordered_set<std::string> robotsList = kRobotsList;
+    // DiscoverNewBotType inserts on the robot scan thread while the aim thread,
+    // frame builder and draw paths read robotsList concurrently. An unordered
+    // set insert can rehash and invalidate iterators mid-iteration (UB/crash).
+    mutable std::shared_mutex m_robotsListMutex;
+
+    bool IsKnownRobotType(const std::string& label) const {
+        std::shared_lock<std::shared_mutex> lock(m_robotsListMutex);
+        return robotsList.contains(label);
+    }
+    void RegisterRobotType(const std::string& label) {
+        std::unique_lock<std::shared_mutex> lock(m_robotsListMutex);
+        robotsList.insert(label);
+    }
 public:
     class FNameCache {
     private:

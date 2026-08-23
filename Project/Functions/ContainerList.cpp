@@ -292,19 +292,12 @@ static void ClearContainerListStaticMaps()
 
 // #region agent log
 static void AgentCrateLog(
-    const char* hypothesisId,
-    const char* message,
-    const std::string& dataJson)
+    const char*,
+    const char*,
+    const std::string&)
 {
-    std::ofstream f(kArcDebugLogPath, std::ios::app);
-    if (!f)
-        return;
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    f << "{\"sessionId\":\"c190fb\",\"runId\":\"crates\",\"hypothesisId\":\""
-        << hypothesisId << "\",\"location\":\"ContainerList.cpp\",\"message\":\""
-        << message << "\",\"data\":" << dataJson
-        << ",\"timestamp\":" << ms << "}\n";
+    // Disabled — 17K writes/session (container_admit + container_verify_softmiss).
+    // Each write flushed to disk inside the scan gate, adding 2-8ms per call.
 }
 // #endregion
 
@@ -763,41 +756,12 @@ void Engine::ContainerList()
             continue;
         }
 
-        if (displayName.empty() || IsGenericWorldEspLabel(displayName)
-            || !IsPlausibleEspLabel(displayName) || IsJunkWorldEspLabel(displayName)) {
-            if (const char* catLabel = WorldItemCategoryLabel(cat)) {
-                const std::string s(catLabel);
-                if (!s.empty() && s != "Unknown" && s != "Other" && s != "Items"
-                    && IsPlausibleEspLabel(s) && !IsGenericWorldEspLabel(s)
-                    && !IsJunkWorldEspLabel(s))
-                    displayName = s;
-            }
-        }
-
-        if (IsJunkWorldEspLabel(displayName) || IsGarbledEspLabel(displayName)
-            || displayName.empty() || !IsPlausibleEspLabel(displayName)) {
-            if (cat == WorldItemCategory::Invalid
-                || cat == WorldItemCategory::Other
-                || cat == WorldItemCategory::Trash)
-                continue;
-            const std::string fallback =
-                ContainerCategoryFallbackEspLabel(cat);
-            if (!fallback.empty())
-                displayName = fallback;
-        }
-
-        if (displayName.empty()) {
-            const char* catFallback = WorldItemCategoryLabel(cat);
-            if (catFallback && catFallback[0] && std::string(catFallback) != "Unknown"
-                && cat != WorldItemCategory::Invalid
-                && cat != WorldItemCategory::Other
-                && cat != WorldItemCategory::Trash)
-                displayName = std::string(catFallback);
-        }
-
+        // No fallback names here. Writing a fake category label ("Crate") into
+        // ItemDisplayName masked the real draw-time resolution: the resolver saw
+        // a "clean" cached name and short-circuited before keyword/CSV/DMA, so
+        // EVERYTHING painted as Crate. If no real name resolved, cache it empty
+        // and let the frame-builder resolver find the true name at draw time.
         displayName = FormatEspDisplayLabel(displayName);
-        if (displayName.empty())
-            continue;
 
         // Distance/Drawing owned by FinalizeWorldCacheMap (item parity) — do not
         // cull at admit or crates beyond loot_distance never enter cache.
@@ -805,6 +769,7 @@ void Engine::ContainerList()
         entry.rootComponent = root;
         entry.APawn = key;
         entry.ActorName = fname;
+        entry.ClassFName = classFname;
         entry.ItemDisplayName = displayName;
         entry.ItemType = displayName;
         entry.worldCategory = static_cast<uint8_t>(cat);
@@ -927,20 +892,24 @@ void Engine::ContainerList()
             it = localCache.erase(it);
             continue;
         }
+        // No category fallback here either: writing "Crate" into the cached name
+        // masked the draw-time resolver (frame builder) which would otherwise
+        // find the real name via keyword/CSV/DMA. Junk/empty names stay empty;
+        // the resolver repopulates them each frame or the entry is skipped.
         if (IsJunkWorldEspLabel(it->second.ItemDisplayName)
-            || IsGarbledEspLabel(it->second.ItemDisplayName)
-            || it->second.ItemDisplayName.empty()) {
-            const auto cat = static_cast<WorldItemCategory>(it->second.worldCategory);
-            if (cat == WorldItemCategory::Invalid
-                || cat == WorldItemCategory::Other
-                || cat == WorldItemCategory::Trash) {
+            || IsGarbledEspLabel(it->second.ItemDisplayName)) {
+            it->second.ItemDisplayName.clear();
+            it->second.ItemType.clear();
+        }
+        if (static_cast<WorldItemCategory>(it->second.worldCategory)
+                == WorldItemCategory::Invalid
+            || static_cast<WorldItemCategory>(it->second.worldCategory)
+                == WorldItemCategory::Other
+            || static_cast<WorldItemCategory>(it->second.worldCategory)
+                == WorldItemCategory::Trash) {
+            if (it->second.ItemDisplayName.empty()) {
                 it = localCache.erase(it);
                 continue;
-            }
-            std::string fixed = ContainerCategoryFallbackEspLabel(cat);
-            if (!fixed.empty()) {
-                it->second.ItemDisplayName = fixed;
-                it->second.ItemType = fixed;
             }
         }
 
@@ -1233,25 +1202,6 @@ void Engine::ContainerList()
         }
         for (uintptr_t key : eraseOpened)
             localCache.erase(key);
-        // #region agent log
-        {
-            static auto s_lastOpenBatch = std::chrono::steady_clock::time_point{};
-            const auto nowB = std::chrono::steady_clock::now();
-            if (s_lastOpenBatch.time_since_epoch().count() == 0
-                || nowB - s_lastOpenBatch >= std::chrono::seconds(2)) {
-                s_lastOpenBatch = nowB;
-                std::ofstream f(kArcDebugLogPath, std::ios::app);
-                if (f) {
-                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"batch\",\"hypothesisId\":\"P4\","
-                      << "\"location\":\"ContainerList.cpp:ContainerList\",\"message\":\"container_open_batch\","
-                      << "\"data\":{\"probed\":" << rows.size()
-                      << ",\"scatterExecs\":" << scatterExecs << "}"
-                      << ",\"timestamp\":" << ts << "}\n";
-                }
-            }
-        }
         // #endregion
     }
 

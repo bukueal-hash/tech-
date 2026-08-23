@@ -145,7 +145,7 @@ namespace Offsets {
     constexpr std::ptrdiff_t Velocity = 0x168;                  // dump: UMovementComponent.Velocity
     constexpr std::ptrdiff_t PioneerCharacterMovement = 0xB48;  // SDK validated
     constexpr std::ptrdiff_t HealthComponent = 0xDD8;           // SDK validated
-    constexpr std::ptrdiff_t InventoryComponent = 0xCB0;        // SDK validated
+    constexpr std::ptrdiff_t InventoryComponent = 0xCA0;        // CL-1341255: UC-posted (was 0xCB0)
     constexpr std::ptrdiff_t EmbarkMesh = 0x7E8;                // SDK validated
 
     // ── Health ────────────────────────────────────────────────────────────────
@@ -154,16 +154,17 @@ namespace Offsets {
     constexpr std::ptrdiff_t PlayerState_MaxHealth = 0x558;     // derived (+0x20)
     constexpr std::ptrdiff_t PlayerState_Armor = 0x560;         // derived (+0x20)
     constexpr std::ptrdiff_t PlayerState_MaxArmor = 0x568;      // derived (+0x20)
-    constexpr std::ptrdiff_t Health = 0x668;                    // UNVERIFIED (non-UPROPERTY)
+    constexpr std::ptrdiff_t Health = 0x678;                    // SDK: HealthComponent.CachedHealth (was 0x668, read 16B too low)
     constexpr std::ptrdiff_t MaxHealth = 0x308;                 // SDK validated
     constexpr std::ptrdiff_t Shield = 0x150;                    // SDK validated
     constexpr std::ptrdiff_t ShieldMax = 0x160;                 // UNVERIFIED (non-UPROPERTY)
     constexpr std::ptrdiff_t MaxDBNO = 0x310;                   // SDK validated
     constexpr std::ptrdiff_t TeamID = 0x822;                    // SDK validated
 
-    constexpr std::ptrdiff_t CurrentItemActors = 0x4B0;         // UNVERIFIED for CL-1341255
-    constexpr std::ptrdiff_t LocalCurrentItemActors = 0x4D0;    // UNVERIFIED for CL-1341255
-    constexpr std::ptrdiff_t EquippedPrimaryItem = 0x510;       // UNVERIFIED for CL-1341255
+    constexpr std::ptrdiff_t CurrentItemActors = 0x4A0;         // CL-1341255: UC-posted (was 0x4B0)
+    constexpr std::ptrdiff_t LocalCurrentItemActors = 0x4C0;    // CL-1341255: UC-posted (was 0x4D0)
+    // EquippedPrimaryItem was 0x510 (UNVERIFIED) — read garbage, masked the
+    // CurrentItemActors fallback. Removed; weapons resolve via inventory chain.
     constexpr std::ptrdiff_t WeaponClip = 0x470;                // u16, ammo in current magazine
     constexpr std::ptrdiff_t WeaponQuality = 0x472;             // UNVERIFIED for CL-1341255
 

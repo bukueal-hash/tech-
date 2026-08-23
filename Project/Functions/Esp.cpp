@@ -35,9 +35,64 @@ struct WorldEspDebugStats {
     int skipDist = 0;
     int skipProj = 0;
     int skipPickedUp = 0;
+    int drawingFalse = 0;
+    int drawingTrue = 0;
+    int pickedUp = 0;
+    int dupKey = 0;
 };
 
 WorldEspDebugStats g_worldEspDbg{};
+
+// Paint-thread watchdog: records timing but does NOT write to the 280+MB
+// debug log on every frame (that I/O IS the freeze). Timestamps go to a
+// separate tiny ring-buffer file so we can diagnose without the disk stall.
+struct EspPaintWatchScope {
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    bool frameLockBusy = false;
+    uint64_t frameSeq = 0;
+
+    ~EspPaintWatchScope()
+    {
+        static auto lastEnd = std::chrono::steady_clock::time_point{};
+        static int ringIdx = 0;
+        const auto now = std::chrono::steady_clock::now();
+        const int gapMs = lastEnd.time_since_epoch().count() == 0
+            ? 0
+            : static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                started - lastEnd).count());
+        const int renderMs = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - started).count());
+        lastEnd = now;
+
+        if (gapMs < 100 && renderMs < 50 && !frameLockBusy)
+            return;
+
+        // Write to a SEPARATE ring-buffer file so we never open
+        // the 280MB debug-c190fb.log from the paint thread.
+        static constexpr int kRingSize = 64;
+        static char ring[kRingSize][256]{};
+        snprintf(ring[ringIdx], sizeof(ring[0]),
+            "esp_paint gapMs=%d renderMs=%d lockBusy=%d seq=%llu\n",
+            gapMs, renderMs, frameLockBusy ? 1 : 0,
+            static_cast<unsigned long long>(frameSeq));
+        ringIdx = (ringIdx + 1) % kRingSize;
+
+        // Flush ring to disk only every 32 writes or on stall
+        static int flushCount = 0;
+        if (++flushCount >= 32 || gapMs > 200 || renderMs > 100) {
+            flushCount = 0;
+            std::ofstream f("F:/Test/ARCs/paint_watch.log", std::ios::trunc);
+            if (f) {
+                for (int i = 0; i < kRingSize; ++i) {
+                    int idx = (ringIdx - kRingSize + i) % kRingSize;
+                    if (idx < 0) idx += kRingSize;
+                    if (ring[idx][0])
+                        f << ring[idx];
+                }
+            }
+        }
+    }
+};
 
 // Clean, human-readable category label for a container. Never empty, never a
 // raw fname or number — used whenever a specific name can't be resolved so a
@@ -601,15 +656,18 @@ static float StackPlayerLabels(
 
 static void RenderPlayerEspFromFrame(
     const std::vector<Engine::EspFramePlayer>& players,
-    const Engine::CameraCache& frameCam);
+    const Engine::CameraCache& frameCam,
+    int& outDrawn);
 
 static void RenderWorldEspFromFrame(
     const std::vector<Engine::EspFrameWorld>& world,
-    const Engine::CameraCache& frameCam);
+    const Engine::CameraCache& frameCam,
+    int& outDrawn, int& outLabelUs, int& outProjUs);
 
 static void RenderRobotEspFromFrame(
     const std::vector<Engine::EspFrameWorld>& robots,
-    const Engine::CameraCache& frameCam);
+    const Engine::CameraCache& frameCam,
+    int& outDrawn);
 
 static void DrawPlayerSkeletonFromCache(
     ImDrawList* drawList,
@@ -770,16 +828,28 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         // Same actor must not draw twice (e.g. Oil pickup + Crate mis-admit).
         // Prefer item/pickup cache over container cache for a shared key.
         std::unordered_set<uintptr_t> worldKeys;
+        int dbgDrawingFalse = 0, dbgDrawingTrue = 0, dbgPickedUp = 0, dbgDupKey = 0;
         auto appendWorld = [&](const std::unordered_map<uintptr_t, WorldCacheEntry>& cache) {
             for (const auto& [key, entry] : cache) {
-                if (!ShouldDrawWorldEsp(entry))
-                    continue;
-                if (IsGroundPickupGoneSticky(key)) {
-                    ++g_worldEspDbg.skipPickedUp;
+                static_assert(sizeof(entry.Drawing) == 1, "Drawing must be bool");
+                if (!entry.Drawing) {
+                    ++dbgDrawingFalse;
                     continue;
                 }
-                if (!worldKeys.insert(key).second)
+                ++dbgDrawingTrue;
+                if (!ShouldDrawWorldEsp(entry)) {
+                    // Drawing was true but ShouldDrawWorldEsp still said no
+                    // (category disabled, getAllowWorldEntry rejected, etc.)
                     continue;
+                }
+                if (IsGroundPickupGoneSticky(key)) {
+                    ++dbgPickedUp;
+                    continue;
+                }
+                if (!worldKeys.insert(key).second) {
+                    ++dbgDupKey;
+                    continue;
+                }
 
                 EspFrameWorld frameWorld{};
                 frameWorld.actorKey = key;
@@ -796,6 +866,11 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             std::shared_lock<std::shared_mutex> lock(m_containerCacheMutex);
             appendWorld(containerCache);
         }
+        // Debug: log why WorldDraw=0 with 1384 cached
+        g_worldEspDbg.drawingFalse = dbgDrawingFalse;
+        g_worldEspDbg.drawingTrue = dbgDrawingTrue;
+        g_worldEspDbg.pickedUp = dbgPickedUp;
+        g_worldEspDbg.dupKey = dbgDupKey;
     }
 
     if (var::showRobots || var::robotAimEnabled || var::show_radar) {
@@ -808,6 +883,11 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             EspFrameWorld frameRobot{};
             frameRobot.actorKey = key;
             frameRobot.entry = entry;
+            // Resolve bot label on the worker thread (DMA allowed) so the
+            // paint thread never calls ResolveBotDrawLabel (blocking DMA).
+            frameRobot.robotLabel = ResolveBotDrawLabel(key, entry.ActorName, entry.ActorName);
+            if (frameRobot.robotLabel.empty() && !entry.ItemDisplayName.empty())
+                frameRobot.robotLabel = ResolveBotDrawLabel(key, entry.ItemDisplayName, entry.ActorName);
             out.robots.push_back(std::move(frameRobot));
         }
     }
@@ -1167,8 +1247,10 @@ static void DrawPlayerEspList(
 
 static void RenderPlayerEspFromFrame(
     const std::vector<Engine::EspFramePlayer>& players,
-    const Engine::CameraCache& frameCam)
+    const Engine::CameraCache& frameCam,
+    int& outDrawn)
 {
+    outDrawn = 0;
     if (!var::enableesp)
         return;
 
@@ -1212,12 +1294,15 @@ static void RenderPlayerEspFromFrame(
         actors.push_back(&entry);
 
     DrawPlayerEspList(actors, frameCam);
+    outDrawn = static_cast<int>(actors.size());
 }
 
 static void RenderRobotEspFromFrame(
     const std::vector<Engine::EspFrameWorld>& robots,
-    const Engine::CameraCache& frameCam)
+    const Engine::CameraCache& frameCam,
+    int& outDrawn)
 {
+    outDrawn = 0;
     if (!var::showRobots)
         return;
 
@@ -1225,9 +1310,12 @@ static void RenderRobotEspFromFrame(
     if (!drawList)
         return;
 
-    const Engine::EngineStateSnapshot stateSnap = engine.GetStateSnapshot();
-    const Vector3 distRef = engine.ResolveDistanceReference(
-        frameCam, stateSnap.acknowledgedPawn);
+    // Paint-thread-safe: GetStateSnapshot takes shared_lock(m_stateMutex)
+    // which blocks when Update/EntityList hold the unique lock during DMA.
+    // frameCam.Location is already valid (resolved by frame builder).
+    const Vector3 distRef = IsPlausibleWorldPos(frameCam.Location)
+        ? frameCam.Location
+        : engine.ResolveDistanceReference(frameCam, 0);
 
     // #region agent log
     // Bots that vanish from the render frame entirely (collect drop) blink
@@ -1252,8 +1340,11 @@ static void RenderRobotEspFromFrame(
         const Engine::WorldCacheEntry& robot = item.entry;
         if (!key || !engine.IsValidPointer(key))
             continue;
-        if (engine.IsCachedPlayer(key))
-            continue;
+        // FREEZE FIX: IsCachedPlayer takes a BLOCKING shared_lock on
+        // m_playerCacheMutex. Called per-bot per-frame on the paint thread it
+        // stalled Present ~200-530ms whenever EntityList held the unique_lock
+        // for its cache swap. ShouldDrawRobotEsp already filters players out
+        // in CollectEspRenderFrame (worker thread) — this check is redundant.
         if (robot.IsBreaked && !var::show_dead_bots)
             continue;
         if (!IsPlausibleWorldPos(robot.WorldPos)) {
@@ -1363,13 +1454,11 @@ static void RenderRobotEspFromFrame(
         const Visuals::EspDrawScale scale =
             Visuals::ComputeEspScaleFromBox(boxH > 1.f ? boxH : 24.f, distM);
 
-        // Paint path must stay DMA-free. Live GetActorFNameString / GetActorClassFName
-        // / ResolveEnemyAssetBotLabel here stalled Present (espMs 500-700). Names are
-        // resolved on the robot worker into ActorName / ItemDisplayName.
+        // Paint path is DMA-free. The frame builder pre-resolved this label
+        // into robotLabel so the paint thread never calls ResolveBotDrawLabel
+        // (which does blocking DMA reads: GetActorClassFName, etc).
         const std::string& fname = robot.ActorName;
-        std::string botLabel = ResolveBotDrawLabel(key, robot.ActorName, fname);
-        if (botLabel.empty() && !robot.ItemDisplayName.empty())
-            botLabel = ResolveBotDrawLabel(key, robot.ItemDisplayName, fname);
+        std::string botLabel = item.robotLabel;
         // No real name → no ESP (heart/dist alone = ghost bots; log GC Electrified).
         // Never use ARC/Bot/Oil placeholders. IsAnyBotActor alone is not enough.
 
@@ -1418,6 +1507,8 @@ static void RenderRobotEspFromFrame(
         if (var::showRobots && var::bot_heart)
             DrawBotHeartIfEnabled(drawList, head, feet, boxH, scale, color);
 
+        ++outDrawn;
+
         if (var::bot_box) {
             const Vector3 screenTop{ head.x, head.y, 0.0 };
             const Vector3 screenBottom{ feet.x, feet.y, 0.0 };
@@ -1457,13 +1548,74 @@ static void RenderRobotEspFromFrame(
     }
 }
 
+// Append-only microsecond-precision paint breakdown. One line per slow paint.
+// Uses ring buffer in memory, flushed to disk on every slow frame.
+struct PaintBreakdownRing {
+    static constexpr int kRing = 128;
+    struct Row {
+        uint64_t seq = 0;
+        int totalUs = 0;
+        int frameCopyUs = 0;
+        int cameraUs = 0;
+        int playersUs = 0;
+        int robotsUs = 0;
+        int worldUs = 0;
+        int flushUs = 0;
+        int nP = 0, nR = 0, nW = 0;
+        int nPDraw = 0, nRDraw = 0, nWDraw = 0;  // entities that actually drew
+        int worldLabelUs = 0;  // time inside label resolution for world entries
+        int worldProjUs = 0;   // time inside projection for world entries
+        bool lockBusy = false;
+    };
+    Row ring[kRing]{};
+    int idx = 0;
+    void push(Row r) {
+        ring[idx] = r;
+        idx = (idx + 1) % kRing;
+        flush();
+    }
+    void flush() {
+        std::ofstream f("F:/Test/ARCs/paint_breakdown.log", std::ios::trunc);
+        if (!f) return;
+        for (int i = 0; i < kRing; ++i) {
+            int ri = (idx - kRing + i + kRing * 2) % kRing;
+            const Row& r = ring[ri];
+            if (!r.seq) continue;
+            f << "seq=" << r.seq
+              << " total=" << r.totalUs
+              << " frameCopy=" << r.frameCopyUs
+              << " cam=" << r.cameraUs
+              << " players=" << r.playersUs
+              << " robots=" << r.robotsUs
+              << " world=" << r.worldUs
+              << " flush=" << r.flushUs
+              << " nP=" << r.nP << "/" << r.nPDraw
+              << " nR=" << r.nR << "/" << r.nRDraw
+              << " nW=" << r.nW << "/" << r.nWDraw
+              << " wLabel=" << r.worldLabelUs
+              << " wProj=" << r.worldProjUs
+              << (r.lockBusy ? " LOCKBUSY" : "")
+              << "\n";
+        }
+    }
+};
+
 void Engine::RenderEsp()
 {
+    EspPaintWatchScope paintWatch{};
+
     const bool drawPlayers = var::enableesp;
     const bool drawBots = var::showRobots || var::robotAimEnabled;
     const bool drawWorld = AnyWorldEspEnabled();
     if (!drawPlayers && !drawBots && !drawWorld && !var::show_radar)
         return;
+
+    using namespace std::chrono;
+    auto nowUs = []() -> int {
+        return static_cast<int>(duration_cast<microseconds>(
+            steady_clock::now().time_since_epoch()).count());
+    };
+    int t0 = nowUs();
 
     SetProjectionViewport(
         ImGui::GetIO().DisplaySize.x,
@@ -1473,28 +1625,49 @@ void Engine::RenderEsp()
     static EspRenderFrame s_paintFrame{};
     {
         std::shared_lock<std::shared_mutex> lock(m_espFrameMutex, std::try_to_lock);
-        if (lock.owns_lock() && m_lastEspFrame.valid)
+        if (!lock.owns_lock())
+            paintWatch.frameLockBusy = true;
+        else if (m_lastEspFrame.valid)
             s_paintFrame = m_lastEspFrame;
     }
     const EspRenderFrame& frame = s_paintFrame;
+    paintWatch.frameSeq = frame.frameSeq;
     if (!frame.valid)
         return;
+
+    int tFrameCopy = nowUs();
+    int frameCopyUs = tFrameCopy - t0;
 
     Engine::CameraCache renderCam{};
     if (!ResolveLiveRenderCamera(frame, renderCam))
         return;
+    int tCamera = nowUs();
+    int cameraUs = tCamera - tFrameCopy;
 
     g_renderQueue.newFrame();
 
+    // Track how many entities actually drew (not skipped)
+    static int s_lastPlayersDrawn = 0, s_lastRobotsDrawn = 0, s_lastWorldDrawn = 0;
+    static int s_lastWorldLabelUs = 0, s_lastWorldProjUs = 0;
+
     if (drawPlayers)
-        RenderPlayerEspFromFrame(frame.players, renderCam);
+        RenderPlayerEspFromFrame(frame.players, renderCam, s_lastPlayersDrawn);
+    int tPlayers = nowUs();
+    int playersUs = tPlayers - tCamera;
+
     if (var::showRobots)
-        RenderRobotEspFromFrame(frame.robots, renderCam);
+        RenderRobotEspFromFrame(frame.robots, renderCam, s_lastRobotsDrawn);
+    int tRobots = nowUs();
+    int robotsUs = tRobots - tPlayers;
+
     if (drawWorld) {
         // Same live POV as players/bots. Using frame.camera here lagged behind
         // g_Camera during stick rotation and drove paintWorld projFail spikes.
-        RenderWorldEspFromFrame(frame.world, renderCam);
+        RenderWorldEspFromFrame(frame.world, renderCam, s_lastWorldDrawn,
+            s_lastWorldLabelUs, s_lastWorldProjUs);
     }
+    int tWorld = nowUs();
+    int worldUs = tWorld - tRobots;
 
     g_renderQueue.endFrame();
 
@@ -1502,60 +1675,72 @@ void Engine::RenderEsp()
         RenderQueue::flushToDrawList(
             drawList,
             g_renderQueue.takeCommands());
-        if (var::show_debug_overlay && drawWorld) {
-            const bool useFrame = CameraOkForEsp(frame.camera);
-            const char* camSrc = useFrame ? "FRAME" : "g_Cam";
-            Engine::CameraCache gCam{};
-            {
-                std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
-                gCam = engine.g_Camera;
-            }
-            char dbgTxt1[256], dbgTxt2[256];
-            std::snprintf(dbgTxt1, sizeof(dbgTxt1),
-                "Cam: %s | Loc: %.0f,%.0f,%.0f | Rot: %.1f,%.1f,%.1f | FOV: %.1f",
-                camSrc,
-                renderCam.Location.x, renderCam.Location.y, renderCam.Location.z,
-                renderCam.Rotation.x, renderCam.Rotation.y, renderCam.Rotation.z,
-                renderCam.FOV);
-            std::snprintf(dbgTxt2, sizeof(dbgTxt2),
-                "g_Cam: %s | Loc: %.0f,%.0f,%.0f | Rot: %.1f,%.1f,%.1f | FOV: %.1f",
-                CameraOkForEsp(gCam) ? "ok" : "BAD",
-                gCam.Location.x, gCam.Location.y, gCam.Location.z,
-                gCam.Rotation.x, gCam.Rotation.y, gCam.Rotation.z,
-                gCam.FOV);
-            drawList->AddText(ImVec2(10, 10), 0xFF00FF00, dbgTxt1);
-            drawList->AddText(ImVec2(10, 10 + ImGui::GetFontSize() + 8), 0xFF00FF00, dbgTxt2);
-        }
+    }
+    int tFlush = nowUs();
+    int flushUs = tFlush - tWorld;
+    int totalUs = tFlush - t0;
+
+    // Log breakdown when slow (>100ms = 100000us) or periodically
+    static int logCounter = 0;
+    if (totalUs > 100000 || (++logCounter % 120 == 0)) {
+        static PaintBreakdownRing s_ring;
+        PaintBreakdownRing::Row row;
+        row.seq = frame.frameSeq;
+        row.totalUs = totalUs;
+        row.frameCopyUs = frameCopyUs;
+        row.cameraUs = cameraUs;
+        row.playersUs = playersUs;
+        row.robotsUs = robotsUs;
+        row.worldUs = worldUs;
+        row.flushUs = flushUs;
+        row.nP = static_cast<int>(frame.players.size());
+        row.nR = static_cast<int>(frame.robots.size());
+        row.nW = static_cast<int>(frame.world.size());
+        row.nPDraw = s_lastPlayersDrawn;
+        row.nRDraw = s_lastRobotsDrawn;
+        row.nWDraw = s_lastWorldDrawn;
+        row.worldLabelUs = s_lastWorldLabelUs;
+        row.worldProjUs = s_lastWorldProjUs;
+        row.lockBusy = paintWatch.frameLockBusy;
+        s_ring.push(row);
     }
 
     if (var::show_debug_overlay && drawWorld) {
-        static auto lastWorldDbg = std::chrono::steady_clock::now();
-        const auto now = std::chrono::steady_clock::now();
-        if (now - lastWorldDbg >= std::chrono::seconds(1)) {
-            lastWorldDbg = now;
-            std::cout << "[debugCam] src="
-                << (CameraOkForEsp(frame.camera) ? "frame" : "g_Camera")
-                << " loc=" << renderCam.Location.x << "," << renderCam.Location.y << "," << renderCam.Location.z
-                << " rot=" << renderCam.Rotation.x << "," << renderCam.Rotation.y << "," << renderCam.Rotation.z
-                << " fov=" << renderCam.FOV
-                << std::endl;
-            std::cout << "[debugWorldEsp] frame=" << g_worldEspDbg.frameEntries
-                << " rendered=" << g_worldEspDbg.rendered
-                << " skipAllow=" << g_worldEspDbg.skipAllow
-                << " skipPos=" << g_worldEspDbg.skipPos
-                << " skipDist=" << g_worldEspDbg.skipDist
-                << " skipProj=" << g_worldEspDbg.skipProj
-                << " skipPickedUp=" << g_worldEspDbg.skipPickedUp
-                << std::endl;
-            g_worldEspDbg = {};
+        const bool useFrame = CameraOkForEsp(frame.camera);
+        const char* camSrc = useFrame ? "FRAME" : "g_Cam";
+        Engine::CameraCache gCam{};
+        {
+            std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
+            gCam = engine.g_Camera;
+        }
+        char dbgTxt1[256], dbgTxt2[256];
+        std::snprintf(dbgTxt1, sizeof(dbgTxt1),
+            "Cam: %s | Loc: %.0f,%.0f,%.0f | Rot: %.1f,%.1f,%.1f | FOV: %.1f",
+            camSrc,
+            renderCam.Location.x, renderCam.Location.y, renderCam.Location.z,
+            renderCam.Rotation.x, renderCam.Rotation.y, renderCam.Rotation.z,
+            renderCam.FOV);
+        std::snprintf(dbgTxt2, sizeof(dbgTxt2),
+            "g_Cam: %s | Loc: %.0f,%.0f,%.0f | Rot: %.1f,%.1f,%.1f | FOV: %.1f",
+            CameraOkForEsp(gCam) ? "ok" : "BAD",
+            gCam.Location.x, gCam.Location.y, gCam.Location.z,
+            gCam.Rotation.x, gCam.Rotation.y, gCam.Rotation.z,
+            gCam.FOV);
+        if (ImDrawList* drawList2 = ImGui::GetForegroundDrawList()) {
+            drawList2->AddText(ImVec2(10, 10), 0xFF00FF00, dbgTxt1);
+            drawList2->AddText(ImVec2(10, 10 + ImGui::GetFontSize() + 8), 0xFF00FF00, dbgTxt2);
         }
     }
 }
 
 static void RenderWorldEspFromFrame(
     const std::vector<Engine::EspFrameWorld>& world,
-    const Engine::CameraCache& frameCam)
+    const Engine::CameraCache& frameCam,
+    int& outDrawn, int& outLabelUs, int& outProjUs)
 {
+    outDrawn = 0;
+    outLabelUs = 0;
+    outProjUs = 0;
     WorldEspDebugStats dbg{};
     dbg.frameEntries = static_cast<int>(world.size());
 
@@ -1757,6 +1942,7 @@ static void RenderWorldEspFromFrame(
             color,
             distM);
         ++dbg.rendered;
+        ++outDrawn;
         // #region agent log
         WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintWorld,
             item.actorKey, true, WorldScan::FlickerCause::Other);
@@ -2081,7 +2267,9 @@ void Engine::RenderRadar(bool interactive)
     };
 
     {
-        std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
+        std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex, std::try_to_lock);
+        if (!lock.owns_lock())
+            return;  // FREEZE FIX: never block the paint thread on cache swap
         for (const auto& [key, actor] : playerCache) {
             (void)key;
             if (!ShouldDrawPlayerEsp(actor))

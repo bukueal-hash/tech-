@@ -827,6 +827,76 @@ void Engine::EntityList()
         entry.WorldPos = pos;
     }
 
+    // ---- PRE-BATCH: collect keys, scatter-read all same-offset fields ----
+    struct RetainBatch {
+        uintptr_t freshRoot = 0;
+        uint8_t enemyTeamId = 0;
+        uintptr_t healthComp = 0;
+        double rawHealth = std::numeric_limits<double>::quiet_NaN();
+        double rawMaxHealth = std::numeric_limits<double>::quiet_NaN();
+        double rawShield = 0.0;
+        double rawMaxShield = 0.0;
+        uintptr_t invCompRaw = 0;
+    };
+    std::unordered_map<uintptr_t, RetainBatch> batchMap;
+    {
+        std::vector<uintptr_t> keys;
+        keys.reserve(localCache.size());
+        for (const auto& [k, v] : localCache) {
+            if (k == sAcknowledgedPawn) continue;
+            keys.push_back(k);
+            batchMap[k] = RetainBatch{};
+        }
+
+        // Batch A: root component pointers
+        {
+            ScatterSession scatter;
+            for (uintptr_t k : keys)
+                scatter.prepare(k + Offsets::RootComponent, batchMap[k].freshRoot);
+            scatter.execute();
+        }
+
+        // Batch B: team IDs
+        {
+            ScatterSession scatter;
+            for (uintptr_t k : keys)
+                scatter.prepare(k + Offsets::TeamID, batchMap[k].enemyTeamId);
+            scatter.execute();
+        }
+
+        // Batch C: HealthComponent pointers (first hop)
+        {
+            ScatterSession scatter;
+            for (uintptr_t k : keys)
+                scatter.prepare(k + Offsets::HealthComponent, batchMap[k].healthComp);
+            scatter.execute();
+        }
+
+        // Batch D: health values from valid health components (second hop)
+        {
+            ScatterSession scatter;
+            for (uintptr_t k : keys) {
+                RetainBatch& rb = batchMap[k];
+                if (!rb.healthComp || !IsValidPointer(rb.healthComp))
+                    continue;
+                scatter.prepare(rb.healthComp + Offsets::Health, rb.rawHealth);
+                scatter.prepare(rb.healthComp + Offsets::MaxHealth, rb.rawMaxHealth);
+                scatter.prepare(rb.healthComp + Offsets::Shield, rb.rawShield);
+                scatter.prepare(rb.healthComp + Offsets::ShieldMax, rb.rawMaxShield);
+            }
+            scatter.execute();
+        }
+
+        // Batch E: InventoryComponent raw pointers (first hop)
+        {
+            ScatterSession scatter;
+            for (uintptr_t k : keys)
+                scatter.prepare(k + Offsets::InventoryComponent, batchMap[k].invCompRaw);
+            scatter.execute();
+        }
+    }
+    // ---- END PRE-BATCH ----
+
     for (auto it = localCache.begin(); it != localCache.end(); )
     {
         auto& actor = it->second;
@@ -839,8 +909,8 @@ void Engine::EntityList()
             continue;
         }
 
-        const uintptr_t freshRoot =
-            Memory::read<uintptr_t>(key + Offsets::RootComponent);
+        const RetainBatch& rb = batchMap[key];
+        const uintptr_t freshRoot = rb.freshRoot;
         if (!freshRoot || !IsValidPointer(freshRoot)) {
             ++dbgRootStale;
             if (WorldScan::MissCounterShouldEvict(
@@ -861,7 +931,7 @@ void Engine::EntityList()
         actor.facingYaw = static_cast<float>(
             Memory::read<double>(freshRoot + Offsets::RelativeRotation + 8));
 
-        const uint8_t enemyTeamId = Memory::read<uint8_t>(key + Offsets::TeamID);
+        const uint8_t enemyTeamId = rb.enemyTeamId;
         actor.enemyTeamId = enemyTeamId;
         actor.isAlly = (myTeamId != 0 && myTeamId == enemyTeamId);
         if (actor.isAlly && var::hide_allies) {
@@ -938,8 +1008,6 @@ void Engine::EntityList()
 
         if (distanceSq > maxDistSq) {
             ++dbgDistSkip;
-            // Soft flap: keep Drawing for a few out-of-range scans so boxes don't
-            // blink at the distance edge. Hard erase paths (ghost/pos) unchanged.
             if (WorldScan::MissCounterShouldEvict(
                     s_playerDistMisses, key, false, kPlayerDistMissClearDrawing)) {
                 actor.Drawing = false;
@@ -951,10 +1019,23 @@ void Engine::EntityList()
         }
         WorldScan::MissCounterClear(s_playerDistMisses, key);
 
-        actor.health = static_cast<float>(get_health(key));
-        actor.maxhealth = static_cast<float>(get_maxhealth(key));
-        actor.shield = static_cast<float>(get_armor(key));
-        actor.maxshield = static_cast<float>(get_maxarmor(key));
+        // Use pre-batched health values (scatter-gather, no serial DMA)
+        if (rb.healthComp && IsValidPointer(rb.healthComp)) {
+            actor.health = std::isfinite(rb.rawHealth)
+                ? static_cast<float>(rb.rawHealth) : 0.0f;
+            actor.maxhealth = std::isfinite(rb.rawMaxHealth)
+                ? static_cast<float>(rb.rawMaxHealth) : 0.0f;
+            actor.shield = std::isfinite(rb.rawShield)
+                ? static_cast<float>(rb.rawShield) : 0.0f;
+            actor.maxshield = std::isfinite(rb.rawMaxShield)
+                ? static_cast<float>(rb.rawMaxShield) : 0.0f;
+        } else {
+            // Fallback: serial read for actors whose health component scatter failed
+            actor.health = static_cast<float>(get_health(key));
+            actor.maxhealth = static_cast<float>(get_maxhealth(key));
+            actor.shield = static_cast<float>(get_armor(key));
+            actor.maxshield = static_cast<float>(get_maxarmor(key));
+        }
 
         if (actor.health < 1.0f) {
             ++dbgHealthSkip;
@@ -971,12 +1052,17 @@ void Engine::EntityList()
         }
 
 
-        // Read weapon system from InventoryComponent (stowed slots + equipped + armor)
+        // Read weapon system — pass pre-batched invComp to skip first DMA read
         std::string invWeapon, invStowed0, invStowed1;
         int invWq = -1, invSq0 = -1, invSq1 = -1, invClip = 0;
         float invArmorPlates = 0.f, invArmorPerPlate = 0.f;
-        ReadPlayerInventory(key, invWeapon, invWq, invClip, invStowed0, invSq0, invStowed1, invSq1,
-            invArmorPlates, invArmorPerPlate);
+        const uintptr_t invComp = ResolveInventoryPtr(rb.invCompRaw);
+        if (invComp)
+            ReadPlayerInventoryFast(key, invComp, invWeapon, invWq, invClip,
+                invStowed0, invSq0, invStowed1, invSq1, invArmorPlates, invArmorPerPlate);
+        else
+            ReadPlayerInventory(key, invWeapon, invWq, invClip, invStowed0, invSq0, invStowed1, invSq1,
+                invArmorPlates, invArmorPerPlate);
         // Only show Unarmed when there is no real gun in primary or stowed.
         if (!invWeapon.empty())
             actor.weaponName = invWeapon;
@@ -1043,7 +1129,7 @@ void Engine::EntityList()
             ? steam_decrypt::IsMeshVisible(static_cast<uint64_t>(actor.actorMesh))
             : true;
 
-        actor.Drawing = actor.health >= 1.0f;
+        actor.Drawing = true;
         ++it;
         entityStarted.store(true, std::memory_order_release);
     }

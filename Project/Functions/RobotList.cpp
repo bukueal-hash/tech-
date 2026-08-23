@@ -426,8 +426,8 @@ std::string DiscoverNewBotType(uintptr_t actor, const std::string& fname)
     if (label.empty())
         return {};
 
-    if (!engine.robotsList.contains(label)) {
-        engine.robotsList.insert(label);
+    if (!engine.IsKnownRobotType(label)) {
+        engine.RegisterRobotType(label);
         // #region agent log
         {
             static std::unordered_set<std::string> s_discoveredSeen;
@@ -475,11 +475,10 @@ bool QuickBotCandidate(uintptr_t actor)
     if (ArcActorType::IsPlayerClassId(masked))
         return false;
 
-    const uintptr_t playerState =
-        Memory::read<uintptr_t>(actor + Offsets::APlayerState);
-    if (playerState && engine.IsValidPointer(playerState))
-        return false;
-
+    // UE5 bots get PlayerStates from their AI controllers — a valid PS alone
+    // no longer proves "human player". Real players are already vetoed above
+    // by class id; this is a cheap pre-filter, the authoritative gate is
+    // VerifyBotActor, so drop the PS veto entirely here.
     if (ArcActorType::IsAnyBotActor(actor))
         return true;
 
@@ -617,9 +616,16 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
         return false;
     if (engine.IsCachedPlayer(actor))
         return false;
+    // UE5 bots get PlayerStates from their AI controllers - a valid PS alone no
+    // longer proves "human player". Only the local player's own PS is a hard
+    // reject; everything else is already vetoed by the checks above.
+    const uintptr_t localPs = localPawn
+        ? Memory::read<uintptr_t>(localPawn + Offsets::APlayerState)
+        : 0;
     const uintptr_t playerState =
         Memory::read<uintptr_t>(actor + Offsets::APlayerState);
-    if (playerState && engine.IsValidPointer(playerState))
+    if (playerState && engine.IsValidPointer(playerState)
+        && playerState == localPs)
         return false;
 
     // Arc entry / cargo / caches / socket containers are world ESP � never bots,
@@ -984,9 +990,15 @@ bool IsArcBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fnam
     if (!actor || actor == localPawn)
         return false;
 
+    // Bots get PlayerStates from AI controllers - only the local player's own
+    // PS is a hard reject here.
+    const uintptr_t localPs = localPawn
+        ? Memory::read<uintptr_t>(localPawn + Offsets::APlayerState)
+        : 0;
     const uintptr_t playerState =
         Memory::read<uintptr_t>(actor + Offsets::APlayerState);
-    if (playerState && engine.IsValidPointer(playerState))
+    if (playerState && engine.IsValidPointer(playerState)
+        && playerState == localPs)
         return false;
 
     if (HasVerifiedEnemyAsset(actor, fnameHint))
@@ -1048,9 +1060,15 @@ bool StillLooksLikeBot(
     if (ArcActorType::IsTargetBotActor(actor))
         return true;
 
+    // Bots get PlayerStates from AI controllers - only the local player's own
+    // PS is a hard reject here.
+    const uintptr_t localPs = localPawn
+        ? Memory::read<uintptr_t>(localPawn + Offsets::APlayerState)
+        : 0;
     const uintptr_t playerState =
         Memory::read<uintptr_t>(actor + Offsets::APlayerState);
-    if (playerState && engine.IsValidPointer(playerState))
+    if (playerState && engine.IsValidPointer(playerState)
+        && playerState == localPs)
         return false;
 
     std::string fname = engine.GetActorFNameStringCached(actor);
@@ -1230,9 +1248,9 @@ bool HasLiveBotVisual(uintptr_t actor, uintptr_t mesh)
 
 uint8_t ReadBotBrokenFlag(uintptr_t actor)
 {
-    // Soft-deprecate bIsBreaked@0x1220 (not in SDK). Prefer only
-    // Constructable_bIsDestroyed@0x1210 (help/esp.txt + SDK). Do not treat
-    // Health==0 as dead — spawn frames often read 0 HP and blocked admits.
+    // Only check Constructable_bIsDestroyed@0x1210 (SDK validated).
+    // bIsBreaked@0x1220 can read garbage on live bots — only use it
+    // in the retain path where false positives are harmless.
     const uint8_t destroyed =
         Memory::read<uint8_t>(actor + Offsets::Constructable_bIsDestroyed);
     return destroyed == 1 ? 1 : 0;
@@ -1657,12 +1675,19 @@ void Engine::RobotList()
                 ++dbgAdmitScatterExecs;
         }
 
+        // Bots get PlayerStates from AI controllers - only the local player's
+        // own PS is a hard skip here; players are otherwise caught by class id
+        // and IsCachedPlayer below.
+        const uintptr_t localPs = sAcknowledgedPawn
+            ? Memory::read<uintptr_t>(sAcknowledgedPawn + Offsets::APlayerState)
+            : 0;
         admitCandidates.reserve(64);
         for (const AdmitProbeRow& r : probeRows) {
             const uint32_t masked = ArcActorType::MaskActorTypeId(r.typeId);
             if (ArcActorType::IsPlayerClassId(masked))
                 continue;
-            if (r.playerState != 0 && Memory::IsValidPtrFast2(r.playerState))
+            if (r.playerState != 0 && Memory::IsValidPtrFast2(r.playerState)
+                && r.playerState == localPs)
                 continue;
             if (engine.IsCachedPlayer(r.actor))
                 continue;

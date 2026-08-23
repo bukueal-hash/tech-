@@ -343,20 +343,14 @@ static bool s_backupScanPending = false;
 // GWorld source tag: 0=none, 1=slot direct, 2=slot inner deref, 3=game-state fallback.
 static std::atomic<int> g_gworldSrc{ 0 };
 static void AgentRaidLog(
-	const char* hypothesisId,
-	const char* location,
-	const char* message,
-	const std::string& dataJson)
+	const char*,
+	const char*,
+	const char*,
+	const std::string&)
 {
-	std::ofstream f(kArcDebugLogPath, std::ios::app);
-	if (!f)
-		return;
-	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-		std::chrono::system_clock::now().time_since_epoch()).count();
-	f << "{\"sessionId\":\"c190fb\",\"runId\":\"pre-fix\",\"hypothesisId\":\""
-		<< hypothesisId << "\",\"location\":\"" << location
-		<< "\",\"message\":\"" << message << "\",\"data\":" << dataJson
-		<< ",\"timestamp\":" << ms << "}\n";
+	// Disabled — 8,665 raw ofstream opens/session. Each open→write→close
+	// fsyncs on the Update thread, file-locks the filesystem, and stalls
+	// the paint thread (GetStateSnapshot blocks on m_stateMutex).
 }
 // #endregion
 

@@ -58,27 +58,8 @@ void LogPerfSpike(const char* threadName, int ms)
             std::cout << std::endl;
         }
     }
-
-    // Throttle file IO: only log spikes, and at most ~2/s per thread name.
-    if (ms < 40)
-        return;
-    thread_local std::unordered_map<std::string, std::chrono::steady_clock::time_point> s_lastSpike;
-    const auto now = std::chrono::steady_clock::now();
-    auto& last = s_lastSpike[threadName];
-    if (last.time_since_epoch().count() != 0
-        && now - last < std::chrono::milliseconds(500))
-        return;
-    last = now;
-
-    std::ofstream f(kArcDebugLogPath, std::ios::app);
-    if (!f)
-        return;
-    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    f << "{\"sessionId\":\"c190fb\",\"runId\":\"baseline\",\"hypothesisId\":\"LAG1\","
-      << "\"location\":\"EngineThreads.cpp\",\"message\":\"perf_spike\","
-      << "\"data\":{\"thread\":\"" << threadName << "\",\"ms\":" << ms << "}"
-      << ",\"timestamp\":" << ts << "}\n";
+    // File I/O disabled — 13K writes/session stalled DMA scans.
+    // Console overlay still works via debug overlay toggle.
 }
 // #endregion
 
@@ -139,22 +120,7 @@ struct CadenceStats {
                   << "  avg=" << static_cast<int>(avg + 0.5) << "ms"
                   << "  drift=" << (drift >= 0 ? "+" : "") << static_cast<int>(drift + 0.5) << "ms"
                   << std::endl;
-        // Also write to session log for post-hoc analysis.
-        std::ofstream f(kArcDebugLogPath, std::ios::app);
-        if (f) {
-            const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            f << "{\"sessionId\":\"c190fb\",\"runId\":\"cadence\",\"hypothesisId\":\"TC\","
-              << "\"location\":\"EngineThreads.cpp\",\"message\":\"cadence_stats\","
-              << "\"data\":{\"thread\":\"" << name << "\""
-              << ",\"targetMs\":" << targetMs
-              << ",\"count\":" << count
-              << ",\"minMs\":" << minInterval
-              << ",\"maxMs\":" << maxInterval
-              << ",\"avgMs\":" << static_cast<int>(avg + 0.5)
-              << ",\"driftMs\":" << static_cast<int>(drift + 0.5)
-              << "},\"timestamp\":" << ts << "}\n";
-        }
+
     }
 
     void reset() {
@@ -189,30 +155,10 @@ std::atomic<const char*> g_scanGateHolder{nullptr};
 //             queued behind the gate when fn() finished).
 //   blockedBy — the scan name that held the gate when this scanner first tried
 //             to acquire it; null when no one was holding it.
-void LogScanGate(const char* scanner, int waitMs, int heldMs, int waiters, const char* blockedBy)
+void LogScanGate(const char*, int, int, int, const char*)
 {
-    if (waitMs < 5)
-        return;
-    thread_local std::unordered_map<std::string, std::chrono::steady_clock::time_point> s_lastGate;
-    const auto now = std::chrono::steady_clock::now();
-    auto& last = s_lastGate[scanner];
-    if (last.time_since_epoch().count() != 0
-        && now - last < std::chrono::milliseconds(500))
-        return;
-    last = now;
-
-    std::ofstream f(kArcDebugLogPath, std::ios::app);
-    if (!f)
-        return;
-    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    f << "{\"sessionId\":\"c190fb\",\"runId\":\"scan-gate\",\"hypothesisId\":\"OV1\","
-      << "\"location\":\"EngineThreads.cpp:gate\",\"message\":\"scan_gate\","
-      << "\"data\":{\"scanner\":\"" << scanner << "\",\"waitMs\":" << waitMs
-      << ",\"heldMs\":" << heldMs
-      << ",\"waiters\":" << waiters
-      << ",\"blockedBy\":\"" << (blockedBy ? blockedBy : "") << "\"}"
-      << ",\"timestamp\":" << ts << "}\n";
+    // Disabled — 8.5K writes/session inside the scan gate mutex.
+    // Each write held the gate an extra 2-8ms while scanners queued.
 }
 // #endregion
 
@@ -285,29 +231,26 @@ void Engine::StartWorkerThreads()
     m_entityThread = std::make_unique<SyncedThread>([this] {
         if (!IsEspRaidActive())
             return;
-        // #region agent log
+        // UNGATED: EntityList does 160 DMA reads over 2.5s. Putting it behind
+        // the scan gate starves RobotList, Update, CollisionVis for 2.5+ seconds.
+        // It writes to a separate playerCache — no shared-data reason to serialize.
         const auto t0 = std::chrono::steady_clock::now();
-        // #endregion
-        RunGatedScan("EntityList", [this] { EntityList(); });
-        // #region agent log
+        EntityList();
         LogPerfSpike("EntityList", static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count()));
-        // #endregion
-    }, 16);
+    }, 48);  // was 16ms — EntityList takes 2s+, scheduling faster only wastes resources
     // Phase 1.5: RobotList was the worst LAG1 offender (baseline ~622ms avg /
     // 1267ms max). Positions stay on PositionRefreshPass @16ms; lengthen this
     // admission/visual pass so FPGA bus contention drops.
     m_robotEspThread = std::make_unique<SyncedThread>([this] {
         if (!IsEspRaidActive())
             return;
-        // #region agent log
+        // UNGATED: RobotList does DMA reads for each bot (fname, mesh, broken flag).
+        // Writing to a separate robotCache — no shared-data reason to serialize behind the gate.
         const auto t0 = std::chrono::steady_clock::now();
-        // #endregion
-        RunGatedScan("RobotList", [this] { RobotList(); });
-        // #region agent log
+        RobotList();
         LogPerfSpike("RobotList", static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count()));
-        // #endregion
     }, 48);
     m_worldEspThread = std::make_unique<SyncedThread>([this] {
         if (!IsEspRaidActive())
@@ -315,18 +258,12 @@ void Engine::StartWorkerThreads()
         // #region agent log
         const auto t0 = std::chrono::steady_clock::now();
         // #endregion
-        RunGatedScan("ContainerList", [this] { ContainerList(); });
-        // #region agent log
-        LogPerfSpike("ContainerList", static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - t0).count()));
-        const auto tItem0 = std::chrono::steady_clock::now();
-        // #endregion
-        RunGatedScan("ItemList", [this] { ItemList(); });
-        // #region agent log
-        LogPerfSpike("ItemList", static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - tItem0).count()));
-        // #endregion
-    }, 16);
+        // UNGATED: ContainerList/ItemList write to separate caches
+        // (containerCache, itemCache) and serializing them behind the
+        // scan gate starves EntityList/RobotList/Update for 3-5 seconds.
+        ContainerList();
+        ItemList();
+    }, 1000);  // scan every 1s (was 16ms — no point running faster than DMA can supply)
     // CAM2 (Fix #3): camera shared m_positionThread with PositionRefreshPass,
     // whose 100-200ms scatter stalls delayed the next UpdateCamera by the same
     // amount (cam_refresh_gap 200-560ms every 3s window). A stale projection

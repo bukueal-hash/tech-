@@ -211,43 +211,5 @@ void Engine::FinalizeWorldCacheMap(
     }
     // #endregion
 
-    // #region agent log
-    {
-        thread_local auto s_last = std::chrono::steady_clock::time_point{};
-        const auto now = std::chrono::steady_clock::now();
-        if (s_last.time_since_epoch().count() == 0
-            || now - s_last >= std::chrono::seconds(2)) {
-            s_last = now;
-            std::ofstream f(kArcDebugLogPath, std::ios::app);
-            if (f) {
-                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                char farLabelEsc[64]{};
-                snprintf(farLabelEsc, sizeof(farLabelEsc), "%.48s", farLabel.c_str());
-                char skipLabelEsc[64]{};
-                snprintf(skipLabelEsc, sizeof(skipLabelEsc), "%.48s", skipLabel.c_str());
-                f << "{\"sessionId\":\"c190fb\",\"runId\":\"baseline\",\"hypothesisId\":\"H1\","
-                  << "\"location\":\"World.cpp:FinalizeWorldCacheMap\",\"message\":\"world_draw_caps\","
-                  << "\"data\":{\"cache\":" << cache.size()
-                  << ",\"drawing\":" << outDrawing
-                  << ",\"distSkip\":" << distSkip
-                  << ",\"lootDist\":" << static_cast<int>(var::loot_distance)
-                  << ",\"spDist\":" << static_cast<int>(var::container_distance_sp)
-                  << ",\"radar\":" << static_cast<int>(var::radar_range)
-                  << ",\"farDist\":" << static_cast<int>(farDist)
-                  << ",\"farCat\":" << farCat
-                  << ",\"farMax\":" << static_cast<int>(farMax)
-                  << ",\"farBase\":" << static_cast<int>(farBase)
-                  << ",\"farSp\":" << farSp
-                  << ",\"farRadar\":" << farRadar
-                  << ",\"farLabel\":\"" << farLabelEsc << "\""
-                  << ",\"nearestHiddenDist\":" << static_cast<int>(skipDist)
-                  << ",\"nearestHiddenCap\":" << static_cast<int>(skipMax)
-                  << ",\"nearestHiddenCat\":" << skipCat
-                  << ",\"nearestHiddenLabel\":\"" << skipLabelEsc << "\"}"
-                  << ",\"timestamp\":" << ts << "}\n";
-            }
-        }
-    }
-    // #endregion
+
 }

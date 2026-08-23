@@ -1168,7 +1168,7 @@ bool Engine::getAllowType(const std::string& actorName, int category) const
     // Radar-only mode must admit bots too (scanner already gates on show_radar).
     const bool wantBots = var::showRobots || var::robotAimEnabled || var::show_radar;
 
-    if (robotsList.find(actorName) != robotsList.end())
+    if (IsKnownRobotType(actorName))
         return wantBots;
 
     // category 3: RobotList — only real robot-list names / fname maps.
@@ -1179,13 +1179,13 @@ bool Engine::getAllowType(const std::string& actorName, int category) const
             return false;
         if (actorName == kBotStructAdmissionToken)
             return true;
-        if (robotsList.find(actorName) != robotsList.end())
+        if (IsKnownRobotType(actorName))
             return true;
         if (const std::string fromPat = LookupEnemyBotByFName(actorName); !fromPat.empty()
-            && robotsList.find(fromPat) != robotsList.end())
+            && IsKnownRobotType(fromPat))
             return true;
         if (const std::string fromDisplay = LookupEnemyBotDisplayLabel(actorName);
-            !fromDisplay.empty() && robotsList.find(fromDisplay) != robotsList.end())
+            !fromDisplay.empty() && IsKnownRobotType(fromDisplay))
             return true;
         return IsAcceptedBotEspLabel(
             *const_cast<Engine*>(this), actorName, std::string{});
@@ -1499,7 +1499,7 @@ std::string Engine::getEntityType(const std::string& actorName)
 
     if (const std::string display = LookupDisplayByFNameAssetIndex(actorName); !display.empty()) {
         const std::string fromDisplay = LookupEnemyBotDisplayLabel(display);
-        if (robotsList.find(fromDisplay) != robotsList.end())
+        if (IsKnownRobotType(fromDisplay))
             return fromDisplay;
     }
 
@@ -1892,6 +1892,133 @@ uintptr_t Engine::ResolveInventoryPtr(uintptr_t raw)
     return 0;
 }
 
+// Scatter-batched variant: invComp pre-read via scatter-gather (skip 1 DMA hop per player).
+void Engine::ReadPlayerInventoryFast(uintptr_t pawn, uintptr_t invComp,
+    std::string& outWeaponName, int& outWeaponQuality,
+    int& outWeaponClip,
+    std::string& outStowed0, int& outStowedQ0,
+    std::string& outStowed1, int& outStowedQ1,
+    float& outArmorPlates, float& outArmorPerPlate)
+{
+    outWeaponName.clear();
+    outWeaponQuality = -1;
+    outWeaponClip = 0;
+    outStowed0.clear();
+    outStowedQ0 = -1;
+    outStowed1.clear();
+    outStowedQ1 = -1;
+    outArmorPlates = 0.f;
+    outArmorPerPlate = 0.f;
+
+    if (!pawn || !invComp)
+        return;
+
+    auto doInventoryBody = [&]() {
+        ReadPlayerInventory(pawn, outWeaponName, outWeaponQuality, outWeaponClip,
+            outStowed0, outStowedQ0, outStowed1, outStowedQ1,
+            outArmorPlates, outArmorPerPlate);
+    };
+    // ReadPlayerInventory delegates to the same logic — the only difference is the
+    // first DMA read (pawn + InventoryComponent) is already done by the caller.
+    // We inline the call instead of delegating to avoid the extra read.
+    (void)doInventoryBody;
+
+    // --- Begin inline copy of ReadPlayerInventory body, minus first DMA read ---
+    // Stowed weapon slot 0
+    StowedWeaponInfo slot0 = Memory::read<StowedWeaponInfo>(invComp + Offsets::StowedWeaponSlot0);
+    if (slot0.WeaponVisual && Memory::IsValidPtrFast2(slot0.WeaponVisual)) {
+        std::string name = GetActorFNameString(slot0.WeaponVisual);
+        if (!name.empty()) {
+            const std::string stripped = StripWeaponAssetName(name);
+            outStowed0 = GetWeaponName(stripped.empty() ? name : stripped);
+        }
+        if (slot0.WeaponQuality >= 0 && slot0.WeaponQuality <= 3)
+            outStowedQ0 = slot0.WeaponQuality + 1;
+    }
+
+    StowedWeaponInfo slot1 = Memory::read<StowedWeaponInfo>(invComp + Offsets::StowedWeaponSlot1);
+    if (slot1.WeaponVisual && Memory::IsValidPtrFast2(slot1.WeaponVisual)) {
+        std::string name = GetActorFNameString(slot1.WeaponVisual);
+        if (!name.empty()) {
+            const std::string stripped = StripWeaponAssetName(name);
+            outStowed1 = GetWeaponName(stripped.empty() ? name : stripped);
+        }
+        if (slot1.WeaponQuality >= 0 && slot1.WeaponQuality <= 3)
+            outStowedQ1 = slot1.WeaponQuality + 1;
+    }
+
+    if (outWeaponName.empty()
+        || outWeaponName == "Unarmed"
+        || outWeaponName.find("Unarmed") != std::string::npos) {
+        auto tryItemArray = [&](std::ptrdiff_t arrOff) {
+            const uint64_t data = Memory::read<uint64_t>(invComp + arrOff);
+            const int32_t count = Memory::read<int32_t>(invComp + arrOff + 0x8);
+            if (!data || count <= 0 || count > 64)
+                return;
+            for (int32_t i = 0; i < count; ++i) {
+                const uintptr_t itemActor = Memory::read<uintptr_t>(
+                    static_cast<uintptr_t>(data) + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
+                const uintptr_t resolved = ResolveInventoryPtr(itemActor);
+                if (!resolved)
+                    continue;
+                std::string nm = GetActorFNameString(resolved);
+                if (nm.empty())
+                    nm = GetActorClassFName(resolved);
+                if (nm.empty())
+                    continue;
+                std::string stripped = StripWeaponAssetName(nm);
+                const std::string friendly = GetWeaponName(stripped.empty() ? nm : stripped);
+                if (!IsPlayerWeaponEspLabel(friendly))
+                    continue;
+                outWeaponName = friendly;
+                const int q = GetWeaponQualityFromActor(resolved);
+                if (q >= 0 && q <= 3)
+                    outWeaponQuality = q + 1;
+                const uint16_t clip = Memory::read<uint16_t>(
+                    static_cast<uintptr_t>(resolved) + Offsets::WeaponClip);
+                if (clip > 0 && clip < 500)
+                    outWeaponClip = static_cast<int>(clip);
+                return;
+            }
+        };
+        tryItemArray(Offsets::CurrentItemActors);
+        if (!IsPlayerWeaponEspLabel(outWeaponName))
+            tryItemArray(Offsets::LocalCurrentItemActors);
+    }
+
+    if (!IsPlayerWeaponEspLabel(outStowed0)) { outStowed0.clear(); outStowedQ0 = -1; }
+    if (!IsPlayerWeaponEspLabel(outStowed1)) { outStowed1.clear(); outStowedQ1 = -1; }
+    if (!IsPlayerWeaponEspLabel(outWeaponName)) {
+        outWeaponName.clear(); outWeaponQuality = -1;
+        if (!outStowed0.empty()) { outWeaponName = outStowed0; outWeaponQuality = outStowedQ0; outStowed0.clear(); outStowedQ0 = -1; }
+        else if (!outStowed1.empty()) { outWeaponName = outStowed1; outWeaponQuality = outStowedQ1; outStowed1.clear(); outStowedQ1 = -1; }
+    }
+    if (!outWeaponName.empty()) {
+        if (outWeaponName == outStowed0) outWeaponQuality = outStowedQ0;
+        else if (outWeaponName == outStowed1) outWeaponQuality = outStowedQ1;
+    }
+    if (!outWeaponName.empty() && outWeaponName == outStowed0) { outStowed0.clear(); outStowedQ0 = -1; }
+    if (!outWeaponName.empty() && outWeaponName == outStowed1) { outStowed1.clear(); outStowedQ1 = -1; }
+    if (outWeaponQuality < 0) {
+        const uintptr_t held = WorldScan::ResolvePreferredHeldItemActor(pawn);
+        if (held) {
+            outWeaponQuality = GetWeaponQualityFromActor(held);
+            if (outWeaponQuality >= 0 && outWeaponQuality <= 3) outWeaponQuality += 1;
+            else if (outWeaponQuality == 4) outWeaponQuality = 4;
+            if (outWeaponClip <= 0) {
+                const uint16_t clip = Memory::read<uint16_t>(static_cast<uintptr_t>(held) + Offsets::WeaponClip);
+                if (clip > 0 && clip < 500) outWeaponClip = static_cast<int>(clip);
+            }
+        }
+    }
+    const uintptr_t armorRaw = Memory::read<uintptr_t>(invComp + Offsets::EquippedArmor);
+    const uintptr_t armorItem = ResolveInventoryPtr(armorRaw);
+    if (armorItem) {
+        outArmorPlates = static_cast<float>(Memory::read<int32_t>(armorItem + 0x264));
+        outArmorPerPlate = static_cast<float>(Memory::read<float>(armorItem + 0x268));
+    }
+}
+
 void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int& outWeaponQuality,
     int& outWeaponClip,
     std::string& outStowed0, int& outStowedQ0,
@@ -1940,21 +2067,8 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
             outStowedQ1 = slot1.WeaponQuality + 1;
     }
 
-    // Read equipped primary item at Inv+0x510 (CL-1315578).
-    const uintptr_t eqRaw = Memory::read<uintptr_t>(invComp + Offsets::EquippedPrimaryItem);
-    const uintptr_t equipped = ResolveInventoryPtr(eqRaw);
-    if (equipped) {
-        std::string eqName = GetActorFNameString(equipped);
-        if (!eqName.empty()) {
-            const std::string stripped = StripWeaponAssetName(eqName);
-            outWeaponName = GetWeaponName(stripped.empty() ? eqName : stripped);
-        }
-        // Read ammo clip from equipped weapon actor
-        const uint16_t eqClip = Memory::read<uint16_t>(
-            static_cast<uintptr_t>(equipped) + Offsets::WeaponClip);
-        if (eqClip > 0 && eqClip < 500)
-            outWeaponClip = static_cast<int>(eqClip);
-    }
+    // EquippedPrimaryItem@0x510 removed (UNVERIFIED, read garbage).
+    // Weapons resolve via CurrentItemActors chain above.
 
     // Fallback: iterate CurrentItemActors TArray @ 0x4B0 (then Local @ 0x4D0).
     if (outWeaponName.empty()
