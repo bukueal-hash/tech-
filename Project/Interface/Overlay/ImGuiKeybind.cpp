@@ -2,6 +2,8 @@
 
 #include "ImGuiKeybind.h"
 
+#include "MenuLayout.h"
+
 #include "../../Input/InputBind.h"
 
 
@@ -146,10 +148,7 @@ bool ImGui::Keybind(const char* label, int* key) {
 
 
 
-    const float wrapX = ImGui::GetCursorStartPos().x + ImGui::GetContentRegionAvail().x;
-    ImGui::PushTextWrapPos(wrapX);
-    ImGui::TextWrapped("%s", label);
-    ImGui::PopTextWrapPos();
+    ArcMenuLayout::Label(label);
 
     ImGui::SetNextItemWidth(-FLT_MIN);
     const float button_w = ImGui::GetContentRegionAvail().x;
@@ -174,21 +173,15 @@ bool ImGui::Keybind(const char* label, int* key) {
 
 
 
-    bool value_changed = false;
-
-
-
-    if (ImGui::Button(buf_display, ImVec2(button_w, 0.f))) {
-
+    bool value_changed = false;    if (ImGui::Button(buf_display, ImVec2(button_w, 0.f))) {
         binding = true;
-
         waitRelease = false;
-
         waitingFrame = false;
-
         snapshotInput();
-
     }
+
+    if (!binding)
+        ImGui::SetItemTooltip("Click to bind a key or gamepad button. Esc clears the binding.");
 
 
 

@@ -91,6 +91,9 @@ struct Snapshot {
     bool hide_allies{};
     bool show_radar{};
     bool show_debug_overlay{};
+    bool debug_skeleton_lag{};
+    bool debug_aim_shake{};
+    bool debug_hatch_detect{};
     float esp_text_scale{};
     float radar_scale{};
     float radar_range{};
@@ -103,6 +106,7 @@ struct Snapshot {
     float esp_distance{};
     float esp_color_visible[4]{};
     float esp_color_invisible[4]{};
+    bool vis_enabled{};
 
     bool bot_box{};
     bool bot_names{};
@@ -120,6 +124,9 @@ struct Snapshot {
     int aim_hold_key{};
     int aim_bone_mode{};
     bool humanizer{};
+    float humanizer_intensity{};
+    float humanizer_react_ms{};
+    float humanizer_overshoot{};
     bool predict{};
     bool randombone{};
     float aimbot_fov{};
@@ -142,6 +149,7 @@ struct Snapshot {
     float aim_sticky_fov_bias_px{};
     int aim_loss_of_sight_grace_ms{};
     bool aim_loss_of_sight_grace_enabled{};
+    int aim_vis_mode{};
 
     float aim_bullet_speed_cm_s{};
 
@@ -152,7 +160,6 @@ struct Snapshot {
     float trigger_deadzone_px{};
     int trigger_fire_delay_ms{};
     bool trigger_auto_hold{};
-    bool trigger_vis_check{};
 
     bool enable_world{};
     bool droppedItems{};
@@ -294,6 +301,9 @@ Snapshot CaptureSnapshot()
     s.hide_allies = var::hide_allies;
     s.show_radar = var::show_radar;
     s.show_debug_overlay = var::show_debug_overlay;
+    s.debug_skeleton_lag = var::debug_skeleton_lag;
+    s.debug_aim_shake = var::debug_aim_shake;
+    s.debug_hatch_detect = var::debug_hatch_detect;
     s.esp_text_scale = var::esp_text_scale;
     s.radar_scale = var::radar_scale;
     s.radar_range = var::radar_range;
@@ -306,6 +316,7 @@ Snapshot CaptureSnapshot()
     s.esp_distance = var::esp_distance;
     std::memcpy(s.esp_color_visible, var::esp_color_visible, sizeof(s.esp_color_visible));
     std::memcpy(s.esp_color_invisible, var::esp_color_invisible, sizeof(s.esp_color_invisible));
+    s.vis_enabled = var::vis_enabled;
     s.bot_box = var::bot_box;
     s.bot_names = var::bot_names;
     s.bot_snaplines = var::bot_snaplines;
@@ -323,6 +334,9 @@ Snapshot CaptureSnapshot()
     s.aim_bone_mode = static_cast<int>(var::aim_bone_mode);
     s.predict = var::predict;
     s.humanizer = var::humanizer;
+    s.humanizer_intensity = var::humanizer_intensity;
+    s.humanizer_react_ms = var::humanizer_react_ms;
+    s.humanizer_overshoot = var::humanizer_overshoot;
     s.randombone = var::randombone;
     s.aimbot_fov = var::aimbot_fov;
     s.aimbot_priority = static_cast<int>(var::aimbot_priority);
@@ -344,6 +358,7 @@ Snapshot CaptureSnapshot()
     s.aim_sticky_fov_bias_px = var::aim_sticky_fov_bias_px;
     s.aim_loss_of_sight_grace_ms = var::aim_loss_of_sight_grace_ms;
     s.aim_loss_of_sight_grace_enabled = var::aim_loss_of_sight_grace_enabled;
+    s.aim_vis_mode = static_cast<int>(var::aim_vis_mode);
     s.aim_bullet_speed_cm_s = var::aim_bullet_speed_cm_s;
 
     s.enable_triggerbot = var::enable_triggerbot;
@@ -352,7 +367,6 @@ Snapshot CaptureSnapshot()
     s.trigger_deadzone_px = var::trigger_deadzone_px;
     s.trigger_fire_delay_ms = var::trigger_fire_delay_ms;
     s.trigger_auto_hold = var::trigger_auto_hold;
-    s.trigger_vis_check = var::trigger_vis_check;
 
     s.enable_world = var::enable_world;
     s.droppedItems = var::droppedItems;
@@ -454,6 +468,9 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.hide_allies == b.hide_allies &&
         a.show_radar == b.show_radar &&
         a.show_debug_overlay == b.show_debug_overlay &&
+        a.debug_skeleton_lag == b.debug_skeleton_lag &&
+        a.debug_aim_shake == b.debug_aim_shake &&
+        a.debug_hatch_detect == b.debug_hatch_detect &&
         a.esp_text_scale == b.esp_text_scale &&
         a.radar_scale == b.radar_scale &&
         a.radar_range == b.radar_range &&
@@ -466,6 +483,7 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.esp_distance == b.esp_distance &&
         ColorsEqual(a.esp_color_visible, b.esp_color_visible) &&
         ColorsEqual(a.esp_color_invisible, b.esp_color_invisible) &&
+        a.vis_enabled == b.vis_enabled &&
         a.bot_box == b.bot_box &&
         a.bot_names == b.bot_names &&
         a.bot_snaplines == b.bot_snaplines &&
@@ -482,6 +500,9 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.aim_bone_mode == b.aim_bone_mode &&
         a.predict == b.predict &&
         a.humanizer == b.humanizer &&
+        a.humanizer_intensity == b.humanizer_intensity &&
+        a.humanizer_react_ms == b.humanizer_react_ms &&
+        a.humanizer_overshoot == b.humanizer_overshoot &&
         a.randombone == b.randombone &&
         a.aimbot_fov == b.aimbot_fov &&
         a.aimbot_priority == b.aimbot_priority &&
@@ -503,6 +524,7 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.aim_sticky_fov_bias_px == b.aim_sticky_fov_bias_px &&
         a.aim_loss_of_sight_grace_ms == b.aim_loss_of_sight_grace_ms &&
         a.aim_loss_of_sight_grace_enabled == b.aim_loss_of_sight_grace_enabled &&
+        a.aim_vis_mode == b.aim_vis_mode &&
         a.aim_bullet_speed_cm_s == b.aim_bullet_speed_cm_s &&
         a.enable_triggerbot == b.enable_triggerbot &&
         a.trigger_hold_mode == b.trigger_hold_mode &&
@@ -510,7 +532,6 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.trigger_deadzone_px == b.trigger_deadzone_px &&
         a.trigger_fire_delay_ms == b.trigger_fire_delay_ms &&
         a.trigger_auto_hold == b.trigger_auto_hold &&
-        a.trigger_vis_check == b.trigger_vis_check &&
         a.enable_world == b.enable_world &&
         a.droppedItems == b.droppedItems &&
         a.raiderStock == b.raiderStock &&
@@ -649,6 +670,11 @@ static bool ApplyAimbotConfigKey(const std::string& key, const std::string& val)
         var::aim_bullet_speed_cm_s = std::clamp(var::aim_bullet_speed_cm_s, 10000.f, 200000.f);
         return true;
     }
+    if (key == "aim_vis_mode") {
+        var::aim_vis_mode = static_cast<AimVisMode>(
+            std::clamp(static_cast<int>(std::atoi(val.c_str())), 0, 1));
+        return true;
+    }
     /* Triggerbot */
     if (key == "enable_triggerbot") {
         var::enable_triggerbot = ParseBool(val, var::enable_triggerbot);
@@ -672,10 +698,6 @@ static bool ApplyAimbotConfigKey(const std::string& key, const std::string& val)
     }
     if (key == "trigger_auto_hold") {
         var::trigger_auto_hold = ParseBool(val, var::trigger_auto_hold);
-        return true;
-    }
-    if (key == "trigger_vis_check") {
-        var::trigger_vis_check = ParseBool(val, var::trigger_vis_check);
         return true;
     }
     if (key == "aim_deadzone_px") {
@@ -807,6 +829,9 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     else if (key == "hide_allies") var::hide_allies = ParseBool(val, var::hide_allies);
     else if (key == "show_radar") var::show_radar = ParseBool(val, var::show_radar);
     else if (key == "show_debug_overlay") var::show_debug_overlay = ParseBool(val, var::show_debug_overlay);
+    else if (key == "debug_skeleton_lag") var::debug_skeleton_lag = ParseBool(val, var::debug_skeleton_lag);
+    else if (key == "debug_aim_shake") var::debug_aim_shake = ParseBool(val, var::debug_aim_shake);
+    else if (key == "debug_hatch_detect") var::debug_hatch_detect = ParseBool(val, var::debug_hatch_detect);
     else if (key == "esp_text_scale") var::esp_text_scale = static_cast<float>(std::atof(val.c_str()));
     else if (key == "radar_scale") var::radar_scale = static_cast<float>(std::atof(val.c_str()));
     else if (key == "radar_range") {
@@ -823,6 +848,7 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     }
     else if (key == "esp_color_visible") ParseColor4(val, var::esp_color_visible);
     else if (key == "esp_color_invisible") ParseColor4(val, var::esp_color_invisible);
+    else if (key == "vis_enabled") var::vis_enabled = ParseBool(val, var::vis_enabled);
     else if (key == "bot_box") var::bot_box = ParseBool(val, var::bot_box);
     else if (key == "bot_names") var::bot_names = ParseBool(val, var::bot_names);
     else if (key == "bot_snaplines") var::bot_snaplines = ParseBool(val, var::bot_snaplines);
@@ -844,6 +870,9 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     }
     else if (key == "predict") var::predict = ParseBool(val, var::predict);
     else if (key == "humanizer") var::humanizer = ParseBool(val, var::humanizer);
+    else if (key == "humanizer_intensity") var::humanizer_intensity = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.f, 3.f);
+    else if (key == "humanizer_react_ms") var::humanizer_react_ms = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.f, 800.f);
+    else if (key == "humanizer_overshoot") var::humanizer_overshoot = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.f, 0.6f);
     else if (key == "randombone") var::randombone = ParseBool(val, var::randombone);
     else if (key == "aimbot_fov") var::aimbot_fov = static_cast<float>(std::atof(val.c_str()));
     else if (key == "aimbot_priority") {
@@ -851,17 +880,6 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
         var::aimbot_priority = static_cast<AimbotPriority>(prio);
     }
     else if (key == "show_fov") var::show_fov = ParseBool(val, var::show_fov);
-    else if (key == "vis_enabled") var::vis_enabled = ParseBool(val, var::vis_enabled);
-    else if (key == "vis_max_range_m") var::vis_max_range_m = static_cast<float>(std::atof(val.c_str()));
-    else if (key == "vis_use_player_esp_dist") var::vis_use_player_esp_dist = ParseBool(val, var::vis_use_player_esp_dist);
-    else if (key == "vis_use_bot_esp_dist") var::vis_use_bot_esp_dist = ParseBool(val, var::vis_use_bot_esp_dist);
-    else if (key == "vis_use_esp_colors") var::vis_use_esp_colors = ParseBool(val, var::vis_use_esp_colors);
-    else if (key == "vis_use_aim") var::vis_use_aim = ParseBool(val, var::vis_use_aim);
-    else if (key == "vis_multi_bone") var::vis_multi_bone = ParseBool(val, var::vis_multi_bone);
-    else if (key == "vis_hysteresis_frames") var::vis_hysteresis_frames = std::atoi(val.c_str());
-    else if (key == "vis_debug") var::vis_debug = ParseBool(val, var::vis_debug);
-    else if (key == "vis_debug_rays") var::vis_debug_rays = ParseBool(val, var::vis_debug_rays);
-    else if (key == "vis_debug_tris") var::vis_debug_tris = ParseBool(val, var::vis_debug_tris);
     else if (key == "camPovUsePending") var::camPovUsePending = ParseBool(val, var::camPovUsePending);
     else if (key == "show_crosshair") var::show_crosshair = ParseBool(val, var::show_crosshair);
     else if (key == "crosshair_style") {
@@ -968,6 +986,9 @@ void WriteIni()
     file << "hide_allies=" << (var::hide_allies ? 1 : 0) << '\n';
     file << "show_radar=" << (var::show_radar ? 1 : 0) << '\n';
     file << "show_debug_overlay=" << (var::show_debug_overlay ? 1 : 0) << '\n';
+    file << "debug_skeleton_lag=" << (var::debug_skeleton_lag ? 1 : 0) << '\n';
+    file << "debug_aim_shake=" << (var::debug_aim_shake ? 1 : 0) << '\n';
+    file << "debug_hatch_detect=" << (var::debug_hatch_detect ? 1 : 0) << '\n';
     file << "esp_text_scale=" << var::esp_text_scale << '\n';
     file << "radar_scale=" << var::radar_scale << '\n';
     file << "radar_range=" << var::radar_range << '\n';
@@ -980,6 +1001,7 @@ void WriteIni()
     file << "esp_distance=" << var::esp_distance << '\n';
     WriteColor4(file, "esp_color_visible", var::esp_color_visible);
     WriteColor4(file, "esp_color_invisible", var::esp_color_invisible);
+    file << "vis_enabled=" << (var::vis_enabled ? 1 : 0) << '\n';
     file << "bot_box=" << (var::bot_box ? 1 : 0) << '\n';
     file << "bot_names=" << (var::bot_names ? 1 : 0) << '\n';
     file << "bot_snaplines=" << (var::bot_snaplines ? 1 : 0) << '\n';
@@ -997,21 +1019,13 @@ void WriteIni()
     file << "aim_bone_mode=" << static_cast<int>(var::aim_bone_mode) << '\n';
     file << "predict=" << (var::predict ? 1 : 0) << '\n';
     file << "humanizer=" << (var::humanizer ? 1 : 0) << '\n';
+    file << "humanizer_intensity=" << var::humanizer_intensity << '\n';
+    file << "humanizer_react_ms=" << var::humanizer_react_ms << '\n';
+    file << "humanizer_overshoot=" << var::humanizer_overshoot << '\n';
     file << "randombone=" << (var::randombone ? 1 : 0) << '\n';
     file << "aimbot_fov=" << var::aimbot_fov << '\n';
     file << "aimbot_priority=" << static_cast<int>(var::aimbot_priority) << '\n';
     file << "show_fov=" << (var::show_fov ? 1 : 0) << '\n';
-    file << "vis_enabled=" << (var::vis_enabled ? 1 : 0) << '\n';
-    file << "vis_max_range_m=" << var::vis_max_range_m << '\n';
-    file << "vis_use_player_esp_dist=" << (var::vis_use_player_esp_dist ? 1 : 0) << '\n';
-    file << "vis_use_bot_esp_dist=" << (var::vis_use_bot_esp_dist ? 1 : 0) << '\n';
-    file << "vis_use_esp_colors=" << (var::vis_use_esp_colors ? 1 : 0) << '\n';
-    file << "vis_use_aim=" << (var::vis_use_aim ? 1 : 0) << '\n';
-    file << "vis_multi_bone=" << (var::vis_multi_bone ? 1 : 0) << '\n';
-    file << "vis_hysteresis_frames=" << var::vis_hysteresis_frames << '\n';
-    file << "vis_debug=" << (var::vis_debug ? 1 : 0) << '\n';
-    file << "vis_debug_rays=" << (var::vis_debug_rays ? 1 : 0) << '\n';
-    file << "vis_debug_tris=" << (var::vis_debug_tris ? 1 : 0) << '\n';
     file << "camPovUsePending=" << (var::camPovUsePending ? 1 : 0) << '\n';
     file << "show_crosshair=" << (var::show_crosshair ? 1 : 0) << '\n';
     file << "crosshair_style=" << var::crosshair_style << '\n';
@@ -1031,14 +1045,13 @@ void WriteIni()
     file << "aim_loss_of_sight_grace_ms=" << var::aim_loss_of_sight_grace_ms << '\n';
     file << "aim_loss_of_sight_grace_enabled=" << (var::aim_loss_of_sight_grace_enabled ? 1 : 0) << '\n';
     file << "aim_bullet_speed_cm_s=" << var::aim_bullet_speed_cm_s << '\n';
+    file << "aim_vis_mode=" << static_cast<int>(var::aim_vis_mode) << '\n';
     file << "enable_triggerbot=" << (var::enable_triggerbot ? 1 : 0) << '\n';
     file << "trigger_hold_mode=" << var::trigger_hold_mode << '\n';
     file << "trigger_hold_key=" << var::trigger_hold_key << '\n';
     file << "trigger_deadzone_px=" << var::trigger_deadzone_px << '\n';
     file << "trigger_fire_delay_ms=" << var::trigger_fire_delay_ms << '\n';
     file << "trigger_auto_hold=" << (var::trigger_auto_hold ? 1 : 0) << '\n';
-    file << "trigger_vis_check=" << (var::trigger_vis_check ? 1 : 0) << '\n';
-
     file << "enable_world=" << (var::enable_world ? 1 : 0) << '\n';
     file << "droppedItems=" << (var::droppedItems ? 1 : 0) << '\n';
     file << "raiderStock=" << (var::raiderStock ? 1 : 0) << '\n';

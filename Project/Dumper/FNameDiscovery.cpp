@@ -78,7 +78,7 @@ bool PlausibleMaskValue(uint64_t mask)
     }
     if (asciiPairs >= 3)
         return false;
-    const int pop = __popcnt64(mask);
+    const int pop = static_cast<int>(__popcnt64(mask));
     return pop >= 8 && pop <= 56;
 }
 

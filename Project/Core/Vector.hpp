@@ -66,7 +66,7 @@ public:
     double y;
     double z;
 
-    inline double Dot(Vector3 v)
+    inline double Dot(Vector3 v) const
     {
         return x * v.x + y * v.y + z * v.z;
     }

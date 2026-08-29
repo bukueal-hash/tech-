@@ -14,9 +14,13 @@ namespace {
 
 constexpr float kEspRefBoxHeight = 175.f;
 constexpr float kEspDistRefM = 30.f;
-constexpr float kEspScaleMin = 0.55f;
-constexpr float kEspScaleMax = 1.0f;
-constexpr float kEspTextMinPx = 9.f;
+// Realistic distance scaling: labels/lines track the projected box — shrink
+// further out (floor 0.35), grow close in (ceiling 1.35). The box itself is
+// projected head/feet and already scales naturally; these bounds stop the
+// fixed-ish text from dwarfing far boxes or staying tiny up close.
+constexpr float kEspScaleMin = 0.35f;
+constexpr float kEspScaleMax = 1.35f;
+constexpr float kEspTextMinPx = 8.f;
 constexpr float kEspTextBasePx = 15.f;
 
 Visuals::EspDrawScale MakeScale(float espScale)
@@ -25,7 +29,7 @@ Visuals::EspDrawScale MakeScale(float espScale)
     s.espScale = std::clamp(espScale, kEspScaleMin, kEspScaleMax);
     const float userText = std::clamp(var::esp_text_scale, 0.5f, 3.0f);
     s.textPx = std::max(kEspTextMinPx, kEspTextBasePx * s.espScale * userText);
-    s.lineThickness = std::clamp(0.55f + s.espScale * 0.45f, 0.55f, 1.35f);
+    s.lineThickness = std::clamp(0.45f + s.espScale * 0.65f, 0.5f, 1.8f);
     return s;
 }
 
@@ -89,7 +93,10 @@ void Visuals::DrawScaledLabel(
     const float y = aboveAnchor ? (anchorY - size.y - 2.f) : anchorY;
 
     const float outline = std::max(1.f, fontSize * 0.07f);
-    const ImU32 outlineColor = IM_COL32(0, 0, 0, 210);
+    // Outline alpha follows the text alpha so distance-faded labels fade
+    // completely instead of leaving a floating black outline.
+    const unsigned textA = (color >> IM_COL32_A_SHIFT) & 0xFFu;
+    const ImU32 outlineColor = IM_COL32(0, 0, 0, 210u * textA / 255u);
     drawList->AddText(font, fontSize, ImVec2(x - outline, y), outlineColor, text);
     drawList->AddText(font, fontSize, ImVec2(x + outline, y), outlineColor, text);
     drawList->AddText(font, fontSize, ImVec2(x, y - outline), outlineColor, text);

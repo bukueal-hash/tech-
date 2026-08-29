@@ -6,12 +6,16 @@
 #include "../Core/AgentLog.h"
 #include "../Core/WorldItemCategory.h"
 #include "../Interface/Utils/Variables/index.h"
+#include "LrtsVisibility.h"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <cstring>
 #include <fstream>
 #include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -186,6 +190,29 @@ void CollectLevelActors(
     std::vector<uint64_t>& actors)
 {
     CollectAllLevelActors(uworld, persistentLevel, actors);
+
+    // Flaky-read hold: the level actor-array read is a ~12KB DMA transfer per
+    // scanner pass. Under bus contention it can come back short or empty —
+    // scanners treat the list as ground truth and ERASE every cache entry not
+    // in it. That meant a player running up during a firefight evicted ALL
+    // cached players/bots/loot ("player ran up, no ESP"), and the same flakes
+    // are the residual random ESP flicker. If the fresh list is a small
+    // fraction of the last good one, serve the last good list for up to 2s.
+    static std::mutex s_holdMu;
+    static std::vector<uint64_t> s_lastGood;
+    static std::chrono::steady_clock::time_point s_lastGoodTp{};
+    std::lock_guard<std::mutex> lock(s_holdMu);
+    const auto now = std::chrono::steady_clock::now();
+    if (!s_lastGood.empty()
+        && now - s_lastGoodTp < std::chrono::seconds(2)
+        && actors.size() * 2 < s_lastGood.size()) {
+        actors = s_lastGood;
+        return;
+    }
+    if (!actors.empty()) {
+        s_lastGood = actors;
+        s_lastGoodTp = now;
+    }
 }
 
 bool RefreshCachedActorPtrs(
@@ -473,6 +500,19 @@ bool ShouldExcludeFromWorldCaches(uintptr_t actor, uintptr_t localPawn)
 {
     if (!actor)
         return true;
+
+    // Extraction hatches are bot-class (EACTOR_TARGET) but must load into the
+    // world/container cache as WorldItemCategory::Hatch. LooksLikeBotPawn below
+    // would otherwise exclude them before the container scan can admit them.
+    {
+        std::string hprobe = engine.GetActorClassFName(actor);
+        if (hprobe.empty())
+            hprobe = engine.GetActorFNameStringCached(actor);
+        if (hprobe.empty())
+            hprobe = engine.GetActorFNameString(actor);
+        if (FnameLooksLikeExtractionHatch(hprobe))
+            return false;
+    }
 
     // Never strip authoritative floor-loot class actors (0xC0000). Console proof:
     // skip_ground_loot_class ShouldExclude wiped rack items next to the player.
@@ -959,7 +999,9 @@ FlickerScoreSnapshot TakeFlickerSnapshotLocked(
 
 void WriteFlickerScoreUnlocked(const FlickerScoreSnapshot& snap)
 {
-    std::ofstream f(kArcDebugLogPath, std::ios::app);
+    // Verify tap: flicker stats are the diagnosis for user-visible blink, so
+    // they go to the real log (10 s cadence, counts only — negligible I/O).
+    std::ofstream f(kArcVerifyPath, std::ios::app);
     if (!f)
         return;
     const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1070,5 +1112,557 @@ void MaybeFlushFlickerScore()
 }
 
 // #endregion
+
+// ── AggGeom probe (diagnostic only, read-only) ─────────────────────────────
+// Offsets taken from this repo's own SDK dump, not from a forum paste:
+//   UStaticMesh::BodySetup          SDK/Class.cpp:26511   0x1F0
+//   UBodySetup::AggGeom             SDK/Class.cpp:25263   0xB8, size 0x78,
+//                                   INLINE struct — never dereference it
+//   FKAggregateGeom TArray order    SDK/Struct.cpp:12248-12254
+namespace {
+
+constexpr uintptr_t kUStaticMesh_BodySetup = 0x1F0;
+constexpr uintptr_t kUBodySetup_AggGeom = 0xB8;
+constexpr int32_t kAggGeomMaxElems = 4096;
+constexpr int kAggGeomArrays = 7;
+constexpr int kAggGeomNameSamples = 64;
+
+/** FName text is normally [A-Za-z0-9_], but never trust it into raw JSON. */
+std::string JsonSafeName(const std::string& in)
+{
+    std::string out;
+    out.reserve(in.size());
+    for (unsigned char c : in) {
+        if (c < 0x20 || c > 0x7E || c == '"' || c == '\\')
+            continue;
+        out.push_back(static_cast<char>(c));
+        if (out.size() >= 96)
+            break;
+    }
+    return out;
+}
+
+std::mutex g_aggProbeMu;
+AggGeomProbeResult g_aggProbe;
+std::atomic<bool> g_aggProbeRunning{ false };
+
+/**
+ * Read the 7 inline TArray headers.
+ *
+ * All 7 come out of one 0x70 struct read, so a single garbage header means the
+ * block is not an FKAggregateGeom at all. Reject the whole BodySetup instead of
+ * trusting whichever slots happened to look sane — otherwise a junk header that
+ * lands inside the sanity window (e.g. Num == Max == 0x1000) gets counted as
+ * real collision.
+ */
+bool ReadAggGeomHeaders(
+    uintptr_t bodySetup,
+    int32_t outCounts[kAggGeomArrays],
+    uint8_t outRaw[0x70])
+{
+    if (!Memory::ReadRaw(bodySetup + kUBodySetup_AggGeom, outRaw, 0x70))
+        return false;
+
+    for (int i = 0; i < kAggGeomArrays; ++i) {
+        uintptr_t data = 0;
+        int32_t num = 0;
+        int32_t max = 0;
+        memcpy(&data, outRaw + i * 0x10, sizeof(data));
+        memcpy(&num, outRaw + i * 0x10 + 0x8, sizeof(num));
+        memcpy(&max, outRaw + i * 0x10 + 0xC, sizeof(max));
+
+        outCounts[i] = 0;
+        if (!data && !num && !max)
+            continue;  // genuinely empty slot
+
+        if (num < 0 || max < 0 || num > max || max >= kAggGeomMaxElems
+            || !Memory::IsValidPtrFast2(data))
+            return false;
+
+        outCounts[i] = num;
+    }
+    return true;
+}
+
+void RunAggGeomProbeJob()
+{
+    AggGeomProbeResult r;
+    r.ran = true;
+
+    const Engine::EngineStateSnapshot snap = engine.GetStateSnapshot();
+    if (!snap.gWorld || !snap.persistentLevel) {
+        r.note = "no gWorld/persistentLevel — not in raid";
+        std::lock_guard<std::mutex> lock(g_aggProbeMu);
+        g_aggProbe = r;
+        return;
+    }
+
+    std::vector<uint64_t> actors;
+    CollectLevelActors(snap.gWorld, snap.persistentLevel, actors);
+    r.actorsWalked = static_cast<int>(actors.size());
+
+    std::unordered_set<uintptr_t> seenBodySetups;
+    int nameSamplesLogged = 0;
+
+    for (uint64_t a : actors) {
+        const uintptr_t actor = static_cast<uintptr_t>(a);
+        if (!actor)
+            continue;
+
+        const uintptr_t root = Memory::read<uintptr_t>(actor + Offsets::RootComponent);
+        if (!Engine::IsPlausibleObjPtr(root))
+            continue;
+        ++r.rootsValid;
+
+        // No component-class filter here: neither engine.GetActorClassFName nor
+        // steam_decrypt::GetActorClassFName resolves a name for root components
+        // on this build, so filtering on it zeroed out the entire walk. The
+        // whole-block validation in ReadAggGeomHeaders is what rejects chains
+        // followed off a non-StaticMeshComponent root.
+        uintptr_t staticMesh = Memory::read<uintptr_t>(root + Offsets::StaticMesh);
+        bool legacy = false;
+        if (!Engine::IsPlausibleObjPtr(staticMesh)) {
+            staticMesh = Memory::read<uintptr_t>(root + Offsets::StaticMeshLegacy);
+            legacy = true;
+        }
+        if (!Engine::IsPlausibleObjPtr(staticMesh))
+            continue;
+        if (legacy)
+            ++r.meshFromLegacy;
+        else
+            ++r.meshFromPrimary;
+
+        const uintptr_t bodySetup =
+            Memory::read<uintptr_t>(staticMesh + kUStaticMesh_BodySetup);
+        if (!Engine::IsPlausibleObjPtr(bodySetup))
+            continue;
+        ++r.bodySetupsValid;
+
+        // Many actors share one UStaticMesh, so one UBodySetup. Read each once.
+        if (!seenBodySetups.insert(bodySetup).second)
+            continue;
+        ++r.bodySetupsUnique;
+
+        int32_t counts[kAggGeomArrays] = {};
+        uint8_t raw[0x70] = {};
+        if (!ReadAggGeomHeaders(bodySetup, counts, raw)) {
+            ++r.headersRejected;
+            continue;
+        }
+
+        r.sphereElems += counts[0];
+        r.boxElems += counts[1];
+        r.sphylElems += counts[2];
+        r.convexElems += counts[3];
+        r.taperedCapsuleElems += counts[4];
+        r.levelSetElems += counts[5];
+        r.skinnedLevelSetElems += counts[6];
+
+        int total = 0;
+        for (int i = 0; i < kAggGeomArrays; ++i)
+            total += counts[i];
+        if (total <= 0)
+            continue;
+        ++r.bodySetupsNonEmpty;
+
+        // Name what the geometry actually belongs to. The UStaticMesh asset
+        // FName is the decisive one: SM_Wall_* / SM_Floor_* means this covers
+        // world structure, prop-only names mean AggGeom can't back a vis check.
+        if (nameSamplesLogged < kAggGeomNameSamples) {
+            ++nameSamplesLogged;
+
+            std::string meshName = engine.GetActorFNameStringCached(staticMesh);
+            if (meshName.empty())
+                meshName = engine.GetActorFNameString(staticMesh);
+            std::string actorName = engine.GetActorFNameStringCached(actor);
+            if (actorName.empty())
+                actorName = engine.GetActorFNameString(actor);
+
+            std::ofstream f(kArcVerifyPath, std::ios::app);
+            if (f) {
+                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"location\":\"WorldScanCommon.cpp\","
+                  << "\"message\":\"agggeom_sample\","
+                  << "\"timestamp\":" << ts
+                  << ",\"mesh\":\"" << JsonSafeName(meshName) << "\""
+                  << ",\"actor\":\"" << JsonSafeName(actorName) << "\""
+                  << ",\"bodySetup\":\"0x" << std::hex << bodySetup << std::dec << "\""
+                  << ",\"sphere\":" << counts[0]
+                  << ",\"box\":" << counts[1]
+                  << ",\"sphyl\":" << counts[2]
+                  << ",\"convex\":" << counts[3]
+                  << ",\"tapered\":" << counts[4]
+                  << ",\"levelSet\":" << counts[5]
+                  << ",\"skinnedLevelSet\":" << counts[6]
+                  << "}\n";
+            }
+        }
+    }
+
+    {
+        std::ofstream f(kArcVerifyPath, std::ios::app);
+        if (f) {
+            const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            f << "{\"location\":\"WorldScanCommon.cpp\","
+              << "\"message\":\"agggeom_probe\","
+              << "\"timestamp\":" << ts
+              << ",\"actorsWalked\":" << r.actorsWalked
+              << ",\"rootsValid\":" << r.rootsValid
+              << ",\"meshPrimary\":" << r.meshFromPrimary
+              << ",\"meshLegacy\":" << r.meshFromLegacy
+              << ",\"bodySetupsValid\":" << r.bodySetupsValid
+              << ",\"bodySetupsUnique\":" << r.bodySetupsUnique
+              << ",\"bodySetupsNonEmpty\":" << r.bodySetupsNonEmpty
+              << ",\"headersRejected\":" << r.headersRejected
+              << ",\"sphere\":" << r.sphereElems
+              << ",\"box\":" << r.boxElems
+              << ",\"sphyl\":" << r.sphylElems
+              << ",\"convex\":" << r.convexElems
+              << ",\"tapered\":" << r.taperedCapsuleElems
+              << ",\"levelSet\":" << r.levelSetElems
+              << ",\"skinnedLevelSet\":" << r.skinnedLevelSetElems
+              << "}\n";
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_aggProbeMu);
+    g_aggProbe = r;
+}
+
+// ── UWorld clock-field probe ────────────────────────────────────────────────
+
+constexpr uint32_t kClockScanSize = 0x2000;
+constexpr int kClockSampleMs = 1000;
+
+std::mutex g_clockProbeMu;
+TimeSecondsProbeResult g_clockProbe;
+std::atomic<bool> g_clockProbeRunning{ false };
+
+void RunTimeSecondsProbeJob()
+{
+    TimeSecondsProbeResult r;
+    r.ran = true;
+
+    const Engine::EngineStateSnapshot snap = engine.GetStateSnapshot();
+    if (!snap.gWorld) {
+        r.note = "no gWorld - not in raid";
+        std::lock_guard<std::mutex> lock(g_clockProbeMu);
+        g_clockProbe = r;
+        return;
+    }
+
+    // Must bypass the VMM data cache. A cached read serves both samples from
+    // the same page copy, every delta comes out zero, and a working clock
+    // looks identical to a missing one.
+    std::vector<uint8_t> a(kClockScanSize), b(kClockScanSize);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!PCIMemory::ReadVirtualMemoryNoCache(snap.gWorld, a.data(), kClockScanSize)) {
+        r.note = "first sample read failed";
+        std::lock_guard<std::mutex> lock(g_clockProbeMu);
+        g_clockProbe = r;
+        return;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kClockSampleMs));
+
+    const auto t1 = std::chrono::steady_clock::now();
+    if (!PCIMemory::ReadVirtualMemoryNoCache(snap.gWorld, b.data(), kClockScanSize)) {
+        r.note = "second sample read failed";
+        std::lock_guard<std::mutex> lock(g_clockProbeMu);
+        g_clockProbe = r;
+        return;
+    }
+
+    r.elapsed = std::chrono::duration<double>(t1 - t0).count();
+
+    r.bytesChanged = 0;
+    for (uint32_t i = 0; i < kClockScanSize; ++i)
+        if (a[i] != b[i])
+            ++r.bytesChanged;
+
+    // A real clock advances by exactly the wall time that passed. Pointers and
+    // flags reinterpreted as doubles land in denormal or absurd ranges, so the
+    // magnitude window plus the growth-rate window together leave very little
+    // room for a false positive.
+    const double lo = r.elapsed * 0.80;
+    const double hi = r.elapsed * 1.20;
+
+    std::ofstream f(kArcVerifyPath, std::ios::app);
+    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    // UE5 widened TimeSeconds to double, but this build is reordered enough
+    // that the type cannot be assumed either. Sweep both: doubles on 8-byte
+    // alignment, floats on 4-byte.
+    auto consider = [&](uint32_t off, bool isFloat, double v1, double v2) {
+        if (!std::isfinite(v1) || !std::isfinite(v2))
+            return;
+        if (v1 < 1.0 || v1 > 1.0e7)
+            return;
+
+        const double delta = v2 - v1;
+        if (delta < lo || delta > hi)
+            return;
+
+        if (r.hits == 0) {
+            r.firstOffset = off;
+            r.firstValue = v2;
+            r.firstIsFloat = isFloat;
+        }
+        ++r.hits;
+
+        if (f) {
+            f << "{\"location\":\"WorldScanCommon.cpp\","
+              << "\"message\":\"worldclock_candidate\","
+              << "\"timestamp\":" << ts
+              << ",\"offset\":\"0x" << std::hex << off << std::dec << "\""
+              << ",\"type\":\"" << (isFloat ? "float" : "double") << "\""
+              << ",\"first\":" << v1
+              << ",\"second\":" << v2
+              << ",\"delta\":" << delta
+              << ",\"elapsed\":" << r.elapsed
+              << "}\n";
+        }
+    };
+
+    for (uint32_t off = 0; off + 8 <= kClockScanSize; off += 8) {
+        double v1, v2;
+        memcpy(&v1, a.data() + off, sizeof(v1));
+        memcpy(&v2, b.data() + off, sizeof(v2));
+        consider(off, false, v1, v2);
+    }
+
+    for (uint32_t off = 0; off + 4 <= kClockScanSize; off += 4) {
+        float v1, v2;
+        memcpy(&v1, a.data() + off, sizeof(v1));
+        memcpy(&v2, b.data() + off, sizeof(v2));
+        consider(off, true, static_cast<double>(v1), static_cast<double>(v2));
+    }
+
+    if (r.hits == 0) {
+        r.note = r.bytesChanged == 0
+            ? "both samples identical - reads still cached or world frozen"
+            : "no advancing float or double in UWorld+0x000..0x2000";
+    }
+
+    if (f) {
+        f << "{\"location\":\"WorldScanCommon.cpp\","
+          << "\"message\":\"worldclock_summary\","
+          << "\"timestamp\":" << ts
+          << ",\"gWorld\":\"0x" << std::hex << snap.gWorld << std::dec << "\""
+          << ",\"hits\":" << r.hits
+          << ",\"firstOffset\":\"0x" << std::hex << r.firstOffset << std::dec << "\""
+          << ",\"bytesChanged\":" << r.bytesChanged
+          << ",\"elapsed\":" << r.elapsed
+          << "}\n";
+    }
+
+    std::lock_guard<std::mutex> lock(g_clockProbeMu);
+    g_clockProbe = r;
+}
+
+// ── Mesh render-tick probe ──────────────────────────────────────────────────
+
+constexpr uint32_t kTickScanSize = 0x1000;
+constexpr int kTickSamples = 200;
+constexpr int kTickIntervalMs = 10;
+
+std::mutex g_tickProbeMu;
+TickProbeResult g_tickProbe;
+std::atomic<bool> g_tickProbeRunning{ false };
+
+void RunTickProbeJob()
+{
+    TickProbeResult r;
+    r.ran = true;
+
+    uint64_t mesh = 0;
+    {
+        std::lock_guard<std::mutex> lock(LrtsVis::g_session.mu);
+        mesh = LrtsVis::g_session.lastMesh;
+    }
+    if (!mesh) {
+        r.note = "no mesh seen yet - enable LRTS in a raid first";
+        std::lock_guard<std::mutex> lock(g_tickProbeMu);
+        g_tickProbe = r;
+        return;
+    }
+    r.mesh = mesh;
+
+    const uint32_t slots = kTickScanSize / 4;
+    std::vector<uint32_t> prev(slots), cur(slots);
+    std::vector<int> changes(slots, 0);
+
+    if (!PCIMemory::ReadVirtualMemoryNoCache(mesh, prev.data(), kTickScanSize)) {
+        r.note = "initial mesh read failed";
+        std::lock_guard<std::mutex> lock(g_tickProbeMu);
+        g_tickProbe = r;
+        return;
+    }
+
+    for (int s = 0; s < kTickSamples; ++s) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kTickIntervalMs));
+        if (!PCIMemory::ReadVirtualMemoryNoCache(mesh, cur.data(), kTickScanSize))
+            continue;
+        ++r.samples;
+        for (uint32_t i = 0; i < slots; ++i) {
+            if (cur[i] != prev[i]) {
+                ++changes[i];
+                prev[i] = cur[i];
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < slots; ++i) {
+        if (changes[i] <= 0)
+            continue;
+        ++r.slotsChanged;
+        // Keep the busiest slots. A per-frame timestamp changes far more often
+        // than positions or animation state, so it rises to the top.
+        for (int k = 0; k < TickProbeResult::kTop; ++k) {
+            if (changes[i] > r.topCount[k]) {
+                for (int j = TickProbeResult::kTop - 1; j > k; --j) {
+                    r.topCount[j] = r.topCount[j - 1];
+                    r.topOffset[j] = r.topOffset[j - 1];
+                }
+                r.topCount[k] = changes[i];
+                r.topOffset[k] = i * 4;
+                break;
+            }
+        }
+    }
+
+    if (r.slotsChanged == 0)
+        r.note = "nothing changed - mesh may be dead or reads failing";
+
+    {
+        std::ofstream f(kArcVerifyPath, std::ios::app);
+        if (f) {
+            const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            for (uint32_t i = 0; i < slots; ++i) {
+                if (changes[i] <= 0)
+                    continue;
+                f << "{\"location\":\"WorldScanCommon.cpp\","
+                  << "\"message\":\"tick_slot\","
+                  << "\"timestamp\":" << ts
+                  << ",\"mesh\":\"0x" << std::hex << mesh << std::dec << "\""
+                  << ",\"offset\":\"0x" << std::hex << (i * 4) << std::dec << "\""
+                  << ",\"changes\":" << changes[i]
+                  << ",\"samples\":" << r.samples
+                  << "}\n";
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_tickProbeMu);
+    g_tickProbe = r;
+}
+
+} // namespace
+
+void StartTickProbe()
+{
+    bool expected = false;
+    if (!g_tickProbeRunning.compare_exchange_strong(expected, true))
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(g_tickProbeMu);
+        g_tickProbe = TickProbeResult{};
+        g_tickProbe.running = true;
+    }
+
+    std::thread([]() {
+        try {
+            RunTickProbeJob();
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(g_tickProbeMu);
+            g_tickProbe.ran = true;
+            g_tickProbe.note = "probe threw";
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_tickProbeMu);
+            g_tickProbe.running = false;
+        }
+        g_tickProbeRunning.store(false);
+    }).detach();
+}
+
+TickProbeResult GetTickProbeResult()
+{
+    std::lock_guard<std::mutex> lock(g_tickProbeMu);
+    return g_tickProbe;
+}
+
+void StartTimeSecondsProbe()
+{
+    bool expected = false;
+    if (!g_clockProbeRunning.compare_exchange_strong(expected, true))
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(g_clockProbeMu);
+        g_clockProbe = TimeSecondsProbeResult{};
+        g_clockProbe.running = true;
+    }
+
+    std::thread([]() {
+        try {
+            RunTimeSecondsProbeJob();
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(g_clockProbeMu);
+            g_clockProbe.ran = true;
+            g_clockProbe.note = "probe threw";
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_clockProbeMu);
+            g_clockProbe.running = false;
+        }
+        g_clockProbeRunning.store(false);
+    }).detach();
+}
+
+TimeSecondsProbeResult GetTimeSecondsProbeResult()
+{
+    std::lock_guard<std::mutex> lock(g_clockProbeMu);
+    return g_clockProbe;
+}
+
+void StartAggGeomProbe()
+{
+    bool expected = false;
+    if (!g_aggProbeRunning.compare_exchange_strong(expected, true))
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(g_aggProbeMu);
+        g_aggProbe = AggGeomProbeResult{};
+        g_aggProbe.running = true;
+    }
+
+    std::thread([]() {
+        try {
+            RunAggGeomProbeJob();
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(g_aggProbeMu);
+            g_aggProbe.ran = true;
+            g_aggProbe.note = "probe threw";
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_aggProbeMu);
+            g_aggProbe.running = false;
+        }
+        g_aggProbeRunning.store(false);
+    }).detach();
+}
+
+AggGeomProbeResult GetAggGeomProbeResult()
+{
+    std::lock_guard<std::mutex> lock(g_aggProbeMu);
+    return g_aggProbe;
+}
 
 } // namespace WorldScan

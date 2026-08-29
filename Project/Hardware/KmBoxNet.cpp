@@ -506,8 +506,12 @@ DWORD WINAPI ThreadListenProcess(LPVOID lpParameter)
 	monitor_run = monitor_ok;
 	while (monitor_run) {
 		int strLen = recvfrom(sock, buff, 1024, 0, &cliAddr, &nSize);
-		memcpy(&hw_mouse, buff, sizeof(hw_mouse));							//物理鼠标状态
-		memcpy(&hw_keyboard, &buff[sizeof(hw_mouse)], sizeof(hw_keyboard));	//物理键盘状态
+		// Audit #28: check receive length before copying — a short/partial
+		// datagram would read past valid buffer into stack garbage.
+		if (strLen >= static_cast<int>(sizeof(hw_mouse) + sizeof(hw_keyboard))) {
+			memcpy(&hw_mouse, buff, sizeof(hw_mouse));
+			memcpy(&hw_keyboard, &buff[sizeof(hw_mouse)], sizeof(hw_keyboard));
+		}
 	}
 	closesocket(sock);
 	return 0;

@@ -20,7 +20,6 @@
 #include "OverlayHost.h"
 #include "Utils/AutoConfig.h"
 #include "Utils/Visuals/visuals.hpp"
-#include "../Functions/CollisionVis.h"
 #include "../Core/Offsets.h"
 
 bool showmenu = false;
@@ -73,89 +72,6 @@ void Render(HWND hwnd)
     if (raidActive && !showmenu && var::show_near_loot_hud)
         DrawNearLootHud(engine);
 
-    if (raidActive && !showmenu && var::vis_enabled && var::vis_debug && var::vis_debug_rays) {
-        std::vector<CollisionVis::DebugRay> rays;
-        CollisionVis::CopyDebugRays(rays);
-        ImDrawList* dl = ImGui::GetForegroundDrawList();
-        if (dl) {
-            for (const auto& r : rays) {
-                Vector3 sa{}, sb{};
-                if (!engine.ProjectWorldLocationToScreen(r.from, sa))
-                    continue;
-                if (!engine.ProjectWorldLocationToScreen(r.blocked ? r.hitPos : r.to, sb))
-                    continue;
-                const ImU32 col = r.blocked ? IM_COL32(255, 60, 60, 220) : IM_COL32(60, 255, 90, 200);
-                dl->AddLine(ImVec2((float)sa.x, (float)sa.y), ImVec2((float)sb.x, (float)sb.y), col, 1.5f);
-            }
-        }
-    }
-
-    if (raidActive && !showmenu && var::vis_enabled && var::vis_debug && var::vis_debug_tris) {
-        std::vector<CollisionVis::DebugTri> tris;
-        CollisionVis::CopyDebugTris(tris);
-        ImDrawList* dl = ImGui::GetForegroundDrawList();
-        if (dl) {
-            Engine::CameraCache cam{};
-            {
-                std::shared_lock<std::shared_mutex> camLock(engine.m_cameraMutex);
-                cam = engine.g_Camera;
-            }
-            const float maxDistCm = CollisionVis::RebuildRadiusM() * 100.f;
-            const float maxDist2 = maxDistCm * maxDistCm;
-            int drawn = 0;
-            auto classColor = [](CollisionVis::BlockerClass c) -> ImU32 {
-                switch (c) {
-                case CollisionVis::BlockerClass::Wall: return IM_COL32(240, 240, 240, 160);
-                case CollisionVis::BlockerClass::Door: return IM_COL32(255, 160, 40, 180);
-                case CollisionVis::BlockerClass::Tree: return IM_COL32(60, 200, 80, 150);
-                default: return IM_COL32(140, 140, 140, 120);
-                }
-            };
-            auto edge = [&](const Vector3& a, const Vector3& b, ImU32 col) {
-                Vector3 sa{}, sb{};
-                if (!engine.ProjectWorldLocationToScreen(a, sa))
-                    return;
-                if (!engine.ProjectWorldLocationToScreen(b, sb))
-                    return;
-                dl->AddLine(ImVec2((float)sa.x, (float)sa.y), ImVec2((float)sb.x, (float)sb.y), col, 1.0f);
-            };
-            for (const auto& t : tris) {
-                const double mx = (t.p0.x + t.p1.x + t.p2.x) / 3.0;
-                const double my = (t.p0.y + t.p1.y + t.p2.y) / 3.0;
-                const double mz = (t.p0.z + t.p1.z + t.p2.z) / 3.0;
-                const double dx = mx - cam.Location.x;
-                const double dy = my - cam.Location.y;
-                const double dz = mz - cam.Location.z;
-                if (dx * dx + dy * dy + dz * dz > maxDist2)
-                    continue;
-                const ImU32 col = classColor(t.cls);
-                edge(t.p0, t.p1, col);
-                edge(t.p1, t.p2, col);
-                edge(t.p2, t.p0, col);
-                ++drawn;
-            }
-            // #region agent log
-            {
-                static auto s_lastDraw = std::chrono::steady_clock::time_point{};
-                const auto now = std::chrono::steady_clock::now();
-                if (s_lastDraw.time_since_epoch().count() == 0
-                    || now - s_lastDraw >= std::chrono::seconds(2)) {
-                    s_lastDraw = now;
-                    std::ofstream f(kArcDebugLogPath, std::ios::app);
-                    if (f) {
-                        const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
-                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"vis\",\"hypothesisId\":\"VD\","
-                          << "\"location\":\"Render.cpp:Render\",\"message\":\"vis_draw_tris\","
-                          << "\"data\":{\"copied\":" << (int)tris.size()
-                          << ",\"drawn\":" << drawn
-                          << "},\"timestamp\":" << ts << "}\n";
-                    }
-                }
-            }
-            // #endregion
-        }
-    }
 
     if (var::show_debug_overlay && !showmenu)
         DrawDebugOffsetValidation(engine);
@@ -222,11 +138,11 @@ static void DrawDebugOffsetValidation(Engine& eng)
         {
             const auto tA = std::chrono::steady_clock::now();
             std::shared_lock<std::shared_mutex> lock(eng.m_espFrameMutex, std::try_to_lock);
-            if (lock.owns_lock() && eng.m_lastEspFrame.valid) {
+            if (lock.owns_lock() && eng.m_espFrameShared && eng.m_espFrameShared->valid) {
                 gotFrame = 1;
-                next.drawTargets = eng.m_lastEspFrame.players.size();
-                next.robotDrawSz = eng.m_lastEspFrame.robots.size();
-                next.worldDrawSz = eng.m_lastEspFrame.world.size();
+                next.drawTargets = eng.m_espFrameShared->players.size();
+                next.robotDrawSz = eng.m_espFrameShared->robots.size();
+                next.worldDrawSz = eng.m_espFrameShared->world.size();
             }
             msFrame = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tA).count();
@@ -349,7 +265,7 @@ static void DrawDebugOffsetValidation(Engine& eng)
     const float colW = 360.f;
     const float spacing = 20.f;
     // Col1 grew (GWorldRaw/Step + vis rows); size panels to content — no clipped border box.
-    const int rowsPerCol = 34;
+    const int rowsPerCol = 37;
     const float h = lineH * rowsPerCol + pad * 2.f;
     const float x1 = 20.f;
     const float x2 = x1 + colW + spacing;
@@ -459,6 +375,8 @@ static void DrawDebugOffsetValidation(Engine& eng)
 
         ok = IsUsableCameraFov(snap.camFov);
         drawRow(xPos, row++, "CameraRead", ok, "FOV:%.1f", snap.camFov);
+
+
     }
 
     {

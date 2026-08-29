@@ -1,4 +1,48 @@
-# Minimal ignore — user wants full repo including Build/ output and binaries.
+# Visual Studio
 .vs/
 *.vcxproj.user
 *.suo
+*.sdf
+*.sln.docstates
+
+# Build output (any depth: root Build/, Project/Build/, ...)
+**/Build/
+**/Intermediate/
+dist/
+out/
+*.obj
+*.pdb
+*.iobj
+*.ipdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.dll
+*.exe
+*.recipe
+*.lastbuildstate
+*.manifest
+*.res
+*.pch
+*.ipch
+*.tlog
+*.log
+*.unsuccessfulbuild
+
+# Runtime-generated artifacts
+imgui.ini
+
+# Runtime logs & dumps (regenerated on demand)
+help/help.txt
+help/dumper_log.txt
+help/session_log.txt
+
+# Debug logs (the big one!)
+debug-*.log
+*.log.bak
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store

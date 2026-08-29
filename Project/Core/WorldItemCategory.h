@@ -43,6 +43,8 @@ enum class WorldItemCategory : uint8_t {
     Buried,
     DeadDrop,
     OpenedContainer,
+    Hatch,
+    QuestItem,
     Count
 };
 
@@ -68,6 +70,9 @@ std::string DirectContainerKeywordLabel(
     const std::string& dataAssetFname);
 
 const char* WorldItemCategoryLabel(WorldItemCategory cat);
+/** True only for real extraction-point hatches (extraction signal + hatch).
+ *  Bare "hatch" fnames (Raider Hatch Key, hatch props) are NOT hatches. */
+bool FnameLooksLikeExtractionHatch(const std::string& fnameOrDisplay);
 /** Guaranteed ESP label when a container has no specific resolved name. */
 std::string ContainerCategoryFallbackEspLabel(WorldItemCategory cat);
 /** Plants / consumable world nodes — never route through container/salvage path. */

@@ -18,6 +18,10 @@ namespace var {
     float esp_distance = 500.f;
     float esp_color_visible[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     float esp_color_invisible[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+    bool vis_enabled = false;
+    bool lrts_debug_trace = false;
+    bool lrts_debug_tree = true;
+    bool lrts_debug_burst = false;
 
     /* Bot ESP */
     bool bot_box = true;
@@ -33,9 +37,12 @@ namespace var {
     bool enable_aimbot = false;
     bool robotAimEnabled = false;
     int aim_hold_key = 0x10; // VK_SHIFT
-    AimBoneMode aim_bone_mode = AimBoneMode::Chest;
+    AimBoneMode aim_bone_mode = AimBoneMode::ClosestBone;
     bool predict = true;
     bool humanizer = false;
+    float humanizer_intensity = 1.0f;   // overall jitter scale (0=off-ish, 2=max)
+    float humanizer_react_ms = 220.f;   // base reaction delay (ms)
+    float humanizer_overshoot = 0.18f;  // settling overshoot as fraction of error
     bool randombone = true;
     float aimbot_fov = 50.f;
     AimbotPriority aimbot_priority = AimbotPriority::Fov;
@@ -58,6 +65,7 @@ namespace var {
     int aim_loss_of_sight_grace_ms = 250;
     bool aim_loss_of_sight_grace_enabled = true;
     float aim_bullet_speed_cm_s = 80000.f;
+    AimVisMode aim_vis_mode = AimVisMode::Always;
 
     /* Triggerbot */
     bool enable_triggerbot = false;
@@ -66,7 +74,6 @@ namespace var {
     float trigger_deadzone_px = 3.f;
     int trigger_fire_delay_ms = 30;
     bool trigger_auto_hold = false;
-    bool trigger_vis_check = false;
 
     /* World */
     bool enable_world = true;
@@ -149,19 +156,10 @@ namespace var {
 
     /* Debug */
     bool show_debug_overlay = false;
+    bool debug_skeleton_lag = false;
+    bool debug_aim_shake = false;
+    bool debug_hatch_detect = false;
 
-    /* Vis / collision LOS */
-    bool vis_enabled = false;
-    float vis_max_range_m = 50.f;
-    bool vis_use_player_esp_dist = true;
-    bool vis_use_bot_esp_dist = true;
-    bool vis_use_esp_colors = false;
-    bool vis_use_aim = false;
-    bool vis_multi_bone = true;
-    int vis_hysteresis_frames = 3;
-    bool vis_debug = false;
-    bool vis_debug_rays = true;
-    bool vis_debug_tris = false;
 
     /* Camera debug */
     bool camPovUsePending = false;

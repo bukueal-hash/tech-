@@ -13,6 +13,13 @@ namespace Offsets {
     constexpr uint64_t GUObjectArrayChunksRva = 0xE80BA10ULL;  // dumper relaxed validated
     constexpr uint64_t FFieldNameKey0Rva = 0xE7B5330ULL;
     constexpr uint64_t FFieldNameKey1Rva = 0xE6F0554ULL;
+    // CL-1341255 GameInstance SIMD decrypt (UWorld+0x478 is encrypted — plain read returns 0):
+    constexpr uint64_t GameInstanceXorKey0Rva = 0xB06C380ULL;     // XOR key 0 (low qword)
+    constexpr uint64_t GameInstanceXorKey1Rva = 0xB06C390ULL;     // XOR key 1 (high qword)
+    constexpr uint64_t GameInstanceShuffleMaskRva = 0xB09C350ULL; // 16-byte PSHUFB mask
+    constexpr std::ptrdiff_t GameInstance_WorldBackRef = 0x2F0;   // GI struct → UWorld (validation)
+    // CL-1341255 player-name SIMD decrypt (replaces hardcoded scramble key):
+    constexpr uint64_t PlayerNameSimdMaskRva = 0xAD2FC50ULL;      // 16-byte PSHUFB mask (read from game base)
 
     // ── UObjectBase (standard UE layout; not game-specific dump) ─────────────
     constexpr std::ptrdiff_t UObject_ObjectFlags = 0x08;
@@ -62,13 +69,22 @@ namespace Offsets {
     constexpr std::ptrdiff_t GameViewportClient_World = 0x1A0;  // SDK validated
 
     // ── PlayerController / Controller ────────────────────────────────────────
-    // FrostSDK dump CL-1341255: Controller::Pawn = 0x3F0, ControlRotation = 0x438.
-    constexpr std::ptrdiff_t AcknowledgedPawn = 0x3F0;             // FrostSDK Controller.Pawn CL-1341255
-    constexpr std::ptrdiff_t ControlRotation = 0x438;
+    // SDK dump (buildid 24710327) Class: AController — Pawn @ 0x3F0, StateName @ 0x3D8.
+    // 0x3F0 is the real pawn slot and is what the working builds used; the 0x3D8
+    // change (a forum hunch) broke every PC-resolution path because the
+    // validators read the primary slot only. Keep 0x3D8 as fallback only.
+    constexpr std::ptrdiff_t AcknowledgedPawn = 0x3F0;             // SDK dump: AController.Pawn (validated)
+    constexpr std::ptrdiff_t AcknowledgedPawn_Fallback = 0x3D8;    // StateName slot per SDK — heuristic fallback only
+    constexpr std::ptrdiff_t Controller_Character = 0x408;         // SDK validated (AController.Character)
+    constexpr std::ptrdiff_t ControlRotation = 0x438;              // SDK validated
     constexpr std::ptrdiff_t AController_PlayerState = 0x3C0;   // SDK validated
     // The game keeps this non-UPROPERTY pointer outside the generated SDK; retain
     // the discovered slot only as a direct-read fallback. FName/PCOwner discovery
     // remains authoritative when this slot is encrypted or moved.
+    // LIVE-PINNED: debug-c190fb.log TracePcDiscovery shows PC+0x4D0 returning a
+    // stable valid APlayerCameraManager ptr on every raid session (cached path,
+    // 640+ traces: pcm=1258A8040 / 12ABDF0080 / 1292330080 / 12A65A2070), and the
+    // same read passes ControllerHasValidPcm (valid ptr + PcmLivePovLooksSane).
     constexpr std::ptrdiff_t APlayerCameraManager = 0x4D0;
     constexpr std::ptrdiff_t APlayerState = 0x3D0;              // SDK validated (APawn.PlayerState)
     constexpr std::ptrdiff_t PlayerNamePrivate = 0x448;         // SDK validated (APlayerState)
@@ -130,22 +146,24 @@ namespace Offsets {
     constexpr std::ptrdiff_t LastRenderTime = LastSubmitTime + 0x4;
     constexpr std::ptrdiff_t LastRenderTimeOnScreen = LastSubmitTime + 0x8;
     constexpr std::ptrdiff_t VisibilityBasedAnimTickOption = 0x0994; // SDK validated
-    constexpr std::ptrdiff_t bRecentlyRendered = 0x0997;        // SDK validated — bit mask 0x20
+    constexpr std::ptrdiff_t bRecentlyRendered = 0x997;         // SDK CL-1341255 SkinnedMeshComponent
 
-    // ── Bone decrypt (CL-1341255: enc@0x790, lod@0x7D0) ──────────────────────
-    constexpr std::ptrdiff_t Encrypted = 0x790;
-    constexpr std::ptrdiff_t LodSelect = 0x7D0;
+    // ── Bone decrypt (CL-1341255 v818: seed@0x7B0, lod@0x7F8) ─────────────────
+    constexpr std::ptrdiff_t Encrypted = 0x7B0;                 // bone pointer decrypt seed (v818)
+    constexpr std::ptrdiff_t Encrypted_Legacy = 0x790;          // previous build's seed slot
+    constexpr std::ptrdiff_t LodSelect = 0x7D0;                 // CL-1341255 (esasiolan + texaftertex confirm)
+    constexpr std::ptrdiff_t LodSelect_Legacy = 0x7D0;          // previous LOD slot
 
     // ── Mesh / character ─────────────────────────────────────────────────────
     constexpr std::ptrdiff_t USkeletalMeshComponent = 0x438;    // SDK validated (Character.Mesh)
-    constexpr std::ptrdiff_t SkeletalMeshAsset = 0xAC0;         // SDK validated
+    constexpr std::ptrdiff_t SkeletalMeshAsset = 0x740;         // SDK CL-1341255 SkinnedMeshComponent.SkeletalMesh (was 0xAC0 — stale)
     constexpr std::ptrdiff_t bNoSkeletonUpdate = 0xC51;         // SDK validated (mask 0x10)
     constexpr std::ptrdiff_t bForceRefpose = 0xC52;             // SDK validated (mask 0x1)
     constexpr std::ptrdiff_t CharacterMovement = 0x440;         // SDK validated
-    constexpr std::ptrdiff_t Velocity = 0x168;                  // dump: UMovementComponent.Velocity
+    constexpr std::ptrdiff_t Velocity = 0x160;                  // SDK: UMovementComponent.Velocity (was 0x168 — stale)
     constexpr std::ptrdiff_t PioneerCharacterMovement = 0xB48;  // SDK validated
     constexpr std::ptrdiff_t HealthComponent = 0xDD8;           // SDK validated
-    constexpr std::ptrdiff_t InventoryComponent = 0xCA0;        // CL-1341255: UC-posted (was 0xCB0)
+    constexpr std::ptrdiff_t InventoryComponent = 0xCB0;        // SDK CL-1341255 PioneerPlayerCharacter (was 0xCA0 — stale)
     constexpr std::ptrdiff_t EmbarkMesh = 0x7E8;                // SDK validated
 
     // ── Health ────────────────────────────────────────────────────────────────
@@ -154,22 +172,21 @@ namespace Offsets {
     constexpr std::ptrdiff_t PlayerState_MaxHealth = 0x558;     // derived (+0x20)
     constexpr std::ptrdiff_t PlayerState_Armor = 0x560;         // derived (+0x20)
     constexpr std::ptrdiff_t PlayerState_MaxArmor = 0x568;      // derived (+0x20)
-    constexpr std::ptrdiff_t Health = 0x678;                    // SDK: HealthComponent.CachedHealth (was 0x668, read 16B too low)
+    constexpr std::ptrdiff_t Health = 0x678;                    // SDK validated (HealthComponent::CachedHealth)
     constexpr std::ptrdiff_t MaxHealth = 0x308;                 // SDK validated
-    constexpr std::ptrdiff_t Shield = 0x150;                    // SDK validated
-    constexpr std::ptrdiff_t ShieldMax = 0x160;                 // UNVERIFIED (non-UPROPERTY)
+    constexpr std::ptrdiff_t Shield = 0x150;                    // == HealthComponent.Armor @ 0x150
+    constexpr std::ptrdiff_t ShieldMax = 0x160;                 // SDK validated: FArmorSlot.CurrentMaxArmor @ Armor+0x10
     constexpr std::ptrdiff_t MaxDBNO = 0x310;                   // SDK validated
-    constexpr std::ptrdiff_t TeamID = 0x822;                    // SDK validated
+    constexpr std::ptrdiff_t TeamID = 0x822;                    // live-pinned (not a dumped field — verified in-game)
 
-    constexpr std::ptrdiff_t CurrentItemActors = 0x4A0;         // CL-1341255: UC-posted (was 0x4B0)
-    constexpr std::ptrdiff_t LocalCurrentItemActors = 0x4C0;    // CL-1341255: UC-posted (was 0x4D0)
-    // EquippedPrimaryItem was 0x510 (UNVERIFIED) — read garbage, masked the
-    // CurrentItemActors fallback. Removed; weapons resolve via inventory chain.
-    constexpr std::ptrdiff_t WeaponClip = 0x470;                // u16, ammo in current magazine
-    constexpr std::ptrdiff_t WeaponQuality = 0x472;             // UNVERIFIED for CL-1341255
+    constexpr std::ptrdiff_t CurrentItemActors = 0x4B0;         // SDK CL-1341255 InventoryComponent (was 0x4A0 — stale)
+    constexpr std::ptrdiff_t LocalCurrentItemActors = 0x4D0;    // SDK CL-1341255 (was 0x4C0 — stale)
+    constexpr std::ptrdiff_t EquippedPrimaryItem = 0x518;       // reads EquippedArmor (was 0x500 — padding)
+    constexpr std::ptrdiff_t WeaponClip = 0x4A0;                // SDK CL-1341255 WeaponActor.CLIP_SIZE (was 0x470 — stale)
+    constexpr std::ptrdiff_t WeaponQuality = 0x4A2;             // SDK CL-1341255 (was 0x472 — stale)
 
-    constexpr std::ptrdiff_t StowedWeaponSlot0 = 0x340;
-    constexpr std::ptrdiff_t StowedWeaponSlot1 = 0x380;
+    constexpr std::ptrdiff_t StowedWeaponSlot0 = 0x330;         // SDK CL-1341255 STOWED_WEAPON_0 (was 0x340 — stale)
+    constexpr std::ptrdiff_t StowedWeaponSlot1 = 0x370;         // SDK CL-1341255 STOWED_WEAPON_1 (was 0x380 — stale)
     constexpr std::ptrdiff_t EquippedArmor = 0x518;
 
     // ── Loot / containers ────────────────────────────────────────────────────
@@ -199,48 +216,29 @@ namespace Offsets {
     constexpr std::ptrdiff_t BBItem_AmountValue = 0x4 + 0xC;
     constexpr std::ptrdiff_t Interaction_bIsActiveByte = 0x137;
     constexpr uint8_t Interaction_bIsActiveMask = 0x8;
-    constexpr std::ptrdiff_t Interaction_CurrentInteractionState = 0x46D;
+    constexpr std::ptrdiff_t Interaction_CurrentInteractionState = 0x47D; // SDK ref +0x10 (was 0x46D — stale)
 
-    constexpr std::ptrdiff_t bIsBreaked = 0x1220;
-    constexpr std::ptrdiff_t Constructable_EnemyTypeDataAsset = 0x11A0;
-    constexpr std::ptrdiff_t Constructable_AITemplateData = 0x1190;
-    constexpr std::ptrdiff_t Constructable_bIsDestroyed = 0x1210;
+    constexpr std::ptrdiff_t bIsBreaked = 0x1220;               // SDK ref PioneerConstructablePawn.bIsDestroyed @ 0x1220
+    constexpr std::ptrdiff_t Constructable_EnemyTypeDataAsset = 0x11B0; // SDK ref (was 0x11A0 — stale)
+    constexpr std::ptrdiff_t Constructable_AITemplateData = 0x11A0;     // SDK ref (was 0x1190 — stale)
+    constexpr std::ptrdiff_t Constructable_bIsDestroyed = 0x1220;       // SDK ref (was 0x1210 — stale)
+
+    // ── Extraction points (ASalvageExtractionPointBase — SDK validated) ───────
+    constexpr std::ptrdiff_t ExtractionPoint_State = 0x0BD2;            // EExtractionState @ 0x0BD2 (Net, RepNotify)
 
     // ── Static mesh collision (StaticMeshComponent / UStaticMesh — CL-1341255) ─
     constexpr std::ptrdiff_t StaticMesh = 0x728;                // SDK validated
     constexpr std::ptrdiff_t StaticMeshLegacy = 0x718;          // previous build's slot (Dumper fallback)
-    constexpr std::ptrdiff_t BodySetup = 0x1F0;                 // SDK validated
-    constexpr std::ptrdiff_t AggGeom = 0xB0;                    // dump: BodySetup.AggGeom
-    constexpr std::ptrdiff_t ExtendedBounds = 0x308;            // SDK validated
-    constexpr std::ptrdiff_t PositiveBoundsExt = 0x2D8;         // SDK validated
-    constexpr std::ptrdiff_t NegativeBoundsExt = 0x2F0;         // SDK validated
-    constexpr std::ptrdiff_t AggGeom_SphereElems = 0x00;
-    constexpr std::ptrdiff_t AggGeom_BoxElems = 0x10;
-    constexpr std::ptrdiff_t AggGeom_SphylElems = 0x20;
-    constexpr std::ptrdiff_t AggGeom_ConvexElems = 0x30;
-    constexpr std::ptrdiff_t ConvexElem_VertexData = 0x30;
-    constexpr std::ptrdiff_t ConvexElem_IndexData = 0x40;
-    constexpr std::ptrdiff_t ConvexElem_Stride = 0x110;
-    constexpr std::ptrdiff_t BoxElem_Center = 0x30;
-    constexpr std::ptrdiff_t BoxElem_Rotation = 0x48;
-    constexpr std::ptrdiff_t BoxElem_XExtent = 0x60;
-    constexpr std::ptrdiff_t BoxElem_YExtent = 0x64;
-    constexpr std::ptrdiff_t BoxElem_ZExtent = 0x68;
-    constexpr std::ptrdiff_t BoxElem_Stride = 0x70;
-    constexpr std::ptrdiff_t SphereElem_Center = 0x30;
-    constexpr std::ptrdiff_t SphereElem_Radius = 0x48;
-    constexpr std::ptrdiff_t SphereElem_Stride = 0x50;
-    constexpr std::ptrdiff_t SphylElem_Center = 0x30;
-    constexpr std::ptrdiff_t SphylElem_Rotation = 0x48;
-    constexpr std::ptrdiff_t SphylElem_Radius = 0x60;
-    constexpr std::ptrdiff_t SphylElem_Length = 0x64;
-    constexpr std::ptrdiff_t SphylElem_Stride = 0x68;
 
     // ── Encrypted render times / component internals ──────────────────────────
     constexpr std::ptrdiff_t Mesh_LastRenderTimeEnc = 0x4BC;
-    constexpr std::ptrdiff_t Mesh_LastRenderTimeOnScreenEnc = 0x4C4;
-    constexpr uint32_t Mesh_LastRenderTimeKey = 0x5AB299E0u;    // UNVERIFIED for CL-1341255
-    constexpr uint32_t Mesh_LastRenderTimeOnScreenKey = 0xA83E5CBEu; // UNVERIFIED for CL-1341255
+    constexpr std::ptrdiff_t Mesh_LastRenderTimeOnScreenEnc = 0x4C4;  // SDK ref PrimitiveComponent (was 0x4C8 — stale)
+    constexpr uint32_t Mesh_LastRenderTimeKey = 0x5AB299E0u;    // SDK ref LAST_RENDER_TIME_XOR
+    constexpr uint32_t Mesh_LastRenderTimeOnScreenKey = 0xA83E5CBEu;  // SDK ref LAST_RENDER_TIME_ON_SCREEN_XOR (was 0xE1664254 — stale)
     constexpr std::ptrdiff_t UActorComponent_WorldPrivate = 0x148; // UNVERIFIED (non-UPROPERTY)
-    constexpr std::ptrdiff_t UWorld_TimeSeconds = 0xA28;        // UNVERIFIED for CL-1341255
+    // Live-verified by WorldScan::StartTimeSecondsProbe on CL-1341255: read
+    // 480.526 and advanced 1.003 per wall second. RealTimeSeconds sits 0x10
+    // later at 0x8C0 running ~6.7s ahead, matching UE5 declaration order.
+    // 0xA28 was wrong and read zero, which is what stalled LRTS.
+    constexpr std::ptrdiff_t UWorld_TimeSeconds = 0x8B0;
 }

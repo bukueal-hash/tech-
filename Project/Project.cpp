@@ -5,11 +5,8 @@
 #include <d3d11.h>
 #include <tchar.h>
 #include <dwmapi.h>
-#include <fstream>
 #include <iostream>
 #include <chrono>
-
-#include "Core/AgentLog.h"
 
 #include "Core/Memory.h"
 #include "Core/SessionLog.h"
@@ -23,6 +20,8 @@
 #include "Interface/Utils/AutoConfig.h"
 #include "Interface/Render.h"
 #include "Core/AssetNames.h"
+#include "Core/CrashHandler.h"
+#include "resource.h"
 #include "Dumper/Dumper.h"
 #include "Dumper/DumperWorker.h"
 
@@ -41,44 +40,14 @@ void Render(HWND hwnd);
 
 static DWORD g_pid = 0;
 
-static LONG WINAPI VectoredCrashHandler(PEXCEPTION_POINTERS ep)
-{
-    if (!ep || !ep->ExceptionRecord)
-        return EXCEPTION_CONTINUE_SEARCH;
-    const DWORD code = ep->ExceptionRecord->ExceptionCode;
-    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ARRAY_BOUNDS_EXCEEDED
-        && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_ILLEGAL_INSTRUCTION)
-        return EXCEPTION_CONTINUE_SEARCH;
-    try {
-        std::ofstream f(kArcDebugLogPath, std::ios::app);
-        if (f) {
-            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            f << "{\"event\":\"veh_crash\",\"ms\":" << ms
-              << ",\"code\":0x" << std::hex << code << std::dec;
-            if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2) {
-                const ULONG_PTR isWrite = ep->ExceptionRecord->ExceptionInformation[0];
-                const ULONG_PTR addr = ep->ExceptionRecord->ExceptionInformation[1];
-                f << ",\"access\":\"" << (isWrite ? "write" : "read")
-                  << "\",\"faultAddr\":0x" << std::hex << addr << std::dec;
-            }
-            if (ep->ContextRecord)
-                f << ",\"rip\":0x" << std::hex << ep->ContextRecord->Rip << std::dec;
-            f << "}" << std::endl;
-        }
-    } catch (...) {}
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-
 int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 {
     ImGui_ImplWin32_EnableDpiAwareness();
     float main_scale = ImGui_ImplWin32_GetDpiScaleForMonitor(::MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY));
 
+    InstallCrashHandler();  // VEH — log crash context before dying
     SessionLog::Init();
     timeBeginPeriod(1);
-
-    AddVectoredExceptionHandler(1, VectoredCrashHandler);
 
     // No AllocConsole — Release is Windows subsystem; keep overlay-only (no black console).
 
@@ -113,6 +82,8 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
+    wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCE(IDI_ICON1));
+    wc.hIconSm = LoadIconW(hInst, MAKEINTRESOURCE(IDI_ICON1));
     wc.lpszClassName = L"UnrealWindow";
 
     RegisterClassExW(&wc);
@@ -139,6 +110,16 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     );
 
     SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), BYTE(255), LWA_ALPHA);
+
+    // Push the icon onto the window explicitly: the taskbar/Alt-Tab does not
+    // always pick up the window-class icon for WS_POPUP | WS_EX_NOACTIVATE
+    // overlay windows, and falls back to a blank white glyph.
+    const HICON hAppIcon = LoadIconW(hInst, MAKEINTRESOURCE(IDI_ICON1));
+    if (hAppIcon)
+    {
+        SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hAppIcon));
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hAppIcon));
+    }
 
     {
         RECT client_area{};

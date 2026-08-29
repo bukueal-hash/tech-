@@ -37,27 +37,32 @@ void DrawHelpDumperTab()
     ImGui::PushTextWrapPos(wrapX);
 
     if (!dmaOk)
-        ImGui::TextColored(ImVec4(1.f, 0.3f, 0.3f, 1.f), "DMA not attached — attach to PioneerGame first");
+        ArcMenuLayout::HoverableTextColoredF(ImVec4(1.f, 0.3f, 0.3f, 1.f), "DMA not attached — attach to PioneerGame first");
     else
-        ImGui::TextColored(ImVec4(0.3f, 1.f, 0.3f, 1.f), "DMA attached  base=0x%llX  size=0x%X",
+        ArcMenuLayout::HoverableTextColoredF(ImVec4(0.3f, 1.f, 0.3f, 1.f), "DMA attached  base=0x%llX  size=0x%X",
             static_cast<unsigned long long>(g_mem.GetBase()), g_mem.GetImageSize());
+    ImGui::SetItemTooltip("Whether the DMA reader is attached to the game process.");
 
-    ImGui::TextWrapped("Status: %s  (%.1fs)  Progress: %d%%",
+    ArcMenuLayout::HoverableTextF("Status: %s  (%.1fs)  Progress: %d%%",
         StatusLabel(status), state.GetElapsedSeconds(), state.GetProgress());
+    ImGui::SetItemTooltip("Current dumper state and progress.");
     ImGui::ProgressBar(state.GetProgress() / 100.f, ImVec2(-1.f, 0.f));
 
     const bool running = (status == DumpStatus::Running);
     ImGui::BeginDisabled(!dmaOk || running);
     if (ImGui::Button("Scan Globals"))
         StartDump(DumpMode::GlobalsOnly);
+    ImGui::SetItemTooltip("Dump global objects only (fast, writes help/globals.json).");
     ImGui::SameLine();
     if (ImGui::Button("Full SDK Dump"))
         StartDump(DumpMode::FullSdk);
+    ImGui::SetItemTooltip("Full SDK dump (slow, writes help/dump.txt).");
     ImGui::EndDisabled();
 
     ImGui::BeginDisabled(!running);
     if (ImGui::Button("Cancel"))
         state.RequestCancel();
+    ImGui::SetItemTooltip("Abort the running dump.");
     ImGui::EndDisabled();
 
     const std::string err = state.GetError();

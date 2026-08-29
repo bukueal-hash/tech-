@@ -193,7 +193,8 @@ void KmboxController::Initialize() {
 }
 
 void KmboxController::renderKmboxSettings() {
-    ImGui::TextUnformatted("KMBox Device");
+    ArcMenuLayout::HoverableText("KMBox Device");
+    ImGui::SetItemTooltip("Hardware mouse device settings.");
     ImGui::Separator();
     ImGui::Spacing();
 
@@ -249,12 +250,13 @@ void KmboxController::renderKmboxSettings() {
     ImGui::Spacing();
 
     if (kmboxConfig.type == "MAKCU") {
-        ImGui::TextUnformatted("MAKCU (Serial) Settings");
+        ArcMenuLayout::HoverableText("MAKCU (Serial) Settings");
+    ImGui::SetItemTooltip("Serial settings for the MAKCU device.");
         ImGui::Separator();
 
         char comBuf[64] = {};
         strcpy_s(comBuf, sizeof(comBuf), kmboxConfig.comPort.c_str());
-        ImGui::TextWrapped("COM port");
+        ArcMenuLayout::HoverableText("COM port");
         ImGui::PushItemWidth(-1.0f);
         if (ImGui::InputText("##kmbox_com_port", comBuf, sizeof(comBuf)))
             kmboxConfig.comPort = comBuf;
@@ -269,7 +271,8 @@ void KmboxController::renderKmboxSettings() {
         }
         ImGui::SetItemTooltip("Scan COM ports and pick the first MAKCU device found.");
     } else {
-        ImGui::TextUnformatted("KmBoxNet (UDP) Settings");
+        ArcMenuLayout::HoverableText("KmBoxNet (UDP) Settings");
+    ImGui::SetItemTooltip("UDP settings for the KmBox Net device.");
         ImGui::Separator();
 
         char ipBuf[64] = {};
@@ -280,7 +283,7 @@ void KmboxController::renderKmboxSettings() {
 
         char portBuf[16] = {};
         strcpy_s(portBuf, sizeof(portBuf), kmboxConfig.port.c_str());
-        ImGui::TextWrapped("Port");
+        ArcMenuLayout::HoverableText("Port");
         ImGui::PushItemWidth(-1.0f);
         if (ImGui::InputText("##kmbox_port", portBuf, sizeof(portBuf)))
             kmboxConfig.port = portBuf;
@@ -294,26 +297,33 @@ void KmboxController::renderKmboxSettings() {
         ImGui::SetItemTooltip("Device UUID / MAC string required by kmNet_init.");
 
         ImGui::Spacing();
-        ImGui::TextUnformatted("KmBoxNet Advanced");
+        ArcMenuLayout::HoverableText("KmBoxNet Advanced");
+    ImGui::SetItemTooltip("Raw device commands for troubleshooting.");
         ImGui::Separator();
 
         if (ImGui::Button("Enable monitor"))
             kmNet_monitor(1);
+        ImGui::SetItemTooltip("Send the monitor-enable command to the KmBox Net device.");
         ImGui::SameLine();
         if (ImGui::Button("Disable monitor"))
             kmNet_monitor(0);
+        ImGui::SetItemTooltip("Send the monitor-disable command to the KmBox Net device.");
 
         if (ImGui::Button("Mask LMB"))
             kmNet_mask_mouse_left(1);
+        ImGui::SetItemTooltip("Block the physical left mouse button from reaching the target PC.");
         ImGui::SameLine();
         if (ImGui::Button("Unmask all"))
             kmNet_unmask_all();
+        ImGui::SetItemTooltip("Unblock all masked mouse buttons.");
 
         if (ImGui::Button("LCD clear"))
             kmNet_lcd_color(0x0000);
+        ImGui::SetItemTooltip("Clear the device LCD display.");
         ImGui::SameLine();
         if (ImGui::Button("Reboot device"))
             kmNet_reboot();
+        ImGui::SetItemTooltip("Reboot the KmBox Net device.");
     }
 
     ImGui::Spacing();
@@ -345,9 +355,10 @@ void KmboxController::renderKmboxSettings() {
     ImGui::SetItemTooltip("Manual hardware left-click test. This is not used by aimbot.");
 
     if (kmboxConfig.initialized)
-        ImGui::TextColored(ImVec4(0, 1, 0, 1.f), "Status: connected");
+        ArcMenuLayout::HoverableTextColoredF(ImVec4(0, 1, 0, 1.f), "Status: connected");
     else
-        ImGui::TextColored(ImVec4(1, 0, 0, 1.f), "Status: not initialized");
+        ArcMenuLayout::HoverableTextColoredF(ImVec4(1, 0, 0, 1.f), "Status: not initialized");
+    ImGui::SetItemTooltip("Whether the hardware mouse connection is active.");
 }
 
 bool KmboxController::LoadKmboxConfig() {

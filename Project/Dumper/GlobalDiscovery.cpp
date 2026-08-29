@@ -281,7 +281,7 @@ bool ValidateBlockMask(uint64_t moduleBase, uint64_t rva, std::string& notes)
         notes = "mask all-ones";
         return false;
     }
-    const int pop = __popcnt64(mask);
+    const int pop = static_cast<int>(__popcnt64(mask));
     if (pop < 8 || pop > 56) {
         notes = "mask entropy weak";
         return false;

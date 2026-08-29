@@ -6,7 +6,6 @@ utilisation per scanner and compare against the theoretical model.
 Reads:
   scan_gate   -> heldMs, waitMs, blockedBy, waiters
   perf_spike  -> thread, ms (total task duration including gate wait)
-  vis_rebuild -> ms, dmaExec (cumulative), dmaLast
 
 Outputs a per-scanner table with:
   - turns/s, avg heldMs, duty%, avg taskMs
@@ -40,7 +39,6 @@ UNGATED = {
     "PositionRefreshPass":    16,
     "FrameBuilder":           12,
     "aim":                     4,
-    "CollisionVis":          250,
 }
 
 
@@ -265,78 +263,6 @@ def compute_ungated_stats(entries):
     return results
 
 
-def compute_vis_rebuild_stats(entries):
-    """Compute vis_rebuild cost metrics from vis_rebuild log entries."""
-    rebuilds = []
-    for e in entries:
-        if e.get("message") == "vis_rebuild":
-            data = e.get("data", {})
-            rebuilds.append({
-                "ts": e.get("timestamp", 0),
-                "ms": data.get("ms", 0),
-                "smc": data.get("smc", 0),
-                "dmaExec": data.get("dmaExec", 0),
-                "dmaLast": data.get("dmaLast", 0),
-                "run": e.get("runId", ""),
-            })
-
-    if len(rebuilds) < 2:
-        return None
-
-    rebuilds.sort(key=lambda r: r["ts"])
-
-    # Split by session gaps
-    SESSION_GAP_MS = 60000
-    segments = []
-    seg = [rebuilds[0]]
-    for i in range(1, len(rebuilds)):
-        if rebuilds[i]["ts"] - rebuilds[i - 1]["ts"] > SESSION_GAP_MS:
-            segments.append(seg)
-            seg = [rebuilds[i]]
-        else:
-            seg.append(rebuilds[i])
-    segments.append(seg)
-
-    all_increments = []
-    for seg_rebuilds in segments:
-        for i in range(1, len(seg_rebuilds)):
-            d = seg_rebuilds[i]["dmaExec"] - seg_rebuilds[i - 1]["dmaExec"]
-            if d >= 0:
-                all_increments.append({
-                    "ts_delta_ms": seg_rebuilds[i]["ts"] - seg_rebuilds[i - 1]["ts"],
-                    "dmaExec_delta": d,
-                    "rebuild_ms": seg_rebuilds[i]["ms"],
-                    "smc": seg_rebuilds[i]["smc"],
-                    "run": seg_rebuilds[i]["run"],
-                })
-
-    ms_vals = [r["ms"] for r in rebuilds]
-    inc_vals = [i["dmaExec_delta"] for i in all_increments]
-
-    pre = [r for r in rebuilds if r["run"] == "pre-fix"]
-    post = [r for r in rebuilds if r["run"] == "vis"]
-    pre_inc = [i for i in all_increments if i["run"] == "pre-fix"]
-    post_inc = [i for i in all_increments if i["run"] == "vis"]
-
-    def avg(lst):
-        return sum(lst) / len(lst) if lst else 0
-
-    return {
-        "total_rebuilds": len(rebuilds),
-        "rebuilds_pre": len(pre),
-        "rebuilds_post": len(post),
-        "avg_ms": avg(ms_vals),
-        "max_ms": max(ms_vals) if ms_vals else 0,
-        "avg_reads_per_rebuild": avg(inc_vals),
-        "max_reads_per_rebuild": max(inc_vals) if inc_vals else 0,
-        "pre_avg_reads": avg([i["dmaExec_delta"] for i in pre_inc]),
-        "post_avg_reads": avg([i["dmaExec_delta"] for i in post_inc]),
-        "pre_avg_ms": avg([r["ms"] for r in pre]),
-        "post_avg_ms": avg([r["ms"] for r in post]),
-        "increments": all_increments,
-    }
-
-
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "debug-c190fb.log"
 
@@ -433,7 +359,7 @@ def main():
         "Drift", "Drops%", "Avg(ms)", "Max(ms)", "Min(ms)"))
     print("-" * 100)
 
-    for thread in ["PositionRefreshPass", "FrameBuilder", "camera", "aim", "CollisionVis"]:
+    for thread in ["PositionRefreshPass", "FrameBuilder", "camera", "aim"]:
         u = ungated_stats.get(thread)
         if not u:
             print("{:<22}  (no data)".format(thread))
@@ -444,35 +370,6 @@ def main():
             u["cadence_drift_ms"], u["pct_turns_dropped"],
             u["avg_ms"], u["max_ms"], u["min_ms"]))
     print("")
-
-    # -- Vis rebuild -------------------------------------------------------
-    vis_stats = compute_vis_rebuild_stats(entries)
-
-    if vis_stats:
-        print("=" * 80)
-        print("VIS REBUILD COST")
-        print("=" * 80)
-        print("  Total rebuilds:     {}".format(vis_stats["total_rebuilds"]))
-        print("  Pre-gating:         {}  avg={:.1f}ms  avg_reads={:.0f}".format(
-            vis_stats["rebuilds_pre"], vis_stats["pre_avg_ms"], vis_stats["pre_avg_reads"]))
-        print("  Post-gating:        {}  avg={:.1f}ms  avg_reads={:.0f}".format(
-            vis_stats["rebuilds_post"], vis_stats["post_avg_ms"], vis_stats["post_avg_reads"]))
-        print("  Overall avg:        {:.1f}ms  avg_reads/rebuild={:.0f}".format(
-            vis_stats["avg_ms"], vis_stats["avg_reads_per_rebuild"]))
-        print("  Overall max:        {}ms  max_reads/rebuild={}".format(
-            vis_stats["max_ms"], vis_stats["max_reads_per_rebuild"]))
-        print("")
-
-        if vis_stats["pre_avg_reads"] > 0:
-            cached_reads = 6  # 2 SMC x 3 reads for CompXform scatter
-            savings_pct = (1 - cached_reads / vis_stats["pre_avg_reads"]) * 100
-            print("  GEOMETRY CACHE PROJECTION (pre-gating baseline):")
-            print("    Current per-rebuild reads: {:.0f}".format(vis_stats["pre_avg_reads"]))
-            print("    Cached per-rebuild reads:  ~{} (CompXform only)".format(cached_reads))
-            print("    Expected savings:          {:.0f}%".format(savings_pct))
-            est_cached_ms = vis_stats["pre_avg_ms"] * cached_reads / vis_stats["pre_avg_reads"]
-            print("    Estimated cached time:     ~{:.1f}ms".format(est_cached_ms))
-        print("")
 
     # -- Bus budget summary ------------------------------------------------
     print("=" * 80)
@@ -488,13 +385,6 @@ def main():
         total_bus_ms += bus_ms
         print("  {:<16}  {:.1f} turns/s x {:.1f}ms = {:.0f} ms/s".format(
             scanner, s["active_turns_per_s"], s["avg_held_ms"], bus_ms))
-
-    if vis_stats and vis_stats["pre_avg_reads"] > 0:
-        rebuilds_per_s = 1.0 / 20.0
-        rebuild_bus_ms = rebuilds_per_s * vis_stats["pre_avg_ms"]
-        total_bus_ms += rebuild_bus_ms
-        print("  {:<16}  {:.2f} turns/s x {:.1f}ms = {:.0f} ms/s".format(
-            "VisRebuild", rebuilds_per_s, vis_stats["pre_avg_ms"], rebuild_bus_ms))
 
     print("  " + "-" * 40)
     print("  TOTAL DUTY:        {:.0f} ms/s = {:.1f}%".format(total_bus_ms, total_bus_ms / 10))

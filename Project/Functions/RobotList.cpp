@@ -7,6 +7,7 @@
 #include "../Core/WorldItemCategory.h"
 #include "RobotList.h"
 #include "WorldScanCommon.h"
+#include "LrtsVisibility.h"
 
 #include <algorithm>
 #include <cctype>
@@ -23,6 +24,38 @@
 std::string ResolveBotTypeLabel(uintptr_t actor, const std::string& fname);
 
 namespace {
+
+// LRTS per-mesh visibility state for bots (persisted across frames)
+static std::unordered_map<uintptr_t, LrtsVis::MeshState> s_lrtsBotMeshStates;
+
+// Per-candidate observation history for the toggle-aware mesh resolver.
+// A render flag is proven live only by watching the 0x20 bit change (set AND
+// clear seen) across resolves; a static non-zero byte (trace: 0x3f/0x40/0x64
+// floats, or const 0x9/0xa/0xb) is garbage and must not win over a toggler.
+struct BotVisChildObs {
+    uintptr_t comp = 0;
+    uint8_t firstByte = 0;   // byte at first observation (baseline)
+    uint8_t changed = 0;     // byte has differed from firstByte at some point
+    uint8_t setSeen = 0;     // non-zero byte with the 0x20 bit observed
+    uint8_t clearSeen = 0;   // non-zero byte without the 0x20 bit observed
+};
+struct BotVisMeshResolve {
+    uintptr_t mesh = 0;      // currently selected probe component
+    std::chrono::steady_clock::time_point at;
+    std::unordered_map<uintptr_t, BotVisChildObs> obs; // comp -> history
+    size_t pickIdx = 0;      // round-robin index when nothing has toggled yet
+};
+static std::unordered_map<uintptr_t, BotVisMeshResolve> s_botVisMeshResolve;
+
+// Burst capture: full-frame-rate NDJSON rows for ONE bot, to measure the true
+// delay between a line-of-sight change and the flag verdict. The 1 Hz trace
+// (8 rows/s shared across bots) could not distinguish real latency from
+// sampling spacing.
+static std::chrono::steady_clock::time_point s_burstCaptureUntil{};
+static uintptr_t s_burstPawn = 0;
+static int s_burstRows = 0;
+static constexpr int kBotBurstMaxRows = 900;     // ~10-15 s at 60-90 fps
+static constexpr int kBotBurstMaxSecs = 15;
 
 bool IsWorldEspLabel(const std::string& name)
 {
@@ -95,11 +128,15 @@ bool IsBotEspPollutionName(const std::string& s)
     // "Bombardier" and "CollisionEffectNetworkSystem" admitted with a garbage
     // root — both churned admit→10-miss evict→re-admit, blinking the bot count
     // 11↔12 every second. SM_* static meshes and effect systems are never bots.
+    // R4: a bare "Landscape" terrain actor (ALandscape) churned the same way in
+    // TheDam_02_P — bot_nopos x443, labeled "Bombardier" via a garbage enemy-DA
+    // slot read at 0x11B0. Terrain/landscape geometry is never a bot.
     if (lower.rfind("sm_", 0) == 0)
         return true;
     if (lower.find("collisioneffect") != std::string::npos
         || lower.find("networksystem") != std::string::npos
-        || lower.find("backdrop") != std::string::npos)
+        || lower.find("backdrop") != std::string::npos
+        || lower.find("landscape") != std::string::npos)
         return true;
     // Fix #11: "WorldItemEffectCue_Actor_Reusable1" sat in the bot pipeline as
     // "Constructable" with zero position, burning DMA every retain pass
@@ -354,7 +391,7 @@ std::string DiscoverNewBotType(uintptr_t actor, const std::string& fname)
             "effectcue", "gameplaycue", "worlditem", "replicator",
             "interpolator", "blackboard", "audiomanager", "audiocomponent",
             "spotaudio", "manager", "spawner", "volume", "subsystem",
-            "soundscape",
+            "soundscape", "landscape",
         };
         for (const char* token : kNeverBotFname) {
             if (fnLower.find(token) != std::string::npos)
@@ -426,8 +463,8 @@ std::string DiscoverNewBotType(uintptr_t actor, const std::string& fname)
     if (label.empty())
         return {};
 
-    if (!engine.IsKnownRobotType(label)) {
-        engine.RegisterRobotType(label);
+    if (!engine.robotsList.contains(label)) {
+        engine.robotsList.insert(label);
         // #region agent log
         {
             static std::unordered_set<std::string> s_discoveredSeen;
@@ -476,9 +513,10 @@ bool QuickBotCandidate(uintptr_t actor)
         return false;
 
     // UE5 bots get PlayerStates from their AI controllers — a valid PS alone
-    // no longer proves "human player". Real players are already vetoed above
-    // by class id; this is a cheap pre-filter, the authoritative gate is
-    // VerifyBotActor, so drop the PS veto entirely here.
+    // no longer proves "human player". Snitch-summoned reinforcement bots
+    // spawn AI-possessed with a PS and were invisible to ESP because of this
+    // veto. Real players are already vetoed above by class id; this is a
+    // cheap pre-filter, the authoritative gate is VerifyBotActor.
     if (ArcActorType::IsAnyBotActor(actor))
         return true;
 
@@ -488,9 +526,6 @@ bool QuickBotCandidate(uintptr_t actor)
 
     if (WorldScan::HasArcEnemyAssetPointer(actor))
         return true;
-
-    if (HasWorldItemStructure(actor))
-        return false;
 
     auto fnameLooksLikeBot = [](const std::string& fname) -> bool {
         if (fname.empty())
@@ -520,7 +555,10 @@ bool QuickBotCandidate(uintptr_t actor)
     if (!LookupBotClassToken(classFn).empty())
         return true;
 
-    return false;
+    // Item/hover/loot structure vetoes AFTER the name checks: constructable
+    // bots (Turret, dispenser-style) can carry hover/interaction pointers, and
+    // the old order rejected them before their "turret" fname was considered.
+    return !HasWorldItemStructure(actor);
 }
 
 // P6: the admission scan re-ran fname/class-fname DMA reads on every static
@@ -539,10 +577,11 @@ static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point>
 static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point>
     s_botVerifyNeg;
 
-// P6b: 4-slice rotating admission ring. Full prune + retain still run every
+// P6b: 8-slice rotating admission ring. Full prune + retain still run every
 // pass; only the expensive admission DMA probes are banded. Positions stay
-// hot via PositionRefreshPass @16ms.
-static constexpr size_t kAdmitSlices = 4;
+// hot via PositionRefreshPass @16ms. 8 slices (was 4) halves reads/pass so
+// the shared DMA link lets the 8ms camera thread keep cadence.
+static constexpr size_t kAdmitSlices = 8;
 static constexpr size_t kAdmitPrioNewMax = 64;
 static size_t s_admitSliceCursor = 0;
 static uint64_t s_admitRingGen = 0;
@@ -616,9 +655,9 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
         return false;
     if (engine.IsCachedPlayer(actor))
         return false;
-    // UE5 bots get PlayerStates from their AI controllers - a valid PS alone no
-    // longer proves "human player". Only the local player's own PS is a hard
-    // reject; everything else is already vetoed by the checks above.
+    // UE5 bots get PlayerStates from their AI controllers — only the local
+    // player's own PS is a hard reject. AI-possessed reinforcement bots
+    // (Snitch summons) spawn with a valid PS and must not be vetoed here.
     const uintptr_t localPs = localPawn
         ? Memory::read<uintptr_t>(localPawn + Offsets::APlayerState)
         : 0;
@@ -639,6 +678,11 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
         const std::string classFname = engine.GetActorClassFName(actor);
         if (IsBotEspPollutionName(probe) || IsBotEspPollutionName(classFname))
             return false;
+        // Extraction hatches are world props (Loot tab) — they can pass the
+        // class-id bot positives below, so hard-veto on name before that.
+        if (FnameLooksLikeExtractionHatch(probe)
+            || FnameLooksLikeExtractionHatch(classFname))
+            return false;
         if (WorldScan::LooksLikeContainerActor(actor, probe)
             || (!classFname.empty() && WorldScan::LooksLikeContainerActor(actor, classFname))
             || (!probe.empty() && FnameLooksLikeWorldContainer(probe))
@@ -654,11 +698,10 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
     if (HasStrongEnemyDataAsset(actor) && ResolveBotSceneRoot(actor) != 0)
         return true;
 
-    // (3) No definitive proof ? weak candidate. Reject anything that carries
-    //     gun / item / pickup / container structure. This is what kept your gun,
-    //     ground boxes and containers OUT � they never reach the bot cache.
-    if (HasWorldItemStructure(actor))
-        return false;
+    // (3) No definitive proof ? weak candidate. Container-name veto here;
+    //     structure veto at (3b) below the bot-name checks. This ordering is
+    //     what keeps guns, ground boxes and containers OUT of the bot cache
+    //     while constructable bots still admit.
     if (WorldScan::LooksLikeContainerActor(actor, fname))
         return false;
 
@@ -703,6 +746,13 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
         if (knownBotName(meshFname))
             return true;
     }
+
+    // (3b) Structure veto after names: a known-bot-named actor that carries
+    // item/hover/loot pointers is still a bot (Turret-style constructs); a
+    // gun/pickup never matches a bot table name, so this still keeps guns and
+    // ground boxes OUT of the bot cache.
+    if (HasWorldItemStructure(actor))
+        return false;
 
     if (!meshOk)
         return false;
@@ -946,8 +996,10 @@ void PopulateBotPartCache(Engine::WorldCacheEntry& actor, uintptr_t key)
     actor.hasBotHeadWorldPos = false;
     if (actor.Mesh && engine.IsValidPointer(actor.Mesh)) {
         uintptr_t boneMesh = 0;
+        std::ptrdiff_t botCtw = 0;
+        std::ptrdiff_t botTrans = 0x20;
         const uintptr_t boneArray =
-            engine.ResolveBoneArray(key, actor.Mesh, &boneMesh);
+            engine.ResolveBoneArray(key, actor.Mesh, &boneMesh, &botCtw, &botTrans);
         if (boneArray && boneMesh && engine.IsValidPointer(boneMesh)) {
             const FTransform ctw = Engine::ReadComponentToWorld(boneMesh);
             for (const auto& [gameIndex, uniBone] : engine.GameBoneMapArcRaiders) {
@@ -990,8 +1042,8 @@ bool IsArcBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fnam
     if (!actor || actor == localPawn)
         return false;
 
-    // Bots get PlayerStates from AI controllers - only the local player's own
-    // PS is a hard reject here.
+    // Bots get PlayerStates from AI controllers — only the local player's
+    // own PS is a hard reject here (reinforcement bots spawn with a PS).
     const uintptr_t localPs = localPawn
         ? Memory::read<uintptr_t>(localPawn + Offsets::APlayerState)
         : 0;
@@ -1060,8 +1112,8 @@ bool StillLooksLikeBot(
     if (ArcActorType::IsTargetBotActor(actor))
         return true;
 
-    // Bots get PlayerStates from AI controllers - only the local player's own
-    // PS is a hard reject here.
+    // Bots get PlayerStates from AI controllers — only the local player's
+    // own PS is a hard reject here (reinforcement bots spawn with a PS).
     const uintptr_t localPs = localPawn
         ? Memory::read<uintptr_t>(localPawn + Offsets::APlayerState)
         : 0;
@@ -1248,15 +1300,56 @@ bool HasLiveBotVisual(uintptr_t actor, uintptr_t mesh)
 
 uint8_t ReadBotBrokenFlag(uintptr_t actor)
 {
-    // Only check Constructable_bIsDestroyed@0x1210 (SDK validated).
-    // bIsBreaked@0x1220 can read garbage on live bots — only use it
-    // in the retain path where false positives are harmless.
+    // Soft-deprecate bIsBreaked@0x1220 (not in SDK). Prefer only
+    // Constructable_bIsDestroyed@0x1210 (help/esp.txt + SDK). Do not treat
+    // Health==0 as dead — spawn frames often read 0 HP and blocked admits.
     const uint8_t destroyed =
         Memory::read<uint8_t>(actor + Offsets::Constructable_bIsDestroyed);
     return destroyed == 1 ? 1 : 0;
 }
 
 static std::atomic<int> g_botDrawLabelMiss{ 0 };
+
+// Bot spawn-cluster grouping: bots admitted near each other within a short
+// window (Snitch summon waves, patrol spawns) share a group id shown on ESP
+// as "G#" under the skeleton.
+static int g_botGroupCounter = 0;
+struct BotGroupSeed { float x, y, z; std::chrono::steady_clock::time_point tp; };
+static std::unordered_map<int, BotGroupSeed> g_botGroupSeeds;
+static std::unordered_map<uintptr_t, int> g_botKeyToGroup;
+
+static int AssignBotGroup(uintptr_t key, const Vector3& pos)
+{
+    if (auto it = g_botKeyToGroup.find(key); it != g_botKeyToGroup.end())
+        return it->second;
+    const auto now = std::chrono::steady_clock::now();
+    int best = 0;
+    for (auto& [gid, seed] : g_botGroupSeeds) {
+        if (now - seed.tp > std::chrono::seconds(4))
+            continue;
+        const float dx = static_cast<float>(pos.x - seed.x);
+        const float dy = static_cast<float>(pos.y - seed.y);
+        const float dz = static_cast<float>(pos.z - seed.z);
+        if (dx * dx + dy * dy + dz * dz < 6.4e7f) {  // (80 m)^2 in cm^2
+            best = gid;
+            break;
+        }
+    }
+    if (best == 0) {
+        best = ++g_botGroupCounter;
+        g_botGroupSeeds[best] = {
+            static_cast<float>(pos.x), static_cast<float>(pos.y),
+            static_cast<float>(pos.z), now };
+        if (g_botGroupSeeds.size() > 256)
+            g_botGroupSeeds.clear();
+    } else {
+        g_botGroupSeeds[best].tp = now;
+    }
+    g_botKeyToGroup[key] = best;
+    if (g_botKeyToGroup.size() > 4096)
+        g_botKeyToGroup.clear();
+    return best;
+}
 
 void RecordBotDrawLabelMiss()
 {
@@ -1389,6 +1482,173 @@ std::string ResolveBotDrawLabel(
     return {};
 }
 
+// Update the persistent observation of one candidate component from a fresh
+// flag-byte read. A render flag is only proven by the 0x20 bit existing in
+// both states across time; a static non-zero byte (0x3f/0x40/0x64 floats, or
+// const 0x9/0xa/0xb) is garbage and must never outrank a toggler.
+static void ObserveBotVisChild(
+    BotVisMeshResolve& st, uintptr_t comp, uint8_t byte)
+{
+    if (!comp)
+        return;
+    BotVisChildObs& o = st.obs[comp];
+    o.comp = comp;
+    if (!o.firstByte)
+        o.firstByte = byte;
+    if (byte != o.firstByte)
+        o.changed = 1;
+    if (byte & LrtsVis::BrrMask)
+        o.setSeen = 1;
+    if (byte && !(byte & LrtsVis::BrrMask))
+        o.clearSeen = 1;
+}
+
+// Priorities: proven toggler > dynamic byte that ever showed the render bit
+// > static set-only > dynamic clear-only > static clear-only > dead (zero).
+// Zero = unbound slot, never a render signal. A constant byte with 0x20 set
+// (float garbage 0x3f) must never outrank a real flag that merely reads clear
+// while occluded.
+static int ScoreBotVisChild(const BotVisChildObs& o)
+{
+    if (!o.comp)
+        return -1000000;
+    if (o.setSeen && o.clearSeen)
+        return 100;                              // proven: 0x20 toggled both ways
+    if (o.changed && o.setSeen)
+        return 80;                               // dynamic byte that showed the flag
+    if (o.changed)
+        return 60;                               // byte moves, may be a live flag
+    if (o.setSeen)
+        return 55;                               // flag bit seen set, byte static
+    if (o.clearSeen)
+        return 20;                               // flag seen clear (occluded?)
+    if (o.firstByte)
+        return 10;
+    return 0;
+}
+
+// LRTS mesh resolution for bots: the render flag lives in different slots per
+// bot class — some follow the 0x438 USkeletalMeshComponent slot, some the
+// EmbarkMesh 0x7E8 slot, and constructive-pawns may defer to child components.
+// Rather than trusting a single non-zero byte, persist which candidate the
+// 0x20 bit has actually toggled on and prefer it. Candidates no child has ever
+// proven get sampled round-robin so a valid but quiet mesh is not missed.
+static uintptr_t ResolveBotVisMesh(
+    uintptr_t actor, uintptr_t primaryMesh, uintptr_t root,
+    BotVisMeshResolve& st)
+{
+    const uintptr_t embark = Memory::read<uintptr_t>(actor + Offsets::EmbarkMesh);
+
+    // Ordered candidate set: primary, embark, root, then root children.
+    std::vector<uintptr_t> cand;
+    auto pushCand = [&](uintptr_t c) {
+        if (!c || !engine.IsValidPointer(c))
+            return;
+        for (uintptr_t x : cand)
+            if (x == c)
+                return;
+        cand.push_back(c);
+    };
+    pushCand(primaryMesh);
+    pushCand(embark);
+    pushCand(root);
+    if (root && engine.IsValidPointer(root))
+        ReadChildComponentsLocal(root, cand, 2);
+
+    // Refresh observations for every candidate.
+    for (uintptr_t c : cand)
+        ObserveBotVisChild(st, c,
+            Memory::read_nocache<uint8_t>(c + LrtsVis::BrrOffset));
+
+    // Drop observations whose component is no longer in the candidate set
+    // (despawned / re-allocated memory must not keep an old winner alive).
+    for (auto it = st.obs.begin(); it != st.obs.end();) {
+        bool alive = false;
+        for (uintptr_t c : cand)
+            if (c == it->first)
+                { alive = true; break; }
+        if (!alive)
+            it = st.obs.erase(it);
+        else
+            ++it;
+    }
+
+    if (cand.empty())
+        return st.mesh ? st.mesh : primaryMesh;
+
+    // Pick the best-scoring candidate; a proven toggler is sticky (never
+    // bounced away to a sibling that happens to be first in child order).
+    uintptr_t best = st.mesh;
+    int bestScore = -1000000;
+    if (best && st.obs.count(best))
+        bestScore = ScoreBotVisChild(st.obs[best]);
+    for (size_t i = 0; i < cand.size(); ++i) {
+        const uintptr_t c = cand[i];
+        const auto it = st.obs.find(c);
+        const int s = (it != st.obs.end()) ? ScoreBotVisChild(it->second) : 0;
+        if (s > bestScore) {
+            best = c;
+            bestScore = s;
+            st.pickIdx = i;
+        }
+    }
+
+    // Nothing proven (score < 60: only static bytes seen) and the current pick
+    // is not known-live — walk forward (wrapping) so a valid mesh that sits
+    // later in the child list gets a chance to show its 0x20 bit, and a static
+    // float-garbage byte can never pin the selection. A dynamic or proven
+    // candidate (score >= 60) sticks.
+    if (bestScore < 60 && cand.size() > 1)
+        best = cand[(st.pickIdx + 1) % cand.size()];
+
+    return best;
+}
+
+// Diagnostic tree walk: collect the mesh slots plus their child components
+// (depth 2) so a single raid reveals which component actually carries the
+// recently-rendered flag for each bot class.
+struct BotVisNode {
+    uintptr_t comp;
+    uint8_t flag[7];  // window around the flag byte: brrOffset-3 .. brrOffset+3
+};
+
+static void CollectBotVisTree(
+    uintptr_t actorKey,
+    uintptr_t primaryMesh,
+    uintptr_t root,
+    std::vector<BotVisNode>& out,
+    bool wantChildren)
+{
+    std::vector<uintptr_t> roots;
+    if (primaryMesh && engine.IsValidPointer(primaryMesh))
+        roots.push_back(primaryMesh);
+    uintptr_t embark = Memory::read<uintptr_t>(actorKey + Offsets::EmbarkMesh);
+    if (embark && engine.IsValidPointer(embark) && embark != primaryMesh)
+        roots.push_back(embark);
+    if (root && engine.IsValidPointer(root)
+        && root != primaryMesh && root != embark)
+        roots.push_back(root);
+
+    std::vector<uintptr_t> all;
+    for (uintptr_t r : roots)
+        all.push_back(r);
+    if (wantChildren) {
+        for (uintptr_t r : roots)
+            ReadChildComponentsLocal(r, all, 1);
+    }
+    std::unordered_set<uintptr_t> seen;
+    for (uintptr_t c : all) {
+        if (!c || !engine.IsValidPointer(c) || !seen.insert(c).second)
+            continue;
+        BotVisNode n{};
+        n.comp = c;
+        for (int i = 0; i < 7; ++i)
+            n.flag[i] = Memory::read_nocache<uint8_t>(
+                c + LrtsVis::BrrOffset - 3 + i);
+        out.push_back(n);
+    }
+}
+
 void Engine::RobotList()
 {
     // Pre-size so runtime bot-type discovery inserts never rehash while the
@@ -1415,6 +1675,11 @@ void Engine::RobotList()
     const uintptr_t sAcknowledgedPawn = ctx.acknowledgedPawn;
     if (!sGWorld || !ctx.persistentLevel)
         return;
+
+    // Read UWorld::TimeSeconds (double in UE5) for LRTS visibility check
+    const float worldTime = var::LrtsVisActive()
+        ? static_cast<float>(Memory::read_nocache<double>(sGWorld + Offsets::UWorld_TimeSeconds))
+        : 0.f;
 
     const uint64_t genAtStart =
         m_worldGeneration.load(std::memory_order_acquire);
@@ -1445,10 +1710,14 @@ void Engine::RobotList()
         }
     }
     // LOS mesh rebuild is owned by Update � calling it every RobotList tick
-    // kept VisCheck rebuilding=1 with smc thousands (overlay lag).
 
     const float maxDistM = var::bot_esp_distance > 0.f ? var::bot_esp_distance : var::kMaxDistanceSliderM;
     const float maxDistSq = maxDistM * maxDistM * 10000.0f;
+    // Dist-edge hysteresis (Schmitt trigger): a bot already drawing stays on up
+    // to 15% past the slider cutoff, so a bot hovering on the boundary can't
+    // blink on/off. New bots still only admit at the true cutoff.
+    constexpr float kDistOffFactor = 1.15f;
+    const float maxDistOffSq = maxDistSq * kDistOffFactor * kDistOffFactor;
 
     std::unordered_map<uintptr_t, WorldCacheEntry> localCache;
     {
@@ -1526,6 +1795,12 @@ void Engine::RobotList()
     size_t dbgAdmitSliceEnd = 0;
     size_t dbgAdmitN = 0;
     bool admitRingAdvanceOk = false;
+
+    // LAG1: cap this pass's DMA. Camera @8ms, position @16ms and the
+    // frame-builder bone reads @12ms share the one DMA link; a scanner that
+    // hogs it starves them all and bones lag behind moving targets.
+    WorldScan::ScanBudget scanBudget(std::chrono::milliseconds(90));
+    bool slicePartial = false;
 
     if (doAdmission) {
         // Resolve the runtime actor-type offset once (serial) so the batch
@@ -1643,8 +1918,9 @@ void Engine::RobotList()
             probeRows.push_back(row);
         }
 
-        constexpr size_t kAdmitChunk = 512;
+        constexpr size_t kAdmitChunk = 128;
         for (size_t base = 0; base < probeRows.size(); base += kAdmitChunk) {
+            if (scanBudget.expired()) { slicePartial = true; break; }
             const size_t end = (std::min)(base + kAdmitChunk, probeRows.size());
             ScatterSession scatter;
             if (!scatter.isValid())
@@ -1673,16 +1949,20 @@ void Engine::RobotList()
             }
             if (prepOk && scatter.execute())
                 ++dbgAdmitScatterExecs;
+            // Short batches + yield so the 8ms camera thread keeps cadence.
+            std::this_thread::yield();
         }
 
-        // Bots get PlayerStates from AI controllers - only the local player's
-        // own PS is a hard skip here; players are otherwise caught by class id
-        // and IsCachedPlayer below.
+        // Bots get PlayerStates from AI controllers — only the local player's
+        // own PS is a hard skip here; players are otherwise caught by class
+        // id and IsCachedPlayer below. Reinforcement bots (Snitch summons)
+        // spawn with a valid PS and must not be skipped.
         const uintptr_t localPs = sAcknowledgedPawn
             ? Memory::read<uintptr_t>(sAcknowledgedPawn + Offsets::APlayerState)
             : 0;
         admitCandidates.reserve(64);
         for (const AdmitProbeRow& r : probeRows) {
+            if (scanBudget.expired()) { slicePartial = true; break; }
             const uint32_t masked = ArcActorType::MaskActorTypeId(r.typeId);
             if (ArcActorType::IsPlayerClassId(masked))
                 continue;
@@ -1718,7 +1998,9 @@ void Engine::RobotList()
         // only after gen-matched writeback so an aborted pass never skips a band.
         s_admitPrevActors.clear();
         s_admitPrevActors.insert(admitIndex.begin(), admitIndex.end());
-        admitRingAdvanceOk = true;
+        // A budgeted partial pass must not skip a ring band — the slice is
+        // retried in full next pass instead (see the advance gate below).
+        admitRingAdvanceOk = !slicePartial;
     }
 
     if (doAdmission) {
@@ -1739,6 +2021,13 @@ void Engine::RobotList()
         // candidate probe via garbage data-asset pointers — block before verify.
         if (IsBotEspPollutionName(fname))
             continue;
+
+        // Extraction hatches belong in the container (Loot) cache, not bots.
+        // ContainerList admits them with WorldItemCategory::Hatch; admitting
+        // them here too put a bot box + bot label on every extraction point.
+        if (FnameLooksLikeExtractionHatch(fname)) {
+            continue;
+        }
 
         // B1 (Fix #8): skip actors whose verify already failed recently.
         if (!localCache.contains(actor)) {
@@ -1870,6 +2159,12 @@ void Engine::RobotList()
         entry.ActorName = itemName;
         entry.IsBreaked = broken != 0;
         entry.category = 3;
+        {
+            // Group # for ESP: bots spawning near each other within seconds
+            // (Snitch summons, patrols) get the same id.
+            const Vector3 groupPos = ReadBotSceneWorldPosLive(root);
+            entry.groupId = AssignBotGroup(actor, groupPos);
+        }
         ++dbgAdmitted;
 
         // #region agent log
@@ -2012,12 +2307,23 @@ void Engine::RobotList()
     {
         auto& actor = it->second;
         const uintptr_t key = it->first;
+        if (scanBudget.expired())
+            break;
 
         std::string fname = engine.GetActorFNameStringCached(key);
         if (fname.empty())
             fname = engine.GetActorFNameString(key);
 
         if (IsBotEspPollutionName(fname) || IsBotEspPollutionLabel(actor.ActorName)) {
+            ClearBotVisualMiss(key);
+            it = localCache.erase(it);
+            continue;
+        }
+
+        // Evict hatches that slipped into the bot cache before the admit-side
+        // exclusion existed (or via any other path) — they are Loot-tab props.
+        if (fname.find("Hatch") != std::string::npos
+            || fname.find("hatch") != std::string::npos) {
             ClearBotVisualMiss(key);
             it = localCache.erase(it);
             continue;
@@ -2066,10 +2372,21 @@ void Engine::RobotList()
             ++dbgVerifyRan;
             if (!VerifyBotActor(key, sAcknowledgedPawn, fname)) {
                 ++dbgReEvict;
+                // GRACE: transient DMA flaps false-negative the verify; an
+                // instant erase blinks the bot for one frame then re-admits it
+                // (evictReadmit flicker). Keep it cached with its last Drawing,
+                // throttle re-verify, erase only after kBotVisualMissEvict
+                // consecutive failures.
+                if (!BotVisualMissShouldEvict(key, false)) {
+                    s_lastBotVerify[key] = nowRetain;
+                    ++it;
+                    continue;
+                }
                 ClearBotVisualMiss(key);
                 s_lastBotVerify.erase(key);
                 s_lastBotPartCache.erase(key);
                 s_lastBotPartMesh.erase(key);
+                s_botVisualEvicted[key] = nowRetain;
                 it = localCache.erase(it);
                 continue;
             }
@@ -2090,7 +2407,33 @@ void Engine::RobotList()
         if (!actor.rootComponent || !engine.IsValidPointer(actor.rootComponent))
             actor.rootComponent = ResolveBotSceneRoot(key);
         if (!actor.rootComponent) {
+            // GRACE: root reads flap under DMA load; keep the bot cached
+            // instead of blink-evicting it (evictReadmit flicker).
+            if (!BotVisualMissShouldEvict(key, false)) {
+                ++it;
+                continue;
+            }
             ClearBotVisualMiss(key);
+            s_botVisualEvicted[key] = nowRetain;
+            s_botLastGoodPos.erase(key);
+            it = localCache.erase(it);
+            continue;
+        }
+
+        // Broken flag read BEFORE the Drawing reset: a garbage/DMA-flapped read
+        // must not blank the box for one frame then re-draw it (flicker).
+        const uint8_t broken = ReadBotBrokenFlag(key);
+        actor.IsBreaked = broken != 0;
+        if (broken != 0 && !var::show_dead_bots) {
+            // GRACE: keep cached with last Drawing while the flag flaps; a
+            // truly-dead bot still climbs to kBotVisualMissEvict and evicts.
+            if (!BotVisualMissShouldEvict(key, false)) {
+                ++it;
+                continue;
+            }
+            ClearBotVisualMiss(key);
+            s_botVisualEvicted[key] = nowRetain;
+            s_botLastGoodPos.erase(key);
             it = localCache.erase(it);
             continue;
         }
@@ -2098,15 +2441,10 @@ void Engine::RobotList()
         actor.category = 3;
         actor.Drawing = false;
 
-        const uint8_t broken = ReadBotBrokenFlag(key);
-        actor.IsBreaked = broken != 0;
-        if (broken != 0 && !var::show_dead_bots) {
-            ClearBotVisualMiss(key);
-            it = localCache.erase(it);
-            continue;
-        }
-
         // Bot HP readers removed (wrong offsets; NDJSON probes deleted).
+        // The GAS Health attribute at AbilitySystem->SpawnedAttributes reads a
+        // constant 100 under fire: ARC bots take part damage via
+        // UConstructableHealthServiceComponent, whose arrays are undumped.
         actor.health = 0.f;
         actor.maxhealth = 0.f;
 
@@ -2197,7 +2535,9 @@ void Engine::RobotList()
                     // from flickering at the distance boundary (41% of all flickers).
                     static std::unordered_map<uintptr_t, uint8_t> s_botDistMisses;
                     constexpr uint8_t kBotDistMissClear = 3;
-                    if (distanceSq <= maxDistSq) {
+                    const bool distInside = distanceSq <= maxDistSq;
+                    const bool distHeld = actor.Drawing && distanceSq <= maxDistOffSq;
+                    if (distInside || distHeld) {
                         actor.Drawing = true;
                         s_botDistMisses.erase(key);
                         ++dbgDrawing;
@@ -2225,7 +2565,8 @@ void Engine::RobotList()
                         const float distanceSq = static_cast<float>(
                             delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
                         actor.Distance = sqrtf(distanceSq) / 100.0f;
-                        if (distanceSq <= maxDistSq) {
+                        if (distanceSq <= maxDistSq
+                            || (actor.Drawing && distanceSq <= maxDistOffSq)) {
                             actor.Drawing = true;
                             ++dbgDrawing;
                         } else {
@@ -2363,16 +2704,214 @@ void Engine::RobotList()
 
         UpdateBotVelocity(actor, actor.WorldPos);
 
-        actor.isVisible = actor.Mesh
-            ? steam_decrypt::IsMeshVisible(static_cast<uint64_t>(actor.Mesh))
-            : true;
+        // LRTS visibility: raw fast-path first, encrypted scan/key fallback.
+        // Every read here must bypass the VMM cache — render timestamps change
+        // per frame and the cached path serves the same bytes twice, so the
+        // scan would never see a value move and could never lock a key.
+        // Bots: constructive-pawns frequently leave BOTH the 0x438 mesh slot
+        // and EmbarkMesh (0x7E8) unbound, so resolve the component that
+        // actually carries a render flag — probe the mesh slots, then the root
+        // component and its children (boxes draw from root). Gate on any probe
+        // candidate, not actor.Mesh alone.
+        if (var::LrtsVisActive()
+            && (actor.Mesh || actor.rootComponent) && worldTime > 10.f) {
+            uintptr_t visMesh = 0;
+            const auto nowResolve = std::chrono::steady_clock::now();
+            auto& ent = s_botVisMeshResolve[actor.APawn];
+            if (nowResolve - ent.at < std::chrono::seconds(1))
+                visMesh = ent.mesh;
+            if (!visMesh) {
+                visMesh = ResolveBotVisMesh(
+                    actor.APawn, actor.Mesh, actor.rootComponent, ent);
+                ent.mesh = visMesh;
+                ent.at = nowResolve;
+            }
+            if (s_botVisMeshResolve.size() > 8192) {
+                const auto tooOld = nowResolve - std::chrono::seconds(10);
+                for (auto it = s_botVisMeshResolve.begin();
+                     it != s_botVisMeshResolve.end();) {
+                    if (it->second.at < tooOld)
+                        it = s_botVisMeshResolve.erase(it);
+                    else
+                        ++it;
+                }
+            }
+            auto vis = LrtsVis::CheckDirect(
+                [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
+                visMesh, LrtsVis::g_session, worldTime,
+                static_cast<uint32_t>(Offsets::Mesh_LastRenderTimeOnScreenEnc),
+                Offsets::Mesh_LastRenderTimeOnScreenKey);
+            if (vis == LrtsVis::Result::Unknown) {
+                const uintptr_t alt = Memory::read<uintptr_t>(actor.APawn + Offsets::EmbarkMesh);
+                if (alt && alt != visMesh && engine.IsValidPointer(alt)) {
+                    vis = LrtsVis::CheckDirect(
+                        [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
+                        alt, LrtsVis::g_session, worldTime,
+                        static_cast<uint32_t>(Offsets::Mesh_LastRenderTimeOnScreenEnc),
+                        Offsets::Mesh_LastRenderTimeOnScreenKey);
+                    if (vis != LrtsVis::Result::Unknown)
+                        visMesh = alt;
+                }
+            }
+            if (vis == LrtsVis::Result::Unknown) {
+                vis = LrtsVis::CheckRendered(
+                    [](uint64_t a) { return Memory::read_nocache<uint8_t>(a); },
+                    visMesh, LrtsVis::g_session,
+                    LrtsVis::BrrOffset, LrtsVis::BrrMask);
+            }
+            if (vis == LrtsVis::Result::Unknown) {
+                vis = LrtsVis::CheckRaw(
+                    [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
+                    visMesh, LrtsVis::g_session, worldTime);
+            }
+            if (vis == LrtsVis::Result::Unknown) {
+                auto& ms = s_lrtsBotMeshStates[visMesh];
+                if (!ms.meshComp) ms.meshComp = visMesh;
+                LrtsVis::Scan(ms, LrtsVis::g_session,
+                    [](uint64_t a) { return Memory::read_nocache<uint8_t>(a); },
+                    [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
+                    [](uint64_t a, void* b, uint32_t s) {
+                        return PCIMemory::ReadVirtualMemoryNoCache(a, b, s);
+                    },
+                    worldTime, sGWorld);
+                vis = LrtsVis::Check(ms, LrtsVis::g_session,
+                    [](uint64_t a) { return Memory::read_nocache<uint8_t>(a); },
+                    [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
+                    worldTime, sGWorld);
+            }
+            actor.isVisible = (vis != LrtsVis::Result::Occluded);
+
+            // Burst capture: full-frame-rate rows for ONE (first) bot so the
+            // true LOS->verdict latency is measurable. The shared 1 Hz trace
+            // cannot. Auto-disables after a duration or row cap.
+            if (var::lrts_debug_burst) {
+                const auto nowBurst = std::chrono::steady_clock::now();
+                if (s_burstPawn == 0) {
+                    s_burstPawn = actor.APawn;
+                    s_burstRows = 0;
+                    s_burstCaptureUntil =
+                        nowBurst + std::chrono::seconds(kBotBurstMaxSecs);
+                }
+                if (s_burstPawn == actor.APawn) {
+                    const uint8_t brrBurst = Memory::read_nocache<uint8_t>(
+                        visMesh + LrtsVis::BrrOffset);
+                    ObserveBotVisChild(ent, visMesh, brrBurst);
+                    std::ofstream bf(kArcVerifyPath, std::ios::app);
+                    if (bf) {
+                        const auto bts = std::chrono::duration_cast<
+                            std::chrono::milliseconds>(
+                                std::chrono::system_clock::now()
+                                    .time_since_epoch()).count();
+                        Vector3 scr{};
+                        const bool inFront = IsPlausibleWorldPos(actor.WorldPos)
+                            && engine.ProjectWorldLocationToScreen(
+                                actor.WorldPos, scr, cam);
+                        bf << "{\"location\":\"RobotList.cpp\","
+                           << "\"message\":\"vis_burst\","
+                           << "\"timestamp\":" << bts
+                           << ",\"mesh\":\"0x" << std::hex << visMesh
+                           << "\",\"brr\":\"0x"
+                           << static_cast<unsigned>(brrBurst) << std::dec << "\""
+                           << ",\"vis\":" << static_cast<int>(vis)
+                           << ",\"inFront\":" << (inFront ? 1 : 0)
+                           << ",\"wt\":" << worldTime
+                           << "}\n";
+                    }
+                    ++s_burstRows;
+                    if (s_burstRows >= kBotBurstMaxRows
+                        || nowBurst > s_burstCaptureUntil) {
+                        var::lrts_debug_burst = false;
+                        s_burstPawn = 0;
+                        s_burstRows = 0;
+                    }
+                }
+            }
+
+            // Per-actor trace, 1 Hz. Answers two things the aggregate counters
+            // cannot: whether distinct actors get distinct flag bytes, and how
+            // long the byte takes to follow a line-of-sight change.
+            if (var::lrts_debug_trace) {
+                static std::chrono::steady_clock::time_point sLastVisTrace{};
+                static int sVisTraceThisPass = 0;
+                const auto nowTrace = std::chrono::steady_clock::now();
+                if (nowTrace - sLastVisTrace > std::chrono::seconds(1)) {
+                    sLastVisTrace = nowTrace;
+                    sVisTraceThisPass = 0;
+                }
+                if (sVisTraceThisPass < 8) {
+                    ++sVisTraceThisPass;
+                    const uint8_t brrTrace = Memory::read_nocache<uint8_t>(
+                        visMesh + LrtsVis::BrrOffset);
+                    ObserveBotVisChild(ent, visMesh, brrTrace);
+                    std::ofstream vf(kArcVerifyPath, std::ios::app);
+                    if (vf) {
+                        const auto vts = std::chrono::duration_cast<
+                            std::chrono::milliseconds>(
+                                std::chrono::system_clock::now()
+                                    .time_since_epoch()).count();
+                        std::vector<BotVisNode> tree;
+                        CollectBotVisTree(actor.APawn, actor.Mesh,
+                            actor.rootComponent, tree, var::lrts_debug_tree);
+                        vf << "{\"location\":\"RobotList.cpp\","
+                           << "\"message\":\"vis_trace\","
+                           << "\"timestamp\":" << vts
+                           << ",\"mesh\":\"0x" << std::hex << visMesh
+                           << "\",\"orig\":\"0x" << actor.Mesh
+                           << "\",\"brr\":\"0x" << static_cast<unsigned>(brrTrace)
+                           << std::dec << "\""
+                           << ",\"vis\":" << static_cast<int>(vis);
+                        if (!tree.empty()) {
+                            vf << ",\"tree\":[";
+                            for (size_t ti = 0; ti < tree.size(); ++ti) {
+                                if (ti) vf << ',';
+                                vf << "{\"c\":\"0x" << std::hex << tree[ti].comp
+                                   << "\",\"w\":\"";
+                                for (int wi = 0; wi < 7; ++wi) {
+                                    if (wi) vf << ',';
+                                    vf << "0x" << static_cast<unsigned>(tree[ti].flag[wi]);
+                                }
+                                vf << "\"}";
+                            }
+                            vf << ']';
+                        }
+                        vf << "}\n";
+                    }
+                }
+            }
+        } else {
+            actor.isVisible = true;
+
+            // The gate skipped this actor, so nothing above ran. Record why.
+            if (var::lrts_debug_trace) {
+                static std::chrono::steady_clock::time_point sLastGateTrace{};
+                const auto nowGate = std::chrono::steady_clock::now();
+                if (nowGate - sLastGateTrace > std::chrono::seconds(1)) {
+                    sLastGateTrace = nowGate;
+                    std::ofstream gf(kArcVerifyPath, std::ios::app);
+                    if (gf) {
+                        const auto gts = std::chrono::duration_cast<
+                            std::chrono::milliseconds>(
+                                std::chrono::system_clock::now()
+                                    .time_since_epoch()).count();
+                        gf << "{\"location\":\"RobotList.cpp\","
+                           << "\"message\":\"vis_gate\","
+                           << "\"timestamp\":" << gts
+                           << ",\"visEnabled\":" << (var::vis_enabled ? 1 : 0)
+                           << ",\"mesh\":\"0x" << std::hex << actor.Mesh << std::dec
+                           << "\",\"worldTime\":" << worldTime
+                           << "}\n";
+                    }
+                }
+            }
+        }
 
         Vector3 delta = actor.WorldPos - cam.Location;
         const float distanceSq = static_cast<float>(
             delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
 
         actor.Distance = sqrtf(distanceSq) / 100.0f;
-        if (distanceSq > maxDistSq) {
+        if (distanceSq > maxDistSq
+            && !(actor.Drawing && distanceSq <= maxDistOffSq)) {
             ++dbgDistSkip;
             actor.Drawing = false;
             ++it;
@@ -2448,6 +2987,45 @@ void Engine::RobotList()
         if (gameState && IsValidPointer(gameState))
             dbgEnemyCount = Memory::read<int32_t>(
                 gameState + Offsets::GameState_EnemyCount);
+    }
+
+    // Always-on file trace of every bot admission/draw stage so "turret never
+    // shows" / "not all bots picked up" reports are traceable from the log —
+    // the console [debugRobot] print needs the debug overlay on and never
+    // reaches disk. kArcDebugLogPath is NUL by design; this tap uses the real
+    // verify log. Throttled 2s.
+    {
+        static IntervalTimer botFileTimer(2000);
+        if (botFileTimer.fire()) {
+            size_t botCacheSz = 0;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_robotCacheMutex);
+                botCacheSz = robotCache.size();
+            }
+            char bbuf[640]{};
+            snprintf(bbuf, sizeof(bbuf),
+                "{\"scanned\":%d,\"admitted\":%d,\"cache\":%zu,\"drawing\":%d,"
+                "\"structHit\":%d,\"quickPass\":%d,\"verifyFail\":%d,\"reEvict\":%d,"
+                "\"admitAny\":%d,\"failRoot\":%d,\"failMesh\":%d,\"failId\":%d,"
+                "\"failOther\":%d,\"fnameMiss\":%d,\"visSkip\":%d,\"distSkip\":%d,"
+                "\"zeroPos\":%d,\"sceneOk\":%d,\"sceneFail\":%d,\"enemyCount\":%d,"
+                "\"slice\":%zu,\"prioNew\":%d,\"cycleMs\":%d}",
+                dbgScanned, dbgAdmitted, botCacheSz, dbgDrawing,
+                dbgStructHit, dbgQuickPass, dbgVerifyFail, dbgReEvict,
+                dbgAdmitAnyBot, dbgFailNoRoot, dbgFailNoMesh, dbgFailNoId,
+                dbgFailOther, dbgFnameHit, dbgVisSkip, dbgDistSkip,
+                dbgZeroPos, dbgScenePosOk, dbgScenePosFail, dbgEnemyCount,
+                dbgAdmitSlice, dbgAdmitPrioNew, s_admitLastCycleMs);
+            std::ofstream f(kArcVerifyPath, std::ios::app);
+            if (f) {
+                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"sessionId\":\"c190fb\",\"runId\":\"bot-admit\","
+                  << "\"hypothesisId\":\"B10\",\"location\":\"RobotList.cpp:RobotList\","
+                  << "\"message\":\"bot_admit_stats\",\"data\":" << bbuf
+                  << ",\"timestamp\":" << ts << "}\n";
+            }
+        }
     }
 
     if (var::show_debug_overlay) {

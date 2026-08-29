@@ -2,7 +2,6 @@
 #include "../Core/AgentLog.h"
 #include "../Core/ActorType.h"
 #include "../Core/IntervalTimer.h"
-#include "CollisionVis.h"
 #include "../Interface/Utils/Variables/index.h"
 #include "WorldScanCommon.h"
 
@@ -16,6 +15,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 
 namespace {
 
@@ -343,14 +343,27 @@ static bool s_backupScanPending = false;
 // GWorld source tag: 0=none, 1=slot direct, 2=slot inner deref, 3=game-state fallback.
 static std::atomic<int> g_gworldSrc{ 0 };
 static void AgentRaidLog(
-	const char*,
-	const char*,
-	const char*,
-	const std::string&)
+	const char* hypothesisId,
+	const char* location,
+	const char* message,
+	const std::string& dataJson)
 {
-	// Disabled — 8,665 raw ofstream opens/session. Each open→write→close
-	// fsyncs on the Update thread, file-locks the filesystem, and stalls
-	// the paint thread (GetStateSnapshot blocks on m_stateMutex).
+	// Verify taps: only raid session lifecycle messages reach the real log
+	// (heartbeat is throttled to 1 Hz upstream). Everything else stays on NUL
+	// so per-frame noise can never reappear.
+	const std::string_view msg(message);
+	const bool verifyTap =
+		msg == "raid_hb" || msg == "raid_edge" || msg == "raid_entered"
+		|| msg == "raid_left" || msg == "world_lost";
+	std::ofstream f(verifyTap ? kArcVerifyPath : kArcDebugLogPath, std::ios::app);
+	if (!f)
+		return;
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::system_clock::now().time_since_epoch()).count();
+	f << "{\"sessionId\":\"c190fb\",\"runId\":\"pre-fix\",\"hypothesisId\":\""
+		<< hypothesisId << "\",\"location\":\"" << location
+		<< "\",\"message\":\"" << message << "\",\"data\":" << dataJson
+		<< ",\"timestamp\":" << ms << "}\n";
 }
 // #endregion
 
@@ -584,9 +597,9 @@ void Engine::Update() {
 				}
 				if (!Engine::IsValidPointer(pc))
 					continue;
-				// Validate: PC→AckPawn→RootComp must look sane
-				const uintptr_t pawn =
-					Memory::read<uintptr_t>(pc + Offsets::AcknowledgedPawn);
+				// Validate: PC→AckPawn→RootComp must look sane. Try all known
+				// AcknowledgedPawn slots so a wrong primary can't reject the PC.
+				const uintptr_t pawn = Engine::ReadAcknowledgedPawn(pc);
 				if (!pawn || !Engine::IsValidPointer(pawn))
 					continue;
 				const uintptr_t root =
@@ -602,8 +615,18 @@ void Engine::Update() {
 	}
 	}
 
-	if (tPlayerController && !tAcknowledgedPawn)
-		tAcknowledgedPawn = Memory::read<uintptr_t>(tPlayerController + Offsets::AcknowledgedPawn);
+	if (tPlayerController && !tAcknowledgedPawn) {
+		// SDK dump: AController.Pawn @ 0x3F0 (primary). 0x3D8/0x408 are
+		// heuristic fallbacks only — validators gate on IsValidPointer.
+		for (std::ptrdiff_t off : { Offsets::AcknowledgedPawn,
+				Offsets::AcknowledgedPawn_Fallback, Offsets::Controller_Character }) {
+			const uintptr_t pawn = Memory::read<uintptr_t>(tPlayerController + off);
+			if (pawn && Engine::IsValidPointer(pawn)) {
+				tAcknowledgedPawn = pawn;
+				break;
+			}
+		}
+	}
 
 	if (tAcknowledgedPawn)
 		tRootComponent = Memory::read<uintptr_t>(tAcknowledgedPawn + Offsets::RootComponent);
@@ -971,6 +994,26 @@ void Engine::HandleWorldLost()
 	}
 
 	const bool wasActive = m_espRaidActive.load(std::memory_order_acquire);
+
+	// Transient read-stall hold: if the raid was active and the world resolved
+	// fine within the grace window, this is a VMM hiccup (fStep=1/2 stall), not
+	// a world change. Nuking camera + caches here blanked ALL ESP for seconds
+	// per stall (user-visible flicker). Hold last-good state; the 12s bound
+	// means a genuine unload still clears promptly. Hub transitions never reach
+	// this path (CheckWorldTransition handles valid->valid changes).
+	{
+		const auto nowSteady = std::chrono::steady_clock::now();
+		if (wasActive
+			&& m_lastGoodWorldTime.time_since_epoch().count() != 0
+			&& nowSteady - m_lastGoodWorldTime < kRaidRawFalseGraceMs) {
+			// #region agent log
+			AgentRaidLog("H2", "Update.cpp:HandleWorldLost", "world_lost_hold",
+				std::string("{\"held\":1}"));
+			// #endregion
+			return;
+		}
+	}
+
 	m_lastWorldPtr = 0;
 	m_lastPersistentLevel = 0;
 	m_espRaidActive.store(false, std::memory_order_release);
@@ -981,7 +1024,6 @@ void Engine::HandleWorldLost()
 	m_worldGeneration.fetch_add(1, std::memory_order_release);
 	ResetRaidTransitionState();
 	ClearEspCaches();
-	CollisionVis::ClearGeomCache();
 	std::cout << "[raid] world_lost" << std::endl;
 	// #region agent log
 	{
@@ -994,6 +1036,12 @@ void Engine::HandleWorldLost()
 
 void Engine::CheckWorldTransition(uintptr_t newWorld, uintptr_t newPersistentLevel)
 {
+	// Heartbeat for the stall-hold: update on EVERY tick the world resolves
+	// non-zero, not only on transitions. Otherwise the timestamp goes stale
+	// after 12 s in the same raid and HandleWorldLost's hold can never pass.
+	if (newWorld)
+		m_lastGoodWorldTime = std::chrono::steady_clock::now();
+
 	if (newWorld == m_lastWorldPtr && newPersistentLevel == m_lastPersistentLevel)
 		return;
 
@@ -1009,10 +1057,11 @@ void Engine::CheckWorldTransition(uintptr_t newWorld, uintptr_t newPersistentLev
 
 	ResetRaidTransitionState();
 	ClearEspCaches();
-	CollisionVis::ClearGeomCache();
 
 	m_lastWorldPtr = newWorld;
 	m_lastPersistentLevel = newPersistentLevel;
+	if (newWorld)
+		m_lastGoodWorldTime = std::chrono::steady_clock::now();
 	m_worldGeneration.fetch_add(1, std::memory_order_release);
 	m_espRaidActive.store(false, std::memory_order_release);
 	m_espDrawReady.store(false, std::memory_order_release);
@@ -1059,7 +1108,7 @@ void Engine::ClearEspCaches()
 	}
 	{
 		std::unique_lock<std::shared_mutex> lock(m_espFrameMutex);
-		m_lastEspFrame = {};
+		m_espFrameShared.reset();
 	}
 	entityStarted.store(false, std::memory_order_release);
 	m_espDrawReady.store(false, std::memory_order_release);
@@ -1187,7 +1236,10 @@ void Engine::TickRaidGate()
 			const uintptr_t slotRaw = m_gWorldRaw.load(std::memory_order_relaxed);
 			d << ",\"gw\":" << gw
 				<< ",\"gwRaw\":" << slotRaw
-				<< ",\"gwSrc\":" << g_gworldSrc.load(std::memory_order_relaxed);
+				<< ",\"gwSrc\":" << g_gworldSrc.load(std::memory_order_relaxed)
+				// Resolver failure step during no_world voids: 1=no slot read,
+				// 2=slot read but level deref failed, 0=healthy.
+				<< ",\"fStep\":" << m_gWorldFailStep.load(std::memory_order_relaxed);
 			if (slotRaw && slotRaw != gw)
 				d << ",\"slotName\":\"" << RaidJsonEscape(PeekObjFName(slotRaw)) << "\"";
 			d << "}";

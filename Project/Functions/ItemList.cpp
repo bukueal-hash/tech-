@@ -138,6 +138,16 @@ WorldItemCategory ClassifyItem(
     bool fnameIsPickup,
     bool fnameIsContainer)
 {
+    // Quest objective items (First Wave Tape, Celeste's Journal, …) get their
+    // own category so the draw path can gold/star them and extend their range.
+    // Matched on resolved display name first (name tables), fname tokens as a
+    // fallback when the name hasn't decrypted yet.
+    if (!displayLower.empty() && IsQuestItemDisplayName(displayLower))
+        return WorldItemCategory::QuestItem;
+    if (fnameLower.find("salvage_quest") != std::string::npos
+        || fnameLower.find("questitem") != std::string::npos)
+        return WorldItemCategory::QuestItem;
+
     // Plant/world harvestables stay Harvestable. Floor BP_ItemActor / DA shells
     // that also carry "consumable_*" (Prickly Pear fruit, etc.) must stay under
     // DroppedPickup so Items/Dropped toggles show them — not harvestable-only.
@@ -235,16 +245,15 @@ static bool IsGroundPickupCategory(WorldItemCategory cat)
 // #region agent log
 static void AgentItemLog(const char* message, const char* hypothesisId, const std::string& dataJson)
 {
+    std::ofstream f(kArcDebugLogPath, std::ios::app);
+    if (!f)
+        return;
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    std::string line = "{\"sessionId\":\"c190fb\",\"runId\":\"baseline\",\"hypothesisId\":\"";
-    line += hypothesisId;
-    line += "\",\"location\":\"ItemList.cpp\",\"message\":\"";
-    line += message;
-    line += "\",\"data\":";
-    line += dataJson;
-    line += ",\"timestamp\":" + std::to_string(ms) + "}\n";
-    DebugLogAppend(line);
+    f << "{\"sessionId\":\"c190fb\",\"runId\":\"baseline\",\"hypothesisId\":\""
+        << hypothesisId << "\",\"location\":\"ItemList.cpp\",\"message\":\""
+        << message << "\",\"data\":" << dataJson
+        << ",\"timestamp\":" << ms << "}\n";
 }
 // #endregion
 
@@ -269,6 +278,9 @@ void Engine::ItemList()
         std::shared_lock<std::shared_mutex> lock(m_itemCacheMutex);
         localCache = itemCache;
     }
+
+    // LAG1: cap this pass's DMA so camera/position/frame-builder keeps cadence.
+    WorldScan::ScanBudget scanBudget(std::chrono::milliseconds(90));
 
     const std::unordered_set<uint64_t> currentSet(
         ctx.currentActors.begin(),
@@ -449,21 +461,53 @@ void Engine::ItemList()
         if (displayName.empty() || IsJunkWorldEspLabel(displayName)
             || IsGarbledEspLabel(displayName) || !IsPlausibleEspLabel(displayName))
             displayName.clear();
+        std::string hoverValidated;
         if (displayName.empty()) {
-            displayName = GetEnglishItemName(key);
+            // CSV tables FIRST — deterministic and decrypt-independent. The
+            // hover memory read can return FName-decrypt sludge that passes
+            // the shape checks; it is vocabulary-validated inside
+            // GetEnglishItemName and only consulted when the tables miss.
+            if (const int64_t assetId = TryReadItemGameAssetIdFromActor(key);
+                assetId != 0) {
+                displayName = LookupDisplayByAssetId(assetId);
+            }
+            if (displayName.empty() && !dataAssetFName.empty())
+                displayName = LookupByAssetName(dataAssetFName);
             if (displayName.empty()) {
-                if (const int64_t assetId = TryReadItemGameAssetIdFromActor(key);
-                    assetId != 0) {
-                    displayName = LookupDisplayByAssetId(assetId);
+                hoverValidated = GetEnglishItemName(key);
+                displayName = hoverValidated;
+            }
+            bool slugSourced = false;
+            if (displayName.empty() && !dataAssetFName.empty()) {
+                displayName = HumanizeActorFName(dataAssetFName);
+                slugSourced = !displayName.empty();
+            }
+            if (displayName.empty() && !labelFname.empty()) {
+                displayName = HumanizeActorFName(labelFname);
+                slugSourced = !displayName.empty();
+            }
+            // N1 telemetry: a label that came ONLY from fname humanization is
+            // the sole remaining "random name" vector (CSV + hover are now
+            // table/vocabulary-validated). Log distinct ones (bounded) so the
+            // debug log shows exactly what slug labels ever draw.
+            if (!displayName.empty() && slugSourced) {
+                static std::unordered_set<std::string> s_slugSeen;
+                if (s_slugSeen.size() < 64
+                    && s_slugSeen.insert(displayName).second) {
+                    // Bounded (≤64 distinct) verification tap → real log.
+                    std::ofstream f(kArcVerifyPath, std::ios::app);
+                    if (f) {
+                        char lbl[96]{};
+                        snprintf(lbl, sizeof(lbl), "%.80s", displayName.c_str());
+                        const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"post-fix\","
+                          << "\"hypothesisId\":\"N1\",\"location\":\"ItemList.cpp:ItemList\","
+                          << "\"message\":\"item_slug_label\",\"data\":{\"label\":\"" << lbl
+                          << "\"},\"timestamp\":" << ts << "}\n";
+                    }
                 }
             }
-            if (displayName.empty() && !dataAssetFName.empty()) {
-                displayName = LookupByAssetName(dataAssetFName);
-                if (displayName.empty())
-                    displayName = HumanizeActorFName(dataAssetFName);
-            }
-            if (displayName.empty() && !labelFname.empty())
-                displayName = HumanizeActorFName(labelFname);
             // Final fallback: try the class FName — it is a different memory read
             // and often still decryptable when the actor FName read fails.
             if ((displayName.empty() || IsGenericWorldEspLabel(displayName))
@@ -505,7 +549,7 @@ void Engine::ItemList()
         // items_meta entry — e.g. DA_Item_* shells with English hover names.
         const bool identityProven = metaHit
             || cat == WorldItemCategory::Harvestable
-            || !GetEnglishItemName(key).empty()
+            || !hoverValidated.empty()
             || classGroundLoot
             || fnameIsPickup
             || (!displayName.empty()
@@ -513,8 +557,33 @@ void Engine::ItemList()
                 && !IsJunkWorldEspLabel(displayName)
                 && !IsFurniturePropLabel(displayName)
                 && IsPlausibleEspLabel(displayName));
-        if (!identityProven)
+        if (!identityProven) {
+            // #region agent log
+            {
+                static std::unordered_set<std::string> s_posGateSeen;
+                static int s_posGateDropped = 0;
+                ++s_posGateDropped;
+                if (s_posGateSeen.insert(displayName).second
+                    && s_posGateSeen.size() <= 60) {
+                    // Bounded (≤60 distinct) verification tap → real log.
+                    std::ofstream f(kArcVerifyPath, std::ios::app);
+                    if (f) {
+                        char lbl[96]{};
+                        snprintf(lbl, sizeof(lbl), "%.80s", displayName.c_str());
+                        const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"post-fix\",\"hypothesisId\":\"P5\","
+                          << "\"location\":\"ItemList.cpp:ItemList\",\"message\":\"item_posgate_drop\","
+                          << "\"data\":{\"label\":\"" << lbl
+                          << "\",\"cat\":" << static_cast<int>(cat)
+                          << ",\"droppedTotal\":" << s_posGateDropped << "}"
+                          << ",\"timestamp\":" << ts << "}\n";
+                    }
+                }
+            }
+            // #endregion
             continue;
+        }
 
         auto& entry = localCache[key];
         entry.rootComponent = root;
@@ -538,6 +607,8 @@ void Engine::ItemList()
 
     for (auto it = localCache.begin(); it != localCache.end(); ) {
         const uintptr_t key = it->first;
+        if (scanBudget.expired())
+            break;
 
         if (occupiedCharacterKeys.contains(key)) {
             it = localCache.erase(it);
@@ -813,6 +884,25 @@ void Engine::ItemList()
 
         // #region agent log
         {
+            static auto s_lastShellLog = std::chrono::steady_clock::time_point{};
+            if (s_lastShellLog.time_since_epoch().count() == 0
+                || nowShell - s_lastShellLog >= std::chrono::seconds(2)) {
+                s_lastShellLog = nowShell;
+                int pickedHidden = 0;
+                for (const auto& row : shellRows)
+                    pickedHidden += row.hid;
+                std::ofstream f(kArcDebugLogPath, std::ios::app);
+                if (f) {
+                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"batch\",\"hypothesisId\":\"P3\","
+                      << "\"location\":\"ItemList.cpp:ItemList\",\"message\":\"item_shell_batch\","
+                      << "\"data\":{\"n\":" << shellRows.size()
+                      << ",\"scatterExecs\":" << scatterExecs
+                      << ",\"pickedHidden\":" << pickedHidden << "}"
+                      << ",\"timestamp\":" << ts << "}\n";
+                }
+            }
         }
         // #endregion
 
@@ -994,19 +1084,19 @@ void Engine::CollectDrawingGroundPickups(std::vector<GroundPickupHudRow>& out) c
         out.resize(24);
 }
 
+// F7 "mark nearest picked" debug HUD: sticky-mark the ground pickup so the
+// item scanner stops reporting it while it lingers. Called from Render.cpp.
+// (Definition restored to fix a pre-existing LNK2001 unresolved external.)
 void Engine::UserConfirmGroundItemPicked(uintptr_t key)
 {
-    if (!key)
-        return;
-
-    {
-        std::unique_lock<std::shared_mutex> lock(m_itemCacheMutex);
-        itemCache.erase(key);
-    }
-
     MarkGroundPickupGoneSticky(key);
 }
 
+// Item scanner shares the same per-scanner static-clear contract as the
+// container and robot scanners (they each clear their static maps on cache
+// reset inside namespace WorldScan). Definition restored to fix a pre-existing
+// LNK2001 unresolved external (declared in WorldScanCommon.h, called in
+// Engine::ClearEspCaches but never defined).
 namespace WorldScan {
 
 void ClearItemScannerStaticState()

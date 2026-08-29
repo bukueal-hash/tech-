@@ -46,6 +46,27 @@ inline bool AnyContainerEspEnabled()
 constexpr size_t kContAdmitSlices = 8;
 constexpr size_t kContAdmitPrioNewMax = 64;
 std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> s_containerScanNeg;
+// C9: transient-failure retry window. A newly streamed-in actor often has no
+// root component / world position yet on its ONE prio probe, then waits for
+// its slice in the full ring sweep — measured at 3.0s median / 11s p90 /
+// 18.3s max (debug-c190fb container_admit_ring). That wait is the "loot ESP
+// appears late after traveling far" symptom. Root/pos/admit-gate failures on
+// prio-probed actors are re-prioritized for 8s, then left to the sweep.
+constexpr size_t kContPrioRetryMax = 24;      // re-probes per pass
+constexpr uint64_t kContPrioRetryWindowMs = 8000;
+constexpr int kContPrioRetryMaxTries = 20;    // ~8s of passes
+std::unordered_map<uintptr_t, std::pair<uint64_t, int>> s_contPrioRetry; // key -> (lastTryMs, tries)
+static uint64_t ContSteadyMs()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+void ContainerPrioRetryMark(uintptr_t actor)
+{
+    if (s_contPrioRetry.size() > 4096)
+        s_contPrioRetry.clear();
+    s_contPrioRetry[actor].first = ContSteadyMs();
+}
 size_t s_contAdmitSliceCursor = 0;
 uint64_t s_contAdmitRingGen = 0;
 size_t s_contAdmitRingActorCount = 0;
@@ -292,12 +313,19 @@ static void ClearContainerListStaticMaps()
 
 // #region agent log
 static void AgentCrateLog(
-    const char*,
-    const char*,
-    const std::string&)
+    const char* hypothesisId,
+    const char* message,
+    const std::string& dataJson)
 {
-    // Disabled — 17K writes/session (container_admit + container_verify_softmiss).
-    // Each write flushed to disk inside the scan gate, adding 2-8ms per call.
+    std::ofstream f(kArcDebugLogPath, std::ios::app);
+    if (!f)
+        return;
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    f << "{\"sessionId\":\"c190fb\",\"runId\":\"crates\",\"hypothesisId\":\""
+        << hypothesisId << "\",\"location\":\"ContainerList.cpp\",\"message\":\""
+        << message << "\",\"data\":" << dataJson
+        << ",\"timestamp\":" << ms << "}\n";
 }
 // #endregion
 
@@ -325,6 +353,9 @@ void Engine::ContainerList()
         std::shared_lock<std::shared_mutex> lock(m_containerCacheMutex);
         localCache = containerCache;
     }
+
+    // LAG1: cap this pass's DMA so camera/position/frame-builder keeps cadence.
+    WorldScan::ScanBudget scanBudget(std::chrono::milliseconds(90));
 
     const std::unordered_set<uint64_t> currentSet(
         ctx.currentActors.begin(),
@@ -430,6 +461,7 @@ void Engine::ContainerList()
         // World generation changed — actor pointers are stale, clear everything.
         s_containerScanNeg.clear();
         s_containerMemoHistory.clear();
+        s_contPrioRetry.clear();
     } else if (s_contAdmitRingActorCount != 0) {
         const size_t delta = (contN > s_contAdmitRingActorCount)
             ? (contN - s_contAdmitRingActorCount)
@@ -466,25 +498,100 @@ void Engine::ContainerList()
     dbgRingSlice = contSlice;
 
     std::unordered_set<uintptr_t> probeSet;
-    probeSet.reserve((contSliceEnd - contBase) + kContAdmitPrioNewMax + 8);
+    probeSet.reserve((contSliceEnd - contBase) + 256 + kContPrioRetryMax + 8);
     for (size_t i = contBase; i < contSliceEnd; ++i)
         probeSet.insert(admitIndex[i]);
     dbgRingSliceActors = static_cast<int>(probeSet.size());
+    std::unordered_set<uintptr_t> prioSet;
+    prioSet.reserve(256 + kContPrioRetryMax + 8);
+
+    // C9: burst cap + retry window + known-actor skip. pendingNew is a
+    // CPU-only set-diff count; when many actors stream in at once (arriving
+    // at a far POI) the fixed 64-probe cap turned the burst into a
+    // multi-second trickle, so the cap rises with the backlog (<= 256).
+    // Steady state (measured med 0 new) keeps the 64-probe budget. Cached
+    // and negatively-memoized actors no longer consume prio slots: after a
+    // ring reset the first 64 array-order actors were all known and starved
+    // the real newcomers.
+    size_t pendingNew = 0;
+    for (uintptr_t newKey : admitIndex) {
+        if (s_contAdmitPrevActors.contains(newKey))
+            continue;
+        if (localCache.contains(newKey) || s_containerScanNeg.count(newKey))
+            continue;
+        ++pendingNew;
+    }
+    const size_t prioCap = (std::min)(static_cast<size_t>(256),
+        (std::max)(kContAdmitPrioNewMax, pendingNew));
+
+    // Retry window first: actors whose earlier prio probe hit a transient
+    // root/pos/admit-gate failure re-probe every pass for 8s instead of
+    // waiting for their slice in the 3-18s full sweep.
+    int dbgPrioRetry = 0;
+    {
+        const uint64_t nowMs = ContSteadyMs();
+        for (auto it = s_contPrioRetry.begin(); it != s_contPrioRetry.end(); ) {
+            if (nowMs - it->second.first > kContPrioRetryWindowMs
+                || it->second.second >= kContPrioRetryMaxTries
+                || localCache.contains(it->first)) {
+                it = s_contPrioRetry.erase(it);
+                continue;
+            }
+            if (dbgPrioRetry >= static_cast<int>(kContPrioRetryMax))
+                break;
+            if (probeSet.insert(it->first).second) {
+                prioSet.insert(it->first);
+                ++dbgPrioRetry;
+                ++it->second.second;
+                it->second.first = nowMs;
+            }
+            ++it;
+        }
+    }
 
     size_t prioAdded = 0;
     for (uintptr_t newKey : admitIndex) {
-        if (prioAdded >= kContAdmitPrioNewMax)
+        if (prioAdded >= prioCap)
             break;
         if (s_contAdmitPrevActors.contains(newKey))
             continue;
-        if (probeSet.insert(newKey).second)
+        if (localCache.contains(newKey) || s_containerScanNeg.count(newKey))
+            continue;
+        if (probeSet.insert(newKey).second) {
+            prioSet.insert(newKey);
             ++prioAdded;
+        }
     }
     dbgRingPrioNew = static_cast<int>(prioAdded);
     s_contAdmitPrevActors.clear();
     s_contAdmitPrevActors.insert(admitIndex.begin(), admitIndex.end());
 
     for (uintptr_t key : probeSet) {
+        if (scanBudget.expired())
+            break;
+        // Decisive probe #1 (before ALL excludes): does an extraction-hatch-class
+        // actor even reach this loop? If yes, the excludes below are hiding it.
+        if (var::debug_hatch_detect) {
+            static std::unordered_set<uintptr_t> s_debugSeenKeys;
+            static uint64_t s_debugSeenGen = 0;
+            if (s_debugSeenGen != genAtStart) {
+                s_debugSeenGen = genAtStart;
+                s_debugSeenKeys.clear();
+            }
+            if (s_debugSeenKeys.insert(key).second) {
+                std::string cprobe = GetActorClassFName(key);
+                if (cprobe.empty())
+                    cprobe = GetActorFNameStringCached(key);
+                if (cprobe.empty())
+                    cprobe = GetActorFNameString(key);
+                if (FnameLooksLikeExtractionHatch(cprobe)) {
+                    std::cout << "[debugHatch] ENTERS-LOOP key=" << std::hex << key << std::dec
+                        << " class=\"" << cprobe << "\""
+                        << " excludedBy=" << (WorldScan::ShouldExcludeFromWorldCaches(key, localPawn) ? 1 : 0)
+                        << std::endl;
+                }
+            }
+        }
         if (localCache.contains(key))
             continue;
         if (ContainerScanNegMemoHit(key, dbgMemoSkip))
@@ -503,6 +610,108 @@ void Engine::ContainerList()
             ContainerScanNegMemoize(key);
             continue;
         }
+
+        // Decisive probe: hatches are bot-class (EACTOR_TARGET). If the strict
+        // matcher is missing them they get bot-memoized below and never fire the
+        // narrow probe. Dump every bot-class actor's names once so we can see
+        // the REAL extraction-point fname.
+        if (var::debug_hatch_detect && ArcActorType::IsBotClassId(maskedType)) {
+            static std::unordered_set<uintptr_t> s_debugHatchKeys;
+            static uint64_t s_debugHatchGen = 0;
+            if (s_debugHatchGen != genAtStart) {
+                s_debugHatchGen = genAtStart;
+                s_debugHatchKeys.clear();
+            }
+            if (s_debugHatchKeys.insert(key).second) {
+                std::string bfname = GetActorFNameStringCached(key);
+                if (bfname.empty())
+                    bfname = GetActorFNameString(key);
+                const std::string bclass = GetActorClassFName(key);
+                std::cout << "[debugHatch] botclass key=" << std::hex << key << std::dec
+                    << " type=" << std::hex << maskedType << std::dec
+                    << " fname=\"" << bfname << "\""
+                    << " class=\"" << bclass << "\""
+                    << std::endl;
+            }
+        }
+
+        // Extraction hatches are bot-class actors (EACTOR_TARGET) but must be
+        // admitted as containers (Loot tab). Check BEFORE the bot skip below.
+        {
+            std::string hatchFname = GetActorFNameStringCached(key);
+            if (hatchFname.empty())
+                hatchFname = GetActorFNameString(key);
+            std::string hatchClassFname = GetActorClassFName(key);
+            std::string hatchProbe = hatchFname.empty() ? hatchClassFname : hatchFname;
+            // Match if EITHER the instance or the class fname is an extraction
+            // hatch. The class fname (BP_SalvageExtractionPoint_Hatch_C) is the
+            // reliable signal; a numbered instance fname may be generic.
+            const bool hMatch = FnameLooksLikeExtractionHatch(hatchProbe)
+                || FnameLooksLikeExtractionHatch(hatchClassFname);
+            if (var::debug_hatch_detect) {
+                // Broad keyword probe: log ANY actor whose name smells like a
+                // hatch/extraction point, even if the strict matcher rejected it,
+                // so we can see the real fnames and why nothing is admitted.
+                std::string hl = ToLowerCopy(hatchFname);
+                std::string hcl = ToLowerCopy(hatchClassFname);
+                const bool kHit =
+                    (hMatch)
+                    || hl.find("hatch") != std::string::npos
+                    || hcl.find("hatch") != std::string::npos
+                    || hl.find("extract") != std::string::npos
+                    || hcl.find("extract") != std::string::npos
+                    || hl.find("barron") != std::string::npos
+                    || hcl.find("barron") != std::string::npos;
+                if (kHit) {
+                    std::cout << "[debugHatch] key=" << std::hex << key << std::dec
+                        << " fname=\"" << hatchFname << "\""
+                        << " class=\"" << hatchClassFname << "\""
+                        << " match=" << (hMatch ? 1 : 0);
+                    if (hMatch) {
+                        std::cout << " type=" << std::hex
+                            << ArcActorType::MaskActorTypeId(
+                                   ArcActorType::ReadActorTypeId(key))
+                            << std::dec;
+                    }
+                }
+            }
+            if (hMatch) {
+                const uintptr_t root = Engine::ResolveActorRoot(key);
+                if (var::debug_hatch_detect)
+                    std::cout << " root=" << std::hex << root << std::dec;
+                if (root) {
+                    const Vector3 worldPos = ReadSceneWorldPos(root);
+                    bool okPos = IsPlausibleWorldPos(worldPos);
+                    if (var::debug_hatch_detect)
+                        std::cout << " pos=" << (okPos ? 1 : 0)
+                            << " (" << static_cast<long long>(worldPos.x) << ","
+                            << static_cast<long long>(worldPos.y) << ","
+                            << static_cast<long long>(worldPos.z) << ")";
+                    if (okPos) {
+                        auto& he = localCache[key];
+                        he.rootComponent = root;
+                        he.APawn = key;
+                        he.ActorName = hatchFname;
+                        he.ItemDisplayName = "Hatch";
+                        he.ItemType = "Hatch";
+                        he.worldCategory = static_cast<uint8_t>(WorldItemCategory::Hatch);
+                        he.extractState = static_cast<int8_t>(
+                            Memory::read<uint8_t>(key + Offsets::ExtractionPoint_State));
+                        he.WorldPos = worldPos;
+                        if (var::debug_hatch_detect)
+                            std::cout << " ADMITTED state="
+                                << static_cast<int>(he.extractState);
+                        ++dbgAdmitted;
+                        if (var::debug_hatch_detect)
+                            std::cout << std::endl;
+                        continue;
+                    }
+                }
+                if (var::debug_hatch_detect)
+                    std::cout << " REJECTED (no plausible root/pos)" << std::endl;
+            }
+        }
+
         if (ArcActorType::IsBotClassId(maskedType)) {
             ContainerScanNegMemoize(key);
             continue;
@@ -541,6 +750,8 @@ void Engine::ContainerList()
         if (fname.empty() && !classFname.empty()
             && !FnameLooksLikeEngineSubobjectClass(classFname))
             fname = classFname;
+
+
 
         if (WorldScan::LooksLikeBotPawn(key, localPawn))
             continue;
@@ -653,6 +864,9 @@ void Engine::ContainerList()
                 ++dbgAdmitSkip;
                 ++dbgStructHit;
                 // C7b: no memo — AdmitContainerActor also reads flaky structs.
+                // C9: prio-probed actors get the 8s retry window instead.
+                if (prioSet.count(key))
+                    ContainerPrioRetryMark(key);
                 continue;
             }
             ++dbgAdmitGate;
@@ -663,12 +877,17 @@ void Engine::ContainerList()
         const uintptr_t root = Engine::ResolveActorRoot(key);
         if (!root || !IsValidPointer(root)) {
             ++dbgRootSkip;
+            // C9: actor still streaming in — retry while it is prio-fresh.
+            if (prioSet.count(key))
+                ContainerPrioRetryMark(key);
             continue;
         }
 
         const Vector3 worldPos = ReadSceneWorldPos(root);
         if (WorldScan::IsOldStyleInvalidXY(worldPos)) {
             ++dbgPosSkip;
+            if (prioSet.count(key))
+                ContainerPrioRetryMark(key);
             continue;
         }
 
@@ -756,12 +975,41 @@ void Engine::ContainerList()
             continue;
         }
 
-        // No fallback names here. Writing a fake category label ("Crate") into
-        // ItemDisplayName masked the real draw-time resolution: the resolver saw
-        // a "clean" cached name and short-circuited before keyword/CSV/DMA, so
-        // EVERYTHING painted as Crate. If no real name resolved, cache it empty
-        // and let the frame-builder resolver find the true name at draw time.
+        if (displayName.empty() || IsGenericWorldEspLabel(displayName)
+            || !IsPlausibleEspLabel(displayName) || IsJunkWorldEspLabel(displayName)) {
+            if (const char* catLabel = WorldItemCategoryLabel(cat)) {
+                const std::string s(catLabel);
+                if (!s.empty() && s != "Unknown" && s != "Other" && s != "Items"
+                    && IsPlausibleEspLabel(s) && !IsGenericWorldEspLabel(s)
+                    && !IsJunkWorldEspLabel(s))
+                    displayName = s;
+            }
+        }
+
+        if (IsJunkWorldEspLabel(displayName) || IsGarbledEspLabel(displayName)
+            || displayName.empty() || !IsPlausibleEspLabel(displayName)) {
+            if (cat == WorldItemCategory::Invalid
+                || cat == WorldItemCategory::Other
+                || cat == WorldItemCategory::Trash)
+                continue;
+            const std::string fallback =
+                ContainerCategoryFallbackEspLabel(cat);
+            if (!fallback.empty())
+                displayName = fallback;
+        }
+
+        if (displayName.empty()) {
+            const char* catFallback = WorldItemCategoryLabel(cat);
+            if (catFallback && catFallback[0] && std::string(catFallback) != "Unknown"
+                && cat != WorldItemCategory::Invalid
+                && cat != WorldItemCategory::Other
+                && cat != WorldItemCategory::Trash)
+                displayName = std::string(catFallback);
+        }
+
         displayName = FormatEspDisplayLabel(displayName);
+        if (displayName.empty())
+            continue;
 
         // Distance/Drawing owned by FinalizeWorldCacheMap (item parity) — do not
         // cull at admit or crates beyond loot_distance never enter cache.
@@ -769,9 +1017,9 @@ void Engine::ContainerList()
         entry.rootComponent = root;
         entry.APawn = key;
         entry.ActorName = fname;
-        entry.ClassFName = classFname;
         entry.ItemDisplayName = displayName;
         entry.ItemType = displayName;
+        entry.ClassFName = classFname;
         entry.worldCategory = static_cast<uint8_t>(cat);
         entry.lootRarityTier = 0;
         entry.lootValue = 0;
@@ -834,9 +1082,11 @@ void Engine::ContainerList()
             char buf[320];
             snprintf(buf, sizeof(buf),
                 "{\"actors\":%zu,\"slice\":%zu,\"sliceActors\":%d,\"prioNew\":%d,"
+                "\"prioRetry\":%d,"
                 "\"checked\":%d,\"memoSkip\":%d,\"memoSize\":%zu,\"coverMask\":%llu,"
                 "\"cycleMs\":%d,\"ringResets\":%d}",
                 contN, dbgRingSlice, dbgRingSliceActors, dbgRingPrioNew,
+                dbgPrioRetry,
                 dbgRingChecked, dbgMemoSkip, s_containerScanNeg.size(),
                 static_cast<unsigned long long>(s_contAdmitCoveredMask),
                 s_contAdmitLastCycleMs, s_contAdmitRingResets);
@@ -857,6 +1107,8 @@ void Engine::ContainerList()
 
     for (auto it = localCache.begin(); it != localCache.end(); ) {
         const uintptr_t key = it->first;
+        if (scanBudget.expired())
+            break;
 
         if (occupiedCharacterKeys.contains(key)) {
             it = localCache.erase(it);
@@ -892,24 +1144,20 @@ void Engine::ContainerList()
             it = localCache.erase(it);
             continue;
         }
-        // No category fallback here either: writing "Crate" into the cached name
-        // masked the draw-time resolver (frame builder) which would otherwise
-        // find the real name via keyword/CSV/DMA. Junk/empty names stay empty;
-        // the resolver repopulates them each frame or the entry is skipped.
         if (IsJunkWorldEspLabel(it->second.ItemDisplayName)
-            || IsGarbledEspLabel(it->second.ItemDisplayName)) {
-            it->second.ItemDisplayName.clear();
-            it->second.ItemType.clear();
-        }
-        if (static_cast<WorldItemCategory>(it->second.worldCategory)
-                == WorldItemCategory::Invalid
-            || static_cast<WorldItemCategory>(it->second.worldCategory)
-                == WorldItemCategory::Other
-            || static_cast<WorldItemCategory>(it->second.worldCategory)
-                == WorldItemCategory::Trash) {
-            if (it->second.ItemDisplayName.empty()) {
+            || IsGarbledEspLabel(it->second.ItemDisplayName)
+            || it->second.ItemDisplayName.empty()) {
+            const auto cat = static_cast<WorldItemCategory>(it->second.worldCategory);
+            if (cat == WorldItemCategory::Invalid
+                || cat == WorldItemCategory::Other
+                || cat == WorldItemCategory::Trash) {
                 it = localCache.erase(it);
                 continue;
+            }
+            std::string fixed = ContainerCategoryFallbackEspLabel(cat);
+            if (!fixed.empty()) {
+                it->second.ItemDisplayName = fixed;
+                it->second.ItemType = fixed;
             }
         }
 
@@ -1202,6 +1450,25 @@ void Engine::ContainerList()
         }
         for (uintptr_t key : eraseOpened)
             localCache.erase(key);
+        // #region agent log
+        {
+            static auto s_lastOpenBatch = std::chrono::steady_clock::time_point{};
+            const auto nowB = std::chrono::steady_clock::now();
+            if (s_lastOpenBatch.time_since_epoch().count() == 0
+                || nowB - s_lastOpenBatch >= std::chrono::seconds(2)) {
+                s_lastOpenBatch = nowB;
+                std::ofstream f(kArcDebugLogPath, std::ios::app);
+                if (f) {
+                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"batch\",\"hypothesisId\":\"P4\","
+                      << "\"location\":\"ContainerList.cpp:ContainerList\",\"message\":\"container_open_batch\","
+                      << "\"data\":{\"probed\":" << rows.size()
+                      << ",\"scatterExecs\":" << scatterExecs << "}"
+                      << ",\"timestamp\":" << ts << "}\n";
+                }
+            }
+        }
         // #endregion
     }
 

@@ -8,6 +8,9 @@ bool AssetNamesInit();
 std::string LookupByAssetName(const std::string& assetName);
 /** English display from numeric game asset id (asset_index.csv). */
 std::string LookupDisplayByAssetId(int64_t assetId);
+/** True when the string is a real display name from the game's own loc/asset
+ *  tables — rejects FName-decrypt sludge that passes shape checks. */
+bool IsKnownItemDisplayName(const std::string& displayName);
 /** Read game asset id from world item actor (ItemDataAsset chain); 0 if unknown. */
 int64_t TryReadItemGameAssetIdFromActor(uint64_t actor);
 std::string LookupByLocKey(const std::string& locKey);
@@ -42,6 +45,8 @@ bool LookupItemMetaByAssetName(const std::string& assetName, int& outRarityTier,
 bool LookupItemMetaById(const std::string& metaId, int& outRarityTier, int& outValue);
 /** DA_Item_* fname from actor hover data asset pointer (if any). */
 std::string GetActorDataAssetFName(uint64_t actor);
+/** True when a display name is a known quest objective item (gold/star ESP). */
+bool IsQuestItemDisplayName(const std::string& display);
 /** DA_EnemyType_* fname from constructable pawn EnemyTypeDataAsset (+0x11A0). */
 std::string GetEnemyTypeDataAssetFName(uint64_t actor);
 /** Resolved bot display from constructable enemy data asset pointers. */

@@ -1,5 +1,7 @@
 // Aimbot.cpp — baseline cache + ESP-matched screen aim, KmBox hardware output only.
 #include "../Core/Engine.h"
+#include "../Core/AimMath.hpp"
+#include "../Core/AgentLog.h"
 #include "../Core/AssetNames.h"
 #include "../Functions/EspDraw.h"
 #include "../Functions/RobotList.h"
@@ -8,7 +10,6 @@
 #include "../Interface/Utils/Visuals/visuals.hpp"
 #include "../Core/IntervalTimer.h"
 #include "../Interface/Utils/Variables/index.h"
-#include "../Functions/CollisionVis.h"
 #include "../ThirdParty/ImGui/imgui.h"
 #include <iostream>
 #include <fstream>
@@ -23,70 +24,88 @@
 // RANDOM BONE SYSTEM (SEQUENCIAL)
 // ============================================
 
-static const UniBone g_SequentialBones[] = {
-    UniBone::Pelvis,
-    UniBone::Spine1,
-    UniBone::Spine2,
+// Hold-drift zone: while ON a target we only ever drift the crosshair between
+// HIGH-VALUE bones on the body (head/neck/chest/spine). The old random-bone
+// walked a fixed 2s Pelvis→Head ladder — predictable AND it dragged the aim to
+// the worst-body thirds. This picker instead re-rolls to a random high-value
+// bone on JITTERED timing, weighted toward head/chest, and NEVER offers
+// Pelvis/limbs, so the crosshair always stays "on the target" in a way that
+// looks like a human re-aiming, not a metronome.
+static const UniBone g_HoldBones[] = {
+    UniBone::Head,
+    UniBone::Neck,
     UniBone::Spine3,
     UniBone::Chest,
-    UniBone::Neck,
-    UniBone::Head
+    UniBone::Spine2
 };
-static constexpr int g_SequentialBonesCount = sizeof(g_SequentialBones) / sizeof(g_SequentialBones[0]);
+static constexpr int g_HoldBonesCount = sizeof(g_HoldBones) / sizeof(g_HoldBones[0]);
+static constexpr float g_HoldWeights[] = { 0.40f, 0.20f, 0.13f, 0.20f, 0.07f }; // head-leaning
 
-struct SequentialBoneState {
+struct HoldDriftState {
     uint64_t targetKey = 0;
     int currentIndex = 0;
-    float lastChangeTime = 0.f;
-    float changeInterval = 2.0f;
-    bool ascending = true;
+    float nextChangeTime = 0.f;
 };
-static SequentialBoneState g_seqBoneState;
+static HoldDriftState g_holdState;
+static std::mt19937_64 g_holdRng{ std::random_device{}() };
 
-static UniBone GetSequentialBone(uint64_t targetKey, float currentTime, const BoneData& bones)
+static float HoldDriftDelay()
 {
-    if (g_seqBoneState.targetKey != targetKey)
+    // Jittered, NON-fixed cadence: 0.4-2.2s, leaner on the short side so the
+    // drift stays alive but never on a beat a watcher could count.
+    std::uniform_real_distribution<float> u(0.4f, 2.2f);
+    return u(g_holdRng);
+}
+
+static UniBone GetHoldDriftBone(uint64_t targetKey, float currentTime, const BoneData& bones)
+{
+    // New target → pick a weighted starting bone (usually head) and arm first
+    // drift for any jittered moment.
+    if (g_holdState.targetKey != targetKey)
     {
-        g_seqBoneState.targetKey = targetKey;
-        g_seqBoneState.currentIndex = g_SequentialBonesCount - 1;
-        g_seqBoneState.lastChangeTime = currentTime;
-        g_seqBoneState.ascending = false;
+        g_holdState.targetKey = targetKey;
+        // Weighted initial pick.
+        std::uniform_real_distribution<float> u(0.f, 1.f);
+        float r = u(g_holdRng), acc = 0.f;
+        int startIdx = 0;
+        for (int i = 0; i < g_HoldBonesCount; ++i) {
+            acc += g_HoldWeights[i];
+            if (r <= acc) { startIdx = i; break; }
+        }
+        g_holdState.currentIndex = startIdx;
+        g_holdState.nextChangeTime = currentTime + HoldDriftDelay();
     }
 
-    const float elapsed = currentTime - g_seqBoneState.lastChangeTime;
-    if (elapsed >= g_seqBoneState.changeInterval)
+    if (currentTime >= g_holdState.nextChangeTime)
     {
-        g_seqBoneState.lastChangeTime = currentTime;
-
-        if (g_seqBoneState.ascending)
-        {
-            g_seqBoneState.currentIndex++;
-            if (g_seqBoneState.currentIndex >= g_SequentialBonesCount)
-            {
-                g_seqBoneState.currentIndex = g_SequentialBonesCount - 2;
-                g_seqBoneState.ascending = false;
-            }
+        // Re-roll to a random weighted bone, avoiding the current one so it
+        // actually drifts rather than sitting. Rarely it may stay put (human).
+        std::uniform_real_distribution<float> u(0.f, 1.f);
+        float r = u(g_holdRng), acc = 0.f;
+        int idx = g_holdState.currentIndex;
+        for (int i = 0; i < g_HoldBonesCount; ++i) {
+            acc += g_HoldWeights[i];
+            if (r <= acc) { idx = i; break; }
         }
-        else
-        {
-            g_seqBoneState.currentIndex--;
-            if (g_seqBoneState.currentIndex < 0)
-            {
-                g_seqBoneState.currentIndex = 1;
-                g_seqBoneState.ascending = true;
-            }
-        }
+        // Small chance to stay on the same bone (feels like holding aim), else
+        // pick a different one (avoids self-repeats dominating the sequence).
+        std::uniform_real_distribution<float> stay(0.f, 1.f);
+        if (stay(g_holdRng) >= 0.25f && idx == g_holdState.currentIndex)
+            idx = (g_holdState.currentIndex + 1) % g_HoldBonesCount;
+        g_holdState.currentIndex = idx;
+        g_holdState.nextChangeTime = currentTime + HoldDriftDelay();
     }
 
-    const UniBone targetBone = g_SequentialBones[g_seqBoneState.currentIndex];
+    const UniBone targetBone = g_HoldBones[g_holdState.currentIndex];
 
+    // Nearest valid fallback so the drift never aims at a missing bone.
     if (!bones.valid.test(static_cast<size_t>(targetBone)))
     {
-        for (int i = 0; i < g_SequentialBonesCount; i++)
+        for (int i = 0; i < g_HoldBonesCount; ++i)
         {
-            const int checkIdx = (g_seqBoneState.currentIndex + i) % g_SequentialBonesCount;
-            if (bones.valid.test(static_cast<size_t>(g_SequentialBones[checkIdx])))
-                return g_SequentialBones[checkIdx];
+            const int checkIdx = (g_holdState.currentIndex + i) % g_HoldBonesCount;
+            if (bones.valid.test(static_cast<size_t>(g_HoldBones[checkIdx])))
+                return g_HoldBones[checkIdx];
         }
         return UniBone::Head;
     }
@@ -128,10 +147,39 @@ static bool ResolveAimBoneWorld(
     };
 
     if (var::randombone) {
-        const UniBone bone = GetSequentialBone(key, currentTime, bones);
-        if (TryBoneWorld(bones, bone, outWorld))
-            return true;
-        return fallbackTorso();
+        // Hold-drift: re-aims to a random HIGH-VALUE bone on jittered timing,
+        // weighted to head/chest, so the crosshair roams the target's body in a
+        // human way and NEVER offers limbs/pelvis (never visibly "comes off").
+        const UniBone bone = GetHoldDriftBone(key, currentTime, bones);
+        Vector3 targetWorld{};
+        if (!TryBoneWorld(bones, bone, targetWorld))
+            return fallbackTorso();
+
+        // Glide instead of teleport: snapping would YANK the crosshair one
+        // bone spacing (15-80px) instantly — read as a robotic "jump". Ease
+        // toward the newly selected bone (first-order lag, ~0.35s settle), so
+        // the drift reads as a smooth human re-aim that stays on the body.
+        static uint64_t s_rbKey = 0;
+        static Vector3 s_rbPoint{};
+        static float s_rbLastT = 0.f;
+        if (s_rbKey != key) {
+            s_rbKey = key;
+            s_rbPoint = targetWorld;
+            s_rbLastT = currentTime;
+        }
+        const float dt = (currentTime > s_rbLastT) ? (currentTime - s_rbLastT) : 0.f;
+        s_rbLastT = currentTime;
+        constexpr float kRbBlendSec = 0.35f;
+        const float a = (dt > 0.f) ? (dt / kRbBlendSec) : 1.f;
+        if (a >= 1.f) {
+            s_rbPoint = targetWorld;
+        } else {
+            s_rbPoint.x += (targetWorld.x - s_rbPoint.x) * a;
+            s_rbPoint.y += (targetWorld.y - s_rbPoint.y) * a;
+            s_rbPoint.z += (targetWorld.z - s_rbPoint.z) * a;
+        }
+        outWorld = s_rbPoint;
+        return true;
     }
 
     switch (var::aim_bone_mode) {
@@ -169,6 +217,7 @@ static bool ResolveAimBoneWorld(
         float bestDist = FLT_MAX;
         bool found = false;
         Vector3 bestWorld{};
+        UniBone bestBone = UniBone::Chest;
         for (UniBone bone : kClosestBones) {
             Vector3 world{};
             if (!TryBoneWorld(bones, bone, world))
@@ -184,10 +233,35 @@ static bool ResolveAimBoneWorld(
             if (dist < bestDist) {
                 bestDist = dist;
                 bestWorld = world;
+                bestBone = bone;
                 found = true;
             }
         }
+
+        // Hysteresis: as the crosshair closes on bone A, bone B becomes closer
+        // and the pick flip-flops — the aim point dithers between two bones
+        // forever. Keep the current bone unless the challenger is 20% closer.
+        static uint64_t s_cbKey = 0;
+        static UniBone s_cbBone = UniBone::Chest;
+        if (s_cbKey != key) {
+            s_cbKey = key;
+            s_cbBone = UniBone::Chest;
+        }
+        Vector3 stickyWorld{};
+        if (TryBoneWorld(bones, s_cbBone, stickyWorld)) {
+            Vector3 stickyScreen{};
+            if (eng.ProjectWorldLocationToScreen(stickyWorld, stickyScreen, cam)) {
+                const float sdx = static_cast<float>(stickyScreen.x - screenCenter.x);
+                const float sdy = static_cast<float>(stickyScreen.y - screenCenter.y);
+                const float stickyDist = std::sqrt(sdx * sdx + sdy * sdy);
+                if (stickyDist <= fovRadius && bestDist >= stickyDist * 0.8f) {
+                    outWorld = stickyWorld;
+                    return true;
+                }
+            }
+        }
         if (found) {
+            s_cbBone = bestBone;
             outWorld = bestWorld;
             return true;
         }
@@ -315,6 +389,23 @@ static bool AimStickyBypassFov(uint64_t key)
 // distance. This model modulates all three components by error magnitude
 // so the aim is visibly sloppier at distance and tighter on target.
 
+// Humanizer v2 — the old model (pure tremor + drift + speed noise) was
+// sub-pixel and read as invisible high-frequency noise, not human aim.
+// Real aim has THREE visible tells this model now adds on top of the noise:
+//
+//   1. REACTION DELAY: a lock does not engage instantly. On a new lock (or a
+//      large error jump) the pull ramps in over a jittered 120-350ms window,
+//      scaled up for far targets. Kills the "snaps the millisecond an enemy
+//      peeks" tell.
+//   2. SETTLING OVERSHOOT: a real flick is loose — it sweeps in fast, blows
+//      past, settles back, and only then holds. Modelled as a damped
+//      2nd-order response whose overshoot amplitude scales with remaining
+//      error, gives a visible arcing-in plus a decaying oscillation on the
+//      approach axis rather than a mechanical linear glide.
+//   3. MICRO RE-AIM: once settled, the crosshair occasionally drifts off and
+//      re-fixes itself every 600-1600ms (the "double-check" tell), instead
+//      of locking on a pixel and never moving again.
+// Tremor + drift + speed noise are retained underneath for naturalness.
 class Humanizer {
 public:
     void Reset()
@@ -323,20 +414,77 @@ public:
         m_driftY = 0.0;
         m_lastTimeMs = 0.0;
         m_initialized = false;
-        // Randomize tremor phase so every lock-on starts at a different
-        // point in the cycle — avoids the "identical jitter pattern" tell.
+        m_reactStartMs = GetTimeMs();
+        m_lastJumpMs = m_reactStartMs;
+        m_reaimEndMs = m_reactStartMs; // micro re-aim armed
         std::uniform_real_distribution<double> phaseDist(0.0, 2.0 * std::numbers::pi);
         m_tremorPhaseX = phaseDist(m_rng);
         m_tremorPhaseY = phaseDist(m_rng);
+        // Randomize the settling spring phase so the overshoot curve differs
+        // per lock-on (avoids a repeatable weave pattern).
+        std::uniform_real_distribution<double> springDist(0.0, 2.0 * std::numbers::pi);
+        m_springPhase = springDist(m_rng);
+        // Reaction delay centered on the user's slider (var::humanizer_react_ms),
+        // jittered 0.45x-1.0x per lock so engagements don't share a fixed delay.
+        {
+            const double base = (std::max)(0.0, static_cast<double>(var::humanizer_react_ms));
+            std::uniform_real_distribution<double> reactDist(base * 0.45, (std::max)(base, 1.0));
+            m_reactMs = reactDist(m_rng);
+        }
+        // Every other knob is ALSO randomized per lock so no two engagements
+        // share a character: overshoot strength, the flick frequency, how fast
+        // that overshoot decays, the X/Y weave leak, and micro-re-aim cadence.
+        {
+            // Per-lock overshoot fraction: user slider is the center; each lock
+            // draws 0.55x..1.5x of it (never identical twice).
+            std::uniform_real_distribution<double> ovDist(
+                0.55 * var::humanizer_overshoot, 1.5 * var::humanizer_overshoot + 0.02);
+            m_overshoot = (std::clamp)(ovDist(m_rng), 0.0, 0.6);
+            std::normal_distribution<double> nd(0.0, 1.0);
+            m_springFreq = (std::clamp)(kSpringFreq * (1.0 + nd(m_rng) * 0.35), 1.6, 4.2);
+            m_springDamp = (std::clamp)(kSpringDamp * (1.0 + nd(m_rng) * 0.3), 4.0, 14.0);
+            m_springCross = (std::clamp)(kSpringCross * (1.0 + nd(m_rng) * 0.4), 0.1, 0.65);
+            m_reaimProb = (std::clamp)(kReaimProb * (0.4 + std::uniform_real_distribution<double>(0.0, 1.0)(m_rng)), 0.02, 0.4);
+            m_reaimHoldMs = (std::clamp)(kReaimHoldMs * (0.6 + std::uniform_real_distribution<double>(0.0, 1.0)(m_rng)), 120.0, 500.0);
+        }
+
+        // Last applied delta, for debug logging.
+        m_lastJx = 0.0;
+        m_lastJy = 0.0;
+        m_lastPhase = 0; // 0 none, 1 reacting, 2 settling, 3 held
     }
 
-    // dx/dy = screen-space error (pixels from crosshair to target).
-    // Adds jitter to dx/dy in place. Larger error = more allowed jitter.
+    // Called each aim tick BEFORE Apply so the caller can log it. Error
+    // jumps (target teleport / bone switch) re-arm the reaction ramp.
+    void NotifyError(double dx, double dy)
+    {
+        const double error = std::sqrt(dx * dx + dy * dy);
+        const double now = GetTimeMs();
+        // A sudden large error after being close = the target moved / we lost
+        // the lock axis — treat like a fresh lock (short, scaled reaction).
+        if (error > kSettleOverJumpsRe && now - m_lastJumpMs > 150.0) {
+            m_lastJumpMs = now;
+            m_reactStartMs = now;
+            {
+                const double base = (std::max)(0.0, static_cast<double>(var::humanizer_react_ms));
+                const double fracFar = (std::min)(error / kReactFarErr, 1.0);
+                std::uniform_real_distribution<double> reactDist(
+                    base * 0.45, (std::max)(base * (0.6 + 0.4 * fracFar), 1.0));
+                m_reactMs = reactDist(m_rng);
+            }
+            m_tSettleBase = now;
+            m_springPhase = std::uniform_real_distribution<double>(0.0, 2.0 * std::numbers::pi)(m_rng);
+        }
+    }
+
+    // dx/dy = screen-space error (px crosshair→target). Adds humanizing
+    // offset to dx/dy in place. Larger error = more visible slop.
     void Apply(float& dx, float& dy)
     {
         const double now = GetTimeMs();
         if (!m_initialized) {
             m_lastTimeMs = now;
+            m_tSettleBase = now;
             m_initialized = true;
             return;
         }
@@ -350,48 +498,106 @@ public:
         const double tS = now / 1000.0;
         const double error = std::sqrt(dx * dx + dy * dy);
 
-        // ── 1. Hand tremor (8-12 Hz sinusoidal) ──────────────────────
-        // Amplitude: 0.3px at 10px error, up to 1.2px at 100px error.
-        // This matches real mouse tremor studies (Elkind 1963, Miall et al. 1993).
-        constexpr double kTremorFreq = 10.0;  // Hz, middle of physiological range
-        constexpr double kTremorBaseAmp = 0.3; // px at close range
-        constexpr double kTremorScale = 0.009;  // additional px per px of error
+        // ── Phase selection ──────────────────────────────────────────
+        // Reacting while within the reaction ramp and error is still big.
+        // Settling (decaying overshoot spring) until error smalls down.
+        // Held: fine tremor + drift + micro re-aim only.
+        int phase = 3; // held
+        const double sinceGate = now - m_lastJumpMs;
+        if (error > kSettleGateErr) {
+            phase = (sinceGate < m_reactMs) ? 1 : 2; // reacting → settling
+        }
+
+        // ── 1. Hand tremor (scaled, both phases) ────────────────────
+        constexpr double kTremorFreq = 10.0;  // Hz, physiological range
+        constexpr double kTremorBaseAmp = 0.3;
+        constexpr double kTremorScale = 0.009;
         const double tremorAmp = kTremorBaseAmp + error * kTremorScale;
         const double tremorX = tremorAmp * std::sin(2.0 * std::numbers::pi * kTremorFreq * tS + m_tremorPhaseX);
         const double tremorY = tremorAmp * std::sin(2.0 * std::numbers::pi * kTremorFreq * 0.97 * tS + m_tremorPhaseY);
-        // 0.97 frequency ratio breaks X/Y sync — real hands don't tremor
-        // at exactly the same frequency on both axes.
 
-        // ── 2. Micro-drift correction (slow random walk) ─────────────
-        // Simulates the eye-hand feedback loop: a small offset drifts
-        // away, then the brain corrects it ~100-200ms later.
-        constexpr double kDriftTheta = 6.0;   // mean-reversion rate (faster = quicker correction)
-        constexpr double kDriftSigma = 0.15;   // noise amplitude
-        constexpr double kDriftMax = 1.5;       // max drift from center (px)
+        // ── 2. Micro-drift correction (random walk) ──────────────────
+        constexpr double kDriftTheta = 6.0;
+        constexpr double kDriftSigma = 0.15;
+        constexpr double kDriftMax = 1.5;
         std::normal_distribution<double> norm(0.0, 1.0);
         m_driftX += -kDriftTheta * m_driftX * dtS + kDriftSigma * std::sqrt(dtS) * norm(m_rng);
         m_driftY += -kDriftTheta * m_driftY * dtS + kDriftSigma * std::sqrt(dtS) * norm(m_rng);
-        // Clamp drift radius so it never wanders far.
         const double driftR = std::sqrt(m_driftX * m_driftX + m_driftY * m_driftY);
-        if (driftR > kDriftMax) {
-            const double scale = kDriftMax / driftR;
-            m_driftX *= scale;
-            m_driftY *= scale;
-        }
-        // Scale drift by error: at close range the brain corrects faster.
+        if (driftR > kDriftMax) { const double s = kDriftMax / driftR; m_driftX *= s; m_driftY *= s; }
         const double driftScale = (std::min)(error / 30.0, 1.0);
 
-        // ── 3. Speed penalty ─────────────────────────────────────────
-        // Fast sweeping movements are inherently less precise. We model
-        // this by adding noise proportional to the current error magnitude
-        // (which correlates with sweep speed — large error = mid-sweep).
-        constexpr double kSpeedNoiseK = 0.004;  // px of noise per px of error
+        // ── 3. Speed penalty (proportional to error) ─────────────────
+        constexpr double kSpeedNoiseK = 0.004;
         const double speedNoiseX = kSpeedNoiseK * error * norm(m_rng);
         const double speedNoiseY = kSpeedNoiseK * error * norm(m_rng);
 
-        // ── Combine ──────────────────────────────────────────────────
-        dx += static_cast<float>(tremorX + m_driftX * driftScale + speedNoiseX);
-        dy += static_cast<float>(tremorY + m_driftY * driftScale + speedNoiseY);
+        // ── 4. Settling overshoot spring (visible loose flick) ───────
+        // A damped sinusoid along the dominant error axis. Amplitude scales
+        // with error and decays over ~450ms; frequency ~2-3Hz (human flick
+        // correction cadence). Direction flips once past the target.
+        double settleX = 0.0, settleY = 0.0;
+        if (phase == 2) {
+            const double sinceSettle = (now - m_tSettleBase) / 1000.0;
+            const double amp = (std::min)(error * m_overshoot, kOvershootMaxPx);
+            const double damp = std::exp(-m_springDamp / 1000.0 * (now - m_tSettleBase));
+            const double osc = amp * std::sin(2.0 * std::numbers::pi * m_springFreq * sinceSettle + m_springPhase) * damp;
+            // Inject mostly along the dominant axis; a fraction leaks to the
+            // other axis so the weave is slightly diagonal (more human).
+            const double eMag = error > 1e-6 ? error : 1.0;
+            settleX = static_cast<double>(dx) / eMag * osc * (1.0 - m_springCross);
+            settleY = static_cast<double>(dy) / eMag * osc * m_springCross;
+        }
+
+        // ── 5. Reaction ease-in (ramp the pull up, don't freeze) ─────
+        double react = 1.0;
+        if (phase == 1) {
+            react = (std::clamp)((sinceGate) / m_reactMs, 0.0, 1.0);
+            react = 0.15 + 0.85 * react; // starts at 15% pull, ramps to 100%
+        }
+
+        // ── 6. Micro re-aim (settled locks randomly drift & re-fix) ───
+        double reaim = 0.0;
+        if (phase == 3 && error < kReaimErr) {
+            const double rngV = std::uniform_real_distribution<double>(0.0, 1.0)(m_rng);
+            const double nowMs = now;
+            if (nowMs >= m_reaimEndMs) {
+                if (rngV < m_reaimProb) {
+                    // Fire a re-aim: small random nudge that decays over ~220ms.
+                    m_reaimEndMs = nowMs + m_reaimHoldMs + std::uniform_real_distribution<double>(0.0, 1.0)(m_rng) * kReaimJitterMs;
+                    m_reaimStartMs = nowMs;
+                    m_reaimNx = std::normal_distribution<double>(0.0, kReaimAmp)(m_rng);
+                    m_reaimNy = std::normal_distribution<double>(0.0, kReaimAmp)(m_rng);
+                }
+            }
+            const double sinceR = nowMs - m_reaimStartMs;
+            if (sinceR >= 0.0 && sinceR < m_reaimHoldMs) {
+                const double env = std::exp(-kReaimDecay / 1000.0 * sinceR);
+                reaim = env * (std::abs(m_reaimNx) + std::abs(m_reaimNy));
+                settleX += m_reaimNx * env;
+                settleY += m_reaimNy * env;
+            }
+        }
+
+        // ── Combine (scaled by the user's intensity slider) ──────────
+        const double intensity = (std::clamp)(static_cast<double>(var::humanizer_intensity), 0.0, 3.0);
+        m_lastJx = ((settleX + reaim) * react + tremorX + m_driftX * driftScale + speedNoiseX) * intensity;
+        m_lastJy = ((settleY + reaim) * react + tremorY + m_driftY * driftScale + speedNoiseY) * intensity;
+        m_lastPhase = phase;
+        dx += static_cast<float>(m_lastJx);
+        dy += static_cast<float>(m_lastJy);
+    }
+
+    // Debug inspection: the jitter this class injected on the last tick.
+    struct PhaseOut { int phase = 0; float jx = 0.f; float jy = 0.f; float react = 0.f; bool reaim = false; };
+    PhaseOut Last() const
+    {
+        PhaseOut o;
+        o.phase = m_lastPhase;
+        o.jx = static_cast<float>(m_lastJx);
+        o.jy = static_cast<float>(m_lastJy);
+        o.reaim = m_reaimStartMs > m_lastJumpMs && (m_lastPhase == 3);
+        return o;
     }
 
 private:
@@ -402,6 +608,24 @@ private:
         return duration_cast<std::chrono::duration<double, std::milli>>(steady_clock::now() - start).count();
     }
 
+    // Tunables (expose as menu sliders later; cheap to keep local for now).
+    static constexpr double kReactMinMs = 120.0;
+    static constexpr double kReactMaxMs = 350.0;
+    static constexpr double kReactFarErr = 140.0;    // error at which reaction hits max
+    static constexpr double kSettleGateErr = 12.0;    // above this → settling/overshoot visible
+    static constexpr double kSettleOverJumpsRe = 30.0; // error jump that re-arms reaction
+    static constexpr double kOvershootFrac = 0.18;    // overshoot amplitude as fraction of error
+    static constexpr double kOvershootMaxPx = 34.0;   // cap on overshoot px
+    static constexpr double kSpringFreq = 2.6;         // Hz, flick correction cadence
+    static constexpr double kSpringDamp = 8.0;         // 1/s decay of the overshoot
+    static constexpr double kSpringCross = 0.35;       // leak to secondary axis (diagonal weave)
+    static constexpr double kReaimErr = 9.0;           // only re-aim once this close
+    static constexpr double kReaimProb = 0.12;         // chance to start a re-aim each poll
+    static constexpr double kReaimAmp = 1.2;           // px re-aim nudge (gaussian sigma)
+    static constexpr double kReaimHoldMs = 220.0;      // re-aim decay window
+    static constexpr double kReaimJitterMs = 1400.0;   // extra random gap before next poll
+    static constexpr double kReaimDecay = 12.0;        // 1/s env decay
+
     double m_driftX = 0.0;
     double m_driftY = 0.0;
     double m_tremorPhaseX = 0.0;
@@ -409,6 +633,30 @@ private:
     double m_lastTimeMs = 0.0;
     bool m_initialized = false;
     std::mt19937_64 m_rng{ std::random_device{}() };
+
+    // Per-lock randomized character (drawn in Reset so each engagement differs).
+    double m_overshoot = 0.18;
+    double m_springFreq = 2.6;
+    double m_springDamp = 8.0;
+    double m_springCross = 0.35;
+    double m_reaimProb = 0.12;
+    double m_reaimHoldMs = 220.0;
+
+    // Reaction / settling / re-aim state.
+    double m_reactStartMs = 0.0;
+    double m_reactMs = 150.0;
+    double m_lastJumpMs = 0.0;
+    double m_tSettleBase = 0.0;
+    double m_springPhase = 0.0;
+    double m_reaimEndMs = 0.0;
+    double m_reaimStartMs = -1.0;
+    double m_reaimNx = 0.0;
+    double m_reaimNy = 0.0;
+
+    // Last-tick debug output.
+    double m_lastJx = 0.0;
+    double m_lastJy = 0.0;
+    int m_lastPhase = 0;
 };
 
 // ============================================
@@ -461,10 +709,10 @@ Vector3 Engine::PredictPosition(
     // old, we attenuate it to avoid predicting based on stale movement data
     // (the target may have changed direction since the last refresh).
     Vector3 predicted = targetPos;
-    const float velMag = std::sqrt(
+    const float velMag = static_cast<float>(std::sqrt(
         targetVelocity.x * targetVelocity.x
         + targetVelocity.y * targetVelocity.y
-        + targetVelocity.z * targetVelocity.z);
+        + targetVelocity.z * targetVelocity.z));
 
     for (int i = 0; i < iterations; i++) {
         Vector3 delta = {
@@ -472,7 +720,7 @@ Vector3 Engine::PredictPosition(
             predicted.y - myPos.y,
             predicted.z - myPos.z
         };
-        const float distance = std::sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
+        const float distance = static_cast<float>(std::sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z));
         if (distance < 1.0f)
             break;
         const float timeToHit = distance / bulletSpeed;
@@ -682,6 +930,8 @@ void Engine::AimAssistPlayer(
     auto consider = [&](uintptr_t key, const PlayerCacheEntry& actor) {
         if (!actor.Drawing) return;
         if (actor.Distance > var::aimbot_distance) return;
+        if (var::aim_vis_mode == AimVisMode::VisibleOnly && !actor.isVisible)
+            return;
 
         Vector3 aimPos{};
         Vector3 worldPos{};
@@ -690,8 +940,9 @@ void Engine::AimAssistPlayer(
         if (!ResolvePlayerAimBoneWorldTwoPhase(
                 *this, bones, key, currentTime, screenCenter, fovRadius, g_aimProjCam, worldPos))
         {
-            worldPos = actor.WorldPos;
-            worldPos.z += 160.0;
+            // Skip — actor.WorldPos (root CTW) oscillates ±100cm on this build,
+            // using it as fallback causes violent shaking.
+            return;
         }
 
         ExtrapolatePlayerAimWorldToNow(
@@ -785,6 +1036,8 @@ void Engine::AimAssistRobot(
         if (!robot.Drawing)
             return;
         if (robot.Distance > var::aimbot_distance)
+            return;
+        if (var::aim_vis_mode == AimVisMode::VisibleOnly && !robot.isVisible)
             return;
 
         // Constructable bots (Fireball, Pop, Surveyor) use @0x1210 — not generic @0x1220.
@@ -893,11 +1146,7 @@ constexpr int kKmAimChunkPx = 512;
 constexpr float kAimViewShakeSuppressDeg = 2.5f;
 /** ESP-frame camera only when live view is stable (avoids stale-cam jitter). */
 constexpr float kAimEspFrameCamMaxDriftDeg = 0.65f;
-/** Learned screen-px closed per mouse count. post-fix3 rem≈dist but error
- *  barely closed → mouse≠1:1 screen; start conservative (need more mouse). */
-constexpr float kMousePxPerCountInit = 0.22f;
-constexpr float kMousePxPerCountMin = 0.04f;
-constexpr float kMousePxPerCountMax = 1.25f;
+// Constants moved to Core/AimMath.hpp (Pillar 1 extraction — tests lock them).
 
 struct AimDebugSnapshot {
     int candidates = 0;
@@ -913,15 +1162,46 @@ struct AimDebugSnapshot {
     int lockedInCand = -1;
     int isRobot = -1;
     float distPx = -1.f;
+    float distanceM = -1.f;
     float velMag = -1.f;
     int dropReason = 0; // 0 none, 1 notInCand, 2 graceExpire, 3 noBest, 4 kmbox
     float pullScale = 1.f;
+    // Aim-shake probe (debug_aim_shake): what was commanded and how the
+    // control loop is behaving tick to tick.
+    float cmdX = 0.f;          // last mouse counts actually sent
+    float cmdY = 0.f;
+    float pxPerMouse = 0.f;    // learned screen-px per mouse count
+    float closeFrac = 0.f;     // fraction of error closed per tick
+    float tickMs = 0.f;        // time between aim ticks
+    // Humanizer output (set in AimAssistence just before SendKmAimDelta, so
+    // the aim_shake probe can show what the model injected last tick).
+    int hnPhase = 0;           // 0 none, 1 reacting, 2 settling, 3 held
+    float hnJx = 0.f;          // last injected jitter (px), X
+    float hnJy = 0.f;          // last injected jitter (px), Y
+    float hnReact = 0.f;       // reaction ease-in scalar (0..1) this tick
+    // Per-lock randomized pull profile (surfaced so the log can confirm the
+    // speed/asym differ per engagement rather than staying fixed).
+    float ppSpeed = 0.f;
+    float ppAccel = 0.f;
+    float ppAsym = 0.f;
+    float ppSharp = 0.f;
+    float ppSitu = 0.f;        // live environment bias (density * type * distance)
+    uint64_t ppStartMs = 0;
 };
 static AimDebugSnapshot s_aimDbg;
 
+// Shake counters persist across ticks (s_aimDbg resets each tick); printed
+// and cleared by the 500ms debug block.
+static int s_dbgFlipX = 0;      // error sign flips since last print (X)
+static int s_dbgFlipY = 0;      // error sign flips since last print (Y)
+static int s_dbgOvershoot = 0;  // adaptive-gain overshoot events
+static int s_dbgSwitches = 0;   // target lock switches since last print
+static bool s_dbgSuppress = false; // last tick's suppress decision
+static float s_dbgShakeDeg = 0.f;  // last tick's view shake
+
 // Adaptive mouse↔screen: post-fix3 sent rem≈distPx*gain but only closed ~10px
 // while rem was ~120 → treat mouse counts as weaker than screen pixels.
-static float s_pxPerMouse = kMousePxPerCountInit;
+static float s_pxPerMouse = AimMath::kMousePxPerCountInit;
 static float s_prevErrX = 0.f;
 static float s_prevErrY = 0.f;
 static float s_prevCmdX = 0.f;
@@ -931,6 +1211,12 @@ static float s_filtMx = 0.f;
 static float s_filtMy = 0.f;
 static float s_lastAimTickMs = 8.f;
 
+static bool s_inDeadzone = false;
+
+// OscDampState moved to Core/AimMath.hpp (Pillar 1 extraction).
+static AimMath::OscDampState s_oscDampX;
+static AimMath::OscDampState s_oscDampY;
+
 static void ResetAimMotionState()
 {
     s_filtMx = 0.f;
@@ -938,16 +1224,147 @@ static void ResetAimMotionState()
     s_prevCmdX = 0.f;
     s_prevCmdY = 0.f;
     s_adaptKey = 0;
+    s_inDeadzone = false;
+    s_oscDampX = {};
+    s_oscDampY = {};
+}
+
+// ── AUTO PREDICTION (no bullet-speed slider) ───────────────────────
+// Self-learning lead scale. `PredictPosition` leads by velocity*timeToHit
+// where timeToHit = distance/bulletSpeed; an uninformed fixed bullet speed
+// leads too much or too little. Instead we learn a multiplier on effective
+// bullet speed from the aim loop's own behavior on MOVING locked targets:
+//   • over-lead (aim sits too far ahead) → the loop overshoots → crank
+//     effective speed up (scale down) so we lead less;
+//   • under-lead (target slips ahead) → error stays big while close → crank
+//     effective speed down (scale up) so we lead more.
+// s_leadScale multiplies the user bullet-speed BASELINE, so the slider stops
+// mattering — it starts at 1.0 and converges per fight. Persists per lock.
+static float s_leadScale = 1.0f;
+static uint64_t s_leadKey = 0;
+static int s_leadOverCount = 0;      // overshoot events in current window
+static int s_leadUnderCount = 0;     // under-lead (err not shrinking) samples
+static uint64_t s_leadWinMs = 0;     // window start
+static float s_leadErrAcc = 0.f;     // accumulated residual while close+moving
+static int s_leadErrN = 0;
+
+// ── Randomized per-lock pull profile ───────────────────────────────
+// Every time the aim locks a (new) target it draws a fresh set of random
+// parameters that shape how that ONE engagement feels: how fast it pulls,
+// whether it accelerates or eases in, per-axis asymmetry, and a duration
+// over which the speed ramps. This means no two pulls are ever identical —
+// the crosshair speed profile differs per engagement instead of following
+// one fixed gain curve. The profile is held stable for the whole lock and
+// only re-rolled when the target switches.
+struct PullProfile {
+    float speed = 1.f;         // overall pull-speed multiplier (0.6x..1.4x)
+    float accel = 0.f;         // -1 (slow start, hurry at end) .. +1 (fast start, ease off)
+    float asym = 1.f;          // X/Y asymmetry: 0.8..1.25 (per-axis speed split)
+    float durationSec = 0.4f;  // how long the ramp spans
+    float sharp = 1.f;         // closeFrac sharpness multiplier near target
+    uint64_t startMs = 0;      // when this profile began
+};
+static PullProfile s_pullProf;
+static std::mt19937_64 s_pullRng{ std::random_device{}() };
+
+// Roll a fresh profile for a new lock. Reuses the platform RNG but keeps its
+// own stream so it never hints at the humanizer's pattern.
+static void ResetPullProfile()
+{
+    s_pullProf.startMs = NowMs();
+    std::uniform_real_distribution<float> u;
+    std::normal_distribution<float> n(0.f, 1.f);
+    s_pullProf.speed = std::clamp(1.0f + n(s_pullRng) * 0.18f, 0.62f, 1.42f);
+    s_pullProf.accel = std::clamp(n(s_pullRng) * 0.6f, -0.75f, 0.85f);
+    s_pullProf.asym = std::clamp(1.0f + n(s_pullRng) * 0.14f, 0.82f, 1.25f);
+    s_pullProf.durationSec = std::clamp(0.25f + u(s_pullRng) * 0.55f, 0.2f, 0.8f);
+    s_pullProf.sharp = std::clamp(0.8f + n(s_pullRng) * 0.25f, 0.55f, 1.3f);
+}
+
+// Situational pull-speed bias — reads the live environment (set by
+// AimAssistence into s_aimDbg) so the SAME randomized profile behaves
+// differently depending on the fight:
+//   • lone target       → patient, careful pull
+//   • a few hostiles    → normal speed
+//   • many hostiles     → fast, snappy (threat pressure)
+//   • player vs bot     → players pull faster than predictable bots
+//   • close vs far      → point-blank snaps, long range eases in
+// The per-lock random character is layered ON TOP, so each pull is still never
+// identical even in the same situation.
+static float SituationalPullFactor()
+{
+    // Threat density from how many targets sit in the aim pool.
+    const int cands = s_aimDbg.candidates;
+    float density;
+    if (cands <= 1)      density = 0.80f;   // lone — patient
+    else if (cands <= 3) density = 1.00f;   // a couple — normal
+    else if (cands <= 6) density = 1.18f;   // cluster — quick
+    else                 density = 1.30f;   // mass — snap
+
+    // Players are the real threat; bots are predictable.
+    const float type = (s_aimDbg.isRobot == 1) ? 0.86f : 1.14f;
+
+    // World distance (meters): small far target wants a careful settle.
+    const float dm = (std::max)(s_aimDbg.distanceM, 0.f);
+    float distance;
+    if (dm <= 0.1f)      distance = 1.0f;    // unknown — neutral
+    else if (dm < 15.f)  distance = 1.24f;   // point-blank — instant
+    else if (dm < 40.f)  distance = 1.05f;   // close-mid
+    else if (dm < 90.f)  distance = 0.90f;   // mid-far — ease in
+    else                 distance = 0.70f;   // long range — slow & careful
+
+    return (std::clamp)(density * type * distance, 0.45f, 1.6f);
 }
 
 float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain = nullptr)
 {
     const float dist = hypotf(dx, dy);
-    if (dist <= var::aim_deadzone_px) {
+
+    // New lock target → fresh oscillation state AND a fresh randomized pull
+    // profile (the error jumps arbitrarily on a switch and would otherwise
+    // look like flips; the pull profile must differ per engagement).
+    if (s_adaptKey != s_aimDbg.locked || s_pullProf.startMs == 0) {
+        s_oscDampX = {};
+        s_oscDampY = {};
+        ResetPullProfile();
+        // New lock = fresh lead-learning window (don't carry a previous fight's
+        // overshoot/trailing bias into the next engagement).
+        s_leadWinMs = 0;
+        s_leadOverCount = 0;
+        s_leadErrAcc = 0.f;
+        s_leadErrN = 0;
+    }
+
+    // Shake probe: an error sign flip between consecutive commands means the
+    // pull crossed over the target — the limit-cycle that feels like shaking.
+    if (s_prevErrX * dx < 0.f && std::fabs(s_prevErrX) > 3.f && std::fabs(dx) > 3.f)
+        ++s_dbgFlipX;
+    if (s_prevErrY * dy < 0.f && std::fabs(s_prevErrY) > 3.f && std::fabs(dy) > 3.f)
+        ++s_dbgFlipY;
+    // Oscillation damping (always on): count crossovers per axis in a 500ms
+    // window; ≥3 in a window means the loop is ringing — ramp damping, which
+    // eases closeFrac and smooths the EMA below until the flips stop.
+    {
+        const bool xFlip = s_prevErrX * dx < 0.f
+            && std::fabs(s_prevErrX) > 3.f && std::fabs(dx) > 3.f;
+        const bool yFlip = s_prevErrY * dy < 0.f
+            && std::fabs(s_prevErrY) > 3.f && std::fabs(dy) > 3.f;
+        const uint64_t flipNowMs = NowMs();
+        s_oscDampX.tick(flipNowMs, xFlip);
+        s_oscDampY.tick(flipNowMs, yFlip);
+    }
+    // Deadzone with hysteresis: once inside, stay inside until error exceeds
+    // deadzone + 2 px. Prevents the aim from oscillating in/out at the boundary.
+    const float dzThreshold = s_inDeadzone
+        ? (var::aim_deadzone_px + 2.0f)
+        : var::aim_deadzone_px;
+    if (dist <= dzThreshold) {
+        s_inDeadzone = true;
         s_filtMx = 0.f;
         s_filtMy = 0.f;
         return 0.f;
     }
+    s_inDeadzone = false;
 
     // Learn px-per-mouse from last command vs this frame's error change.
     if (s_adaptKey != 0 && s_adaptKey == s_aimDbg.locked) {
@@ -956,24 +1373,80 @@ float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain =
             const float dErrX = s_prevErrX - dx;
             const float dErrY = s_prevErrY - dy;
             const float along = (dErrX * s_prevCmdX + dErrY * s_prevCmdY) / cmdMag;
-            if (along > 0.75f) {
-                float sample = along / cmdMag;
-                if (sample < kMousePxPerCountMin)
-                    sample = kMousePxPerCountMin;
-                if (sample > kMousePxPerCountMax)
-                    sample = kMousePxPerCountMax;
-                s_pxPerMouse = s_pxPerMouse * 0.82f + sample * 0.18f;
-            } else if (along < -1.f && cmdMag > 8.f) {
-                // Command increased error (overshoot / wrong scale) — lower px/mouse
-                // so next tick sends more mouse for same screen error.
-                s_pxPerMouse = (std::max)(kMousePxPerCountMin, s_pxPerMouse * 0.92f);
+            // Misattribution guard: a target strafing across the crosshair
+            // shrinks/raises error WITHOUT our pull — learning (either branch)
+            // from that poisons the scale. Only learn when the error actually
+            // moved along the commanded direction by a meaningful amount.
+            const bool errMovedAlongCmd = along > 1.0f;
+            const float errMagNow = hypotf(dx, dy);
+            const float errMagPrev = hypotf(s_prevErrX, s_prevErrY);
+            if (along > 0.75f && errMovedAlongCmd) {
+                const float sample =
+                    AimMath::ClampPxPerMouseSample(along / cmdMag);
+                // Slow EMA (0.92/0.08, was 0.82/0.18): fast adaptation chased
+                // per-tick noise and swung the scale itself into oscillation.
+                s_pxPerMouse = AimMath::LearnPxPerMouse(s_pxPerMouse, sample);
+            } else if (along < -1.f && cmdMag > 8.f
+                && errMagNow > errMagPrev + 2.f
+                && ((s_prevErrX * dx < 0.f && std::fabs(s_prevErrX) > 3.f
+                     && std::fabs(dx) > 3.f)
+                    || (s_prevErrY * dy < 0.f && std::fabs(s_prevErrY) > 3.f
+                        && std::fabs(dy) > 3.f))) {
+                // Overshoot: the error crossed the target and GREW after our
+                // command — the mouse is STRONGER than learned. Raise the
+                // scale so the next tick sends FEWER counts. The old code
+                // lowered it (more counts), which fed the Y limit cycle the
+                // aim-shake probe measured (flipY 22, overshoot 29). The sign
+                // flip requirement keeps target motion — which also grows
+                // errMag — from being misattributed as a weak mouse.
+                s_pxPerMouse = AimMath::OvershootRaisePxPerMouse(s_pxPerMouse);
+                ++s_dbgOvershoot;
             }
         }
+
+        // ── AUTO PREDICTION lead estimator ─────────────────────────
+        // Only learn while LOCKED, tracking a MOVING target, and we've pulled
+        // real mouse (errMag meaningful). Over-lead shows up as loop overshoot;
+        // under-lead shows up as residual error that refuses to shrink while
+        // close. Aggregate over a ~450ms window, then nudge s_leadScale slowly
+        // (multiplies the baseline bullet speed). Bounded + per-lock.
+        {
+            const bool targetMoving = s_aimDbg.velMag > 80.f;
+            const float errMag = hypotf(dx, dy);
+            const uint64_t nowL = NowMs();
+            if (g_kmbox.kmboxConfig.initialized && targetMoving) {
+                if (s_leadWinMs == 0)
+                    s_leadWinMs = nowL;
+                if (s_dbgOvershoot > 0)
+                    s_leadOverCount = (std::max)(s_leadOverCount, s_dbgOvershoot);
+                // Under-lead: close but residual stays stubbornly above a
+                // small threshold while the target moves → we trail it.
+                if (errMag > 5.f && errMag < 45.f)
+                    s_leadErrAcc += errMag, ++s_leadErrN;
+                if (nowL - s_leadWinMs >= 300) {
+                    const float avgErr = s_leadErrN > 0 ? s_leadErrAcc / s_leadErrN : 0.f;
+                    if (s_leadOverCount >= 1) {
+                        // Overshooting the leader → aim too far ahead → less lead.
+                        s_leadScale = (std::clamp)(s_leadScale * 1.05f, 0.5f, 2.0f);
+                    } else if (avgErr > 10.f && s_leadErrN >= 6) {
+                        // Stuck off-center on a moving target → trail → more lead.
+                        s_leadScale = (std::clamp)(s_leadScale * 0.95f, 0.5f, 2.0f);
+                    }
+                    s_leadOverCount = 0;
+                    s_leadErrAcc = 0.f;
+                    s_leadErrN = 0;
+                    s_leadWinMs = nowL;
+                }
+            } else {
+                s_leadWinMs = 0;
+                s_leadOverCount = 0;
+                s_leadErrAcc = 0.f;
+                s_leadErrN = 0;
+            }
+        }
+        s_leadKey = s_aimDbg.locked;
     }
-    if (s_pxPerMouse < kMousePxPerCountMin)
-        s_pxPerMouse = kMousePxPerCountMin;
-    if (s_pxPerMouse > kMousePxPerCountMax)
-        s_pxPerMouse = kMousePxPerCountMax;
+    s_pxPerMouse = AimMath::ClampPxPerMouseSample(s_pxPerMouse);
 
     // Single clean gain — the old three-setting interaction (speed/smooth/sensitivity)
     // was confusing and the three sliders fought each other. One internal gain that
@@ -982,51 +1455,68 @@ float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain =
     const float userBias = kBaseGain;
 
     // Fraction of remaining screen error to close this tick — smooth, not snap.
-    float closeFrac = 0.38f;
-    if (dist > 12.f)
-        closeFrac = 0.48f;
-    if (dist > 28.f)
-        closeFrac = 0.58f;
-    if (dist > 55.f)
-        closeFrac = 0.68f;
-    if (dist > 100.f)
-        closeFrac = 0.78f;
+    float closeFrac = AimMath::CloseFractionForDist(dist);
 
-    if (var::aim_algorithm == AimAlgorithm::Accelerated) {
-        const float norm = (std::min)(dist / 100.f, 1.f);
-        closeFrac = (std::min)(0.92f, closeFrac + 0.12f * norm * norm);
-    }
+    if (var::aim_algorithm == AimAlgorithm::Accelerated)
+        closeFrac = AimMath::AcceleratedCloseFrac(closeFrac, dist);
 
     if (pullScale < 0.f)
         pullScale = 0.f;
     if (pullScale > 1.f)
         pullScale = 1.f;
-    closeFrac *= (std::max)(pullScale, 0.90f);
+    closeFrac = AimMath::ApplyPullScale(closeFrac, pullScale);
+
+    // Per-lock randomized pull profile: speed varies WITHIN the engagement via
+    // a jittered ramp, and base speed/sharpness differ per target — so no two
+    // pulls are ever the same curve. accel<0 = slow start then hurry; accel>0 =
+    // fast start then ease off.
+    // Environment bias driven by the LIVE situation (enemy density, players vs
+    // bots, world distance) — layered under the per-lock randomness so the same
+    // situation always baselines correctly but no two pulls are identical.
+    const float situ = SituationalPullFactor();
+    {
+        const float elapsed = static_cast<float>(NowMs() - s_pullProf.startMs) / 1000.f;
+        const float t = elapsed / s_pullProf.durationSec;
+        const float ramp = AimMath::PullProfileRamp(s_pullProf.accel, t);
+        closeFrac = AimMath::ApplyPullProfile(
+            closeFrac, s_pullProf.speed, ramp, s_pullProf.sharp, situ);
+    }
+    s_aimDbg.ppSitu = situ;
 
     // Convert desired screen close → mouse counts via learned scale.
+    // Oscillation damping eases the pull per axis while the loop rings.
     const float invScale = 1.f / s_pxPerMouse;
-    float mx = dx * closeFrac * invScale * userBias;
-    float my = dy * closeFrac * invScale * userBias;
+    const float dampPullX = AimMath::OscDampPullFactor(s_oscDampX.damp, AimMath::kOscPullFactor);
+    const float dampPullY = AimMath::OscDampPullFactor(s_oscDampY.damp, AimMath::kOscPullFactor);
+    // Per-lock asymmetry: split the per-axis speed (X faster than Y or vice
+    // versa), which rotates the approach vector slightly per engagement and
+    // makes the path feel less machine-perfect.
+    const float asymX = s_pullProf.asym;
+    const float asymY = 1.f / s_pullProf.asym;
+    float mx = dx * closeFrac * invScale * userBias * dampPullX * asymX;
+    float my = dy * closeFrac * invScale * userBias * dampPullY * asymY;
+
+    s_aimDbg.pxPerMouse = s_pxPerMouse;
+    s_aimDbg.closeFrac = closeFrac * (std::max)(pullScale, 0.90f);
+    s_aimDbg.ppSpeed = s_pullProf.speed;
+    s_aimDbg.ppAccel = s_pullProf.accel;
+    s_aimDbg.ppAsym = s_pullProf.asym;
+    s_aimDbg.ppSharp = s_pullProf.sharp;
+    s_aimDbg.ppStartMs = s_pullProf.startMs;
 
     // Cap mouse burst so one late tick cannot slam (choppy). Scale cap with
     // recent tickMs so slow ticks still catch movers.
-    float tickScale = s_lastAimTickMs / 8.f;
-    if (tickScale < 1.f)
-        tickScale = 1.f;
-    if (tickScale > 10.f)
-        tickScale = 10.f;
-    float maxMouse = (dist > 40.f ? 140.f : 95.f) * tickScale;
-    const float mag = hypotf(mx, my);
-    if (mag > maxMouse && mag > 0.01f) {
-        const float s = maxMouse / mag;
-        mx *= s;
-        my *= s;
-    }
+    const float tickScale = AimMath::TickScaleFromTickMs(s_lastAimTickMs);
+    const float maxMouse = AimMath::MaxMouseForDist(dist, tickScale);
+    std::tie(mx, my) = AimMath::ClampMouseBurst(mx, my, maxMouse);
 
     // Light EMA — kills dy sign-flip chatter without lagging far catch-up.
+    // Damping lowers the alpha further (stronger smoothing) while ringing.
     const float filtA = dist > 35.f ? 0.72f : 0.48f;
-    s_filtMx = s_filtMx * (1.f - filtA) + mx * filtA;
-    s_filtMy = s_filtMy * (1.f - filtA) + my * filtA;
+    const float filtAX = AimMath::EmaAlphaWithDamp(filtA, s_oscDampX.damp);
+    const float filtAY = AimMath::EmaAlphaWithDamp(filtA, s_oscDampY.damp);
+    s_filtMx = AimMath::EmaStep(s_filtMx, mx, filtAX);
+    s_filtMy = AimMath::EmaStep(s_filtMy, my, filtAY);
     mx = s_filtMx;
     my = s_filtMy;
 
@@ -1038,8 +1528,12 @@ float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain =
     int remX = static_cast<int>(std::round(mx));
     int remY = static_cast<int>(std::round(my));
 
-    // Always nudge at least 1 count toward error when outside deadzone.
-    if (remX == 0 && remY == 0 && dist > var::aim_deadzone_px + 0.5f) {
+    // Nudge at least 1 count toward error — but only when well outside the
+    // deadzone. The old threshold (deadzone + 0.5) caused limit-cycle
+    // oscillation: nudge → overshoot → nudge back → overshoot → shake.
+    // Gate at deadzone + 3 px so the 1-count nudge never fires right at the
+    // boundary where it would bounce.
+    if (remX == 0 && remY == 0 && dist > var::aim_deadzone_px + 3.0f) {
         remX = (dx > 0.f) ? 1 : ((dx < 0.f) ? -1 : 0);
         remY = (dy > 0.f) ? 1 : ((dy < 0.f) ? -1 : 0);
         if (remX == 0 && remY == 0)
@@ -1049,11 +1543,62 @@ float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain =
     if (remX == 0 && remY == 0)
         return gainOut;
 
+    // Shake probe: log the crossover event with full loop state, throttled.
+    if (var::debug_aim_shake && (s_dbgFlipX > 0 || s_dbgFlipY > 0)) {
+        static uint64_t s_shakeLastLogMs = 0;
+        const uint64_t nowMsShake = NowMs();
+        if (nowMsShake - s_shakeLastLogMs >= 150) {
+            s_shakeLastLogMs = nowMsShake;
+            std::cout << "[debugShake] flipX=" << s_dbgFlipX
+                << " flipY=" << s_dbgFlipY
+                << " overshoot=" << s_dbgOvershoot
+                << " err=(" << dx << "," << dy << ")"
+                << " prevErr=(" << s_prevErrX << "," << s_prevErrY << ")"
+                << " cmd=(" << remX << "," << remY << ")"
+                << " pxPerMouse=" << s_pxPerMouse
+                << " closeFrac=" << closeFrac
+                << " distPx=" << s_aimDbg.distPx
+                << " tickMs=" << s_lastAimTickMs
+                << " shakeDeg=" << s_dbgShakeDeg
+                << " suppress=" << (s_dbgSuppress ? 1 : 0)
+                << " damp=(" << s_oscDampX.damp << "," << s_oscDampY.damp << ")"
+                << std::endl;
+            {
+                std::ofstream lf(kArcVerifyPath, std::ios::app);
+                if (lf) {
+                    lf << "{\"location\":\"Aimbot.cpp\"," 
+                       << "\"message\":\"aim_shake\"," 
+                       << "\"data\":{\"flipX\":" << s_dbgFlipX
+                       << ",\"flipY\":" << s_dbgFlipY
+                       << ",\"overshoot\":" << s_dbgOvershoot
+                       << ",\"err\":[" << dx << "," << dy << "]"
+                       << ",\"prevErr\":[" << s_prevErrX << "," << s_prevErrY << "]"
+                       << ",\"cmd\":[" << remX << "," << remY << "]"
+                       << ",\"pxPerMouse\":" << s_pxPerMouse
+                       << ",\"closeFrac\":" << closeFrac
+                       << ",\"distPx\":" << s_aimDbg.distPx
+                       << ",\"tickMs\":" << s_lastAimTickMs
+                       << ",\"shakeDeg\":" << s_dbgShakeDeg
+                       << ",\"suppress\":" << (s_dbgSuppress ? 1 : 0)
+                       << ",\"damp\":[" << s_oscDampX.damp << "," << s_oscDampY.damp << "]"
+                       << ",\"hn\":[" << s_aimDbg.hnPhase << "," << s_aimDbg.hnJx << "," << s_aimDbg.hnJy << "]"
+                       << ",\"pp\":[" << s_aimDbg.ppSpeed << "," << s_aimDbg.ppAccel << "," << s_aimDbg.ppAsym << "," << s_aimDbg.ppSharp << "," << s_aimDbg.ppSitu << "," << s_leadScale << "]"
+                       << ",\"velMag\":" << s_aimDbg.velMag
+                       << ",\"posSrc\":" << static_cast<int>(s_aimDbg.posSrc)
+                       << ",\"distM\":" << s_aimDbg.distanceM
+                       << "},\"ts\":" << nowMsShake << "}\n";
+                }
+            }
+        }
+    }
+
     s_prevErrX = dx;
     s_prevErrY = dy;
     s_prevCmdX = static_cast<float>(remX);
     s_prevCmdY = static_cast<float>(remY);
     s_adaptKey = s_aimDbg.locked;
+    s_aimDbg.cmdX = static_cast<float>(remX);
+    s_aimDbg.cmdY = static_cast<float>(remY);
 
     while (remX != 0 || remY != 0) {
         int stepX = remX;
@@ -1114,6 +1659,18 @@ void Engine::AimAssistence()
 
     const int bindAim = var::aim_hold_key ? var::aim_hold_key : VK_SHIFT;
     const bool keyPressed = KeyBindIsHeld(bindAim);
+
+    // Shake probe: measure aim tick cadence. Slow/irregular ticks make the
+    // pull stutter; combined with flip/overshoot counts it separates "control
+    // loop oscillation" from "DMA timing jitter".
+    if (keyPressed) {
+        static std::chrono::steady_clock::time_point s_lastAimInvoke{};
+        const auto invokeNow = std::chrono::steady_clock::now();
+        if (s_lastAimInvoke.time_since_epoch().count() != 0)
+            s_aimDbg.tickMs =
+                std::chrono::duration<float, std::milli>(invokeNow - s_lastAimInvoke).count();
+        s_lastAimInvoke = invokeNow;
+    }
 
     if (!keyPressed)
     {
@@ -1181,19 +1738,18 @@ void Engine::AimAssistence()
     // Final suppress is decided after we know bone distPx (below).
     bool suppressAimOutput = false;
 
-    EspRenderFrame espFrame{};
+    std::shared_ptr<const EspRenderFrame> espFrameShared;
     {
         // Never block publish — same try_lock + last-good policy as paint.
-        static EspRenderFrame s_lastGoodAimFrame{};
+        static std::shared_ptr<const EspRenderFrame> s_lastGoodAimFrame;
         std::shared_lock<std::shared_mutex> lock(m_espFrameMutex, std::try_to_lock);
-        if (lock.owns_lock()) {
-            if (m_lastEspFrame.valid)
-                s_lastGoodAimFrame = m_lastEspFrame;
-            espFrame = s_lastGoodAimFrame;
-        } else {
-            espFrame = s_lastGoodAimFrame;
-        }
+        if (lock.owns_lock() && m_espFrameShared && m_espFrameShared->valid)
+            s_lastGoodAimFrame = m_espFrameShared;
+        espFrameShared = s_lastGoodAimFrame;
     }
+    // Bind to a valid frame or an immutable empty one; no deep copy either way.
+    static const EspRenderFrame kInvalidAimFrame{};
+    const EspRenderFrame& espFrame = espFrameShared ? *espFrameShared : kInvalidAimFrame;
 
     CameraCache aimProjCam = aimCam;
     // Per-axis drift check: reject ESP frame camera if EITHER axis exceeds the
@@ -1203,7 +1759,7 @@ void Engine::AimAssistence()
     const float pitchDrift = std::abs(static_cast<float>(
         aimCam.Rotation.x - espFrame.camera.Rotation.x));
     const float yawDrift = std::abs(static_cast<float>(
-        NormalizeYawDelta(aimCam.Rotation.y - espFrame.camera.Rotation.y)));
+        NormalizeYawDelta(static_cast<float>(aimCam.Rotation.y - espFrame.camera.Rotation.y))));
     if (viewShakeDeg < kAimViewShakeSuppressDeg
         && espFrame.valid
         && IsPlausibleWorldPos(espFrame.camera.Location)
@@ -1250,9 +1806,15 @@ void Engine::AimAssistence()
     g_playerAimLockedKey = lockedTarget;
 
     const float currentTime = GetTimeSeconds();
-    const float bulletSpeed = var::aim_bullet_speed_cm_s > 0.f
+    // AUTO prediction: the user slider is only a baseline — the learned
+    // s_leadScale (multiplies effective bullet speed) is what actually tunes
+    // lead per fight, so the slider stops mattering. Higher scale = faster
+    // effective bullet = LESS lead (fixes overshoot); lower = MORE lead
+    // (fixes trailing a strafer). Clamped, persists per lock.
+    const float baseSpeed = var::aim_bullet_speed_cm_s > 0.f
         ? var::aim_bullet_speed_cm_s
         : 80000.f;
+    const float bulletSpeed = baseSpeed * s_leadScale;
     const uint64_t nowMs = NowMs();
 
     std::vector<AimTarget> allTargets;
@@ -1325,9 +1887,9 @@ void Engine::AimAssistence()
                         // otherwise overshoot by vel*dt before the next cache refresh
                         // corrects it).
                         constexpr float kMaxGraceStepCm = 8.f;
-                        float stepX = s_graceVelocity.x * dtSec;
-                        float stepY = s_graceVelocity.y * dtSec;
-                        float stepZ = s_graceVelocity.z * dtSec;
+                        float stepX = static_cast<float>(s_graceVelocity.x * dtSec);
+                        float stepY = static_cast<float>(s_graceVelocity.y * dtSec);
+                        float stepZ = static_cast<float>(s_graceVelocity.z * dtSec);
                         const float stepMag = std::sqrt(stepX * stepX + stepY * stepY + stepZ * stepZ);
                         if (stepMag > kMaxGraceStepCm) {
                             const float scale = kMaxGraceStepCm / stepMag;
@@ -1407,6 +1969,7 @@ void Engine::AimAssistence()
     s_aimDbg.candidates = static_cast<int>(allTargets.size());
     s_aimDbg.isRobot = bestTarget->isRobot ? 1 : 0;
     s_aimDbg.distPx = bestTarget->distToCenter;
+    s_aimDbg.distanceM = bestTarget->distanceM;
     {
         const Vector3& v = s_graceVelocity;
         s_aimDbg.velMag = static_cast<float>(
@@ -1419,13 +1982,42 @@ void Engine::AimAssistence()
     if (lockedTarget != bestTarget->entityKey)
     {
         const float sinceLastSwitch = currentTime - lastSwitchTime;
-        const bool allowSwitch = !var::sticky_target_lock
-            || lockedTarget == 0
-            || bestTarget->score > lastTargetScore * 1.2f
-            || sinceLastSwitch > 0.45f;
+
+        // Anti flip-flop: with two players near the crosshair the score ranking
+        // flips with per-tick noise, and the old `sinceLastSwitch > 0.45` rule
+        // then let whichever one won that instant STEAL the lock every 450ms —
+        // the aim visibly swapped back and forth. Now a switch needs ALL of:
+        // dwell elapsed, challenger clearly better than the LOCKED target's
+        // LIVE score (not a stale snapshot), and not bouncing straight back to
+        // the target we just left.
+        float lockedScoreNow = -FLT_MAX;
+        if (lockedTarget != 0) {
+            for (const AimTarget& t : allTargets) {
+                if (t.entityKey == lockedTarget) {
+                    lockedScoreNow = t.score;
+                    break;
+                }
+            }
+        }
+
+        constexpr float kTargetSwitchDwellSec = 0.35f;
+        constexpr float kTargetSwitchScoreMargin = 1.25f;
+        constexpr float kTargetSwitchNoBounceSec = 1.5f;
+
+        const bool dwellElapsed = sinceLastSwitch >= kTargetSwitchDwellSec;
+        const bool challengerClearlyBetter =
+            bestTarget->score > lockedScoreNow * kTargetSwitchScoreMargin;
+        const bool bounceBack =
+            previousTarget != 0
+            && bestTarget->entityKey == previousTarget
+            && sinceLastSwitch < kTargetSwitchNoBounceSec;
+
+        const bool allowSwitch = lockedTarget == 0
+            || (dwellElapsed && challengerClearlyBetter && !bounceBack);
 
         if (allowSwitch)
         {
+            ++s_dbgSwitches;
             previousTarget = lockedTarget;
             lockedTarget = bestTarget->entityKey;
             lockedIsRobot = bestTarget->isRobot;
@@ -1505,16 +2097,22 @@ void Engine::AimAssistence()
         suppressAimOutput = true;
     }
 
-    if (var::humanizer)
+    if (var::humanizer) {
+        humanizer.NotifyError(dx, dy);
         humanizer.Apply(dx, dy);
+        const Humanizer::PhaseOut hn = humanizer.Last();
+        s_aimDbg.hnPhase = hn.phase;
+        s_aimDbg.hnJx = hn.jx;
+        s_aimDbg.hnJy = hn.jy;
+    } else {
+        s_aimDbg.hnPhase = 0;
+        s_aimDbg.hnJx = 0.f;
+        s_aimDbg.hnJy = 0.f;
+    }
 
     // Reload / flinch moves the view — skip hardware pull for this tick (keep lock).
-    if (!suppressAimOutput) {
-        if (var::vis_use_aim && var::vis_enabled) {
-            if (!CollisionVis::AimLosAllows(aimProjCam.Location, bestTarget->worldPos))
-                suppressAimOutput = true;
-        }
-    }
+    s_dbgSuppress = suppressAimOutput;
+    s_dbgShakeDeg = viewShakeDeg;
     if (!suppressAimOutput)
         s_aimDbg.lastGain = SendKmAimDelta(dx, dy, pullScale, &s_aimDbg.lastGain);
 
@@ -1555,18 +2153,7 @@ void Engine::AimAssistence()
                 static_cast<float>(bestTarget->aimPos.y - screenCenter.y));
 
             if (trigDistPx <= var::trigger_deadzone_px) {
-                // Optional LOS check
-                bool losClear = true;
-                if (var::trigger_vis_check && var::vis_enabled) {
-                    Vector3 camPos{};
-                    {
-                        std::shared_lock<std::shared_mutex> lock(m_cameraMutex);
-                        camPos = g_Camera.Location;
-                    }
-                    losClear = CollisionVis::AimLosAllows(camPos, bestTarget->worldPos);
-                }
-
-                if (losClear) {
+                if (true) {
                     const uint64_t nowMsTrig = NowMs();
                     if (var::trigger_auto_hold) {
                         if (!s_isHolding) {
@@ -1626,6 +2213,41 @@ void Engine::AimAssistence()
                 << " camFov=" << aimProjCam.FOV
                 << " frameValid=" << (espFrame.valid ? 1 : 0)
                 << std::endl;
+
+            if (var::debug_aim_shake) {
+                std::cout << "[debugShakeSum] flips=(" << s_dbgFlipX
+                    << "," << s_dbgFlipY << ")"
+                    << " overshoot=" << s_dbgOvershoot
+                    << " switches=" << s_dbgSwitches
+                    << " cmd=(" << s_aimDbg.cmdX << "," << s_aimDbg.cmdY << ")"
+                    << " pxPerMouse=" << s_aimDbg.pxPerMouse
+                    << " closeFrac=" << s_aimDbg.closeFrac
+                    << " tickMs=" << s_aimDbg.tickMs
+                    << " damp=(" << s_oscDampX.damp << "," << s_oscDampY.damp << ")"
+                    << std::endl;
+                {
+                    const uint64_t sumTs = NowMs();
+                    std::ofstream lf(kArcVerifyPath, std::ios::app);
+                    if (lf) {
+                        lf << "{\"location\":\"Aimbot.cpp\"," 
+                           << "\"message\":\"aim_shake_sum\"," 
+                           << "\"data\":{\"flipX\":" << s_dbgFlipX
+                           << ",\"flipY\":" << s_dbgFlipY
+                           << ",\"overshoot\":" << s_dbgOvershoot
+                           << ",\"switches\":" << s_dbgSwitches
+                           << ",\"cmd\":[" << s_aimDbg.cmdX << "," << s_aimDbg.cmdY << "]"
+                           << ",\"pxPerMouse\":" << s_aimDbg.pxPerMouse
+                           << ",\"closeFrac\":" << s_aimDbg.closeFrac
+                           << ",\"tickMs\":" << s_aimDbg.tickMs
+                           << ",\"damp\":[" << s_oscDampX.damp << "," << s_oscDampY.damp << "]"
+                           << "},\"ts\":" << sumTs << "}\n";
+                    }
+                }
+                s_dbgFlipX = 0;
+                s_dbgFlipY = 0;
+                s_dbgOvershoot = 0;
+                s_dbgSwitches = 0;
+            }
 
             uint64_t dmaExec = 0, dmaPrep = 0, dmaLast = 0;
             DmaScatterStats_Get(dmaExec, dmaPrep, dmaLast);

@@ -1,9 +1,11 @@
 #include "../Core/Engine.h"
 #include "../Core/Offsets.h"
+#include "../Core/AgentLog.h"
 #include "../Interface/Utils/Variables/index.h"
 #include "WorldScanCommon.h"
 
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <unordered_map>
 #include <vector>
@@ -184,6 +186,6 @@ void Engine::BuildEspRenderFrameWorker()
         return;
 
     std::unique_lock<std::shared_mutex> lock(m_espFrameMutex);
-    m_lastEspFrame = std::move(frame);
-    m_lastEspFrameValid.store(m_lastEspFrame.valid, std::memory_order_release);
+    m_espFrameShared = std::make_shared<EspRenderFrame>(std::move(frame));
+    m_lastEspFrameValid.store(m_espFrameShared->valid, std::memory_order_release);
 }

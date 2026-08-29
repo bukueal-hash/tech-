@@ -165,6 +165,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ResourceCompile Include="app.rc" />
+  </ItemGroup>
+  <ItemGroup>
     <ClInclude Include="Core\Cache.hpp">
       <Filter>Core</Filter>
     </ClInclude>

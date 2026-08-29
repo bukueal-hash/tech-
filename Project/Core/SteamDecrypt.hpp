@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -46,10 +47,17 @@ inline uint64_t rotl64(uint64_t x, int n)
 	return (x << n) | (x >> (64 - n));
 }
 
+// Test seam (Pillar 1 / docs/aplus-plan.md): when set, MemRead routes through
+// this instead of the DMA backend, so the decode math can run on synthetic
+// buffers in Project.Tests. Production never sets it (nullptr = DMA).
+inline bool (*g_memReadOverride)(uint64_t addr, void* buf, size_t size) = nullptr;
+
 inline bool MemRead(uint64_t addr, void* buf, size_t size)
 {
 	if (!addr || !buf || !size)
 		return false;
+	if (g_memReadOverride)
+		return g_memReadOverride(addr, buf, size);
 	return Memory::ReadRaw(static_cast<uintptr_t>(addr), buf, size);
 }
 
@@ -135,44 +143,95 @@ inline void Decrypt(std::vector<uint16_t>& buffer, int maxLength) {
 	DecryptWithKey(buffer, maxLength, kKeyCurrent, kRotCurrent);
 }
 
+// ── CL-1341255 SIMD name decrypt ────────────────────────────────────────────
+// Scramble key 0xD351FEEC/rol28 is stale on this build. New pipeline:
+// 16-byte PSHUFB mask read from game base @ RVA 0xAD2FC50 (never hardcode —
+// it moves per build), then XOR each qword lane with 0xA738DD8241D227C2.
+constexpr uint64_t kSimdXorVal = 0xA738DD8241D227C2ULL;
+
+inline bool GetSimdMask(/*out*/ uint8_t (&mask)[16]) {
+	static alignas(16) uint8_t cached[16]{};
+	static bool cachedOk = false;
+	static std::mutex mtx;
+	std::lock_guard<std::mutex> lock(mtx);
+	if (!cachedOk) {
+		const uint64_t base = Memory::getBaseAddress();
+		if (!base)
+			return false;
+		cachedOk = steam_decrypt::MemRead(
+			base + Offsets::PlayerNameSimdMaskRva, cached, sizeof(cached));
+		if (cachedOk) {
+			bool allZero = true;
+			for (int i = 0; i < 16; ++i)
+				if (cached[i]) { allZero = false; break; }
+			if (allZero)
+				cachedOk = false;
+		}
+	}
+	if (!cachedOk)
+		return false;
+	memcpy(mask, cached, sizeof(mask));
+	return true;
+}
+
+// SIMD pipeline attempt — caller gates on name plausibility and falls back
+// to the legacy scramble keys when this doesn't produce a real name.
+inline void DecryptSimd(std::vector<uint16_t>& buffer, int maxLength) {
+	if (buffer.empty() || maxLength <= 0)
+		return;
+
+	alignas(16) uint8_t mask[16];
+	if (!GetSimdMask(mask))
+		return;
+
+	const int length = (std::min)(
+		maxLength, static_cast<int>(buffer.size()));
+
+	const __m128i shuffleMask = _mm_loadu_si128(reinterpret_cast<const __m128i*>(mask));
+	const __m128i xorVal = _mm_set1_epi64x(static_cast<long long>(kSimdXorVal));
+
+	int i = 0;
+	for (; i + 8 <= length; i += 8) {
+		__m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&buffer[static_cast<size_t>(i)]));
+		v = _mm_shuffle_epi8(v, shuffleMask);
+		v = _mm_xor_si128(v, xorVal);
+		_mm_storeu_si128(reinterpret_cast<__m128i*>(&buffer[static_cast<size_t>(i)]), v);
+	}
+	for (; i < length && buffer[static_cast<size_t>(i)] != 0; ++i) {
+		// tail (< 8 wchars): byte-wise shuffle equivalent is identity for the
+		// low lanes the mask keeps in place — apply XOR only.
+		buffer[static_cast<size_t>(i)] = static_cast<uint16_t>(
+			buffer[static_cast<size_t>(i)] ^ static_cast<uint16_t>(kSimdXorVal & 0xFFFFu));
+	}
+}
+
 } // namespace PlayerName
 
-// ── Bones namespace (CL-1335610 2026-08-11) ─────────────────────────────────
+// ── Bones namespace (CL-1341255 v818 pipeline) ─────────────────────────────
 // Theia-style SIMD pointer decrypt, bones are plaintext component-space transforms.
-// No per-bone XOR/quaternion needed — each bone is a plain FTransform at 0x60 stride.
+// CL-1341255 v818: seed @ mesh+0x7B0, LOD @ mesh+0x7F8, descriptor @ bone+0x48,
+// stride 0x60, ROL64=50, ROL32=22, XOR key removed (0), PSHUFB mask below.
+// Same pipeline on all maps — CTW @ 0x370 is what makes it work off-Stella.
 
 namespace Bones {
 
-constexpr uint64_t SeedOffset       = 0x790;
-constexpr uint64_t LodOffset        = 0x7D0;
-constexpr uint64_t DescriptorOffset = 0xB0;
+constexpr uint64_t SeedOffset       = 0x7B0;   // CL-1341255 (was 0x790)
+constexpr uint64_t SeedOffsetLegacy = 0x790;
+constexpr uint64_t LodOffset        = 0x7D0;   // CL-1341255 (esasiolan + texaftertex confirm)
+constexpr uint64_t LodOffsetLegacy  = 0x7F8;   // alternate slot
+constexpr uint64_t DescriptorOffset = 0x48;    // CL-1341255 (was 0xB0)
 constexpr uint64_t BoneStride       = 0x60;
 constexpr uint32_t LodShiftRight    = 27;
 constexpr uint32_t LodBitMask       = 0xFFFFFFF0;
-constexpr uint64_t XorKey           = 0x8387081898D8D8DDULL;
-constexpr int      PshuflwImm       = 0x4B;
-constexpr int      Rol32Amount      = 5;
+constexpr uint64_t XorKey           = 0;       // CL-1341255: XOR key removed
+constexpr int      Rol32Amount      = 22;      // CL-1341255 (was 5)
+constexpr int      Rol64Amount      = 50;      // CL-1341255 (new step)
 constexpr int      MaxBoneCount     = 500;
 
 inline uint64_t DecryptBoneArrayPointer(const uint8_t seed[16]) {
-	__m128i v = _mm_loadu_si128(
-		reinterpret_cast<const __m128i*>(seed));
-
-	v = _mm_shufflelo_epi16(v, PshuflwImm);
-	v = _mm_xor_si128(
-		v,
-		_mm_set_epi64x(
-			0,
-			static_cast<long long>(XorKey)));
-	v = _mm_or_si128(
-		_mm_slli_epi32(v, Rol32Amount),
-		_mm_srli_epi32(v, 32 - Rol32Amount));
-
-	alignas(16) const __m128i shuffleMask = _mm_setr_epi8(
-		6, 2, 0, 7, 5, 1, 3, 4,
-		0, 0, 0, 0, 0, 0, 0, 0);
-	v = _mm_shuffle_epi8(v, shuffleMask);
-	return static_cast<uint64_t>(_mm_cvtsi128_si64(v));
+	// Pure function lives in BoneMath.hpp (XorKey is 0 on this build, so the
+	// legacy xor step is a no-op and was dropped there).
+	return BoneMath::DecryptBoneArrayPointer(seed);
 }
 
 struct BoneArrayResult {
@@ -223,6 +282,57 @@ inline BoneArrayResult DecryptBoneArray(
 		result.Count = 0;
 
 	return result;
+}
+
+// Forum-verified decrypt (UC post, tested in-game on BP_PioneerCharacter_C:
+// count=97, sensible translations). Key 0xA738DD8241D227C2 (both lanes),
+// ROL64 by 0x26, pshuflw 0x39, LOD at mesh+lodOff, idx = (lod>>11)&0x10,
+// count @ base+idx+0x98, array @ base+idx+0x90. Seed/LOD slots differ per
+// build (+0x10/+0x20 shifts observed) — the caller tries every combo and the
+// score gate keeps whichever yields a real skeleton.
+inline uint64_t DecryptBoneArrayForum(
+	uint64_t mesh, uint64_t seedOff, uint64_t lodOff)
+{
+	if (!steam_decrypt::ValidPtr(mesh))
+		return 0;
+
+	alignas(16) uint8_t seed[16]{};
+	if (!steam_decrypt::MemRead(mesh + seedOff, seed, sizeof(seed)))
+		return 0;
+	const uint64_t encLo = steam_decrypt::MemReadVal<uint64_t>(mesh + seedOff);
+	const uint64_t encHi = steam_decrypt::MemReadVal<uint64_t>(mesh + seedOff + 8);
+	if (!encLo && !encHi)
+		return 0;
+
+	constexpr uint64_t kKey = 0xA738DD8241D227C2ULL;
+	const __m128i v = _mm_or_si128(
+		_mm_slli_epi64(
+			_mm_xor_si128(
+				_mm_loadu_si128(reinterpret_cast<const __m128i*>(seed)),
+				_mm_set1_epi64x(static_cast<long long>(kKey))),
+			0x26),
+		_mm_srli_epi64(
+			_mm_xor_si128(
+				_mm_loadu_si128(reinterpret_cast<const __m128i*>(seed)),
+				_mm_set1_epi64x(static_cast<long long>(kKey))),
+			0x1A));
+	const __m128i shuffled = _mm_shufflelo_epi16(v, 0x39);
+	const uint64_t base = static_cast<uint64_t>(
+		_mm_cvtsi128_si64(shuffled));
+	if (!steam_decrypt::ValidPtr(base))
+		return 0;
+
+	const uint32_t lod = steam_decrypt::MemReadVal<uint32_t>(mesh + lodOff);
+	const uint32_t idx = (lod >> 11) & 0x10u;
+
+	const uint32_t count = steam_decrypt::MemReadVal<uint32_t>(base + idx + 0x98);
+	if (count <= 0 || count > MaxBoneCount)
+		return 0;
+
+	const uint64_t arr = steam_decrypt::MemReadVal<uint64_t>(base + idx + 0x90);
+	if (!steam_decrypt::ValidPtr(arr))
+		return 0;
+	return arr;
 }
 
 } // namespace Bones
@@ -326,16 +436,28 @@ inline bool Init(uint64_t moduleBase)
 		return true;
 
 	uint8_t KsBuf[KeystreamCount * 2]{};
-	if (!steam_decrypt::MemRead(moduleBase + KeystreamRva, KsBuf, sizeof(KsBuf)))
+	const bool readOk = steam_decrypt::MemRead(moduleBase + KeystreamRva, KsBuf, sizeof(KsBuf));
+	if (!readOk) {
+		std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+		if (f) f << "{\"sessionId\":\"c190fb\",\"runId\":\"diag\",\"hypothesisId\":\"FNAME\","
+		           << "\"location\":\"SteamDecrypt.hpp:Init\",\"message\":\"keystream_read_failed\","
+		           << "\"data\":{\"rva\":\"0x" << std::hex << KeystreamRva << std::dec << "\"}}\n";
 		return false;
+	}
 
 	int nz = 0;
 	for (int I = 0; I < KeystreamCount; ++I) {
 		std::memcpy(&keyTable[I], KsBuf + I * 2, 2);
 		nz += (keyTable[I] != 0);
 	}
-	if (nz < 8)
+	if (nz < 8) {
+		std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
+		if (f) f << "{\"sessionId\":\"c190fb\",\"runId\":\"diag\",\"hypothesisId\":\"FNAME\","
+		           << "\"location\":\"SteamDecrypt.hpp:Init\",\"message\":\"keystream_low_nz\","
+		           << "\"data\":{\"rva\":\"0x" << std::hex << KeystreamRva << std::dec
+		           << "\",\"nz\":" << nz << "}}\n";
 		return false;
+	}
 
 	ready = true;
 	return true;
@@ -716,12 +838,27 @@ inline void DecryptPlayerName(std::vector<uint16_t>& NameBuffer, int MaxLength)
 	PlayerName::Decrypt(NameBuffer, MaxLength);
 }
 
+// CL-1341255 SIMD pipeline (mask read from game base @ 0xAD2FC50).
+inline void DecryptPlayerNameSimd(std::vector<uint16_t>& NameBuffer, int MaxLength)
+{
+	PlayerName::DecryptSimd(NameBuffer, MaxLength);
+}
+
 // Legacy pre-CL-1341255 scramble (0xA7A3FF6B / rol 19) — fallback for older
 // builds when the current key doesn't produce a plausible player name.
 inline void DecryptPlayerNameLegacy(std::vector<uint16_t>& NameBuffer, int MaxLength)
 {
 	PlayerName::DecryptWithKey(NameBuffer, MaxLength,
 		PlayerName::kKeyLegacy, PlayerName::kRotLegacy);
+}
+
+// Forum-pasted FText decode key (0x20003155 / rol 29) — the scramble that
+// actually matches this build's APlayerState name strings. Tried after the
+// CL-1341255 and legacy keys; plaintext-first stays the hot path.
+inline void DecryptPlayerNameForum(std::vector<uint16_t>& NameBuffer, int MaxLength)
+{
+	PlayerName::DecryptWithKey(NameBuffer, MaxLength,
+		0x20003155u, 29);
 }
 
 inline void DecryptName(std::vector<uint16_t>& nameBuffer, int maxLength)
@@ -733,6 +870,26 @@ inline bool IsPlausibleArcPlayerName(const std::string& name)
 {
 	if (name.size() < 2 || name.size() > 32)
 		return false;
+
+	// Control characters (0x00-0x1F, 0x7F) never appear in a real player name.
+	// A name containing them is scrambled text that must fall through to the
+	// decrypt paths — otherwise "q\x17"-style garbage short-circuits and gets
+	// displayed as-is.
+	for (unsigned char c : name) {
+		if (c == 0)
+			break;
+		if (c < 0x20 || c == 0x7F)
+			return false;
+	}
+
+	// Gamer tags start with a letter or digit, never punctuation/space.
+	{
+		const unsigned char first = static_cast<unsigned char>(name[0]);
+		const bool alphaFirst = (first >= 'a' && first <= 'z') ||
+			(first >= 'A' && first <= 'Z') || (first >= '0' && first <= '9');
+		if (!alphaFirst)
+			return false;
+	}
 
 	int printable = 0;
 	int vowels = 0;
@@ -832,17 +989,39 @@ inline std::string ReadPlayerNameFromFString(uintptr_t fstringAddr)
 			continue;
 
 		if (rawLen >= 2) {
-			// Try the CL-1341255 key first; re-decrypt with the legacy
-			// key/rotation when the result isn't a plausible player name
-			// (older builds / differently-scrambled names).
+			// LIVE-VERIFIED (debug-c190fb.log): names ARE scrambled on
+			// CL-1341255 — "2!}lvfc" @ PS+0x448 decodes to "Execoper" with the
+			// current key. Try the proven current-key scramble FIRST, then the
+			// other decrypts, and raw LAST as a safety net. Plaintext-first was
+			// removed: scrambled strings like "6`pW~{&o" pass the plausibility
+			// gate and were being displayed as-is.
+			std::string result;
 			const std::vector<uint16_t> original = chars;
-			DecryptPlayerName(chars, rawLen);
-			std::string result = WideCharsToPlayerName(chars, rawLen);
+
+			PlayerName::Decrypt(chars, rawLen);
+			result = WideCharsToPlayerName(chars, rawLen);
+			if (IsPlausibleArcPlayerName(result))
+				return result;
+
+			chars = original;
+			DecryptPlayerNameSimd(chars, rawLen);
+			result = WideCharsToPlayerName(chars, rawLen);
+			if (IsPlausibleArcPlayerName(result))
+				return result;
+
+			chars = original;
+			DecryptPlayerNameLegacy(chars, rawLen);
+			result = WideCharsToPlayerName(chars, rawLen);
 			if (!IsPlausibleArcPlayerName(result)) {
 				chars = original;
-				DecryptPlayerNameLegacy(chars, rawLen);
+				DecryptPlayerNameForum(chars, rawLen);
 				result = WideCharsToPlayerName(chars, rawLen);
 			}
+			if (IsPlausibleArcPlayerName(result))
+				return result;
+
+			chars = original;
+			result = WideCharsToPlayerName(chars, rawLen);
 			if (IsPlausibleArcPlayerName(result))
 				return result;
 		} else {
@@ -942,7 +1121,13 @@ inline std::uintptr_t GetBoneArrayDecrypt(std::uintptr_t MeshAddr)
 	return static_cast<std::uintptr_t>(bones.Array);
 }
 
-// ── Mesh visibility (encrypted LastRenderTimeOnScreen) ──────────────────────
+// ── Mesh visibility (encrypted LastRenderTimeOnScreen — auto-scanning) ────
+// Arc Raiders vis check, occlusion-based: Denuvo Anti-Cheat XOR-encrypts
+// render times. Offset + XOR key are AUTO-SCANNED at runtime from a
+// frustum-rendered mesh (bRecentlyRendered), verified by re-read, then:
+//   LRTS decrypts to ~UWorld::TimeSeconds → mesh visible (not behind wall)
+//   LRTS stale                            → behind wall / not rendered
+// Replaces the old hardcoded 0x4C8 + 0xE1664254 pair that broke every build.
 
 inline float DecryptRenderFloat(uint32_t encrypted, uint32_t key)
 {
@@ -950,27 +1135,6 @@ inline float DecryptRenderFloat(uint32_t encrypted, uint32_t key)
 	float f = 0.f;
 	std::memcpy(&f, &bits, sizeof(f));
 	return f;
-}
-
-/**
- * Returns true when the mesh was rendered on-screen within the last 0.5 s.
- * Reads the encrypted LastRenderTimeOnScreen, decrypts it, then compares
- * against the world's current TimeSeconds via the mesh's WorldPrivate ptr.
- */
-inline bool IsMeshVisible(uint64_t mesh)
-{
-	if (!mesh || !ValidPtr(mesh))
-		return false;
-
-	const uint32_t raw = MemReadVal<uint32_t>(mesh + Offsets::Mesh_LastRenderTimeOnScreenEnc);
-	const float lrtos = DecryptRenderFloat(raw, Offsets::Mesh_LastRenderTimeOnScreenKey);
-
-	const uint64_t worldPrivate = MemReadVal<uint64_t>(mesh + Offsets::UActorComponent_WorldPrivate);
-	if (!worldPrivate || !ValidPtr(worldPrivate))
-		return false;
-	const double timeSeconds = MemReadVal<double>(worldPrivate + Offsets::UWorld_TimeSeconds);
-
-	return (static_cast<float>(timeSeconds) - lrtos) < 0.5f;
 }
 
 } // namespace steam_decrypt

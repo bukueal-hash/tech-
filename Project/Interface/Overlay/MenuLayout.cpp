@@ -3,8 +3,31 @@
 #include "../Utils/AutoConfig.h"
 
 #include <cfloat>
+#include <cstdarg>
 
 namespace ArcMenuLayout {
+
+namespace {
+
+// Subtle highlight under any text the mouse is over, so plain labels respond
+// to hover the same way buttons do.
+void HighlightHoveredItem()
+{
+    if (ImGui::IsItemHovered()) {
+        ImGui::GetWindowDrawList()->AddRectFilled(
+            ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+            IM_COL32(255, 255, 255, 22));
+    }
+}
+
+// Screen rect of the most recently drawn Label(). Consumed by
+// ArcMenuHoverTooltip() so the row tooltip also fires when the mouse is over
+// the label text instead of only the control itself.
+bool g_labelRectValid = false;
+ImVec2 g_labelRectMin(0.f, 0.f);
+ImVec2 g_labelRectMax(0.f, 0.f);
+
+} // namespace
 
 float ContentWrapX()
 {
@@ -16,6 +39,61 @@ void Label(const char* text)
     ImGui::PushTextWrapPos(ContentWrapX());
     ImGui::TextWrapped("%s", text);
     ImGui::PopTextWrapPos();
+
+    g_labelRectValid = true;
+    g_labelRectMin = ImGui::GetItemRectMin();
+    g_labelRectMax = ImGui::GetItemRectMax();
+    HighlightHoveredItem();
+}
+
+void HoverableText(const char* text)
+{
+    ImGui::PushTextWrapPos(ContentWrapX());
+    ImGui::TextWrapped("%s", text);
+    ImGui::PopTextWrapPos();
+    HighlightHoveredItem();
+}
+
+void HoverableTextF(const char* fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    ImGui::PushTextWrapPos(ContentWrapX());
+    ImGui::TextV(fmt, args);
+    ImGui::PopTextWrapPos();
+    va_end(args);
+    HighlightHoveredItem();
+}
+
+void HoverableTextColoredF(const ImVec4& color, const char* fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    ImGui::PushStyleColor(ImGuiCol_Text, color);
+    ImGui::PushTextWrapPos(ContentWrapX());
+    ImGui::TextV(fmt, args);
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+    va_end(args);
+    HighlightHoveredItem();
+}
+
+bool LastLabelRect(ImVec2* outMin, ImVec2* outMax)
+{
+    const bool ok = g_labelRectValid;
+    if (ok) {
+        if (outMin)
+            *outMin = g_labelRectMin;
+        if (outMax)
+            *outMax = g_labelRectMax;
+    }
+    g_labelRectValid = false; // consumed by the row tooltip
+    return ok;
+}
+
+void ResetHoverState()
+{
+    g_labelRectValid = false;
 }
 
 void PushControlWidth()
@@ -97,6 +175,7 @@ bool CheckboxWithColorRow(const char* label, bool* enabled, float color[4], cons
     ImGui::PushTextWrapPos(startX + kColorColumnX - 2.f);
     ImGui::TextUnformatted(label);
     ImGui::PopTextWrapPos();
+    HighlightHoveredItem();
     if (ColorEditAtColumn(colorId, color))
         changed = true;
     ImGui::PopID();
@@ -121,6 +200,7 @@ bool CheckboxWithDualColorRow(
     ImGui::PushTextWrapPos(startX + kColorColumnX - 2.f);
     ImGui::TextUnformatted(label);
     ImGui::PopTextWrapPos();
+    HighlightHoveredItem();
     ImGui::SameLine();
     if (ColorEditAtColumnPos(idA, colorA))
         changed = true;

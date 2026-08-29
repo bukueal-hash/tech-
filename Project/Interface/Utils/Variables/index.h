@@ -22,6 +22,12 @@ enum class AimAlgorithm : int {
     Accelerated = 1,
 };
 
+/** When VisibleOnly, aim/trigger skip targets with stale LRTS (behind wall). */
+enum class AimVisMode : int {
+    Always = 0,
+    VisibleOnly = 1,
+};
+
 namespace var {
     /** Max range (m) for all distance sliders — matches practical game replication limit. */
     inline constexpr float kMaxDistanceSliderM = 500.f;
@@ -49,6 +55,17 @@ namespace var {
     }
     extern float esp_color_visible[4];
     extern float esp_color_invisible[4];
+    extern bool vis_enabled;    // LRTS occlusion-based visibility check
+    extern bool lrts_debug_trace; // append per-second vis trace NDJSON rows
+    extern bool lrts_debug_tree;  // include component tree bytes in each row
+    extern bool lrts_debug_burst; // full-frame-rate one-bot latency capture
+    extern AimVisMode aim_vis_mode;
+
+    /** Run LRTS reads when ESP vis and/or aim visible-only need isVisible. */
+    inline bool LrtsVisActive()
+    {
+        return vis_enabled || aim_vis_mode == AimVisMode::VisibleOnly;
+    }
 
     /* Bot ESP */
     extern bool bot_box;
@@ -69,6 +86,9 @@ namespace var {
     extern AimBoneMode aim_bone_mode;
     extern bool predict;
     extern bool humanizer;
+    extern float humanizer_intensity;
+    extern float humanizer_react_ms;
+    extern float humanizer_overshoot;
     extern bool randombone;
     extern float aimbot_fov;
     extern AimbotPriority aimbot_priority;
@@ -107,7 +127,6 @@ namespace var {
     extern float trigger_deadzone_px;
     extern int trigger_fire_delay_ms;
     extern bool trigger_auto_hold;
-    extern bool trigger_vis_check;
 
     /* World */
     extern bool enable_world;
@@ -189,19 +208,10 @@ namespace var {
 
     /* Debug */
     extern bool show_debug_overlay;
+    extern bool debug_skeleton_lag;
+    extern bool debug_aim_shake;
+    extern bool debug_hatch_detect;
 
-    /* Vis / collision LOS (gates default off) */
-    extern bool vis_enabled;
-    extern float vis_max_range_m;
-    extern bool vis_use_player_esp_dist;
-    extern bool vis_use_bot_esp_dist;
-    extern bool vis_use_esp_colors;
-    extern bool vis_use_aim;
-    extern bool vis_multi_bone;
-    extern int vis_hysteresis_frames;
-    extern bool vis_debug;
-    extern bool vis_debug_rays;
-    extern bool vis_debug_tris;
 
     /* Camera debug */
     extern bool camPovUsePending;  // false=live ViewTarget(0x4C8..), true=PendingViewTarget(0xCA0..)
@@ -233,5 +243,5 @@ inline bool AnyWorldEspEnabled()
         var::show_world_field_crate || var::show_world_supply_station ||
         var::show_world_keys || var::show_world_locker || var::show_world_trash ||
         var::show_world_safe || var::show_world_buried || var::show_world_deaddrop ||
-        var::show_world_open_container);
+        var::show_world_open_container || var::showHatches);
 }

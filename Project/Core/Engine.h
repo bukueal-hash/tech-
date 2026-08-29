@@ -82,13 +82,6 @@ public:
         std::string& outStowed0, int& outStowedQ0,
         std::string& outStowed1, int& outStowedQ1,
         float& outArmorPlates, float& outArmorPerPlate);
-    /** Scatter-batched: invComp already pre-read via scatter-gather, skip first DMA hop. */
-    void ReadPlayerInventoryFast(uintptr_t pawn, uintptr_t invComp,
-        std::string& outWeaponName, int& outWeaponQuality,
-        int& outWeaponClip,
-        std::string& outStowed0, int& outStowedQ0,
-        std::string& outStowed1, int& outStowedQ1,
-        float& outArmorPlates, float& outArmorPerPlate);
 
 private:
     std::atomic<bool> entityStarted{ false };
@@ -102,7 +95,6 @@ private:
     std::unique_ptr<SyncedThread> m_positionThread;
     std::unique_ptr<SyncedThread> m_cameraThread;
     std::unique_ptr<SyncedThread> m_frameBuilderThread;
-    std::unique_ptr<SyncedThread> m_visThread;
 
 public:
     // Thread synchronization (paint debug overlay uses try_lock on these)
@@ -130,12 +122,21 @@ private:
     static constexpr std::chrono::milliseconds kPartyEnterDelayMs{ 500 };
     /** User spec: map found -> wait 10s before ESP scanning starts. */
     static constexpr std::chrono::milliseconds kRaidEnterDelayMs{ 10000 };
-    static constexpr std::chrono::milliseconds kRaidRawFalseGraceMs{ 5000 };
+    /** Live-verified (debug-c190fb.log TheDam burst): VMM read stalls of ~8.5s
+     *  where GWorld resolvers return 0 for every attempt. With a 5s grace the
+     *  gate dropped, ClearEspCaches() wiped everything, and re-arm+rescan made
+     *  ESP vanish/refill patch-by-patch (user-visible "flicker"). 12s rides
+     *  out the observed stalls on last-known data instead of wiping. */
+    static constexpr std::chrono::milliseconds kRaidRawFalseGraceMs{ 12000 };
     /** Soft draw-ready if not all three caches fill (solo / empty pocket). */
     static constexpr std::chrono::milliseconds kEspCacheReadySoftMs{ 12000 };
     static constexpr int kPartyMinPlayers{ 3 };
 
     std::chrono::steady_clock::time_point m_raidFalseSince{};
+    /** Last time the world pointer resolved non-zero (CheckWorldTransition).
+     *  HandleWorldLost uses it to hold through transient read stalls instead of
+     *  nuking camera + caches on every VMM hiccup (user-visible flicker). */
+    std::chrono::steady_clock::time_point m_lastGoodWorldTime{};
 
     void TickRaidGate();
     void TickEspCacheReadiness();
@@ -492,7 +493,9 @@ public:
     uintptr_t ResolveBoneArray(
         uintptr_t actor,
         uintptr_t primaryMesh,
-        uintptr_t* outBoneMesh = nullptr);
+        uintptr_t* outBoneMesh = nullptr,
+        std::ptrdiff_t* outCtwOffset = nullptr,
+        std::ptrdiff_t* outTransOff = nullptr);
     Vector3 GetBone(int boneIndex, uintptr_t boneArray, FTransform componentToWorld);
 
 public:
@@ -515,7 +518,6 @@ public:
         Vector3 ScreenPos;
 
         std::string ActorName;
-        std::string ClassFName;
 
         bool Drawing = false;
         bool isVisible = false;
@@ -528,10 +530,17 @@ public:
 
         std::string ItemDisplayName;
         std::string ItemType;
+        std::string ClassFName;  // class fname for container keyword matching at draw time
 
         int lootRarityTier = 0;
     int lootValue = 0;
     uint8_t worldCategory = 0;
+    // Extraction hatch state (EExtractionState: 0=Dormant,1=Disabled,2=Broken,
+    // 3=Closed,4=Closing,5=Requested,6=Arriving,7=Ready). -1 = not a hatch.
+    int8_t extractState = -1;
+    // Bots: spawn-cluster group # (Snitch summon waves / patrol spawns).
+    // Drawn on ESP as "G#" under the skeleton. 0 = unassigned.
+    int groupId = 0;
     // Cached opened-state for containers: avoids uncached DMA reads in
     // FinalizeWorldCacheMap.  -1 = not probed yet, 0 = closed, 1 = opened.
     int8_t cachedOpened = -1;
@@ -561,7 +570,6 @@ public:
     struct EspFrameWorld {
         uintptr_t actorKey = 0;
         WorldCacheEntry entry{};
-        std::string robotLabel;  // pre-resolved in frame builder (DMA ok), used by paint thread
     };
 
     struct EspRenderFrame {
@@ -570,10 +578,17 @@ public:
         std::vector<EspFrameWorld> world;
         std::vector<EspFrameWorld> robots;
         uint64_t frameSeq = 0;
+        // Steady ms when this frame was collected. Paint continues the
+        // velocity lead from here so skeletons/boxes do not swim behind
+        // during the collect→present gap.
+        uint64_t collectStampMs = 0;
         bool valid = false;
     };
 
-    EspRenderFrame m_lastEspFrame{};
+    // Published as an immutable snapshot. Consumers copy the shared_ptr (no
+    // deep copy); the 250Hz aim thread was previously memcpy'ing the whole
+    // frame twice per tick (~100MB/s churn) plus one copy per paint.
+    std::shared_ptr<const EspRenderFrame> m_espFrameShared;
     mutable std::shared_mutex m_espFrameMutex;
     std::atomic<uint64_t> m_espFrameSeq{ 0 };
 
@@ -762,21 +777,38 @@ public:
         return tryPickupCollider();
     }
 
+    /**
+     * Read the possessed pawn pointer off a controller, trying every known slot:
+     * 0x3F0 (SDK-verified AController.Pawn), 0x3D8 (StateName per SDK — heuristic),
+     * 0x408 (PC::Character — heuristic). A wrong primary slot can no longer zero
+     * PC resolution — callers still apply their own world-position/root gates.
+     */
+    static uintptr_t ReadAcknowledgedPawn(uintptr_t controller)
+    {
+        if (!IsUsableObjectPtr(controller))
+            return 0;
+
+        static const std::ptrdiff_t kPawnOffs[] = {
+            Offsets::AcknowledgedPawn,
+            Offsets::AcknowledgedPawn_Fallback,
+            Offsets::Controller_Character,
+        };
+        for (std::ptrdiff_t off : kPawnOffs) {
+            const uintptr_t pawn = Memory::read_nocache<uintptr_t>(controller + off);
+            if (IsUsableObjectPtr(pawn))
+                return pawn;
+        }
+        return 0;
+    }
+
     static uintptr_t ResolveAcknowledgedPawn(uintptr_t pc)
     {
         if (!IsUsableObjectPtr(pc))
             return 0;
 
-        static const std::ptrdiff_t kPawnOffs[] = {
-            Offsets::AcknowledgedPawn
-        };
-        for (std::ptrdiff_t off : kPawnOffs) {
-            const uintptr_t pawn = Memory::read_nocache<uintptr_t>(pc + off);
-            if (!IsUsableObjectPtr(pawn))
-                continue;
-            if (ResolveActorRoot(pawn))
-                return pawn;
-        }
+        const uintptr_t pawn = ReadAcknowledgedPawn(pc);
+        if (pawn && ResolveActorRoot(pawn))
+            return pawn;
         return 0;
     }
 
@@ -899,18 +931,32 @@ public:
         return value;
     }
 
-    /** Read health directly from the HealthComponent — NaN on read failure so
-     *  callers distinguish "unreadable" from "dead"; the old wrapper returned
-     *  0.0, which made a flaky read look like health 0 and ghost-evicted
-     *  live players. */
+    /** PioneerPlayerState+0x530 is bIsInEncounter — never use as HP. */
+    static double ReadPlayerStatWithHealthFallback(
+        uintptr_t actor,
+        std::ptrdiff_t psOff,
+        std::ptrdiff_t compOff)
+    {
+        (void)psOff;
+        if (!actor)
+            return std::numeric_limits<double>::quiet_NaN();
+
+        const double hcValue = ReadHealthComponentStat(actor, compOff);
+        if (std::isfinite(hcValue) && hcValue >= 0.0 && hcValue < 100000.0)
+            return hcValue;
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
     double get_health(uintptr_t actor)
     {
-        return ReadHealthComponentStat(actor, Offsets::Health);
+        return ReadPlayerStatWithHealthFallback(
+            actor, Offsets::PlayerState_Health, Offsets::Health);
     }
 
     double get_maxhealth(uintptr_t actor)
     {
-        return ReadHealthComponentStat(actor, Offsets::MaxHealth);
+        return ReadPlayerStatWithHealthFallback(
+            actor, Offsets::PlayerState_MaxHealth, Offsets::MaxHealth);
     }
 
     double get_armor(uintptr_t actor)
@@ -986,19 +1032,6 @@ public:
 
 public:
     std::unordered_set<std::string> robotsList = kRobotsList;
-    // DiscoverNewBotType inserts on the robot scan thread while the aim thread,
-    // frame builder and draw paths read robotsList concurrently. An unordered
-    // set insert can rehash and invalidate iterators mid-iteration (UB/crash).
-    mutable std::shared_mutex m_robotsListMutex;
-
-    bool IsKnownRobotType(const std::string& label) const {
-        std::shared_lock<std::shared_mutex> lock(m_robotsListMutex);
-        return robotsList.contains(label);
-    }
-    void RegisterRobotType(const std::string& label) {
-        std::unique_lock<std::shared_mutex> lock(m_robotsListMutex);
-        robotsList.insert(label);
-    }
 public:
     class FNameCache {
     private:

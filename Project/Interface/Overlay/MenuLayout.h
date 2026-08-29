@@ -13,6 +13,11 @@ constexpr ImGuiColorEditFlags kColorFlags =
 
 float ContentWrapX();
 void Label(const char* text);
+void HoverableText(const char* text);
+void HoverableTextF(const char* fmt, ...);
+void HoverableTextColoredF(const ImVec4& color, const char* fmt, ...);
+bool LastLabelRect(ImVec2* outMin, ImVec2* outMax);
+void ResetHoverState();
 void PushControlWidth();
 bool SliderFloat(
     const char* label,

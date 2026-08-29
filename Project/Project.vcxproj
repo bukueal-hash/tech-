@@ -77,11 +77,15 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <OutDir>$(SolutionDir)\Build\</OutDir>
-    <IntDir>$(SolutionDir)\Build\Intermediate\</IntDir>
+    <!-- IntDir on the NVMe (C:) — the PNY SATA SSD on F: flaked under sustained
+         obj/tlog writes (C1083 Invalid argument / MSB6003 user-mapped section).
+         $(LOCALAPPDATA) resolves to the OS drive without admin rights. -->
+    <IntDir>$(LOCALAPPDATA)\ARCsBuild\Intermediate\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <OutDir>$(SolutionDir)\Build\</OutDir>
-    <IntDir>$(SolutionDir)\Build\Intermediate\</IntDir>
+    <!-- IntDir on the NVMe (C:) — see Debug note above. -->
+    <IntDir>$(LOCALAPPDATA)\ARCsBuild\Intermediate\</IntDir>
     <TargetName>ArcRaiders</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
@@ -181,10 +185,10 @@
     <ClCompile Include="Functions\RobotList.cpp" />
     <ClCompile Include="Functions\World.cpp" />
     <ClCompile Include="Functions\BoneList.cpp" />
-    <ClCompile Include="Functions\CollisionVis.cpp" />
     <ClCompile Include="Functions\Esp.cpp" />
     <ClCompile Include="Functions\Aimbot.cpp" />
     <ClCompile Include="Core\SessionLog.cpp" />
+    <ClCompile Include="Core\CrashHandler.cpp" />
     <ClCompile Include="Core\AssetNames.cpp" />
     <ClCompile Include="Core\WorldItemCategory.cpp" />
     <ClCompile Include="Functions\Update.cpp" />
@@ -223,6 +227,9 @@
     <ClCompile Include="ThirdParty\ImGui\imgui_widgets.cpp" />
     <!-- Entry point -->
     <ClCompile Include="Project.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="app.rc" />
   </ItemGroup>
   <ItemGroup>
     <!-- Core -->
@@ -268,6 +275,7 @@
     <ClInclude Include="Interface\Utils\AutoConfig.h" />
     <ClInclude Include="Interface\Utils\Variables\index.h" />
     <ClInclude Include="Interface\Utils\Visuals\visuals.hpp" />
+    <!-- Functions -->
     <!-- ThirdParty (ImGui) -->
     <ClInclude Include="ThirdParty\ImGui\imconfig.h" />
     <ClInclude Include="ThirdParty\ImGui\imgui.h" />

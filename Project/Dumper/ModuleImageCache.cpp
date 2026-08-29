@@ -5,8 +5,10 @@
 #include "../DMA/Memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <sstream>
+#include <thread>
 
 namespace Dumper {
 
@@ -179,52 +181,128 @@ bool ModuleImageCache::Load(uint64_t moduleBase, uint32_t imageSize, DumperState
     size_t bytesRead = 0;
     size_t pageFaults = 0;
 
-    for (size_t offset = 0; offset < range.size; offset += kPageSize) {
+    // Warm-start-in-raid failure mode: the game streams the map while the
+    // cache is read, DMA returns the image partially unreadable (observed
+    // 38/67MB, 7083 bad pages, 56%) — sig scans then miss the FName
+    // block-mask / GUObject patterns and name decryption stays broken for
+    // the WHOLE session (everything classifies as Crate). Contention settles
+    // within seconds, so retry with a best-attempt strategy instead of
+    // accepting the first degraded read.
+    constexpr int kMaxReadAttempts = 4;
+    constexpr double kGoodReadablePct = 80.0;
+    std::vector<uint8_t> bestData;
+    size_t bestBytesRead = 0;
+    double prevPct = -1.0;
+
+    for (int attempt = 1; attempt <= kMaxReadAttempts; ++attempt) {
+        if (attempt > 1) {
+            std::ostringstream oss;
+            oss << "Module cache: retry " << attempt << "/" << kMaxReadAttempts
+                << " (previous read degraded)";
+            state.AppendLog(oss.str());
+            std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+        }
         if (state.IsCancelRequested())
             return false;
 
-        const size_t pageLen = (std::min)(kPageSize, static_cast<size_t>(range.size) - offset);
-        DWORD cbRead = 0;
-        const BOOL ok = VMMDLL_MemReadEx(
-            h,
-            pid,
-            moduleBase + range.startRva + offset,
-            data_.data() + offset,
-            static_cast<DWORD>(pageLen),
-            &cbRead,
-            VMMDLL_FLAG_NOCACHE);
+        std::fill(data_.begin(), data_.end(), 0);
+        bytesRead = 0;
+        pageFaults = 0;
 
-        if (ok && cbRead > 0) {
-            bytesRead += cbRead;
-            if (cbRead < pageLen)
-                std::memset(data_.data() + offset + cbRead, 0, pageLen - cbRead);
-        } else {
-            ++pageFaults;
-            std::memset(data_.data() + offset, 0, pageLen);
+        for (size_t offset = 0; offset < range.size; offset += kPageSize) {
+            if (state.IsCancelRequested())
+                return false;
+
+            const size_t pageLen = (std::min)(kPageSize, static_cast<size_t>(range.size) - offset);
+            DWORD cbRead = 0;
+            const BOOL ok = VMMDLL_MemReadEx(
+                h,
+                pid,
+                moduleBase + range.startRva + offset,
+                data_.data() + offset,
+                static_cast<DWORD>(pageLen),
+                &cbRead,
+                VMMDLL_FLAG_NOCACHE);
+
+            if (ok && cbRead > 0) {
+                bytesRead += cbRead;
+                if (cbRead < pageLen)
+                    std::memset(data_.data() + offset + cbRead, 0, pageLen - cbRead);
+            } else {
+                ++pageFaults;
+                std::memset(data_.data() + offset, 0, pageLen);
+            }
+
+            if ((offset / kPageSize) % 256 == 0 || offset + kPageSize >= range.size) {
+                const int pct = static_cast<int>((offset + pageLen) * 20 / range.size);
+                state.SetProgress(pct);
+            }
         }
 
-        if ((offset / kPageSize) % 256 == 0 || offset + kPageSize >= range.size) {
-            const int pct = static_cast<int>((offset + pageLen) * 20 / range.size);
-            state.SetProgress(pct);
+        const double pctReadable = range.size
+            ? (100.0 * static_cast<double>(bytesRead) / static_cast<double>(range.size)) : 0.0;
+
+        std::ostringstream summary;
+        summary << "Module cache: read (attempt " << attempt << "/" << kMaxReadAttempts
+                << ") " << bytesRead << " / " << range.size
+                << " bytes (" << pageFaults << " bad pages, "
+                << static_cast<int>(pctReadable) << "% readable)";
+        state.AppendLog(summary.str());
+
+        // Track the best attempt by byte coverage — a later retry that reads
+        // more of the image replaces the kept buffer.
+        if (bytesRead > bestBytesRead) {
+            bestBytesRead = bytesRead;
+            bestData = data_;
         }
+
+        const bool goodEnough = pctReadable >= kGoodReadablePct;
+        const bool stable = prevPct >= 0.0
+            && (pctReadable - prevPct) < 1.0 && (prevPct - pctReadable) < 1.0;
+        prevPct = pctReadable;
+        if (goodEnough || stable)
+            break;
     }
 
-    const double pctReadable = range.size
-        ? (100.0 * static_cast<double>(bytesRead) / static_cast<double>(range.size)) : 0.0;
+    // Best attempt wins.
+    if (!bestData.empty())
+        data_ = std::move(bestData);
 
-    std::ostringstream summary;
-    summary << "Module cache: read " << bytesRead << " / " << range.size
-            << " bytes (" << pageFaults << " bad pages, "
-            << static_cast<int>(pctReadable) << "% readable)";
-    state.AppendLog(summary.str());
+    {
+        // Recompute final stats for the kept buffer.
+        size_t kept = 0;
+        for (size_t offset = 0; offset < range.size; offset += kPageSize) {
+            const size_t pageLen = (std::min)(kPageSize, static_cast<size_t>(range.size) - offset);
+            bool nonZero = false;
+            for (size_t i = 0; i < pageLen; i += 64) {
+                if (*reinterpret_cast<const uint64_t*>(data_.data() + offset + i) != 0) {
+                    nonZero = true;
+                    break;
+                }
+            }
+            if (nonZero)
+                kept += pageLen;
+        }
+        bytesRead = kept;
+        const double pctReadable = range.size
+            ? (100.0 * static_cast<double>(bytesRead) / static_cast<double>(range.size)) : 0.0;
 
-    if (bytesRead < kMinBytesForSigScan) {
-        state.AppendLog("Module cache: too few bytes read for sig scan");
-        return false;
-    }
-    if (peOk && bytesRead < kMinReadableBytes && pctReadable < 80.0 && range.startRva != 0) {
-        state.AppendLog("Module cache: readable ratio below 80% threshold");
-        return false;
+        std::ostringstream summary;
+        summary << "Module cache: final image " << bytesRead << " / " << range.size
+                << " bytes (" << static_cast<int>(pctReadable) << "% readable)";
+        state.AppendLog(summary.str());
+
+        if (bytesRead < kMinBytesForSigScan) {
+            state.AppendLog("Module cache: too few bytes read for sig scan");
+            return false;
+        }
+        // Gate no longer depends on peOk — the warm-start failure had peOk
+        // false, which silently DISABLED this check and let a 56% image
+        // through to sig scan.
+        if (pctReadable < kGoodReadablePct * 0.75 && range.startRva != 0) {
+            state.AppendLog("Module cache: readable ratio far below threshold after retries");
+            return false;
+        }
     }
 
     baseVa_ = moduleBase + range.startRva;

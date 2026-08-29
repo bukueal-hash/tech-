@@ -10,6 +10,7 @@
 #include <Windows.h>
 
 #include <nlohmann/json.hpp>
+#include "ItemMetaParser.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -45,6 +46,12 @@ std::unordered_map<std::string, std::string> g_assetIdToName;
 std::unordered_map<std::string, std::string> g_assetIdToDisplay;
 std::unordered_map<std::string, std::string> g_nameToAssetId;
 
+// Every display name the game's own tables know (loc + asset + asset-id).
+// Used to validate DMA hover-name reads: FName/string decrypt sludge can pass
+// the shape checks (plausible/garbled) but is never a real game name — this
+// is the fix for "items with a random name instead of the item name".
+std::unordered_set<std::string> g_knownDisplayLower;
+
 struct WorldObjPattern {
     std::string token;
     std::string display;
@@ -71,6 +78,10 @@ struct EnemyBotPattern {
 std::vector<EnemyBotPattern> g_enemyBotPatterns;
 std::unordered_map<std::string, std::string> g_mapsById;
 std::unordered_map<std::string, std::string> g_botClassTokenMap;
+// Normalized display names of quest objective items (ST_ItemNames_QuestItems
+// keys + DA_Item_Salvage_Quest_* CSV rows). The ESP draws these gold with a
+// star and an extended range so they stand out from ordinary loot.
+std::unordered_set<std::string> g_questItemNames;
 
 std::string NormalizePlainKey(std::string s);
 bool IsBlockedFnameToken(const std::string& token);
@@ -384,6 +395,15 @@ void RegisterLocEntry(const std::string& key, const std::string& value)
         return;
     }
 
+    // Quest objective items (ID_ITEMNAMES_QUESTITEM_* from
+    // ST_ItemNames_QuestItems.json) — their display names feed the quest set.
+    if (upper.rfind("ID_ITEMNAMES_QUESTITEM_", 0) == 0) {
+        const std::string key = NormalizePlainKey(value);
+        if (!key.empty())
+            g_questItemNames.insert(key);
+        return;
+    }
+
     if (upper.find("ID_WORLDOBJECT") != 0)
         return;
 
@@ -413,13 +433,9 @@ void FinalizeWorldObjectPatterns()
 
 int RarityToTier(const std::string& rarityRaw)
 {
-    const std::string rarity = ToLowerCopy(TrimCopy(rarityRaw));
-    if (rarity == "common") return 1;
-    if (rarity == "uncommon") return 2;
-    if (rarity == "rare") return 3;
-    if (rarity == "epic") return 4;
-    if (rarity == "legendary") return 5;
-    return 0;
+    // Pure logic lives in Core/ItemMetaParser.hpp (Pillar 1 extraction —
+    // Project.Tests locks it).
+    return ItemMetaParser::RarityToTier(rarityRaw);
 }
 
 std::string UnescapeJsonString(const std::string& raw)
@@ -544,6 +560,13 @@ bool LoadAssetIndexCsv(const std::string& path)
             g_assetByName[assetName] = displayName;
             RegisterFnameAssetPattern(assetName, displayName);
             RegisterEnemyBotFromAssetName(assetName, displayName);
+            // DA_Item_Salvage_Quest_* — quest objective items.
+            if (assetName.find("Salvage_Quest") != std::string::npos
+                || assetName.find("Quest_") != std::string::npos) {
+                const std::string key = NormalizePlainKey(displayName);
+                if (!key.empty())
+                    g_questItemNames.insert(key);
+            }
         }
 
         if (!worldCategory.empty() && !displayName.empty()) {
@@ -717,24 +740,11 @@ bool LoadItemsMetaJson(const std::string& path)
 
     size_t loaded = 0;
     for (const auto& row : doc) {
-        if (!row.is_object())
+        const auto parsed = ItemMetaParser::ParseRow(row);
+        if (!parsed)
             continue;
-
-        const std::string name = row.value("name", std::string{});
-        const std::string rarity = row.value("rarity", std::string{});
-        int value = 0;
-        if (row.contains("value") && row["value"].is_number())
-            value = row["value"].get<int>();
-        const std::string metaId = row.value("id", std::string{});
-        const std::string assetName = row.value("asset", std::string{});
-        if (name.empty())
-            continue;
-
-        const int tier = RarityToTier(rarity);
-        if (tier <= 0)
-            continue;
-
-        RegisterMetaEntry(name, metaId, assetName, tier, value);
+        RegisterMetaEntry(parsed->name, parsed->id, parsed->asset,
+                          parsed->tier, parsed->value);
         ++loaded;
     }
 
@@ -966,6 +976,18 @@ bool AssetNamesInit()
     const bool botsItemsMapsOk =
         LoadBotsItemsMapsJson(dataDir + "Bots_Items_Maps\\en.json");
     LinkMetaByDisplayToAssets();
+
+    // Build the display-name vocabulary after all tables are loaded.
+    for (const auto& kv : g_assetIdToDisplay)
+        if (kv.second.size() >= 2)
+            g_knownDisplayLower.insert(ToLowerCopy(kv.second));
+    for (const auto& kv : g_assetByName)
+        if (kv.second.size() >= 2)
+            g_knownDisplayLower.insert(ToLowerCopy(kv.second));
+    for (const auto& kv : g_locByKey)
+        if (kv.second.size() >= 2)
+            g_knownDisplayLower.insert(ToLowerCopy(kv.second));
+
     FinalizeWorldObjectPatterns();
     FinalizeAssetWorldPropPatterns();
     FinalizeFnameAssetPatterns();
@@ -1037,6 +1059,14 @@ std::string LookupDisplayByAssetId(int64_t assetId)
     return {};
 }
 
+// SHARED GATE — grep callers before edit
+bool IsKnownItemDisplayName(const std::string& displayName)
+{
+    if (displayName.size() < 2)
+        return false;
+    return g_knownDisplayLower.contains(ToLowerCopy(displayName));
+}
+
 int64_t TryReadItemGameAssetIdFromActor(uint64_t actor)
 {
     if (!actor)
@@ -1058,23 +1088,16 @@ int64_t TryReadItemGameAssetIdFromActor(uint64_t actor)
         if (assetFname.empty())
             return 0;
 
-        // CSV/JSON asset-id values must never throw from a scan thread:
-        // std::invalid_argument / out_of_range would abort the process.
-        auto safeStoll = [](const std::string& s) -> int64_t {
-            try { return std::stoll(s); }
-            catch (...) { return 0; }
-        };
-
         if (auto it = g_nameToAssetId.find(assetFname); it != g_nameToAssetId.end())
-            return safeStoll(it->second);
+            return std::stoll(it->second);
         for (const char* prefix : { "DA_", "WID_" }) {
             const size_t plen = strlen(prefix);
             if (assetFname.size() > plen && assetFname.compare(0, plen, prefix) == 0) {
                 const std::string stripped = assetFname.substr(plen);
                 if (auto it2 = g_nameToAssetId.find(stripped); it2 != g_nameToAssetId.end())
-                    return safeStoll(it2->second);
+                    return std::stoll(it2->second);
                 if (auto it3 = g_nameToAssetId.find(prefix + stripped); it3 != g_nameToAssetId.end())
-                    return safeStoll(it3->second);
+                    return std::stoll(it3->second);
             }
         }
         return 0;
@@ -1206,6 +1229,14 @@ bool LookupAssetWorldPropByFName(
     return false;
 }
 
+bool IsQuestItemDisplayName(const std::string& display)
+{
+    if (display.empty())
+        return false;
+    const std::string key = NormalizePlainKey(display);
+    return !key.empty() && g_questItemNames.find(key) != g_questItemNames.end();
+}
+
 std::string LookupEnemyBotByFName(const std::string& actorFName)
 {
     if (actorFName.empty())
@@ -1294,25 +1325,25 @@ bool IsAcceptedBotEspLabel(
     if (label == "Bot" || label == "Oil")
         return false;
 
-    if (eng.IsKnownRobotType(label))
+    if (eng.robotsList.contains(label))
         return true;
     if (const std::string fromPat = LookupEnemyBotByFName(label); !fromPat.empty()
-        && eng.IsKnownRobotType(fromPat))
+        && eng.robotsList.contains(fromPat))
         return true;
 
     const std::string mapped = LookupEnemyBotDisplayLabel(label);
-    if (!mapped.empty() && eng.IsKnownRobotType(mapped))
+    if (!mapped.empty() && eng.robotsList.contains(mapped))
         return true;
 
     if (!fnameHint.empty()) {
         const std::string fromEntity = eng.getEntityType(fnameHint);
         if (fromEntity != "Invalid" && fromEntity != "ARC"
-            && fromEntity == label && eng.IsKnownRobotType(fromEntity))
+            && fromEntity == label && eng.robotsList.contains(fromEntity))
             return true;
     }
 
     const std::string normalized = NormalizeBotDisplayName(label);
-    if (normalized != label && eng.IsKnownRobotType(normalized))
+    if (normalized != label && eng.robotsList.contains(normalized))
         return true;
 
     return false;
@@ -1324,10 +1355,10 @@ static std::string MapDisplayToRobotType(Engine& eng, const std::string& display
         return {};
     if (const std::string mapped = LookupEnemyBotDisplayLabel(display); !mapped.empty())
         return mapped;
-    if (eng.IsKnownRobotType(display))
+    if (eng.robotsList.contains(display))
         return display;
     if (const std::string fromPat = LookupEnemyBotByFName(display); !fromPat.empty()
-        && eng.IsKnownRobotType(fromPat))
+        && eng.robotsList.contains(fromPat))
         return fromPat;
     return {};
 }

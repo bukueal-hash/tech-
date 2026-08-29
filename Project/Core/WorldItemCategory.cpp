@@ -85,6 +85,11 @@ static const WorldPropTokenEntry kWorldPropTokens[] = {
     { "electricalcabinet", WorldItemCategory::Industrial, "Electrical Cabinet" },
     { "trailercompressor", WorldItemCategory::Industrial, "Trailer Compressor" },
     { "ventmachine", WorldItemCategory::Industrial, "Vent Machine" },
+    { "aircompressor", WorldItemCategory::Industrial, "Air Compressor" },
+    { "analogdisplay", WorldItemCategory::Industrial, "Analog Display" },
+    { "console", WorldItemCategory::Industrial, "Console" },
+    { "server", WorldItemCategory::Industrial, "Server" },
+    { "machine", WorldItemCategory::Industrial, "Machine" },
     { "filingcabinet", WorldItemCategory::Furniture, "Filing Cabinet" },
     { "weaponsrack", WorldItemCategory::Furniture, "Weapons Rack" },
     { "weaponrack", WorldItemCategory::Furniture, "Weapon Rack" },
@@ -93,6 +98,9 @@ static const WorldPropTokenEntry kWorldPropTokens[] = {
     { "patrolcar", WorldItemCategory::Vehicles, "Patrol Car" },
     { "patrol_car", WorldItemCategory::Vehicles, "Patrol Car" },
     { "truckutility", WorldItemCategory::Vehicles, "Truck Utility" },
+    { "car", WorldItemCategory::Vehicles, "Car" },
+    { "bus", WorldItemCategory::Vehicles, "Bus" },
+    { "truck", WorldItemCategory::Vehicles, "Truck" },
     { "crashedarcprobe", WorldItemCategory::Probe, "Crashed ARC Probe" },
     { "arcprobe", WorldItemCategory::Probe, "ARC Probe" },
     { "burieddetectable", WorldItemCategory::Buried, "Buried Loot" },
@@ -144,6 +152,15 @@ static const WorldPropTokenEntry kWorldPropTokens[] = {
     { "drawer", WorldItemCategory::Furniture, "Drawer" },
     { "desk", WorldItemCategory::Furniture, "Desk" },
     { "closet", WorldItemCategory::Furniture, "Closet" },
+    { "cupboardcafe", WorldItemCategory::Furniture, "Cupboard" },
+    { "fridge", WorldItemCategory::Furniture, "Fridge" },
+    { "refrigerator", WorldItemCategory::Furniture, "Refrigerator" },
+    { "freezer", WorldItemCategory::Furniture, "Freezer" },
+    { "shelf", WorldItemCategory::Furniture, "Shelf" },
+    { "walladd", WorldItemCategory::Furniture, "Wall Add" },
+    { "suitcase", WorldItemCategory::Furniture, "Suitcase" },
+    { "briefcase", WorldItemCategory::Furniture, "Briefcase" },
+    { "tvunit", WorldItemCategory::Furniture, "TV Unit" },
     { "cooler", WorldItemCategory::Crate, "Cooler" },
     { "icebox", WorldItemCategory::Crate, "Cooler" },
     { "backpack", WorldItemCategory::Backpack, "Backpack" },
@@ -276,7 +293,12 @@ WorldItemCategory ClassifySocketSalvageContainerFromFname(const std::string& fna
         cat != WorldItemCategory::Invalid)
         return cat;
 
-    return WorldItemCategory::Crate;
+    // Unknown subtype (Car, Console, Shelf, ...): do NOT collapse to Crate here.
+    // Fall through to ClassifyWorldActor so the display-label token pass can
+    // classify it (BP_SocketContainer_* names verified in the SDK help.txt dump).
+    // Generic bare containers still land on Crate via the socketcontainer
+    // catch-all in ClassifyWorldActor.
+    return WorldItemCategory::Invalid;
 }
 
 static bool IsSpokenNumberWord(const std::string& wordLower)
@@ -471,6 +493,18 @@ std::string ResolveSocketContainerDisplayName(const std::string& fname)
         { "barricade", "Barricade" },
         { "archusk", "Arc Husk" },
         { "truckutility", "Truck Utility" },
+        { "aircompressor", "Air Compressor" },
+        { "analogdisplay", "Analog Display" },
+        { "console", "Console" },
+        { "shelf", "Shelf" },
+        { "walladd", "Wall Add" },
+        { "suitcase", "Suitcase" },
+        { "briefcase", "Briefcase" },
+        { "tvunit", "TV Unit" },
+        { "car", "Car" },
+        { "bus", "Bus" },
+        { "truck", "Truck" },
+        { "machine", "Machine" },
         { "machinem", "Machine" },
         { "doorright", "Machine" },
     };
@@ -824,8 +858,34 @@ const char* WorldItemCategoryLabel(WorldItemCategory cat)
     case WorldItemCategory::Buried: return "Buried Loot";
     case WorldItemCategory::DeadDrop: return "Dead Drop";
     case WorldItemCategory::OpenedContainer: return "Open Container";
+    case WorldItemCategory::Hatch: return "Hatch";
+    case WorldItemCategory::QuestItem: return "Quest Item";
     default: return "Unknown";
     }
+}
+
+// SHARED GATE — grep callers before edit
+bool FnameLooksLikeExtractionHatch(const std::string& fnameOrDisplay)
+{
+    if (fnameOrDisplay.size() < 10)
+        return false;
+    std::string lower;
+    lower.reserve(fnameOrDisplay.size());
+    for (char c : fnameOrDisplay)
+        lower.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(c))));
+    // Exact display name for the Barron extraction hatch. Keep this exact
+    // so ordinary containers with "hatch" in their names are not promoted.
+    if (lower == "barron hatch")
+        return true;
+    // Real extraction points: BP_SalvageExtractionPoint_Hatch_C family.
+    // Bare "hatch" ALSO matches Raider Hatch keys, Hatchling charms and
+    // hatch props — those are items/containers, never extraction points,
+    // and were the cause of containers painting as "Hatch".
+    if (lower.find("extractionpoint") != std::string::npos)
+        return true;
+    return lower.find("extraction") != std::string::npos
+        && lower.find("hatch") != std::string::npos;
 }
 
 std::string ContainerCategoryFallbackEspLabel(WorldItemCategory cat)
@@ -854,6 +914,8 @@ std::string ContainerCategoryFallbackEspLabel(WorldItemCategory cat)
     case WorldItemCategory::DeadDrop:           return "Dead Drop";
     case WorldItemCategory::Corpse:             return "Dead Body";
     case WorldItemCategory::OpenedContainer:    return "Open Container";
+    case WorldItemCategory::Hatch:              return "Hatch";
+    case WorldItemCategory::QuestItem:          return "Quest Item";
     default:                                    return "Container";
     }
 }
@@ -939,6 +1001,7 @@ bool WorldCategoryIsContainerProp(WorldItemCategory cat)
     case WorldItemCategory::Buried:
     case WorldItemCategory::DeadDrop:
     case WorldItemCategory::OpenedContainer:
+    case WorldItemCategory::Hatch:
         return true;
     default:
         return false;
@@ -973,6 +1036,10 @@ static bool CategoryRowUsesSp(WorldItemCategory cat)
 
 float WorldCategoryMaxDrawMeters(WorldItemCategory cat)
 {
+    // Quest items ignore the loot slider — they always draw from far away so
+    // objectives pop in before normal loot even renders.
+    if (cat == WorldItemCategory::QuestItem)
+        return 150.f;
     // Per-row SP: unchecked = loot_distance, checked = container_distance_sp.
     return CategoryRowUsesSp(cat)
         ? var::container_distance_sp
@@ -1190,6 +1257,7 @@ const char* WorldItemCategoryConfigSuffix(WorldItemCategory cat)
     case WorldItemCategory::Buried: return "buried";
     case WorldItemCategory::DeadDrop: return "deaddrop";
     case WorldItemCategory::OpenedContainer: return "open_container";
+    case WorldItemCategory::Hatch: return "hatch";
     default: return nullptr;
     }
 }
@@ -1305,6 +1373,12 @@ WorldItemCategory ClassifyWorldActor(const std::string& fnameLower, const std::s
         return WorldItemCategory::Safe;
     if (Contains(f, "vault") || Contains(d, "vault"))
         return WorldItemCategory::Safe;
+
+    // Extraction hatches are world props, not bots. Requires the extraction
+    // signal — bare "hatch" matched Raider Hatch keys / hatch props and
+    // painted regular containers as extraction points.
+    if (FnameLooksLikeExtractionHatch(f) || FnameLooksLikeExtractionHatch(d))
+        return WorldItemCategory::Hatch;
 
     if (Contains(d, "ammo") || Contains(f, "ammo") || Contains(f, "ammobox") || Contains(f, "ammo_box"))
         return WorldItemCategory::Ammo;
@@ -2012,6 +2086,11 @@ bool IsJunkWorldEspLabel(const std::string& label)
         // BP_InWorldPingObject_C drew as "In Ping Object".
         "scene root",
         "ping object",
+        // SubSystemAction DataAssets (base-building UI actions, not items).
+        "pioneer ping",
+        "emote ui",
+        "quick slot",
+        "selfie angle",
         "friendifier",
     };
     for (const char* token : kBlocked) {
@@ -2766,6 +2845,8 @@ uint32_t WorldCategoryLabelColor(WorldItemCategory cat)
         return EspDraw::ColorFromRGBA(var::color_world_deaddrop);
     case WorldItemCategory::OpenedContainer:
         return EspDraw::ColorFromRGBA(var::color_world_open_container);
+    case WorldItemCategory::Hatch:
+        return EspDraw::ColorFromRGBA(var::color_hatches);
     default:
         return EspDraw::ColorFromRGBA(var::color_loot);
     }
@@ -2791,6 +2872,10 @@ uint32_t RarityTierColor(int lootTier)
 
 uint32_t WorldLootLabelColor(WorldItemCategory cat, int lootTier, bool isPickup)
 {
+    // Quest items are always gold, regardless of rarity-color mode — this is
+    // what makes them stand out from the loot wall.
+    if (cat == WorldItemCategory::QuestItem)
+        return (0xFFu << 24) | (0x3Cu << 16) | (0xC8u << 8) | 0xFFu; // gold
     if (isPickup) {
         if (var::loot_rarity_color && lootTier > 0)
             return RarityTierColor(lootTier);
@@ -2897,6 +2982,12 @@ bool WorldCategoryEnabled(int category)
         return var::show_world_deaddrop;
     case WorldItemCategory::OpenedContainer:
         return var::show_world_open_container;
+    case WorldItemCategory::Hatch:
+        return var::showHatches;
+    case WorldItemCategory::QuestItem:
+        // Quest objective items draw whenever loot/items ESP is on — they are
+        // ground pickups (DA_Item_Salvage_Quest_*), never player/bot ESP.
+        return var::droppedItems || var::show_world_items;
     default:
         return false;
     }

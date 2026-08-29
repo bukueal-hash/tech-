@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>A++ Engineering Plan — Six Pillars</title>
+<style>
+body{margin:0;background:#0d1117;color:#e6edf3;font:15px/1.55 system-ui,Segoe UI,sans-serif}
+main{max-width:980px;margin:0 auto;padding:32px}
+h1{margin:0 0 10px;color:#7ee787}
+h2{margin-top:30px;color:#79c0ff}
+h3{color:#d2a8ff;margin-top:20px}
+.sub{color:#8b949e;line-height:1.7}.bar{height:14px;background:#21262d;border-radius:8px;overflow:hidden;margin:18px 0 28px}
+.fill{height:100%;width:18%;background:linear-gradient(90deg,#3fb950,#7ee787)}
+section{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:18px 20px;margin:14px 0}
+.item{margin:12px 0;line-height:1.6}.eta{color:#d29922;font-size:13px}code{color:#a5d6ff;background:#21262d;padding:2px 6px;border-radius:4px}table{width:100%;border-collapse:collapse;margin:10px 0}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #30363d;font-size:14px}th{color:#79c0ff;font-weight:600}.ok{color:#3fb950}.warn{color:#d29922}.bad{color:#f85149}a{color:#79c0ff}ul{margin:8px 0 10px 0;padding-left:22px}li{margin:6px 0}li > ul{margin-top:8px;margin-bottom:4px;padding-left:20px}
+</style>
+</head>
+<body><main>
+<h1>A++++ Engineering Plan — Six Pillars</h1>
+<div class="sub"><b>Progress: 0 / 6 pillars complete — foundational quality work in progress across build hygiene and test discipline</b><br>
+Goal: take the project from a working but fragile B/B+ state to an A++++ standard where a senior engineer can clone the repo, run one command, get a green build, pass the test suite, and never fight leaked artifacts, undocumented assumptions, or brittle runtime behavior.</div>
+<div class="bar"><div class="fill"></div></div>
+
+<h2>Pillar 1 — Clean, reproducible build</h2>
+<section>
+<div class="item"><b>Why it comes first:</b> without a clean build, CI cannot be trusted, refactors become dangerous, and repo hygiene collapses under artifact drift.</div>
+<ul>
+<li>☑ Remove tracked artifact trees from version control and keep them ignored.</li>
+<li>☑ Move large runtime dumps and generated logs out of tracked workspace paths.</li>
+<li>☑ Consolidate the build flow through one script with explicit modes: build, run, test, package, and full rebuild.</li>
+<li>☐ Enforce a single warning policy for project sources through Directory.Build.props.</li>
+<li>☐ Keep third-party dependencies on a separate warning policy to avoid vendored-library noise.</li>
+<li>☐ Move outputs to a single out/ directory and block repo-root artifact writes.</li>
+</ul>
+<div class="item"><span class="ok">Done when:</span> a clean checkout plus one build command yields a green build and a clean git status.</div>
+</section>
+
+<h2>Pillar 2 — Test coverage for the real logic</h2>
+<section>
+<div class="item"><b>Why this is the highest leverage move:</b> the project’s deterministic logic is exactly where a test gate pays off the fastest: math, decode paths, parser safety, and world-state validation.</div>
+<ul>
+<li>☑ Add a dedicated test project without DMA or game-runtime dependencies.</li>
+<li>☑ Build a memory-read seam so the FName decode path can be exercised with a synthetic memory image.</li>
+<li>☑ Cover the most valuable logic areas:
+<ul>
+<li>vector and matrix math</li>
+<li>bone transforms and aim-smoothing math</li>
+<li>JSON parsing and fuzz safety</li>
+<li>SteamDecrypt and FName decode</li>
+</ul>
+</li>
+<li>☐ Add synthetic raycast and world-projection cases for visibility logic.</li>
+<li>☐ Add coverage measurement and a minimum threshold for pure logic.</li>
+<li>☑ Make the test runner part of the project build flow.</li>
+</ul>
+<div class="item"><span class="ok">Done when:</span> the test command is required for green builds and pure-logic coverage hits a meaningful target.</div>
+</section>
+
+<h2>Pillar 3 — CI as enforcement, not decoration</h2>
+<section>
+<div class="item"><b>Why this matters:</b> the overlay cannot run in CI, but the project can still enforce compile correctness, tests, and hygiene using a Windows runner.</div>
+<ul>
+<li>☐ Add a GitHub Actions Windows pipeline for release build and test execution.</li>
+<li>☐ Fail on any nonzero exit from the test binary.</li>
+<li>☐ Fail if git status is dirty after build/test.</li>
+<li>☐ Add a static analysis pass with a staged warning gate.</li>
+<li>☐ Publish build, test, and hygiene badges in the README.</li>
+</ul>
+<div class="item"><span class="ok">Done when:</span> every push or pull request shows a clear green compile-and-test signal.</div>
+</section>
+
+<h2>Pillar 4 — Defensive coding and crash hygiene</h2>
+<section>
+<div class="item"><b>Why:</b> the project already includes a crash handler and session logs, which is a strong foundation. What is missing is systematic hardening and reliable diagnostics.</div>
+<ul>
+<li>☐ Wrap timer setup in RAII so every Begin has a matching End.</li>
+<li>☐ Centralize memory reads behind a checked interface that validates bounds and alignment.</li>
+<li>☐ Add bounded retry/backoff logic for hardware and serial communication paths.</li>
+<li>☐ Extend crash handling to create dump artifacts and structured failure logs.</li>
+<li>☐ Turn on stricter security and bounds checks where the compiler can help.</li>
+</ul>
+<div class="item"><span class="ok">Done when:</span> fuzzed parser input cannot crash the app, and a crash leaves a readable dump and log behind.</div>
+</section>
+
+<h2>Pillar 5 — Architecture clarity</h2>
+<section>
+<div class="item"><b>Why:</b> the project has grown through multiple passes and feature-specific additions; it now needs a single documented operating model instead of implicit assumptions.</div>
+<ul>
+<li>☐ Write a project architecture note covering the full update path: read → decode → model → render.</li>
+<li>☐ Define one explicit entity model and pass ordering for update logic.</li>
+<li>☐ Replace the worst global-state patterns with explicit runtime containers.</li>
+<li>☐ Refactor in small, build-safe stages rather than one risky rewrite.</li>
+</ul>
+<div class="item"><span class="ok">Done when:</span> a new engineer can trace one entity from memory read to render without hunting through unrelated modules.</div>
+</section>
+
+<h2>Pillar 6 — Documentation and process discipline</h2>
+<section>
+<div class="item"><b>Why:</b> a project this complex is only safe if the process is as clear as the code. Strong documentation culture is already present; the work is to formalize it.</div>
+<ul>
+<li>☐ Add a README with purpose, one-command build, and test flow.</li>
+<li>☐ Add a changelog and conventional commit guidance.</li>
+<li>☐ Enforce a pre-commit checklist: clean status, pass tests, no tracked artifacts.</li>
+<li>☐ Keep plans in docs/ and archive completed work so the project history stays readable.</li>
+</ul>
+<div class="item"><span class="ok">Done when:</span> a stranger can clone the repo, read the docs, build it, and pass the tests without tribal knowledge.</div>
+</section>
+
+<h2>Execution order and effort</h2>
+<table>
+<tr><th>#</th><th>Pillar</th><th>Effort</th><th>Unlocks</th></tr>
+<tr><td>1</td><td><b>Clean build</b></td><td>1–2 sessions</td><td>everything</td></tr>
+<tr><td>2</td><td><b>Test coverage</b></td><td>3–5 sessions</td><td>CI and safe refactors</td></tr>
+<tr><td>3</td><td><b>CI enforcement</b></td><td>1–2 sessions</td><td>quality gate</td></tr>
+<tr><td>4</td><td><b>Defensive coding</b></td><td>2–3 sessions</td><td>hardening</td></tr>
+<tr><td>5</td><td><b>Architecture clarity</b></td><td>2–4 sessions</td><td>maintainability</td></tr>
+<tr><td>6</td><td><b>Docs and process</b></td><td>1 session</td><td>onboarding</td></tr>
+</table>
+<div class="item"><span class="warn">Total:</span> roughly two weeks of focused work.</div>
+
+<h2>Definition of A++++</h2>
+<section>
+<ul>
+<li>☐ One-command build works from a clean checkout.</li>
+<li>☐ git status stays clean after build and test.</li>
+<li>☐ Test suite is required for green status.</li>
+<li>☐ Line coverage clears a meaningful threshold on pure logic.</li>
+<li>☐ CI enforces compile, tests, and hygiene.</li>
+<li>☐ Runtime errors are logged and dumps are created when needed.</li>
+<li>☐ Docs explain the architecture and the operating model.</li>
+<li>☐ Repeated builds are deterministic and never leak artifacts into the repo.</li>
+</ul>
+</section>
+</main></body></html>

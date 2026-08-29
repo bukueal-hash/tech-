@@ -1,4 +1,5 @@
 #include "../Core/Engine.h"
+#include "../Core/AgentLog.h"
 #include "../Core/ActorType.h"
 #include "../Core/AssetNames.h"
 #include "../Core/Memory.h"
@@ -16,6 +17,7 @@
 #include <cmath>
 #include <cfloat>
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <unordered_set>
 #include <unordered_map>
@@ -25,7 +27,7 @@ extern Engine engine;
 
 namespace {
 
-constexpr size_t kMaxEspFrameBoneReads = 16;
+constexpr size_t kMaxEspFrameBoneReads = 24;
 
 struct WorldEspDebugStats {
     int frameEntries = 0;
@@ -35,64 +37,9 @@ struct WorldEspDebugStats {
     int skipDist = 0;
     int skipProj = 0;
     int skipPickedUp = 0;
-    int drawingFalse = 0;
-    int drawingTrue = 0;
-    int pickedUp = 0;
-    int dupKey = 0;
 };
 
 WorldEspDebugStats g_worldEspDbg{};
-
-// Paint-thread watchdog: records timing but does NOT write to the 280+MB
-// debug log on every frame (that I/O IS the freeze). Timestamps go to a
-// separate tiny ring-buffer file so we can diagnose without the disk stall.
-struct EspPaintWatchScope {
-    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
-    bool frameLockBusy = false;
-    uint64_t frameSeq = 0;
-
-    ~EspPaintWatchScope()
-    {
-        static auto lastEnd = std::chrono::steady_clock::time_point{};
-        static int ringIdx = 0;
-        const auto now = std::chrono::steady_clock::now();
-        const int gapMs = lastEnd.time_since_epoch().count() == 0
-            ? 0
-            : static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                started - lastEnd).count());
-        const int renderMs = static_cast<int>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - started).count());
-        lastEnd = now;
-
-        if (gapMs < 100 && renderMs < 50 && !frameLockBusy)
-            return;
-
-        // Write to a SEPARATE ring-buffer file so we never open
-        // the 280MB debug-c190fb.log from the paint thread.
-        static constexpr int kRingSize = 64;
-        static char ring[kRingSize][256]{};
-        snprintf(ring[ringIdx], sizeof(ring[0]),
-            "esp_paint gapMs=%d renderMs=%d lockBusy=%d seq=%llu\n",
-            gapMs, renderMs, frameLockBusy ? 1 : 0,
-            static_cast<unsigned long long>(frameSeq));
-        ringIdx = (ringIdx + 1) % kRingSize;
-
-        // Flush ring to disk only every 32 writes or on stall
-        static int flushCount = 0;
-        if (++flushCount >= 32 || gapMs > 200 || renderMs > 100) {
-            flushCount = 0;
-            std::ofstream f("F:/Test/ARCs/paint_watch.log", std::ios::trunc);
-            if (f) {
-                for (int i = 0; i < kRingSize; ++i) {
-                    int idx = (ringIdx - kRingSize + i) % kRingSize;
-                    if (idx < 0) idx += kRingSize;
-                    if (ring[idx][0])
-                        f << ring[idx];
-                }
-            }
-        }
-    }
-};
 
 // Clean, human-readable category label for a container. Never empty, never a
 // raw fname or number — used whenever a specific name can't be resolved so a
@@ -222,6 +169,7 @@ bool IsGroundLootEspCategory(WorldItemCategory cat)
     case WorldItemCategory::Medical:
     case WorldItemCategory::Keys:
     case WorldItemCategory::Harvestable:
+    case WorldItemCategory::QuestItem:
         return true;
     default:
         return false;
@@ -352,9 +300,27 @@ static bool CameraOkForEsp(const Engine::CameraCache& cam)
     return IsPlausibleWorldPos(cam.Location);
 }
 
+static int g_camLeadSkips = 0;  // ghost-guard skips, surfaced in [debugCam]
+
+// #region agent log
+// Which camera the paint actually used, and how much rotation lead it got.
+struct RenderCamDebug {
+    const char* src = "none";
+    bool leadApplied = false;
+    bool leadSkipped = false;
+    float leadYaw = 0.f;
+    float leadPitch = 0.f;
+};
+
+// Points that failed with the paint camera and were re-projected with
+// g_Camera instead - two cameras placing entities inside one paint.
+static int g_ghostProjFallback = 0;
+// #endregion
+
 static bool ResolveLiveRenderCamera(
     const Engine::EspRenderFrame& frame,
-    Engine::CameraCache& outCam)
+    Engine::CameraCache& outCam,
+    RenderCamDebug* outDbg = nullptr)
 {
     // Paint path must NOT DMA. TryBuildCameraFromPcmPov stalled Present;
     // worker UpdateCamera publishes g_Camera; frame.camera is the backup.
@@ -373,16 +339,42 @@ static bool ResolveLiveRenderCamera(
                     raw.Rotation.y - s_prevCam.Rotation.y);
                 const float dpitch = static_cast<float>(
                     raw.Rotation.x - s_prevCam.Rotation.x);
-                constexpr float kLead = 0.5f;
-                constexpr float kMaxDeg = 3.5f;
-                float leadYaw = dyaw * kLead;
-                float leadPitch = dpitch * kLead;
-                if (leadYaw > kMaxDeg) leadYaw = kMaxDeg;
-                else if (leadYaw < -kMaxDeg) leadYaw = -kMaxDeg;
-                if (leadPitch > kMaxDeg) leadPitch = kMaxDeg;
-                else if (leadPitch < -kMaxDeg) leadPitch = -kMaxDeg;
-                cam.Rotation.y += leadYaw;
-                cam.Rotation.x += leadPitch;
+                // CAM3: fixed camera-freshness lead. The old 0.35 x paint-delta
+                // lead scaled with the PAINT gap, so its size wobbled frame to
+                // frame and every rate-guard trip popped boxes back (user: ESP
+                // jumps). g_Camera now publishes @8ms on its own HIGHEST-prio
+                // thread, so the true present-time camera is at most ~8ms old.
+                // Lead = yawRate * 8ms sampling window, same every paint for a
+                // given turn speed => smooth, no snap-back. Clamp 0.4 deg.
+                constexpr float kCameraLeadSec = 0.008f;
+                constexpr float kMaxDeg = 0.4f;
+                constexpr float kMaxLeadRateDegPerSec = 320.f;
+                const float yawRate = std::fabs(dyaw) / dtSec;
+                const float pitchRate = std::fabs(dpitch) / dtSec;
+                if (yawRate <= kMaxLeadRateDegPerSec
+                    && pitchRate <= kMaxLeadRateDegPerSec) {
+                    float leadYaw = dyaw * (kCameraLeadSec / dtSec);
+                    float leadPitch = dpitch * (kCameraLeadSec / dtSec);
+                    if (leadYaw > kMaxDeg) leadYaw = kMaxDeg;
+                    else if (leadYaw < -kMaxDeg) leadYaw = -kMaxDeg;
+                    if (leadPitch > kMaxDeg) leadPitch = kMaxDeg;
+                    else if (leadPitch < -kMaxDeg) leadPitch = -kMaxDeg;
+                    cam.Rotation.y += leadYaw;
+                    cam.Rotation.x += leadPitch;
+                    // #region agent log
+                    if (outDbg) {
+                        outDbg->leadApplied = true;
+                        outDbg->leadYaw = leadYaw;
+                        outDbg->leadPitch = leadPitch;
+                    }
+                    // #endregion
+                } else {
+                    ++g_camLeadSkips;
+                    // #region agent log
+                    if (outDbg)
+                        outDbg->leadSkipped = true;
+                    // #endregion
+                }
             }
         }
         s_prevCam = raw;
@@ -394,12 +386,20 @@ static bool ResolveLiveRenderCamera(
         std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
         if (CameraOkForEsp(engine.g_Camera)) {
             outCam = engine.g_Camera;
+            // #region agent log
+            if (outDbg)
+                outDbg->src = "g_Cam";
+            // #endregion
             applyRotExtrap(outCam);
             return true;
         }
     }
     if (frame.valid && CameraOkForEsp(frame.camera)) {
         outCam = frame.camera;
+        // #region agent log
+        if (outDbg)
+            outDbg->src = "FRAME";
+        // #endregion
         applyRotExtrap(outCam);
         return true;
     }
@@ -469,8 +469,17 @@ static bool ProjectWorldEspPoint(
         std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
         liveCam = engine.g_Camera;
     }
-    if (IsUsableCameraFov(liveCam.FOV) && IsPlausibleWorldPos(liveCam.Location))
-        return engine.ProjectWorldLocationToScreen(worldPos, outScreen, liveCam);
+    if (IsUsableCameraFov(liveCam.FOV) && IsPlausibleWorldPos(liveCam.Location)) {
+        const bool ok =
+            engine.ProjectWorldLocationToScreen(worldPos, outScreen, liveCam);
+        // #region agent log
+        // This point lands via g_Camera while the rest of the paint used
+        // renderCam - a mixed-camera placement inside one frame.
+        if (ok)
+            ++g_ghostProjFallback;
+        // #endregion
+        return ok;
+    }
     return false;
 }
 
@@ -657,17 +666,15 @@ static float StackPlayerLabels(
 static void RenderPlayerEspFromFrame(
     const std::vector<Engine::EspFramePlayer>& players,
     const Engine::CameraCache& frameCam,
-    int& outDrawn);
+    uint64_t collectStampMs);
 
 static void RenderWorldEspFromFrame(
     const std::vector<Engine::EspFrameWorld>& world,
-    const Engine::CameraCache& frameCam,
-    int& outDrawn, int& outLabelUs, int& outProjUs);
+    const Engine::CameraCache& frameCam);
 
 static void RenderRobotEspFromFrame(
     const std::vector<Engine::EspFrameWorld>& robots,
-    const Engine::CameraCache& frameCam,
-    int& outDrawn);
+    const Engine::CameraCache& frameCam);
 
 static void DrawPlayerSkeletonFromCache(
     ImDrawList* drawList,
@@ -828,28 +835,16 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         // Same actor must not draw twice (e.g. Oil pickup + Crate mis-admit).
         // Prefer item/pickup cache over container cache for a shared key.
         std::unordered_set<uintptr_t> worldKeys;
-        int dbgDrawingFalse = 0, dbgDrawingTrue = 0, dbgPickedUp = 0, dbgDupKey = 0;
         auto appendWorld = [&](const std::unordered_map<uintptr_t, WorldCacheEntry>& cache) {
             for (const auto& [key, entry] : cache) {
-                static_assert(sizeof(entry.Drawing) == 1, "Drawing must be bool");
-                if (!entry.Drawing) {
-                    ++dbgDrawingFalse;
+                if (!ShouldDrawWorldEsp(entry))
                     continue;
-                }
-                ++dbgDrawingTrue;
-                if (!ShouldDrawWorldEsp(entry)) {
-                    // Drawing was true but ShouldDrawWorldEsp still said no
-                    // (category disabled, getAllowWorldEntry rejected, etc.)
-                    continue;
-                }
                 if (IsGroundPickupGoneSticky(key)) {
-                    ++dbgPickedUp;
+                    ++g_worldEspDbg.skipPickedUp;
                     continue;
                 }
-                if (!worldKeys.insert(key).second) {
-                    ++dbgDupKey;
+                if (!worldKeys.insert(key).second)
                     continue;
-                }
 
                 EspFrameWorld frameWorld{};
                 frameWorld.actorKey = key;
@@ -866,11 +861,6 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             std::shared_lock<std::shared_mutex> lock(m_containerCacheMutex);
             appendWorld(containerCache);
         }
-        // Debug: log why WorldDraw=0 with 1384 cached
-        g_worldEspDbg.drawingFalse = dbgDrawingFalse;
-        g_worldEspDbg.drawingTrue = dbgDrawingTrue;
-        g_worldEspDbg.pickedUp = dbgPickedUp;
-        g_worldEspDbg.dupKey = dbgDupKey;
     }
 
     if (var::showRobots || var::robotAimEnabled || var::show_radar) {
@@ -883,11 +873,6 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             EspFrameWorld frameRobot{};
             frameRobot.actorKey = key;
             frameRobot.entry = entry;
-            // Resolve bot label on the worker thread (DMA allowed) so the
-            // paint thread never calls ResolveBotDrawLabel (blocking DMA).
-            frameRobot.robotLabel = ResolveBotDrawLabel(key, entry.ActorName, entry.ActorName);
-            if (frameRobot.robotLabel.empty() && !entry.ItemDisplayName.empty())
-                frameRobot.robotLabel = ResolveBotDrawLabel(key, entry.ItemDisplayName, entry.ActorName);
             out.robots.push_back(std::move(frameRobot));
         }
     }
@@ -977,9 +962,12 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             (nowMs - static_cast<uint64_t>(lastUpdateMs)) * 0.001f;
         if (dtSec <= 0.f || dtSec > 0.12f)
             return;
-        pos.x += vel.x * dtSec;
-        pos.y += vel.y * dtSec;
-        pos.z += vel.z * dtSec;
+        const float ex = static_cast<float>(vel.x * dtSec);
+        const float ey = static_cast<float>(vel.y * dtSec);
+        const float ez = static_cast<float>(vel.z * dtSec);
+        pos.x += ex;
+        pos.y += ey;
+        pos.z += ez;
     };
 
     for (EspFramePlayer& framePlayer : out.players) {
@@ -987,6 +975,10 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         if (!IsPlausibleWorldPos(e.WorldPos))
             continue;
         extrapolateEntry(e.WorldPos, e.cachedVelocity, e.lastVelocityUpdate);
+        // Extrapolate skeleton bones too so they stay on target with the
+        // ESP box — without this the skeleton lags one DMA cycle behind.
+        for (auto& wb : e.boneData.bonesWorldDouble)
+            extrapolateEntry(wb, e.cachedVelocity, e.lastVelocityUpdate);
     }
 
     for (EspFrameWorld& frameRobot : out.robots) {
@@ -1075,6 +1067,9 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         }
     }
 
+    out.collectStampMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
     out.valid = true;
 
     // #region agent log
@@ -1103,7 +1098,7 @@ static void DrawPlayerEspList(
     // Smooths the projected head/feet so the box glides instead of snapping.
     struct SmoothedPos { ImVec2 head{}; ImVec2 feet{}; bool valid = false; };
     static std::unordered_map<uintptr_t, SmoothedPos> s_smooth;
-    static constexpr float kSmoothAlpha = 0.35f;  // 0=no smooth, 1=instant. 0.35 ~ 4-frame settle
+    static constexpr float kSmoothAlpha = 0.6f;   // 0=no smooth, 1=instant. 0.6 keeps the box near the raw bones — the skeleton/silhouette are NOT smoothed, and a slow box read as a ghost offset from them.
     std::unordered_set<uintptr_t> seenThisFrame;
 
     for (const Engine::PlayerCacheEntry* actor : actors) {
@@ -1138,7 +1133,7 @@ static void DrawPlayerEspList(
             // #endregion
             continue;
         }
-
+        // Player hop debug: log first 3 players every 2s
         ImVec2 head{};
         ImVec2 feet{};
         if (!EspDraw::WorldToScreenBox(engine, frameCam, headWorld, feetWorld, head, feet)) {
@@ -1207,6 +1202,109 @@ static void DrawPlayerEspList(
                 drawList, engine, live, frameCam, color, live.Distance);
         }
 
+        // Skeleton-lag probe: box anchor (red) vs bone pelvis (green). The gap
+        // plus the age text shows WHICH lag term dominates: sample age (DMA
+        // latency / bone-read cap), extrapolation age, or a real mesh-vs-capsule
+        // offset that exists in the game itself.
+        if (var::debug_skeleton_lag) {
+            const uint64_t nowMsDbg = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            const bool havePelvis = live.boneData.valid.test(
+                static_cast<size_t>(UniBone::Pelvis));
+            if (havePelvis && live.boneData.readStampMs != 0) {
+                const Vector3& pelvisW =
+                    live.boneData.bonesWorldDouble[static_cast<size_t>(UniBone::Pelvis)];
+                const double dW = std::sqrt(
+                    (pelvisW.x - live.WorldPos.x) * (pelvisW.x - live.WorldPos.x)
+                    + (pelvisW.y - live.WorldPos.y) * (pelvisW.y - live.WorldPos.y)
+                    + (pelvisW.z - live.WorldPos.z) * (pelvisW.z - live.WorldPos.z));
+
+                Vector3 anchorScr{};
+                Vector3 pelvisScr{};
+                const bool okA = engine.ProjectWorldLocationToScreen(
+                    live.WorldPos, anchorScr, frameCam);
+                const bool okP = engine.ProjectWorldLocationToScreen(
+                    pelvisW, pelvisScr, frameCam);
+                if (okA && okP) {
+                    const float dPx = static_cast<float>(std::sqrt(
+                        (pelvisScr.x - anchorScr.x) * (pelvisScr.x - anchorScr.x)
+                        + (pelvisScr.y - anchorScr.y) * (pelvisScr.y - anchorScr.y)));
+
+                    const ImVec2 aS(static_cast<float>(anchorScr.x),
+                                    static_cast<float>(anchorScr.y));
+                    const ImVec2 pS(static_cast<float>(pelvisScr.x),
+                                    static_cast<float>(pelvisScr.y));
+                    drawList->AddLine(aS, pS, IM_COL32(255, 255, 0, 200), 1.0f);
+                    drawList->AddCircleFilled(aS, 3.5f, IM_COL32(255, 70, 70, 255));
+                    drawList->AddCircle(aS, 5.5f, IM_COL32(255, 70, 70, 220));
+                    drawList->AddCircleFilled(pS, 3.5f, IM_COL32(70, 255, 70, 255));
+                    drawList->AddCircle(pS, 5.5f, IM_COL32(70, 255, 70, 220));
+
+                    const uint64_t ageMs = nowMsDbg - live.boneData.readStampMs;
+                    const float extAgeMs = (live.lastVelocityUpdate > 0.f)
+                        ? static_cast<float>(nowMsDbg) - live.lastVelocityUpdate
+                        : -1.f;
+                    const float speed = static_cast<float>(std::sqrt(
+                        live.cachedVelocity.x * live.cachedVelocity.x
+                        + live.cachedVelocity.y * live.cachedVelocity.y
+                        + live.cachedVelocity.z * live.cachedVelocity.z));
+
+                    char dbgBuf[160];
+                    snprintf(dbgBuf, sizeof(dbgBuf),
+                        "age %llums | ext %.0fms | dW %.0fcm | dS %.0fpx | v %.0f",
+                        static_cast<unsigned long long>(ageMs),
+                        extAgeMs, dW, dPx, speed);
+                    drawList->AddText(
+                        ImVec2(pS.x + 10.f, pS.y - 8.f),
+                        IM_COL32(255, 255, 120, 255), dbgBuf);
+
+                    // Console + file line — closest drawn player, 500ms cadence.
+                    // File copy lands in debug-c190fb.log so the probe is
+                    // readable outside the exe console.
+                    static uint64_t s_skelLastPrintMs = 0;
+                    static float s_skelBestDist = -1.f;
+                    static char s_skelLine[192] = {};
+                    static struct {
+                        uint64_t key; double ageMs, extAgeMs, dW, dPx, speed, dist;
+                    } s_skelVals{};
+                    if (s_skelBestDist < 0.f || live.Distance < s_skelBestDist) {
+                        s_skelBestDist = live.Distance;
+                        s_skelVals = { static_cast<uint64_t>(live.APawn),
+                            static_cast<double>(ageMs), extAgeMs,
+                            dW, dPx, speed, live.Distance };
+                        snprintf(s_skelLine, sizeof(s_skelLine),
+                            "[debugSkel] key=%llu age=%llums extAge=%.0fms "
+                            "dWorld=%.1fcm dScreen=%.1fpx speed=%.0fcm/s dist=%.0fm",
+                            static_cast<unsigned long long>(live.APawn),
+                            static_cast<unsigned long long>(ageMs),
+                            extAgeMs, dW, dPx, speed, live.Distance);
+                    }
+                    if (nowMsDbg - s_skelLastPrintMs >= 500 && s_skelLine[0]) {
+                        std::cout << s_skelLine << std::endl;
+                        {
+                            std::ofstream lf(kArcVerifyPath, std::ios::app);
+                            if (lf) {
+                                lf << "{\"location\":\"Esp.cpp\"," 
+                                   << "\"message\":\"skel_lag\"," 
+                                   << "\"data\":{\"key\":" << s_skelVals.key
+                                   << ",\"ageMs\":" << s_skelVals.ageMs
+                                   << ",\"extAgeMs\":" << s_skelVals.extAgeMs
+                                   << ",\"dWcm\":" << s_skelVals.dW
+                                   << ",\"dSpx\":" << s_skelVals.dPx
+                                   << ",\"speed\":" << s_skelVals.speed
+                                   << ",\"dist\":" << s_skelVals.dist
+                                   << "},\"ts\":" << nowMsDbg << "}\n";
+                            }
+                        }
+                        s_skelLastPrintMs = nowMsDbg;
+                        s_skelLine[0] = 0;
+                        s_skelBestDist = -1.f;
+                    }
+                }
+            }
+        }
+
         if (var::box) {
             const Vector3 screenTop{ head.x, head.y, 0.0 };
             const Vector3 screenBottom{ feet.x, feet.y, 0.0 };
@@ -1248,9 +1346,8 @@ static void DrawPlayerEspList(
 static void RenderPlayerEspFromFrame(
     const std::vector<Engine::EspFramePlayer>& players,
     const Engine::CameraCache& frameCam,
-    int& outDrawn)
+    uint64_t collectStampMs)
 {
-    outDrawn = 0;
     if (!var::enableesp)
         return;
 
@@ -1278,6 +1375,33 @@ static void RenderPlayerEspFromFrame(
         drawEntries.push_back(item.entry);
     }
 
+    // Paint-gap velocity continuation: extrapolation ran at COLLECT time with
+    // its own clamp, but paint happens 40-90ms later — during that gap the
+    // skeleton/world entries freeze while the game moves on. Continue the
+    // same cached velocity over the collect→present delta (pure math, no DMA).
+    // Clamp bounds worst-case drift if paint stalls.
+    if (collectStampMs != 0) {
+        const uint64_t paintNowMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        float gapSec = static_cast<float>(paintNowMs - collectStampMs) * 0.001f;
+        if (gapSec > 0.f && gapSec <= 0.25f) {
+            for (Engine::PlayerCacheEntry& e : drawEntries) {
+                const Vector3& v = e.cachedVelocity;
+                if (v.x == 0.f && v.y == 0.f && v.z == 0.f)
+                    continue;
+                e.WorldPos.x += v.x * gapSec;
+                e.WorldPos.y += v.y * gapSec;
+                e.WorldPos.z += v.z * gapSec;
+                for (auto& wb : e.boneData.bonesWorldDouble) {
+                    wb.x += v.x * gapSec;
+                    wb.y += v.y * gapSec;
+                    wb.z += v.z * gapSec;
+                }
+            }
+        }
+    }
+
     std::sort(
         drawEntries.begin(),
         drawEntries.end(),
@@ -1294,15 +1418,12 @@ static void RenderPlayerEspFromFrame(
         actors.push_back(&entry);
 
     DrawPlayerEspList(actors, frameCam);
-    outDrawn = static_cast<int>(actors.size());
 }
 
 static void RenderRobotEspFromFrame(
     const std::vector<Engine::EspFrameWorld>& robots,
-    const Engine::CameraCache& frameCam,
-    int& outDrawn)
+    const Engine::CameraCache& frameCam)
 {
-    outDrawn = 0;
     if (!var::showRobots)
         return;
 
@@ -1310,12 +1431,9 @@ static void RenderRobotEspFromFrame(
     if (!drawList)
         return;
 
-    // Paint-thread-safe: GetStateSnapshot takes shared_lock(m_stateMutex)
-    // which blocks when Update/EntityList hold the unique lock during DMA.
-    // frameCam.Location is already valid (resolved by frame builder).
-    const Vector3 distRef = IsPlausibleWorldPos(frameCam.Location)
-        ? frameCam.Location
-        : engine.ResolveDistanceReference(frameCam, 0);
+    const Engine::EngineStateSnapshot stateSnap = engine.GetStateSnapshot();
+    const Vector3 distRef = engine.ResolveDistanceReference(
+        frameCam, stateSnap.acknowledgedPawn);
 
     // #region agent log
     // Bots that vanish from the render frame entirely (collect drop) blink
@@ -1340,11 +1458,8 @@ static void RenderRobotEspFromFrame(
         const Engine::WorldCacheEntry& robot = item.entry;
         if (!key || !engine.IsValidPointer(key))
             continue;
-        // FREEZE FIX: IsCachedPlayer takes a BLOCKING shared_lock on
-        // m_playerCacheMutex. Called per-bot per-frame on the paint thread it
-        // stalled Present ~200-530ms whenever EntityList held the unique_lock
-        // for its cache swap. ShouldDrawRobotEsp already filters players out
-        // in CollectEspRenderFrame (worker thread) — this check is redundant.
+        if (engine.IsCachedPlayer(key))
+            continue;
         if (robot.IsBreaked && !var::show_dead_bots)
             continue;
         if (!IsPlausibleWorldPos(robot.WorldPos)) {
@@ -1365,7 +1480,10 @@ static void RenderRobotEspFromFrame(
 
         const float botMaxM =
             var::bot_esp_distance > 0.f ? var::bot_esp_distance : var::kMaxDistanceSliderM;
-        if (distM > botMaxM) {
+        // Dist-edge hysteresis: must match the robot worker's off band (1.15x),
+        // otherwise the paint path hard-cuts a bot the worker is still holding.
+        constexpr float kDistOffFactor = 1.15f;
+        if (distM > botMaxM * kDistOffFactor) {
             // #region agent log
             WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
                 key, false, WorldScan::FlickerCause::DistEdge);
@@ -1387,47 +1505,18 @@ static void RenderRobotEspFromFrame(
 
         ImVec2 head{};
         ImVec2 feet{};
-        // PROJ1 (Fix #7): same sticky-screen hold as world labels — a brief
-        // WorldToScreenBox miss must not blank the bot box.
-        static std::unordered_map<uintptr_t, std::pair<ImVec2, ImVec2>> s_botLastScreen;
-        static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> s_botLastScreenWhen;
-        // PROJ2 (Fix #13): 400ms was short during hard turns — bots still in
-        // view briefly flake W2S and blink. Hold a bit longer while the
-        // in-view gate still blocks ghost mid-screen flashes.
-        static constexpr auto kBotScreenFreezeTtl = std::chrono::milliseconds(700);
-        const auto botPaintNow = std::chrono::steady_clock::now();
+        // Paint does no DMA: a WorldToScreenBox miss is deterministic geometry
+        // (behind near plane / outside bounds), never a flaky read. Repainting
+        // the last screen coords here stamped a ghost copy of the box at a
+        // stale pixel position for up to 1.5s.
         if (!EspDraw::WorldToScreenBox(engine, frameCam, headWorld, feetWorld, head, feet)) {
-            // GHOST1: same in-view gate as world labels — no stale-coordinate
-            // phantom boxes after camera rotation.
-            const bool stillInView = WorldPointRoughlyInView(frameCam, headWorld);
-            if (stillInView) {
-                if (const auto fit = s_botLastScreenWhen.find(key);
-                    fit != s_botLastScreenWhen.end()
-                    && botPaintNow - fit->second <= kBotScreenFreezeTtl) {
-                    const auto& last = s_botLastScreen[key];
-                    head = last.first;
-                    feet = last.second;
-                } else {
-                    // #region agent log
-                    // PROJ2 (Fix #13): only count projFail while the bot is
-                    // still in the view cone. Looking away used to inflate
-                    // paintBots 8-12 every turn.
-                    WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
-                        key, false, WorldScan::FlickerCause::ProjFail);
-                    // #endregion
-                    continue;
-                }
-            } else {
-                // Looking away — not flicker.
-                continue;
+            if (WorldPointRoughlyInView(frameCam, headWorld)) {
+                // #region agent log
+                WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
+                    key, false, WorldScan::FlickerCause::ProjFail);
+                // #endregion
             }
-        } else {
-            s_botLastScreen[key] = { head, feet };
-            s_botLastScreenWhen[key] = botPaintNow;
-            if (s_botLastScreen.size() > 2048) {
-                s_botLastScreen.clear();
-                s_botLastScreenWhen.clear();
-            }
+            continue;
         }
 
         // ── EMA smoothing (same as player path) ───────────────────────
@@ -1454,29 +1543,18 @@ static void RenderRobotEspFromFrame(
         const Visuals::EspDrawScale scale =
             Visuals::ComputeEspScaleFromBox(boxH > 1.f ? boxH : 24.f, distM);
 
-        // Paint path is DMA-free. The frame builder pre-resolved this label
-        // into robotLabel so the paint thread never calls ResolveBotDrawLabel
-        // (which does blocking DMA reads: GetActorClassFName, etc).
+        // Paint path must stay DMA-free. Live GetActorFNameString / GetActorClassFName
+        // / ResolveEnemyAssetBotLabel here stalled Present (espMs 500-700). Names are
+        // resolved on the robot worker into ActorName / ItemDisplayName.
         const std::string& fname = robot.ActorName;
-        std::string botLabel = item.robotLabel;
+        std::string botLabel = ResolveBotDrawLabel(key, robot.ActorName, fname);
+        if (botLabel.empty() && !robot.ItemDisplayName.empty())
+            botLabel = ResolveBotDrawLabel(key, robot.ItemDisplayName, fname);
         // No real name → no ESP (heart/dist alone = ghost bots; log GC Electrified).
         // Never use ARC/Bot/Oil placeholders. IsAnyBotActor alone is not enough.
 
-        // Hatch (extraction point) — separate from bots, own color
-        bool isHatch = false;
-        {
-            std::string lower = botLabel;
-            for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            isHatch = lower.find("hatch") != std::string::npos;
-        }
-        if (isHatch && !var::showHatches)
-            continue;
-
-        const ImU32 color = isHatch
-            ? ImGui::ColorConvertFloat4ToU32(ImVec4(
-                var::color_hatches[0], var::color_hatches[1],
-                var::color_hatches[2], var::color_hatches[3]))
-            : color_base;
+        // Hatches are containers now (Loot tab) — never arrive in the robot path.
+        const ImU32 color = color_base;
         if (botLabel.empty() || !IsAcceptedBotEspLabel(engine, botLabel, fname)) {
             RecordBotDrawLabelMiss();
             // #region agent log
@@ -1506,8 +1584,6 @@ static void RenderRobotEspFromFrame(
         }
         if (var::showRobots && var::bot_heart)
             DrawBotHeartIfEnabled(drawList, head, feet, boxH, scale, color);
-
-        ++outDrawn;
 
         if (var::bot_box) {
             const Vector3 screenTop{ head.x, head.y, 0.0 };
@@ -1548,126 +1624,363 @@ static void RenderRobotEspFromFrame(
     }
 }
 
-// Append-only microsecond-precision paint breakdown. One line per slow paint.
-// Uses ring buffer in memory, flushed to disk on every slow frame.
-struct PaintBreakdownRing {
-    static constexpr int kRing = 128;
-    struct Row {
-        uint64_t seq = 0;
-        int totalUs = 0;
-        int frameCopyUs = 0;
-        int cameraUs = 0;
-        int playersUs = 0;
-        int robotsUs = 0;
-        int worldUs = 0;
-        int flushUs = 0;
-        int nP = 0, nR = 0, nW = 0;
-        int nPDraw = 0, nRDraw = 0, nWDraw = 0;  // entities that actually drew
-        int worldLabelUs = 0;  // time inside label resolution for world entries
-        int worldProjUs = 0;   // time inside projection for world entries
-        bool lockBusy = false;
-    };
-    Row ring[kRing]{};
-    int idx = 0;
-    void push(Row r) {
-        ring[idx] = r;
-        idx = (idx + 1) % kRing;
-        flush();
-    }
-    void flush() {
-        std::ofstream f("F:/Test/ARCs/paint_breakdown.log", std::ios::trunc);
-        if (!f) return;
-        for (int i = 0; i < kRing; ++i) {
-            int ri = (idx - kRing + i + kRing * 2) % kRing;
-            const Row& r = ring[ri];
-            if (!r.seq) continue;
-            f << "seq=" << r.seq
-              << " total=" << r.totalUs
-              << " frameCopy=" << r.frameCopyUs
-              << " cam=" << r.cameraUs
-              << " players=" << r.playersUs
-              << " robots=" << r.robotsUs
-              << " world=" << r.worldUs
-              << " flush=" << r.flushUs
-              << " nP=" << r.nP << "/" << r.nPDraw
-              << " nR=" << r.nR << "/" << r.nRDraw
-              << " nW=" << r.nW << "/" << r.nWDraw
-              << " wLabel=" << r.worldLabelUs
-              << " wProj=" << r.worldProjUs
-              << (r.lockBusy ? " LOCKBUSY" : "")
-              << "\n";
-        }
-    }
+// #region agent log
+// Ghost/flicker tracer. On-screen only: this build is Windows subsystem with
+// no AllocConsole, so std::cout traces are invisible. Gated on
+// var::show_debug_overlay by the caller. Pure observation, no draw changes.
+
+struct GhostTraceEvent {
+    uint64_t paint = 0;
+    char kind[12]{};
+    char src[8]{};
+    float dyaw = 0.f;
+    float dpitch = 0.f;
+    float dloc = 0.f;
+    float dtMs = 0.f;
+    uint64_t frameSeq = 0;
+    int frameAgeMs = 0;
+    int entJumps = 0;
+    int mixedCam = 0;
+    char worst[40]{};
+    float x0 = 0.f;
+    float y0 = 0.f;
+    float x1 = 0.f;
+    float y1 = 0.f;
 };
+
+struct GhostEntTrack {
+    float x = 0.f;
+    float y = 0.f;
+    float dx = 0.f;
+    float dy = 0.f;
+    uint64_t paint = 0;
+};
+
+static constexpr int kGhostEventSlots = 8;
+
+static void GhostTracePaint(
+    const Engine::EspRenderFrame& frame,
+    const Engine::CameraCache& renderCam,
+    const RenderCamDebug& camDbg)
+{
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    if (!dl)
+        return;
+
+    static uint64_t s_paint = 0;
+    static uint64_t s_camZigs = 0;
+    static uint64_t s_srcFlips = 0;
+    static uint64_t s_entZigs = 0;
+    static GhostTraceEvent s_events[kGhostEventSlots]{};
+    static int s_eventCount = 0;
+    static int s_eventHead = 0;
+    static std::chrono::steady_clock::time_point s_flashUntil{};
+
+    static Engine::CameraCache s_cam1{};
+    static Engine::CameraCache s_cam2{};
+    static bool s_have1 = false;
+    static bool s_have2 = false;
+    static std::chrono::steady_clock::time_point s_prevTp{};
+    static char s_prevSrc[8] = "none";
+    static std::unordered_map<uintptr_t, GhostEntTrack> s_ent;
+
+    ++s_paint;
+    const auto now = std::chrono::steady_clock::now();
+    const float dtMs = s_have1
+        ? std::chrono::duration<float, std::milli>(now - s_prevTp).count()
+        : 0.f;
+    const ImVec2 disp = ImGui::GetIO().DisplaySize;
+
+    auto wrapDeg = [](double d) {
+        while (d > 180.0)
+            d -= 360.0;
+        while (d < -180.0)
+            d += 360.0;
+        return d;
+    };
+
+    // Out-and-back detector: a ghost flash steps off the trend for ONE paint
+    // and comes straight back. A real flick keeps the same sign.
+    float dyawNow = 0.f;
+    float dyawPrev = 0.f;
+    float dpitchNow = 0.f;
+    float dpitchPrev = 0.f;
+    float dlocNow = 0.f;
+    float dlocPrev = 0.f;
+    if (s_have1) {
+        dyawNow = static_cast<float>(
+            wrapDeg(renderCam.Rotation.y - s_cam1.Rotation.y));
+        dpitchNow = static_cast<float>(
+            wrapDeg(renderCam.Rotation.x - s_cam1.Rotation.x));
+        const double lx = renderCam.Location.x - s_cam1.Location.x;
+        const double ly = renderCam.Location.y - s_cam1.Location.y;
+        const double lz = renderCam.Location.z - s_cam1.Location.z;
+        dlocNow = static_cast<float>(std::sqrt(lx * lx + ly * ly + lz * lz));
+    }
+    if (s_have2) {
+        dyawPrev = static_cast<float>(
+            wrapDeg(s_cam1.Rotation.y - s_cam2.Rotation.y));
+        dpitchPrev = static_cast<float>(
+            wrapDeg(s_cam1.Rotation.x - s_cam2.Rotation.x));
+        const double lx = s_cam1.Location.x - s_cam2.Location.x;
+        const double ly = s_cam1.Location.y - s_cam2.Location.y;
+        const double lz = s_cam1.Location.z - s_cam2.Location.z;
+        dlocPrev = static_cast<float>(std::sqrt(lx * lx + ly * ly + lz * lz));
+    }
+
+    bool camZig = false;
+    if (s_have2) {
+        constexpr float kMinDeg = 1.5f;
+        if (std::fabs(dyawNow) > kMinDeg && std::fabs(dyawPrev) > kMinDeg
+            && dyawNow * dyawPrev < 0.f)
+            camZig = true;
+        if (std::fabs(dpitchNow) > kMinDeg && std::fabs(dpitchPrev) > kMinDeg
+            && dpitchNow * dpitchPrev < 0.f)
+            camZig = true;
+        if (dlocNow > 200.f && dlocPrev > 200.f)
+            camZig = true;
+    }
+
+    const bool srcFlip = s_have1 && std::strcmp(camDbg.src, s_prevSrc) != 0;
+
+    // Per-entity screen zigzag: overlay steady but one object teleports.
+    int entJumps = 0;
+    char worst[40]{};
+    float wx0 = 0.f;
+    float wy0 = 0.f;
+    float wx1 = 0.f;
+    float wy1 = 0.f;
+    float worstMag = 0.f;
+    const float jumpPx = disp.x > 16.f ? disp.x * 0.18f : 200.f;
+
+    auto traceEnt = [&](uintptr_t key, const Vector3& worldPos,
+                        const std::string& label) {
+        if (!key || !IsPlausibleWorldPos(worldPos))
+            return;
+        Vector3 scr{};
+        if (!engine.ProjectWorldLocationToScreen(worldPos, scr, renderCam))
+            return;
+        const float x = static_cast<float>(scr.x);
+        const float y = static_cast<float>(scr.y);
+        float keepDx = 0.f;
+        float keepDy = 0.f;
+        auto it = s_ent.find(key);
+        if (it != s_ent.end() && it->second.paint + 3 >= s_paint) {
+            const float dx = x - it->second.x;
+            const float dy = y - it->second.y;
+            const float mag = std::sqrt(dx * dx + dy * dy);
+            const float pmag = std::sqrt(
+                it->second.dx * it->second.dx + it->second.dy * it->second.dy);
+            const float dot = dx * it->second.dx + dy * it->second.dy;
+            if (mag > jumpPx && pmag > jumpPx && dot < 0.f) {
+                ++entJumps;
+                if (mag > worstMag) {
+                    worstMag = mag;
+                    wx0 = it->second.x;
+                    wy0 = it->second.y;
+                    wx1 = x;
+                    wy1 = y;
+                    std::snprintf(worst, sizeof(worst), "%s",
+                        label.empty() ? "?" : label.c_str());
+                }
+            }
+            keepDx = dx;
+            keepDy = dy;
+        }
+        GhostEntTrack& track = s_ent[key];
+        track.x = x;
+        track.y = y;
+        track.dx = keepDx;
+        track.dy = keepDy;
+        track.paint = s_paint;
+    };
+
+    for (const Engine::EspFrameWorld& w : frame.world) {
+        traceEnt(w.actorKey, w.entry.WorldPos,
+            w.entry.ItemDisplayName.empty()
+                ? w.entry.ActorName
+                : w.entry.ItemDisplayName);
+    }
+    for (const Engine::EspFrameWorld& b : frame.robots)
+        traceEnt(b.actorKey, b.entry.WorldPos, b.entry.ActorName);
+    const std::string kPlayerLabel = "player";
+    for (const Engine::EspFramePlayer& pl : frame.players)
+        traceEnt(pl.actorKey, pl.entry.WorldPos, kPlayerLabel);
+
+    if (s_ent.size() > 8192)
+        s_ent.clear();
+
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count());
+    const int frameAgeMs = frame.collectStampMs != 0
+        ? static_cast<int>(nowMs - frame.collectStampMs)
+        : -1;
+
+    const int mixedCam = g_ghostProjFallback;
+    g_ghostProjFallback = 0;
+
+    if (camZig || srcFlip || entJumps > 0) {
+        GhostTraceEvent ev{};
+        ev.paint = s_paint;
+        std::snprintf(ev.kind, sizeof(ev.kind), "%s",
+            camZig ? "CAMZIG" : (srcFlip ? "SRCFLIP" : "ENTZIG"));
+        std::snprintf(ev.src, sizeof(ev.src), "%s", camDbg.src);
+        ev.dyaw = dyawNow;
+        ev.dpitch = dpitchNow;
+        ev.dloc = dlocNow;
+        ev.dtMs = dtMs;
+        ev.frameSeq = frame.frameSeq;
+        ev.frameAgeMs = frameAgeMs;
+        ev.entJumps = entJumps;
+        ev.mixedCam = mixedCam;
+        std::snprintf(ev.worst, sizeof(ev.worst), "%s", worst);
+        ev.x0 = wx0;
+        ev.y0 = wy0;
+        ev.x1 = wx1;
+        ev.y1 = wy1;
+        s_events[s_eventHead] = ev;
+        s_eventHead = (s_eventHead + 1) % kGhostEventSlots;
+        if (s_eventCount < kGhostEventSlots)
+            ++s_eventCount;
+        if (camZig)
+            ++s_camZigs;
+        if (srcFlip)
+            ++s_srcFlips;
+        if (entJumps > 0)
+            ++s_entZigs;
+        s_flashUntil = now + std::chrono::milliseconds(400);
+    }
+
+    s_cam2 = s_cam1;
+    s_have2 = s_have1;
+    s_cam1 = renderCam;
+    s_have1 = true;
+    s_prevTp = now;
+    std::snprintf(s_prevSrc, sizeof(s_prevSrc), "%s", camDbg.src);
+
+    ImFont* font = ImGui::GetFont();
+    const float fs = 14.f;
+    const float panelW = 620.f;
+    const float px = disp.x > panelW + 40.f ? disp.x - panelW - 20.f : 20.f;
+    const float py = 60.f;
+    const float panelH = 34.f + (kGhostEventSlots + 3) * 16.f;
+    dl->AddRectFilled(ImVec2(px, py), ImVec2(px + panelW, py + panelH),
+        IM_COL32(0, 0, 0, 225));
+    dl->AddText(font, 16.f, ImVec2(px + 8.f, py + 5.f),
+        IM_COL32(255, 200, 100, 255), "GHOST TRACER");
+    float ry = py + 28.f;
+
+    char line[320];
+    std::snprintf(line, sizeof(line),
+        "paint %llu | src %s | lead %s %.2f/%.2f | leadSkips %d | dt %.1fms",
+        static_cast<unsigned long long>(s_paint),
+        camDbg.src,
+        camDbg.leadApplied ? "ON" : (camDbg.leadSkipped ? "SKIP" : "-"),
+        camDbg.leadYaw,
+        camDbg.leadPitch,
+        g_camLeadSkips,
+        dtMs);
+    dl->AddText(font, fs, ImVec2(px + 8.f, ry), IM_COL32(200, 220, 255, 255), line);
+    ry += 16.f;
+
+    std::snprintf(line, sizeof(line),
+        "camzig %llu | srcflip %llu | entzig %llu | mixedCam %d",
+        static_cast<unsigned long long>(s_camZigs),
+        static_cast<unsigned long long>(s_srcFlips),
+        static_cast<unsigned long long>(s_entZigs),
+        mixedCam);
+    dl->AddText(font, fs, ImVec2(px + 8.f, ry), IM_COL32(200, 220, 255, 255), line);
+    ry += 16.f;
+
+    std::snprintf(line, sizeof(line),
+        "seq %llu age %dms | ply %d bot %d wld %d | dyaw %.2f dpitch %.2f dloc %.0f",
+        static_cast<unsigned long long>(frame.frameSeq),
+        frameAgeMs,
+        static_cast<int>(frame.players.size()),
+        static_cast<int>(frame.robots.size()),
+        static_cast<int>(frame.world.size()),
+        dyawNow,
+        dpitchNow,
+        dlocNow);
+    dl->AddText(font, fs, ImVec2(px + 8.f, ry), IM_COL32(200, 220, 255, 255), line);
+    ry += 18.f;
+
+    for (int i = 0; i < s_eventCount; ++i) {
+        const int idx =
+            (s_eventHead - 1 - i + kGhostEventSlots * 2) % kGhostEventSlots;
+        const GhostTraceEvent& ev = s_events[idx];
+        std::snprintf(line, sizeof(line),
+            "#%llu %s src=%s dy=%.1f dp=%.1f dl=%.0f dt=%.0f seq=%llu age=%d ent=%d mix=%d %s (%.0f,%.0f)>(%.0f,%.0f)",
+            static_cast<unsigned long long>(ev.paint),
+            ev.kind,
+            ev.src,
+            ev.dyaw,
+            ev.dpitch,
+            ev.dloc,
+            ev.dtMs,
+            static_cast<unsigned long long>(ev.frameSeq),
+            ev.frameAgeMs,
+            ev.entJumps,
+            ev.mixedCam,
+            ev.worst,
+            ev.x0,
+            ev.y0,
+            ev.x1,
+            ev.y1);
+        dl->AddText(font, fs, ImVec2(px + 8.f, ry),
+            IM_COL32(255, 120, 120, 255), line);
+        ry += 16.f;
+    }
+
+    if (now < s_flashUntil) {
+        dl->AddRect(ImVec2(3.f, 3.f), ImVec2(disp.x - 3.f, disp.y - 3.f),
+            IM_COL32(255, 40, 40, 255), 0.f, 0, 6.f);
+    }
+}
+// #endregion
 
 void Engine::RenderEsp()
 {
-    EspPaintWatchScope paintWatch{};
-
     const bool drawPlayers = var::enableesp;
     const bool drawBots = var::showRobots || var::robotAimEnabled;
     const bool drawWorld = AnyWorldEspEnabled();
     if (!drawPlayers && !drawBots && !drawWorld && !var::show_radar)
         return;
 
-    using namespace std::chrono;
-    auto nowUs = []() -> int {
-        return static_cast<int>(duration_cast<microseconds>(
-            steady_clock::now().time_since_epoch()).count());
-    };
-    int t0 = nowUs();
-
     SetProjectionViewport(
         ImGui::GetIO().DisplaySize.x,
         ImGui::GetIO().DisplaySize.y);
 
     // Never block paint on m_espFrameMutex — keep last good frame if busy.
-    static EspRenderFrame s_paintFrame{};
+    static std::shared_ptr<const EspRenderFrame> s_paintFrame;
     {
         std::shared_lock<std::shared_mutex> lock(m_espFrameMutex, std::try_to_lock);
-        if (!lock.owns_lock())
-            paintWatch.frameLockBusy = true;
-        else if (m_lastEspFrame.valid)
-            s_paintFrame = m_lastEspFrame;
+        if (lock.owns_lock() && m_espFrameShared && m_espFrameShared->valid)
+            s_paintFrame = m_espFrameShared;
     }
-    const EspRenderFrame& frame = s_paintFrame;
-    paintWatch.frameSeq = frame.frameSeq;
+    if (!s_paintFrame)
+        return;
+    const EspRenderFrame& frame = *s_paintFrame;
     if (!frame.valid)
         return;
 
-    int tFrameCopy = nowUs();
-    int frameCopyUs = tFrameCopy - t0;
-
     Engine::CameraCache renderCam{};
-    if (!ResolveLiveRenderCamera(frame, renderCam))
+    RenderCamDebug camDbg{};
+    if (!ResolveLiveRenderCamera(frame, renderCam, &camDbg))
         return;
-    int tCamera = nowUs();
-    int cameraUs = tCamera - tFrameCopy;
 
     g_renderQueue.newFrame();
 
-    // Track how many entities actually drew (not skipped)
-    static int s_lastPlayersDrawn = 0, s_lastRobotsDrawn = 0, s_lastWorldDrawn = 0;
-    static int s_lastWorldLabelUs = 0, s_lastWorldProjUs = 0;
-
     if (drawPlayers)
-        RenderPlayerEspFromFrame(frame.players, renderCam, s_lastPlayersDrawn);
-    int tPlayers = nowUs();
-    int playersUs = tPlayers - tCamera;
-
+        RenderPlayerEspFromFrame(frame.players, renderCam, frame.collectStampMs);
     if (var::showRobots)
-        RenderRobotEspFromFrame(frame.robots, renderCam, s_lastRobotsDrawn);
-    int tRobots = nowUs();
-    int robotsUs = tRobots - tPlayers;
-
+        RenderRobotEspFromFrame(frame.robots, renderCam);
     if (drawWorld) {
         // Same live POV as players/bots. Using frame.camera here lagged behind
         // g_Camera during stick rotation and drove paintWorld projFail spikes.
-        RenderWorldEspFromFrame(frame.world, renderCam, s_lastWorldDrawn,
-            s_lastWorldLabelUs, s_lastWorldProjUs);
+        RenderWorldEspFromFrame(frame.world, renderCam);
     }
-    int tWorld = nowUs();
-    int worldUs = tWorld - tRobots;
 
     g_renderQueue.endFrame();
 
@@ -1675,73 +1988,67 @@ void Engine::RenderEsp()
         RenderQueue::flushToDrawList(
             drawList,
             g_renderQueue.takeCommands());
+        if (var::show_debug_overlay && drawWorld) {
+            const bool useFrame = CameraOkForEsp(frame.camera);
+            const char* camSrc = useFrame ? "FRAME" : "g_Cam";
+            Engine::CameraCache gCam{};
+            {
+                std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
+                gCam = engine.g_Camera;
+            }
+            char dbgTxt1[256], dbgTxt2[256];
+            std::snprintf(dbgTxt1, sizeof(dbgTxt1),
+                "Cam: %s | Loc: %.0f,%.0f,%.0f | Rot: %.1f,%.1f,%.1f | FOV: %.1f",
+                camSrc,
+                renderCam.Location.x, renderCam.Location.y, renderCam.Location.z,
+                renderCam.Rotation.x, renderCam.Rotation.y, renderCam.Rotation.z,
+                renderCam.FOV);
+            std::snprintf(dbgTxt2, sizeof(dbgTxt2),
+                "g_Cam: %s | Loc: %.0f,%.0f,%.0f | Rot: %.1f,%.1f,%.1f | FOV: %.1f",
+                CameraOkForEsp(gCam) ? "ok" : "BAD",
+                gCam.Location.x, gCam.Location.y, gCam.Location.z,
+                gCam.Rotation.x, gCam.Rotation.y, gCam.Rotation.z,
+                gCam.FOV);
+            drawList->AddText(ImVec2(10, 10), 0xFF00FF00, dbgTxt1);
+            drawList->AddText(ImVec2(10, 10 + ImGui::GetFontSize() + 8), 0xFF00FF00, dbgTxt2);
+        }
     }
-    int tFlush = nowUs();
-    int flushUs = tFlush - tWorld;
-    int totalUs = tFlush - t0;
 
-    // Log breakdown when slow (>100ms = 100000us) or periodically
-    static int logCounter = 0;
-    if (totalUs > 100000 || (++logCounter % 120 == 0)) {
-        static PaintBreakdownRing s_ring;
-        PaintBreakdownRing::Row row;
-        row.seq = frame.frameSeq;
-        row.totalUs = totalUs;
-        row.frameCopyUs = frameCopyUs;
-        row.cameraUs = cameraUs;
-        row.playersUs = playersUs;
-        row.robotsUs = robotsUs;
-        row.worldUs = worldUs;
-        row.flushUs = flushUs;
-        row.nP = static_cast<int>(frame.players.size());
-        row.nR = static_cast<int>(frame.robots.size());
-        row.nW = static_cast<int>(frame.world.size());
-        row.nPDraw = s_lastPlayersDrawn;
-        row.nRDraw = s_lastRobotsDrawn;
-        row.nWDraw = s_lastWorldDrawn;
-        row.worldLabelUs = s_lastWorldLabelUs;
-        row.worldProjUs = s_lastWorldProjUs;
-        row.lockBusy = paintWatch.frameLockBusy;
-        s_ring.push(row);
-    }
+    // #region agent log
+    if (var::show_debug_overlay)
+        GhostTracePaint(frame, renderCam, camDbg);
+    // #endregion
 
     if (var::show_debug_overlay && drawWorld) {
-        const bool useFrame = CameraOkForEsp(frame.camera);
-        const char* camSrc = useFrame ? "FRAME" : "g_Cam";
-        Engine::CameraCache gCam{};
-        {
-            std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
-            gCam = engine.g_Camera;
-        }
-        char dbgTxt1[256], dbgTxt2[256];
-        std::snprintf(dbgTxt1, sizeof(dbgTxt1),
-            "Cam: %s | Loc: %.0f,%.0f,%.0f | Rot: %.1f,%.1f,%.1f | FOV: %.1f",
-            camSrc,
-            renderCam.Location.x, renderCam.Location.y, renderCam.Location.z,
-            renderCam.Rotation.x, renderCam.Rotation.y, renderCam.Rotation.z,
-            renderCam.FOV);
-        std::snprintf(dbgTxt2, sizeof(dbgTxt2),
-            "g_Cam: %s | Loc: %.0f,%.0f,%.0f | Rot: %.1f,%.1f,%.1f | FOV: %.1f",
-            CameraOkForEsp(gCam) ? "ok" : "BAD",
-            gCam.Location.x, gCam.Location.y, gCam.Location.z,
-            gCam.Rotation.x, gCam.Rotation.y, gCam.Rotation.z,
-            gCam.FOV);
-        if (ImDrawList* drawList2 = ImGui::GetForegroundDrawList()) {
-            drawList2->AddText(ImVec2(10, 10), 0xFF00FF00, dbgTxt1);
-            drawList2->AddText(ImVec2(10, 10 + ImGui::GetFontSize() + 8), 0xFF00FF00, dbgTxt2);
-        }
-    }
+        static auto lastWorldDbg = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastWorldDbg >= std::chrono::seconds(1)) {
+            lastWorldDbg = now;
+            std::cout << "[debugCam] src="
+                << (CameraOkForEsp(frame.camera) ? "frame" : "g_Camera")
+                << " loc=" << renderCam.Location.x << "," << renderCam.Location.y << "," << renderCam.Location.z
+                << " rot=" << renderCam.Rotation.x << "," << renderCam.Rotation.y << "," << renderCam.Rotation.z
+                << " fov=" << renderCam.FOV
+                << " leadSkip=" << g_camLeadSkips
+                << std::endl;
+            std::cout << "[debugWorldEsp] frame=" << g_worldEspDbg.frameEntries
+                << " rendered=" << g_worldEspDbg.rendered
+                << " skipAllow=" << g_worldEspDbg.skipAllow
+                << " skipPos=" << g_worldEspDbg.skipPos
+                << " skipDist=" << g_worldEspDbg.skipDist
+                << " skipProj=" << g_worldEspDbg.skipProj
+                << " skipPickedUp=" << g_worldEspDbg.skipPickedUp
+                << std::endl;
+            g_worldEspDbg = {};
+        }    }
 }
 
 static void RenderWorldEspFromFrame(
     const std::vector<Engine::EspFrameWorld>& world,
-    const Engine::CameraCache& frameCam,
-    int& outDrawn, int& outLabelUs, int& outProjUs)
+    const Engine::CameraCache& frameCam)
 {
-    outDrawn = 0;
-    outLabelUs = 0;
-    outProjUs = 0;
-    WorldEspDebugStats dbg{};
+    WorldEspDebugStats dbg{}
+;
     dbg.frameEntries = static_cast<int>(world.size());
 
     if (!AnyWorldEspEnabled())
@@ -1816,7 +2123,17 @@ static void RenderWorldEspFromFrame(
             label = entry.ItemDisplayName;
             if (label.empty() || IsJunkWorldEspLabel(label) || IsGarbledEspLabel(label)
                 || !IsCleanContainerName(label)) {
-                label = ContainerCategoryFallbackLabel(cat);
+                // Audit #14: try class fname keyword lookup before falling back
+                // to "Crate". ClassFName is stored at ContainerList admission.
+                if (!entry.ClassFName.empty()) {
+                    const std::string kw = DirectContainerKeywordLabel(
+                        entry.ActorName, entry.ClassFName, {});
+                    if (!kw.empty() && !IsJunkWorldEspLabel(kw))
+                        label = kw;
+                }
+                if (label.empty() || IsJunkWorldEspLabel(label)
+                    || IsGarbledEspLabel(label) || !IsCleanContainerName(label))
+                    label = ContainerCategoryFallbackLabel(cat);
             }
             if (var::show_world_open_container
                 && cat == WorldItemCategory::OpenedContainer
@@ -1855,6 +2172,10 @@ static void RenderWorldEspFromFrame(
             // #endregion
             continue;
         }
+        // Quest items get the star prefix (UTF-8 U+2605) — the only label in
+        // the app with one. Escaped as raw bytes to survive MSVC codepages.
+        if (cat == WorldItemCategory::QuestItem)
+            label = "\xE2\x98\x85 " + label;
 
         int lootValue = entry.lootValue;
         int lootTier = entry.lootRarityTier;
@@ -1872,7 +2193,20 @@ static void RenderWorldEspFromFrame(
             filterView.lootValue = 0;
             filterView.lootRarityTier = 0;
         }
-        if (distM > WorldLootPickupMaxDrawMeters(cat, &filterView)) {
+        // Smooth range exit: fade the label over the last part of its draw
+        // range instead of popping off at the hard limit. Band = 20% of the
+        // category range (min 4 m); fully faded = skip.
+        const float lootMaxM = WorldLootPickupMaxDrawMeters(cat, &filterView);
+        const float lootFadeBand = (std::max)(4.f, lootMaxM * 0.2f);
+        float lootAlpha = 1.f;
+        if (distM > lootMaxM - lootFadeBand)
+            lootAlpha = std::clamp((lootMaxM - distM) / lootFadeBand, 0.f, 1.f);
+        // Quest items breathe slowly so they catch the eye in a loot pile.
+        if (cat == WorldItemCategory::QuestItem) {
+            const float t = static_cast<float>(ImGui::GetTime());
+            lootAlpha *= 0.72f + 0.28f * (0.5f + 0.5f * sinf(t * 3.5f));
+        }
+        if (lootAlpha <= 0.02f) {
             ++dbg.skipDist;
             // #region agent log
             WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintWorld,
@@ -1883,38 +2217,17 @@ static void RenderWorldEspFromFrame(
 
         const bool isPickup = LootItemLooksLikePickup(filterView);
 
-        // PROJ1 (Fix #6): a single failed WorldToScreen blanked the label for
-        // that frame (paintWorld projFail spikes of 40-50 per 10s). Hold the
-        // last good screen pos briefly so a transient miss no longer blinks.
-        static std::unordered_map<uintptr_t, std::pair<Vector3, std::chrono::steady_clock::time_point>>
-            s_worldLastScreen;
-        static constexpr auto kWorldScreenFreezeTtl = std::chrono::milliseconds(400);
-        const auto paintNow = std::chrono::steady_clock::now();
-
+        // Paint does no DMA: a ProjectWorldEspPoint miss is deterministic
+        // geometry, never a flaky read. Holding the last screen pos here
+        // stamped phantom labels at stale pixel positions for up to 400ms.
         Vector3 screen{};
-        bool projected = ProjectWorldEspPoint(worldPos, frameCam, screen);
-        if (projected) {
-            s_worldLastScreen[item.actorKey] = { screen, paintNow };
-            if (s_worldLastScreen.size() > 4096)
-                s_worldLastScreen.clear();
-        } else {
+        if (!ProjectWorldEspPoint(worldPos, frameCam, screen)) {
             ++dbg.skipProj;
-            // GHOST1: never repaint a stale screen pos once the camera no
-            // longer faces the object — that painted phantom labels at
-            // random spots after rotation.
-            if (const auto fit = s_worldLastScreen.find(item.actorKey);
-                fit != s_worldLastScreen.end()
-                && paintNow - fit->second.second <= kWorldScreenFreezeTtl
-                && WorldPointRoughlyInView(frameCam, worldPos)) {
-                screen = fit->second.first;
-                projected = true;
-            } else {
-                // #region agent log
-                WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintWorld,
-                    item.actorKey, false, WorldScan::FlickerCause::ProjFail);
-                // #endregion
-                continue;
-            }
+            // #region agent log
+            WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintWorld,
+                item.actorKey, false, WorldScan::FlickerCause::ProjFail);
+            // #endregion
+            continue;
         }
 
         const float screenW = ImGui::GetIO().DisplaySize.x;
@@ -1923,17 +2236,43 @@ static void RenderWorldEspFromFrame(
             || screen.y < -8.f || screen.y > screenH + 8.f)
             continue;
 
-        const ImU32 color = WorldLootLabelColor(
+        ImU32 color = WorldLootLabelColor(
             cat,
             lootTier,
             isPickup && !looksLikeContainer);
+        if (lootAlpha < 1.f) {
+            const unsigned fadedA = static_cast<unsigned>(
+                static_cast<float>((color >> IM_COL32_A_SHIFT) & 0xFFu)
+                * lootAlpha);
+            color = (color & 0x00FFFFFFu) | (fadedA << IM_COL32_A_SHIFT);
+        }
+
+        // Extraction hatches: append the replicated SDK state to the label.
+        std::string drawLabel = label;
+        if (cat == WorldItemCategory::Hatch && entry.extractState >= 0) {
+            const char* state = "Unknown";
+            switch (entry.extractState) {
+            case 0: state = "Dormant"; break;
+            case 1: state = "Disabled"; break;
+            case 2: state = "Broken"; break;
+            case 3: state = "Closed"; break;
+            case 4: state = "Closing"; break;
+            case 5: state = "Active"; break;
+            case 6: state = "Arriving"; break;
+            case 7: state = "Ready"; break;
+            default: break;
+            }
+            drawLabel += " (";
+            drawLabel += state;
+            drawLabel += ")";
+        }
 
         char buf[160]{};
         if (var::show_loot_value && lootValue > 0 && isPickup && !isContainerEsp
             && !looksLikeContainer)
-            snprintf(buf, sizeof(buf), "%s [%d] [%.0fm]", label.c_str(), lootValue, distM);
+            snprintf(buf, sizeof(buf), "%s [%d] [%.0fm]", drawLabel.c_str(), lootValue, distM);
         else
-            snprintf(buf, sizeof(buf), "%s [%.0fm]", label.c_str(), distM);
+            snprintf(buf, sizeof(buf), "%s [%.0fm]", drawLabel.c_str(), distM);
 
         EspDraw::DrawLabelEsp(
             drawList,
@@ -1942,7 +2281,6 @@ static void RenderWorldEspFromFrame(
             color,
             distM);
         ++dbg.rendered;
-        ++outDrawn;
         // #region agent log
         WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintWorld,
             item.actorKey, true, WorldScan::FlickerCause::Other);
@@ -1950,6 +2288,24 @@ static void RenderWorldEspFromFrame(
     }
 
     g_worldEspDbg = dbg;
+    // File-log the ghost-guard skips (throttled 5s) so leadSkip is verifiable
+    // in the debug log — [debugCam] only prints with the debug overlay on.
+    if (g_camLeadSkips > 0) {
+        static std::chrono::steady_clock::time_point s_lastLeadLog{};
+        const auto nowLl = std::chrono::steady_clock::now();
+        if (nowLl - s_lastLeadLog >= std::chrono::seconds(5)) {
+            s_lastLeadLog = nowLl;
+            std::ofstream lf(kArcVerifyPath, std::ios::app);
+            if (lf) {
+                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                lf << "{\"location\":\"Esp.cpp\",\"message\":\"cam_lead_skip\","
+                   << "\"data\":{\"skips\":" << g_camLeadSkips
+                   << "},\"ts\":" << ts << "}\n";
+            }
+            g_camLeadSkips = 0;
+        }
+    }
 }
 
 void Engine::RenderFovCircle()
@@ -2132,14 +2488,15 @@ void Engine::RenderRadar(bool interactive)
         return;
 
     // Never CollectEspRenderFrame on the paint thread (DMA). try_lock only.
-    EspRenderFrame frame{};
+    std::shared_ptr<const EspRenderFrame> frameShared;
     {
         std::shared_lock<std::shared_mutex> lock(m_espFrameMutex, std::try_to_lock);
         if (lock.owns_lock())
-            frame = m_lastEspFrame;
+            frameShared = m_espFrameShared;
     }
-    if (!frame.valid)
+    if (!frameShared || !frameShared->valid)
         return;
+    const EspRenderFrame& frame = *frameShared;
 
     Engine::CameraCache frameCam{};
     {
@@ -2267,9 +2624,7 @@ void Engine::RenderRadar(bool interactive)
     };
 
     {
-        std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex, std::try_to_lock);
-        if (!lock.owns_lock())
-            return;  // FREEZE FIX: never block the paint thread on cache swap
+        std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
         for (const auto& [key, actor] : playerCache) {
             (void)key;
             if (!ShouldDrawPlayerEsp(actor))
@@ -2334,12 +2689,37 @@ void Engine::RenderRadar(bool interactive)
         drawBlip(rx, ry, color, robot.Distance);
     }
 
+    // Quest items: always shown as a gold star (never filtered by loot
+    // rarity/value or the SP-special gate) so objectives pop on the radar.
+    auto drawStar = [&](float scx, float scy, float distM, ImU32 color) {
+        ImVec2 c(scx, scy);
+        const float R = std::clamp(
+            4.0f * Visuals::EspDistanceScale(distM), 3.2f, 4.6f);
+        const float r = R * 0.42f;
+        ImVec2 pts[10];
+        for (int i = 0; i < 10; ++i) {
+            const float ang = -static_cast<float>(M_PI) / 2.f + static_cast<float>(i) * static_cast<float>(M_PI) / 5.f;
+            const float rad = (i % 2 == 0) ? R : r;
+            pts[i] = ImVec2(c.x + std::cos(ang) * rad, c.y + std::sin(ang) * rad);
+        }
+        drawList->AddConvexPolyFilled(pts, 10, color);
+        drawList->AddPolyline(pts, 10, IM_COL32(255, 255, 255, 180), true, 1.f);
+    };
+
     for (const EspFrameWorld& item : frame.world) {
         const WorldCacheEntry& entry = item.entry;
         if (!IsPlausibleWorldPos(entry.WorldPos))
             continue;
 
         const auto cat = static_cast<WorldItemCategory>(entry.worldCategory);
+        if (cat == WorldItemCategory::QuestItem) {
+            float rx{}, ry{};
+            if (!projectBlip(entry.WorldPos, rx, ry))
+                continue;
+            drawStar(rx, ry, entry.Distance, IM_COL32(255, 200, 60, 255));
+            continue;
+        }
+
         WorldLootFilterView filterView{
             entry.worldCategory,
             entry.ActorName,
