@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+
+jobs:
+  windows-build-and-test:
+    name: Windows build + tests
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve MSBuild path
+        id: msbuild
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe not found."
+          }
+
+          $path = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $path) {
+            throw "MSBuild was not found in the installed Visual Studio toolchain."
+          }
+
+          "msbuild_path=$((Join-Path $path 'MSBuild\Current\Bin\MSBuild.exe'))" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Build Release x64
+        shell: pwsh
+        run: |
+          $msbuild = "${{ steps.msbuild.outputs.msbuild_path }}"
+          if (-not (Test-Path $msbuild)) {
+            throw "MSBuild not found at: $msbuild"
+          }
+
+          & $msbuild "ArcRaiders.sln" /m:1 /p:Configuration=Release /p:Platform=x64 /t:Build /v:minimal /p:TrackFileAccess=false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run test suite
+        shell: pwsh
+        run: |
+          $testExe = Join-Path $PWD "Build\Tests\ArcRaiders.Tests.exe"
+          if (-not (Test-Path $testExe)) {
+            throw "Test binary not found: $testExe"
+          }
+
+          & $testExe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Ensure the repo stays clean after build/test
+        shell: pwsh
+        run: |
+          $dirty = git status --porcelain --untracked-files=normal
+          if ($dirty) {
+            Write-Error "Repository is dirty after build/test:"
+            $dirty | Write-Error
+            exit 1
+          }
+
+          Write-Host "Repository remained clean after build and tests."
