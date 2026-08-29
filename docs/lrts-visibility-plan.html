@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Arc Raiders LRTS Visibility Plan</title>
+<style>body{margin:0;background:#0d1117;color:#e6edf3;font:15px/1.6 system-ui,Segoe UI,sans-serif}main{max-width:960px;margin:auto;padding:32px}h1{color:#7ee787}h2{color:#79c0ff;border-bottom:1px solid #30363d;padding-bottom:6px;margin-top:30px}h3{color:#d2a8ff}.sub{color:#8b949e}.warn{background:#3d2d0a;border-left:4px solid #d29922;padding:12px;margin:16px 0}.badge{display:inline-block;background:#238636;color:#fff;border-radius:4px;padding:2px 8px;font-weight:600}pre,code{background:#161b22;border:1px solid #30363d;border-radius:5px}pre{padding:12px;overflow:auto}code{padding:1px 4px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #30363d;padding:7px;text-align:left}th{background:#161b22;color:#79c0ff}.ok{color:#7ee787}</style></head>
+<body><main>
+<h1>Arc Raiders LRTS Visibility</h1><p class="sub">LastRenderTimeOnScreen &middot; LRTS-only &middot; plan only &middot; 2026-08-28</p>
+<span class="badge">NO GEOMETRY / NO PHYSX FALLBACK</span>
+<div class="warn"><b>Rule:</b> do not build until the current game build proves the mesh pointer, BRR offset, candidate range, changing encrypted timestamp, and wall-stale behavior. Build-specific values are verification gates, not assumed facts.</div>
+<h2>Objective</h2><p>Use each enemy skeletal mesh's encrypted <code>LastRenderTimeOnScreen</code>. Decode it and compare it to <code>UWorld::TimeSeconds</code>. A value close to world time means rendered/visible; a stale value means occluded.</p>
+<h2>Known field meanings</h2><ul><li><code>LRTS</code> = LastRenderTimeOnScreen, intended occlusion-aware value.</li><li><code>LRT</code> = LastRenderTime, frustum/render value only.</li><li><code>bRecentlyRendered</code> is only a frustum signal for choosing a sample mesh.</li></ul>
+<h2>Encryption</h2><pre>bits = byteswap(encrypted XOR key)
+float value = bit_cast_float(bits)
+key = candidate_raw XOR byteswap(worldTime_bits)</pre>
+<h2>Stage 0 — mandatory evidence</h2><ol><li>Confirm the supplied mesh pointer is the actual USkeletalMeshComponent.</li><li>Verify <code>BRR_OFFSET=0x997</code> and mask <code>0x20</code>.</li><li>Verify the scan range <code>mesh+0x400..mesh+0x600</code>.</li><li>Confirm worldTime source/type/unit.</li><li>Find a candidate that decrypts near worldTime and changes after ~120ms.</li><li>Prove the selected field becomes stale behind a wall while LRT does not.</li></ol><p class="ok"><b>Stage 0 passes only with dynamic evidence.</b> One plausible static float is not enough.</p>
+<h2>Stage 1 — isolated module</h2><pre>Project/Functions/LrtsVisibility.h
+Project/Functions/LrtsVisibility.cpp</pre><p>Expose <code>Reset(world)</code>, <code>Observe(mesh,time)</code>, and <code>Check(mesh,time)</code>. Return Visible, Occluded, or Unknown. Unknown is used for warmup, bad reads, and unverified keys.</p>
+<h2>Stage 2 — discovery</h2><ol><li>Scan only recently-rendered valid enemy meshes.</li><li>Read the bounded candidate range.</li><li>Derive provisional keys from worldTime.</li><li>Wait ~120ms and require raw change plus time-consistent decoded value.</li><li>Prefer a verified LRT/LRTS pair 4 or 8 bytes apart.</li><li>Mark verified only after the dynamic test.</li></ol>
+<h2>Stage 3 — key maintenance</h2><p>Keep up to six verified session keys, delayed-verify new keys, reject duplicates, and reset all state on world changes. Never use an unverified key to hide a target.</p>
+<h2>Stage 4 — visibility</h2><pre>if (!verified || read_failed || no_key)
+    return Unknown;
+
+delta = worldTime - decodedLrts;
+return abs(delta) &lt; 0.5 ? Visible : Occluded;</pre><p>Only Occluded maps to <code>isVisible=false</code>. Unknown remains shown.</p>
+<h2>Stage 5 — ESP wiring</h2><p>After evidence and isolated tests pass, call the module only for admitted players/bots and replace the temporary <code>isVisible=true</code>. Do not add AggGeom, cooked collision, PhysX scene scanning, or another fallback.</p>
+<h2>Stage 6 — acceptance</h2><table><tr><th>Test</th><th>Expected</th></tr><tr><td>Visible target</td><td>LRTS tracks worldTime → Visible</td></tr><tr><td>Behind wall</td><td>LRTS stale → Occluded</td></tr><tr><td>Off-frustum</td><td>LRT is not mistaken for LRTS</td></tr><tr><td>Warmup/bad read</td><td>Unknown → target remains shown</td></tr><tr><td>World change</td><td>keys/offsets reset and rediscover</td></tr><tr><td>Static candidate</td><td>Rejected as non-render-time data</td></tr></table>
+<h2>Reviewer checklist</h2><ul><li>Current mesh pointer proven.</li><li>BRR offset/mask proven.</li><li>Candidate range proven.</li><li>Dynamic key verification proven.</li><li>Wall-stale LRTS behavior proven.</li><li>No geometry or PhysX fallback.</li></ul>
+</main></body></html>

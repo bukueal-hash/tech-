@@ -1,0 +1,133 @@
+#pragma once
+// Pure bone / transform math — header-only, no DMA, no Windows SDK beyond d3d9.
+// Extracted from Cache.hpp (FQuat/FTransform) and SteamDecrypt.hpp
+// (DecryptBoneArrayPointer) so Project.Tests can exercise the real code.
+// Behavior is byte-for-byte identical to the pre-extraction sources.
+
+#include "Vector.hpp"
+
+#include <cstdint>
+#include <cstring>
+#include <Windows.h>
+#include <d3d9.h>
+#include <immintrin.h>
+
+// ── Transform (moved verbatim from Cache.hpp) ───────────────────────────────
+struct FQuat
+{
+    double x;
+    double y;
+    double z;
+    double w;
+
+    // Multiplica dois quaternions
+    FQuat Multiply(const FQuat& other) const
+    {
+        return FQuat{
+            w * other.x + x * other.w + y * other.z - z * other.y,
+            w * other.y - x * other.z + y * other.w + z * other.x,
+            w * other.z + x * other.y - y * other.x + z * other.w,
+            w * other.w - x * other.x - y * other.y - z * other.z
+        };
+    }
+
+    // Rotaciona um vetor pelo quaternion
+    Vector3 RotateVector(const Vector3& v) const
+    {
+        Vector3 q(x, y, z);
+        Vector3 t;
+
+        // t = 2 * cross(q, v)
+        t.x = 2.0 * (q.y * v.z - q.z * v.y);
+        t.y = 2.0 * (q.z * v.x - q.x * v.z);
+        t.z = 2.0 * (q.x * v.y - q.y * v.x);
+
+        // result = v + w * t + cross(q, t)
+        Vector3 result;
+        result.x = v.x + w * t.x + (q.y * t.z - q.z * t.y);
+        result.y = v.y + w * t.y + (q.z * t.x - q.x * t.z);
+        result.z = v.z + w * t.z + (q.x * t.y - q.y * t.x);
+
+        return result;
+    }
+};
+
+struct FTransform
+{
+    struct FQuat Rotation;  // 0x0(0x20)
+    Vector3 Translation;  // 0x20(0x18)
+    char pad_56[8];  // 0x38(0x8)
+    Vector3 Scale3D;  // 0x40(0x18)
+    char pad_88[8];  // 0x58(0x8)
+
+    D3DMATRIX ToMatrixWithScale() const
+    {
+        D3DMATRIX m;
+        m._41 = static_cast<float>(Translation.x);
+        m._42 = static_cast<float>(Translation.y);
+        m._43 = static_cast<float>(Translation.z);
+
+        const float x2 = static_cast<float>(Rotation.x + Rotation.x);
+        const float y2 = static_cast<float>(Rotation.y + Rotation.y);
+        const float z2 = static_cast<float>(Rotation.z + Rotation.z);
+
+        const float xx2 = static_cast<float>(Rotation.x * x2);
+        const float yy2 = static_cast<float>(Rotation.y * y2);
+        const float zz2 = static_cast<float>(Rotation.z * z2);
+        m._11 = static_cast<float>((1.0f - (yy2 + zz2)) * Scale3D.x);
+        m._22 = static_cast<float>((1.0f - (xx2 + zz2)) * Scale3D.y);
+        m._33 = static_cast<float>((1.0f - (xx2 + yy2)) * Scale3D.z);
+
+        const float yz2 = static_cast<float>(Rotation.y * z2);
+        const float wx2 = static_cast<float>(Rotation.w * x2);
+        m._32 = static_cast<float>((yz2 - wx2) * Scale3D.z);
+        m._23 = static_cast<float>((yz2 + wx2) * Scale3D.y);
+
+        const float xy2 = static_cast<float>(Rotation.x * y2);
+        const float wz2 = static_cast<float>(Rotation.w * z2);
+        m._21 = static_cast<float>((xy2 - wz2) * Scale3D.y);
+        m._12 = static_cast<float>((xy2 + wz2) * Scale3D.x);
+
+        const float xz2 = static_cast<float>(Rotation.x * z2);
+        const float wy2 = static_cast<float>(Rotation.w * y2);
+        m._31 = static_cast<float>((xz2 + wy2) * Scale3D.z);
+        m._13 = static_cast<float>((xz2 - wy2) * Scale3D.x);
+
+        m._14 = 0.0f;
+        m._24 = 0.0f;
+        m._34 = 0.0f;
+        m._44 = 1.0f;
+
+        return m;
+    }
+};
+
+// ── Bone array pointer decrypt (moved verbatim from SteamDecrypt.hpp Bones) ─
+// CL-1341255 v818: PSHUFB mask {05,00,04,06,07,02,03,01}, ROL32=22 per dword,
+// then ROL64=50 of the low qword. Pure function of the 16-byte seed.
+namespace BoneMath {
+
+constexpr int Rol32Amount = 22;
+constexpr int Rol64Amount = 50;
+
+inline uint64_t DecryptBoneArrayPointer(const uint8_t seed[16]) {
+    const __m128i v = _mm_loadu_si128(
+        reinterpret_cast<const __m128i*>(seed));
+
+    // PSHUFB mask: {05,00,04,06,07,02,03,01}
+    alignas(16) const __m128i shuffleMask = _mm_setr_epi8(
+        5, 0, 4, 6, 7, 2, 3, 1,
+        0, 0, 0, 0, 0, 0, 0, 0);
+    const __m128i shuffled = _mm_shuffle_epi8(v, shuffleMask);
+
+    // ROL32 per dword by 22
+    const __m128i rol32 = _mm_or_si128(
+        _mm_slli_epi32(shuffled, Rol32Amount),
+        _mm_srli_epi32(shuffled, 32 - Rol32Amount));
+
+    // ROL64 of the low qword by 50
+    const uint64_t lo = static_cast<uint64_t>(_mm_cvtsi128_si64(rol32));
+    return (lo << Rol64Amount) | (lo >> (64 - Rol64Amount));
+}
+
+} // namespace BoneMath

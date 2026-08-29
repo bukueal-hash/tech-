@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PhysX Mirror Fix — Research &amp; Stage Plan</title>
+<style>
+body{margin:0;background:#0d1117;color:#e6edf3;font:15px/1.55 system-ui,Segoe UI,sans-serif}
+main{max-width:960px;margin:0 auto;padding:32px}
+h1{margin:0 0 8px;color:#7ee787}h2{margin-top:30px;color:#79c0ff}h3{color:#d2a8ff;margin-top:20px}
+.sub{color:#8b949e}.bar{height:14px;background:#21262d;border-radius:8px;overflow:hidden;margin:18px 0 28px}
+.fill{height:100%;width:0%;background:#3fb950}
+section{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px 20px;margin:14px 0}
+.item{margin:12px 0}.eta{color:#d29922;font-size:13px}code{color:#a5d6ff;background:#21262d;padding:2px 5px;border-radius:4px}
+table{width:100%;border-collapse:collapse;margin:10px 0}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid #30363d;font-size:14px}
+th{color:#79c0ff;font-weight:600}
+.ok{color:#3fb950}.warn{color:#d29922}.bad{color:#f85149}
+.arch{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:16px 20px;margin:14px 0;font-family:monospace;font-size:13px;line-height:1.6;white-space:pre;color:#8b949e}
+.arch b{color:#7ee787}.arch em{color:#d29922;font-style:normal}
+a{color:#79c0ff}
+</style>
+</head>
+<body><main>
+<h1>PhysX Mirror Fix — Research &amp; Stage Plan</h1>
+<div class="sub"><b>Progress: 0 / 5 stages complete</b><br>
+Why the WorldMirror found 0 actors, what five other games do for external visibility, and the staged fix. Sources: zarboz UE4 PhysX writeup (Feb 2026), junglepuppy Tarkov PhysX recreation, Arc Raiders obstruction thread (UC), PUBG reversal thread.</div>
+<div class="bar"><div class="fill"></div></div>
+
+<h2>1 — The wrong conclusion, corrected</h2>
+<section>
+<div class="item"><span class="bad">✗ Earlier claim:</span> "No PhysX DLLs loaded → game uses Chaos, mirror must be rewritten."</div>
+<div class="item"><span class="warn">Why it was wrong:</span> the module list was taken from <code>ArcRaiders.exe</code> on <em>this</em> PC — that is our DMA client, not the game. The game runs on the target machine; its modules are invisible here. Meanwhile <code>help.txt</code> contains <code>Gu::HeightField (PhysX3Common_x64.dll, IDA-verified)</code> structures — PhysX 3.4 is statically linked into the game.</div>
+<div class="item"><span class="ok">✓ Community confirms:</span> jouh + zarboz on UC (Feb 2026): "the game uses physx not chaos, you can make perfect vis check pretty easily." The PhysX mirror approach is correct — the <em>discovery</em> is what's broken.</div>
+</section>
+
+<h2>2 — Root cause of the 0-actor failure</h2>
+<section>
+<div class="item"><b>a) Wrong object accepted as PxScene.</b> <code>UWorld+0x4E0</code> is labeled <code>PHYS_SCENE</code> in help.txt but the note says <em>PhysicsField</em> — the Chaos-style field system, not FPhysScene. Our <code>LooksLikePxScene()</code> only checked "vtable is a usermode address" — everything passes that.</div>
+<div class="item"><b>b) Back-pointer validation not implemented.</b> zarboz's check — <code>FPhysScene+0xA0 == UWorld</code> — is documented in our own physx-mirror-plan.md but never coded into the combined discovery path.</div>
+<div class="item"><b>c) Sig-scan loses to hints.</b> <code>48 8B 81 ?? ?? ?? ?? C3</code> scan exists, but hint offsets are tried first and a garbage candidate at 0x4E0 wins.</div>
+<div class="item"><b>d) Garbage in, garbage out.</b> The NpScene scanner then read 1MB of the wrong object: 85K read failures, 2551 fake candidates, concreteType values 0 / 65 / 44768 instead of 6 / 7. The scanner itself is fine — it was fed a fake scene.</div>
+</section>
+
+<h2>3 — What other games do</h2>
+<table>
+<tr><th>Game</th><th>Engine / Physics</th><th>Approach</th><th>Status</th></tr>
+<tr><td><b>Escape from Tarkov</b></td><td>Unity + PhysX 4.1</td><td><code>physx_sdk</code> global → scene array → <code>NpScene+0x23D8</code> rigid actor array → shapes via ptr_table. vegacold1995 added <b>SceneQueryManager</b> for statics — ~90% less traversal than actors alone. Full convex-hull vertex parsing.</td><td class="ok">Working; ~98% visibility accuracy reported</td></tr>
+<tr><td><b>PUBG</b></td><td>UE4.16 + PhysX (static)</td><td>PhysicsScene inside UWorld; needs <em>both</em> RigidActors (dynamics) and SceneQueryManager (statics). Convex hulls parsed from <code>hull_data</code> (vertices live after polygon array).</td><td class="ok">Working; gotcha: level streaming scene swaps</td></tr>
+<tr><td><b>Arc Raiders</b></td><td>Embark UE + PhysX 3.4 (static)</td><td>zarboz: UWorld → FPhysScene → +0xB0 PxScene → NpScene scan with runtime offset discovery; scatter-read batches; Embree BVH; FKAggregateGeom as second data path.</td><td class="ok">"Stable for months" (zarboz)</td></tr>
+<tr><td><b>Marvel Rivals / Dead by Daylight</b></td><td>UE5 + Chaos</td><td>No PxScene/NpScene exists. Solver is <code>FPBDRigidsSolver</code> → <code>FPBDRigidsSOAs</code> particle arrays — completely different SDK. Most revert to internal <code>LineOfSight</code> hooks.</td><td class="bad">Unsolved externally</td></tr>
+<tr><td><b>PUBG (newer builds)</b></td><td>UE5 + Chaos</td><td>Decompile shows <code>FPhysScene_Chaos @ UWorld+0x228</code>, <code>ChaosInterface</code> raycast traits — same Chaos wall.</td><td class="bad">Chaos case</td></tr>
+</table>
+<div class="item"><b>Takeaway:</b> every success story reads the PhysX NpScene <em>and/or</em> UE's own <code>FKAggregateGeom</code> asset data, validates with concreteType 6/7, caches locally, raycasts on CPU. Chaos games are the ones that get stuck. We are on the PhysX side of that line.</div>
+</section>
+
+<h2>4 — Two data paths, one query engine</h2>
+<div class="arch"><b>Path A: PhysX NpScene (primary)</b>
+  UWorld → FPhysScene <em>(validated: +0xA0 back-ptr == UWorld)</em>
+        → PxScene +0xB0 <em>(vtable must be in a module range)</em>
+        → NpScene scan → PxRigidActor[] → shapes → geometry
+<b>Path B: FKAggregateGeom (fallback, zero PhysX internals)</b>
+  Level actor → StaticMeshComponent.StaticMesh 0x728
+        → StaticMesh.BodySetup 0x1F0
+        → BodySetup.AggGeom 0xB8 (KSphereElem / KBoxElem / KSphylElem / KConvexElem)
+        → dedupe by StaticMesh asset ptr, instance transform per component
+        ↓ both paths
+<em>existing local grid broadphase + prim raycast + LineOfSight()</em> — already built</div>
+<div class="item">All Path B offsets are <span class="ok">already verified in our own SDK dump</span> (CL-1341255): <code>StaticMesh 0x728</code>, <code>BodySetup 0x1F0</code>, <code>AggGeom 0xB8</code> (size 0x78), elems at 0x0 / 0x10 / 0x20 / 0x30. If NpScene offsets ever drift again, Path B keeps visibility alive.</div>
+</section>
+
+<h2>Stage 1 — Discovery hardening</h2>
+<section>
+<div class="item">☐ <b>Validate FPhysScene properly</b> — for each UWorld candidate require <code>candidate+0xA0 == UWorld</code> (zarboz back-pointer). Reject anything else before touching it.<br><span class="eta">ETA: 1 session</span></div>
+<div class="item">☐ <b>Module-range vtable check</b> — resolve game exe + PhysX3Common_x64.dll base/size via DMA; a "vtable" must land inside one. Kills heap-pointer false positives like <code>0x14B3E2D20</code>.<br><span class="eta">ETA: same session</span></div>
+<div class="item">☐ <b>Prioritize sig-scan over hints</b> — <code>48 8B 81 ?? ?? ?? ?? C3</code> result tried first; drop <code>0x4E0</code> from the hint list (it's PhysicsField); keep +0xB0 standard PxScene offset before in-object scan.<br><span class="eta">ETA: same session</span></div>
+</section>
+
+<h2>Stage 2 — NpScene scan on the real scene</h2>
+<section>
+<div class="item">☐ <b>Restore strict validators</b> — concreteType 6/7 at +0x08, min 3 rigid actors (1 was too lenient), count 1..50000, capacity ≥ count. Reference offset 0x23D8 (PhysX 3.4 stock), seen at 0x2618 elsewhere — scan, don't hardcode.<br><span class="eta">ETA: 1 session</span></div>
+<div class="item">☐ <b>Cache last-known-good offset</b> — retry it first each pass; invalidate on level/raid transition.<br><span class="eta">ETA: same session</span></div>
+</section>
+
+<h2>Stage 3 — AggGeom fallback path</h2>
+<section>
+<div class="item">☐ <b>Harvest from level actors</b> — walk PersistentLevel actors → RootComponent → <code>StaticMesh 0x728</code> → <code>BodySetup 0x1F0</code> → <code>AggGeom 0xB8</code>; read sphere/box/sphyl/convex elem arrays; compose component-to-world × elem transform.<br><span class="eta">ETA: 2 sessions</span></div>
+<div class="item">☐ <b>Dedupe by asset</b> — one geometry read per unique StaticMesh pointer; per-instance transform only. Strict byte budget per tick.<br><span class="eta">ETA: same session</span></div>
+</section>
+
+<h2>Stage 4 — Wiring + raid validation</h2>
+<section>
+<div class="item">☐ <b>Feed the existing engine</b> — both paths normalize into the current prim cache/grid; <code>LineOfSight()</code> stays unchanged. 50cm near-target tolerance; aim ray at root pos +35cm Z (zarboz tips).<br><span class="eta">ETA: 1 raid</span></div>
+<div class="item">☐ <b>Sanity checks</b> — blocked % against known cover, clear in open field; actor/shape counts in the thousands (not 0, not 50K).<br><span class="eta">ETA: same raid</span></div>
+</section>
+
+<h2>Stage 5 — Performance &amp; hardening</h2>
+<section>
+<div class="item">☐ <b>Batched reads</b> — group actor/shape reads into the fewest DMA transactions the Memory layer supports (zarboz: ~100× vs sequential).<br><span class="eta">ETA: 1–2 sessions</span></div>
+<div class="item">☐ <b>Re-enable overlay rows</b> only when <code>Ready()</code> is real (prims non-empty). Mirror-only visibility, always-true fallback while warming.<br><span class="eta">ETA: same session</span></div>
+</section>
+
+<p class="sub">Rules: one stage at a time → stop exe → build → raid-test → tick. No geometry work on the paint thread. Discovery is invalid until <code>+0xA0</code> back-pointer passes — no more trusting pretty vtables.</p>
+</main></body></html>

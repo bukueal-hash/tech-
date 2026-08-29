@@ -1,0 +1,4 @@
+// App icon resource - embeds icon.ico into ArcRaiders.exe.
+#include "resource.h"
+
+IDI_ICON1               ICON                    "icon.ico"
