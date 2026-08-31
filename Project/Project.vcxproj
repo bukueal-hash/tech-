@@ -185,6 +185,7 @@
     <ClCompile Include="Functions\RobotList.cpp" />
     <ClCompile Include="Functions\World.cpp" />
     <ClCompile Include="Functions\BoneList.cpp" />
+    <ClCompile Include="Functions\CollisionMirror.cpp" />
     <ClCompile Include="Functions\Esp.cpp" />
     <ClCompile Include="Functions\Aimbot.cpp" />
     <ClCompile Include="Core\SessionLog.cpp" />
@@ -276,6 +277,7 @@
     <ClInclude Include="Interface\Utils\Variables\index.h" />
     <ClInclude Include="Interface\Utils\Visuals\visuals.hpp" />
     <!-- Functions -->
+    <ClInclude Include="Functions\CollisionMirror.h" />
     <!-- ThirdParty (ImGui) -->
     <ClInclude Include="ThirdParty\ImGui\imconfig.h" />
     <ClInclude Include="ThirdParty\ImGui\imgui.h" />

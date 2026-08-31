@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bot Admission Resume-Frontier Fix — Plan</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.55; padding: 32px; max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 24px; color: #f0f6fc; margin-bottom: 4px; }
+  h2 { font-size: 19px; color: #79c0ff; margin-top: 32px; margin-bottom: 10px; border-bottom: 1px solid #21262d; padding-bottom: 6px; }
+  h3 { font-size: 15px; color: #f0f6fc; margin-top: 20px; margin-bottom: 8px; }
+  .meta { color: #8b949e; font-size: 13px; margin-bottom: 24px; }
+  p { margin-bottom: 12px; }
+  code { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 1px 6px; font-size: 12.5px; font-family: 'Cascadia Code', Consolas, monospace; color: #e6edf3; }
+  pre { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; overflow-x: auto; margin: 12px 0 16px; font-size: 12px; line-height: 1.5; font-family: 'Cascadia Code', Consolas, monospace; color: #e6edf3; }
+  pre code { background: none; border: none; padding: 0; }
+  ul { margin: 0 0 14px 22px; }
+  li { margin-bottom: 6px; }
+  table { border-collapse: collapse; margin: 12px 0 16px; width: 100%; }
+  th, td { border: 1px solid #30363d; padding: 8px 12px; text-align: left; font-size: 13.5px; }
+  th { background: #161b22; color: #79c0ff; }
+  td code { font-size: 12px; }
+  .badge { display: inline-block; background: #f0883e; color: #0d1117; font-size: 11px; font-weight: 600; padding: 2px 10px; border-radius: 12px; margin-left: 8px; vertical-align: middle; }
+  .green { color: #3fb950; font-weight: 600; }
+  .red { color: #f85149; font-weight: 600; }
+  .hl { background: #f2cc60; color: #0d1117; border-radius: 4px; padding: 0 6px; font-weight: 600; }
+  .evidence { background: #10151c; border: 1px solid #f0883e; border-radius: 8px; padding: 16px 18px; margin: 14px 0; }
+  .evidence pre { border-color: #30363d; }
+  .evidence p { margin-bottom: 6px; }
+  .note { color: #8b949e; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<h1>Bot Admission Resume-Frontier Fix <span class="badge">Ready to implement</span></h1>
+<div class="meta">2026-08-29 · Riventides 16K-actor maps · B4 (bot frontier) already applied, this plan completes + mirrors it</div>
+
+<h2>Evidence (live raid logs, debug-c190fb.log)</h2>
+
+<h3>Bot ring deadlocked — Riventides, 16K actors</h3>
+<div class="evidence">
+<pre><code>bot_admit_stats:    scanned:0 admitted:0 cache:0 drawing:0 quickPass:0
+                    slice:0 (frozen)   enemyCount:42-77   actorCount:664 (persistent)
+player_admit_stats: scanned:16384 admitN:16383 cache:11 slice:0 ringResets:2</code></pre>
+<p><span class="red">Bots: zero scan, zero cache, zero draw.</span> The 8-slice admit ring never leaves slice 0. <span class="red">Players: ring also frozen at slice 0</span> — only cached players draw; new players would never admit on this map. Streaming levels push total actors to <code>kMaxActorsTotal</code> (16384); a 2048-row slice can't complete its scout window inside the shared 90&nbsp;ms DMA budget.</p>
+</div>
+
+<h3>Root-cause chain</h3>
+<pre><code>16K actor arrays saturate the shared DMA link
+  → admission probe scatter only lands ~1-3 of 43 chunks per pass
+  → slicePartial=true → admitRingAdvanceOk=false  (ring never advances)
+  → next pass restarts the SAME slice from row 0
+  → zero-buffer rows (never scattered) still get fname-probed
+  → mass negative-memoization → permanent blindness
+  → cache:0, drawing:0</code></pre>
+
+<p>B4 (already in <code>RobotList.cpp</code>) fixes the <strong>scan</strong> restart with <code>s_admitResumeRow</code>, deterministic <code>bandRows</code> order, and processing only freshly-scattered rows. Two gaps remain:</p>
+<ul>
+  <li><strong>Frontier captured before screening.</strong> A 40&nbsp;ms screening / 60&nbsp;ms serial-verify break after a full scan resets resume to 0 → whole band re-scattered next pass → livelock on slice 0 even with B4 compiled.</li>
+  <li><strong>Verify stage sets <code>slicePartial=true</code>.</strong> Ring advancement is frozen by a stage that must not gate discovery.</li>
+</ul>
+
+<h2>Stage 1 — B5: monotonic frontier (resume from the screening frontier)</h2>
+<p><strong>File:</strong> <code>Project/Functions/RobotList.cpp</code></p>
+<p>The resume cursor must reflect how far the band was <em>fully consumed</em> (scattered <strong>and</strong> screened), not only how far it was scattered. Steps:</p>
+<ul>
+  <li>Move the frontier bookkeeping <strong>after</strong> the screening loop. Keep <code>scatteredEnd = min(base, probeRows.size())</code> and the distance-sort gate as-is. Capture <code>processEnd</code> (row index the 40&nbsp;ms screening budget reached).</li>
+</ul>
+<pre><code>// B5: resume from the SCREENING frontier — monotonic progress. Rows in
+// [processEnd, scatteredEnd) were scattered but not screened; they are
+// re-scattered next pass (cheap, chunked) and cannot be lost.
+const size_t prioCount = prioRows.size();
+const bool sortedSweep = scatteredEnd &gt;= probeRows.size();
+const bool consumedAll  = sortedSweep &amp;&amp; processEnd == scatteredEnd;
+if (consumedAll) {
+    s_admitResumeRow = 0;          // full band consumed → advance ring
+} else if (sortedSweep) {
+    s_admitResumeRow = 0;          // distance-sorted order ≠ band order; replay
+    slicePartial = true;
+} else {
+    const size_t bandProcessed =
+        (processEnd &gt; prioCount) ? (processEnd - prioCount) : 0;
+    s_admitResumeRow =
+        resume + (std::min)(bandProcessed, bandRows.size() - resume);
+}</code></pre>
+<p>Ring gate unchanged (<code>admitRingAdvanceOk = !slicePartial</code>) — now only scatter/screening partiality stalls it, and every partial state persists real progress.</p>
+
+<h2>Stage 2 — Serial-verify backlog (RobotList)</h2>
+<ul>
+  <li>New static <code>std::vector&lt;uintptr_t&gt; s_admitVerifyBacklog;</code> (cap 4096, keep tail on overflow), cleared in the <code>ringReset</code> block.</li>
+  <li>Convert the verify loop to an indexed loop over <code>pending = backlog + admitCandidates</code>; on budget break requeue the remainder — <span class="green"><strong>no <code>slicePartial</code></strong></span>.</li>
+</ul>
+<pre><code>WorldScan::ScanBudget admitBudget(std::chrono::milliseconds(60));
+std::vector&lt;uintptr_t&gt; pending;
+pending.reserve(s_admitVerifyBacklog.size() + admitCandidates.size());
+pending.insert(pending.end(), s_admitVerifyBacklog.begin(), s_admitVerifyBacklog.end());
+pending.insert(pending.end(), admitCandidates.begin(), admitCandidates.end());
+s_admitVerifyBacklog.clear();
+size_t vi = 0;
+for (; vi &lt; pending.size(); ++vi) {
+    if (admitBudget.expired()) {
+        // requeue tail (capped) — verify never stalls the ring; cached bots
+        // re-verify cheaply via neg-memo TTL, the backlog drains across passes
+        ...break;   // NO slicePartial here
+    }
+    const uintptr_t actor = pending[vi];
+    ...existing body unchanged...
+}</code></pre>
+<p>New spawns still surface immediately via the prior-actor diff + <code>kAdmitPrioNewMax</code> prio band, so the backlog cannot delay genuine new bots.</p>
+
+<h2>Stage 3 — Mirror B5 to the player ring (EntityList)</h2>
+<p><strong>File:</strong> <code>Project/Functions/EntityList.cpp</code></p>
+<p>The player ring is pre-B4: unordered <code>probeSet</code> iteration, no resume frontier, screening over <strong>all</strong> rows (zero-buffer rows beyond <code>scatteredEnd</code> too), distance-sort gated only on <code>!probeRows.empty()</code> — frozen at slice 0 on Riventides.</p>
+<ul>
+  <li>New static <code>s_playerAdmitResumeRow</code> (cleared in <code>ringReset</code>). A separate verify backlog is <strong>not</strong> needed here — the serial PS-chase/fname stage <em>is</em> the screening loop, so the <code>processEnd</code> frontier covers partial passes.</li>
+  <li><code>probeSet</code> → deterministic <code>bandRows</code> + <code>prioRows</code> (band math, dedup, prio cap, prio rows lead — same as B4 bot path). <code>PlayerScanNegMemoHit</code> moves into the screening loop so <code>probeRows</code> stays a 1:1 projection of prio+band (frontier stays positionally exact).</li>
+  <li>Compute <code>scatteredEnd</code> after the chunked scatter; gate the distance-sort on <code>scatteredEnd &gt;= probeRows.size()</code>.</li>
+  <li>Screen loop → <code>for (size_t ri = 0; ri &lt; scatteredEnd; ++ri)</code> with fresh 40&nbsp;ms budget, capture <code>processEnd</code>, then the same B5 frontier + <code>slicePartial</code> rule.</li>
+</ul>
+
+<h2>Stage 4 — Build + field verification</h2>
+<ul>
+  <li>Link + launch with <code>scripts\build.ps1 -Run</code> (self-elevates, closes the game, links, relaunches).</li>
+  <li>Riventides raid, watch <code>debug-c190fb.log</code>:</li>
+</ul>
+<pre><code>bot_admit_stats   → slice cycles 0..7, scanned&gt;0, quickPass&gt;0, cache climbs, drawing&gt;0
+player_admit_stats → slice cycles, cache grows past 11</code></pre>
+<ul>
+  <li><strong>Vischeck harness (already in the tree):</strong> enable <code>Draw LOS rays</code> — green = admitted + LOS-clear, red = admitted + blocked. Bots must render first; that is the end-to-end gate.</li>
+  <li>Regression: <code>cam_lead_skip</code> stays 1-3, <code>flicker_score</code> zeros (B5 is pure bookkeeping on top of chunked scatter + yield).</li>
+</ul>
+
+<h2>Out of scope (deliberately)</h2>
+<ul>
+  <li>Lowering <code>kMaxActorsTotal</code>, level-stream culling, or actor-list filtering upstream — the 16K scan stays; the ring drains it over time instead of dying on it.</li>
+  <li>ContainerList admission — world items work via the couple-scatter world path; no ring, no fix.</li>
+  <li>KD-tree / LRTS vischeck internals — verdict/draw-time only, doesn't gate admission.</li>
+</ul>
+
+<h2>Reviewer checklist</h2>
+<ul>
+  <li><input type="checkbox"> No offset changes — SDK dump verified for CL-1341255.</li>
+  <li><input type="checkbox"> RobotList B5: resume after screening; <code>consumedAll</code> → advance; <code>sortedSweep</code> partial → replay; else <code>bandProcessed</code>.</li>
+  <li><input type="checkbox"> Backlog cap 4096; cleared on <code>ringReset</code>; verify break does NOT set <code>slicePartial</code>.</li>
+  <li><input type="checkbox"> EntityList mirrors deterministic bandRows, <code>scatteredEnd</code>-gated distance sort, bounded screen loop, same frontier rule.</li>
+  <li><input type="checkbox"> Build OK; raid log shows both rings cycling slices and both caches growing.</li>
+  <li><input type="checkbox"> Bots render, behind-wall bots drop via vischeck, <code>cam_lead_skip</code> 1-3, <code>flicker_score</code> zeros.</li>
+</ul>
+
+</body>
+</html>

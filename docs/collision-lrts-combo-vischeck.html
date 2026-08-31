@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Collision + LRTS Combined Vischeck — Plan</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.55; padding: 32px; max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 26px; color: #f0f6fc; margin-bottom: 4px; }
+  h2 { font-size: 19px; color: #79c0ff; margin-top: 32px; margin-bottom: 10px; border-bottom: 1px solid #21262d; padding-bottom: 6px; }
+  h3 { font-size: 15px; color: #f0f6fc; margin-top: 20px; margin-bottom: 8px; }
+  .meta { color: #8b949e; font-size: 13px; margin-bottom: 24px; }
+  p { margin-bottom: 12px; }
+  code { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 1px 6px; font-size: 12.5px; font-family: 'Cascadia Code', Consolas, monospace; color: #e6edf3; }
+  pre { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; overflow-x: auto; margin: 12px 0 16px; font-size: 12.5px; line-height: 1.5; font-family: 'Cascadia Code', Consolas, monospace; color: #e6edf3; }
+  pre code { background: none; border: none; padding: 0; }
+  ul { margin: 0 0 14px 22px; }
+  li { margin-bottom: 6px; }
+  table { border-collapse: collapse; margin: 12px 0 16px; width: 100%; }
+  th, td { border: 1px solid #30363d; padding: 8px 12px; text-align: left; font-size: 13.5px; }
+  th { background: #161b22; color: #79c0ff; }
+  td code { font-size: 12px; }
+  .badge { display: inline-block; background: #1f6feb; color: #fff; font-size: 11px; font-weight: 600; padding: 2px 10px; border-radius: 12px; margin-left: 8px; vertical-align: middle; }
+  .green { color: #3fb950; font-weight: 600; }
+  .red { color: #f85149; font-weight: 600; }
+  .hl { background: #f2cc60; color: #0d1117; border-radius: 4px; padding: 0 6px; font-weight: 600; }
+  .evidence { background: #10151c; border: 1px solid #1f6feb; border-radius: 8px; padding: 16px 18px; margin: 14px 0; }
+  .evidence p { margin-bottom: 6px; }
+  .note { color: #8b949e; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<h1>Collision + LRTS Combined Vischeck <span class="badge">Ready to implement</span></h1>
+<div class="meta">2026-08-29 · Evidence collected live · Offsets from this repo's own SDK dump (build 24710327)</div>
+
+<h2>Evidence (collected live today)</h2>
+
+<h3>1. AggGeom probe — in-raid, TheDam_02_P, 1245 actors</h3>
+<div class="evidence">
+<pre><code>actors 1245  roots 1198  mesh 459/31(legacy)
+bodySetups 309  unique 105  <span class="hl">nonEmpty 30</span>
+bodySetups rejected: 47
+<span class="hl">sph 1  box 8  sphyl 1  convex 101</span>
+tapered 0  levelSet 12  skinnedLevelSet 0</code></pre>
+<p><span class="green">AggGeom is NOT empty on this build.</span> 30 body setups carry real primitives — 101 convex hulls, 8 boxes, 1 sphere, 1 capsule. The old "0 primitives" conclusion came from a broken probe; this chain reads them fine.</p>
+</div>
+
+<h3>2. Element layouts — from this repo's SDK dump, not the forum</h3>
+<p class="note">The UC forum source's element offsets are months stale — <strong>do not use them</strong>. help/help.txt (build 24710327, Aug 18 2026) has the exact layouts for THIS build:</p>
+<pre><code>// KAggregateGeom @ UBodySetup+0xB8 (size 0x78)
+SphereElems   0x0  // TArray&lt;KSphereElem&gt;   item 0x50
+BoxElems      0x10 // TArray&lt;KBoxElem&gt;      item 0x70
+SphylElems    0x20 // TArray&lt;KSphylElem&gt;    item 0x68
+ConvexElems   0x30 // TArray&lt;KConvexElem&gt;   item 0x110
+TaperedElems  0x40 // TArray&lt;KTaperedCapsuleElem&gt;
+LevelSetElems 0x50
+SkinnedElems  0x60
+
+// KBoxElem (0x70)
+Center   0x30 // Vector  3×double = 0x18
+Rotation 0x48 // Rotator 3×double = 0x18
+X 0x60  Y 0x64  Z 0x68
+
+// KConvexElem (0x110)
+VertexData 0x30 // TArray&lt;Vector&gt;  item 0x18 (double3)
+IndexData  0x40 // TArray&lt;int32&gt;
+ElemBox    0x50 // Box 0x38
+Transform  0x90 // Transform 0x60 (doubles)
+
+// KSphereElem (0x50)   Center 0x30 · Radius 0x48
+// KSphylElem (0x68)    Center 0x30 · Rotation 0x48 · Radius 0x60 · Length 0x64</code></pre>
+
+<p>Verified chain (all from SDK dump, matches the working probe):</p>
+<pre><code>Actor.RootComponent                0x238
+SceneComponent.ComponentToWorld    0x370   (FTransform doubles: q@+0x00 t@+0x20 s@+0x40)
+StaticMeshComponent.StaticMesh     0x728
+UStaticMesh.BodySetup              0x1F0
+UBodySetup.AggGeom                 0xB8    (inline struct, 7 TArray headers)</code></pre>
+<p>FVector/FTransform are <strong>double-precision (LWC)</strong> — matches the UC source's FVec3d/FQuat4d reads, so the transform math ports as-is.</p>
+
+<h2>Stage 1 — CollisionMirror module (port, offsets corrected)</h2>
+<p>New file: <code>Project/Functions/CollisionMirror.h/.cpp</code> — port the UC pipeline with offsets replaced by the table above.</p>
+<ul>
+  <li><strong>Read world triangles per StaticMeshComponent:</strong> convex (VertexData + IndexData → world via comp transform), boxes (12-tri), spheres (8-tri octahedron), sphyls (box approx). Level-set elems <strong>skipped</strong> (no portable layout). Every read capped + validated like the probe.</li>
+  <li><strong>KD-tree</strong> over world triangles (leaf ≤ 8 tris, median AABB split).</li>
+  <li><strong>Background rebuild:</strong> static-mesh roots within 60000 units, dedupe by mesh+transform fingerprint, rebuild on move &gt; 3000 units or 20s. Publish under mutex; queries <code>try_lock</code> the pointer and raycast lock-free — <span class="green">paint never blocks</span> (same rule as the radar fix).</li>
+  <li><strong><code>is_visible(from,to)</code>:</strong> segment ray vs KD-tree (Moller–Trumbore, t_max=1). No tree yet → visible (fail-open).</li>
+</ul>
+
+<h2>Stage 2 — Debug visualization (the part you asked for)</h2>
+<p>New vars <code>collision_debug_draw</code> + <code>collision_debug_rays</code> (default off), checkboxes in the LRTS menu tab.</p>
+<h3>Blocks</h3>
+<ul>
+  <li>Every triangle in the published tree, projected via <code>ProjectWorldLocationToScreen</code> and drawn with <code>g_renderQueue.addLine</code> (3 edges per tri).</li>
+  <li>Gray/white for normal geometry, <span class="red"><strong>red for the triangle a ray actually hits</strong></span> (tagged during the LOS pass).</li>
+  <li>Clamp to triangles within ~2000 units of the camera.</li>
+</ul>
+<h3>Rays</h3>
+<ul>
+  <li>For each bot/player the ESP processes: camera→target line — <span class="green"><strong>green</strong> = visible</span>, <span class="red"><strong>red</strong> = blocked</span>.</li>
+  <li>Queued to <code>g_renderQueue</code> at verdict time, flushed on paint — zero new paint-path work.</li>
+</ul>
+<p><strong>This stage doubles as the validation harness:</strong> with debug on you can <em>see</em> whether the tree matches the map (blocks on walls) and whether rays flip at real occlusion edges — before any verdict is trusted.</p>
+
+<h2>Stage 3 — LRTS + collision voting (the "real vischeck")</h2>
+<p>Hooks into the existing per-entity chain where <code>actor.isVisible</code> is set. LRTS primary, collision as fallback + tie-breaker:</p>
+<table>
+  <tr><th>LRTS verdict</th><th>Collision ray</th><th>Final</th></tr>
+  <tr><td>Visible</td><td>blocked</td><td><span class="red">Occluded</span> <span class="note">← stale stamp behind walls (30–70s wasp case)</span></td></tr>
+  <tr><td>Visible</td><td>clear</td><td><span class="green">Visible</span></td></tr>
+  <tr><td>Occluded</td><td>any</td><td><span class="red">Occluded</span> <span class="note">← renderer truth wins</span></td></tr>
+  <tr><td>Unknown</td><td>blocked</td><td><span class="red">Occluded</span> <span class="note">← collision fills LRTS gaps</span></td></tr>
+  <tr><td>Unknown</td><td>clear</td><td><span class="green">Visible</span></td></tr>
+  <tr><td>Unknown</td><td>no tree (warmup)</td><td><span class="green">Visible</span> <span class="note">← fail-open</span></td></tr>
+</table>
+<p>Feeds the same <code>VerdictSmoother</code> (2-check occlusion confirm, Unknown holds verdict) so the combo inherits the flicker-free behavior already in place. The LOS raycast is pure math on cached triangles — no DMA in the query; the rebuild stays on the worker, throttled by movement/interval.</p>
+
+<h2>Stage 4 — Validation gates (before trusting it)</h2>
+<ul>
+  <li>Debug-on visual: blocks on walls/floors, rays red crossing a wall, green in open air.</li>
+  <li>Wall-pop test: strafe behind a wall — box hides fast, no ghost flicker.</li>
+  <li>Red/green split matches what you see on screen.</li>
+  <li>Tree stats readout in menu: tri count, mesh count, rebuild time, query time.</li>
+</ul>
+
+<h2>Out of scope (deliberately)</h2>
+<ul>
+  <li>Level-set / tapered-capsule geometry (no portable layout; the 101 convex hulls carry the weight).</li>
+  <li>Persisting geometry across raids (rebuild is cheap).</li>
+  <li>Dynamic occluders (doors/vehicles) — static meshes only, same as the UC source; LRTS covers the dynamic gaps.</li>
+</ul>
+
+<h2>Reviewer checklist</h2>
+<ul>
+  <li><input type="checkbox"> CollisionMirror compiles against verified offsets (no forum offsets).</li>
+  <li><input type="checkbox"> Probe + collision module agree: ~30 nonEmpty, ~101 convex in the same raid.</li>
+  <li><input type="checkbox"> Debug blocks visibly align with walls/floors in a raid.</li>
+  <li><input type="checkbox"> Debug rays flip green/red at real occlusion edges.</li>
+  <li><input type="checkbox"> Paint thread shows zero new paint_stall spikes with debug off.</li>
+  <li><input type="checkbox"> Combined voting wired into EntityList + RobotList, verdicts smooth.</li>
+</ul>
+
+</body>
+</html>

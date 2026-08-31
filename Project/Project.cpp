@@ -19,6 +19,7 @@
 #include "Interface/OverlayHost.h"
 #include "Interface/Utils/AutoConfig.h"
 #include "Interface/Render.h"
+#include "Core/AgentLog.h"
 #include "Core/AssetNames.h"
 #include "Core/CrashHandler.h"
 #include "resource.h"
@@ -94,8 +95,13 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
+    // Opaque overlay (game runs on the DMA target PC — no transparency needed).
+    // Deliberately NOT WS_EX_LAYERED and no DWM glass margins: the layered+
+    // glass combo lets the DWM ghost-composite a stale copy of the surface
+    // ("exact copy of everything flashes off to the side"). A plain topmost
+    // opaque popup presents straight with no composition path to ghost.
     const HWND hwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE,
+        WS_EX_TOPMOST | WS_EX_NOACTIVATE,
         wc.lpszClassName,
         L"UnrealWindow",
         WS_POPUP,
@@ -109,8 +115,6 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         nullptr
     );
 
-    SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), BYTE(255), LWA_ALPHA);
-
     // Push the icon onto the window explicitly: the taskbar/Alt-Tab does not
     // always pick up the window-class icon for WS_POPUP | WS_EX_NOACTIVATE
     // overlay windows, and falls back to a blank white glyph.
@@ -119,26 +123,6 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     {
         SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hAppIcon));
         SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hAppIcon));
-    }
-
-    {
-        RECT client_area{};
-        GetClientRect(hwnd, &client_area);
-
-        RECT window_area{};
-        GetWindowRect(hwnd, &window_area);
-
-        POINT diff{};
-        ClientToScreen(hwnd, &diff);
-
-        const MARGINS margins{
-            window_area.left + (diff.x - window_area.left),
-            window_area.top + (diff.y - window_area.top),
-            client_area.right,
-            client_area.bottom
-        };
-
-        DwmExtendFrameIntoClientArea(hwnd, &margins);
     }
 
     if (!CreateDeviceD3D(hwnd))
@@ -224,19 +208,23 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
             CreateRenderTarget();
         }
 
+        // Paint-stall diagnostic: time the whole frame iteration (NewFrame →
+        // Present) AND which phase ate the time (New/Rend/Draw/Pres). Baseline
+        // is ~4ms at 240Hz vsync; anything >= 25ms is a stall that can re-show
+        // the previous backbuffer (ghost-copy flash). Recorded in-memory only;
+        // the worker drains it (AgentLog.h).
+        const auto frameStart = std::chrono::steady_clock::now();
+
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
-
+        const auto tAfterNew = std::chrono::steady_clock::now();
 
         Render(hwnd);
-
-
         AutoConfig_Tick();
-
-
         if (GetAsyncKeyState(VK_END) & 0x1)
             SendMessage(hwnd, WM_CLOSE, 0, 0);
+        const auto tAfterRender = std::chrono::steady_clock::now();
 
         ImGui::Render();
 
@@ -252,10 +240,26 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color_with_alpha);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-
+        const auto tAfterDraw = std::chrono::steady_clock::now();
 
         HRESULT hr = g_pSwapChain->Present(1, 0);
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
+
+        const auto tEnd = std::chrono::steady_clock::now();
+        const float frameMs = std::chrono::duration<float, std::milli>(tEnd - frameStart).count();
+        float worstMs = 0.f;
+        const char* worstPhase = "-";
+        {
+            const float mNew = std::chrono::duration<float, std::milli>(tAfterNew - frameStart).count();
+            const float mRend = std::chrono::duration<float, std::milli>(tAfterRender - tAfterNew).count();
+            const float mDraw = std::chrono::duration<float, std::milli>(tAfterDraw - tAfterRender).count();
+            const float mPres = std::chrono::duration<float, std::milli>(tEnd - tAfterDraw).count();
+            if (mPres > worstMs) { worstMs = mPres; worstPhase = "Pres"; }
+            if (mDraw > worstMs) { worstMs = mDraw; worstPhase = "Draw"; }
+            if (mRend > worstMs) { worstMs = mRend; worstPhase = "Rend"; }
+            if (mNew > worstMs)  { worstMs = mNew;  worstPhase = "New"; }
+        }
+        PaintStallNote(frameMs, worstPhase, worstMs);
 
     }
 

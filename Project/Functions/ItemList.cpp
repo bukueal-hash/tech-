@@ -1056,7 +1056,12 @@ void Engine::ItemList()
 void Engine::CollectDrawingGroundPickups(std::vector<GroundPickupHudRow>& out) const
 {
     out.clear();
-    std::shared_lock<std::shared_mutex> lock(m_itemCacheMutex);
+    // Near-loot HUD runs on the paint thread every ~200ms. Never block on the
+    // item scanner's exclusive DMA-backed cache write (same class as the radar
+    // m_playerCacheMutex stall): try_lock + skip this HUD iteration if busy.
+    std::shared_lock<std::shared_mutex> lock(m_itemCacheMutex, std::defer_lock);
+    if (!lock.try_lock())
+        return;
     out.reserve(itemCache.size());
     for (const auto& [key, entry] : itemCache) {
         if (!entry.Drawing)

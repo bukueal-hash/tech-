@@ -420,81 +420,24 @@ Vector3 Engine::GetProjectionScreenCenter() const
 		0.0};
 }
 
-namespace {
-
-// UE-style camera axes (matches ARC reference TransformWorldToScreen).
-void RotationGetAxes(const Vector3& rot, Vector3& axisX, Vector3& axisY, Vector3& axisZ)
-{
-	constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
-	const double sp = std::sin(rot.x * kDegToRad);
-	const double cp = std::cos(rot.x * kDegToRad);
-	const double sy = std::sin(rot.y * kDegToRad);
-	const double cy = std::cos(rot.y * kDegToRad);
-	const double sr = std::sin(rot.z * kDegToRad);
-	const double cr = std::cos(rot.z * kDegToRad);
-
-	axisX = Vector3{ cy * cp, sy * cp, sp };
-
-	axisY = Vector3{ cy * sp * sr - sy * cr, sy * sp * sr + cy * cr, -cp * sr };
-
-	axisZ = Vector3{ -(cy * sp * cr + sy * sr), cy * sr - sy * sp * cr, cp * cr };
-}
-
-} // namespace
-
 bool Engine::ProjectWorldLocationToScreen(
 	Vector3 WorldLocation,
 	Vector3& screen,
 	const CameraCache& CameraInfo
 )
 {
-	if (WorldLocation.x == 0.0 &&
-		WorldLocation.y == 0.0 &&
-		WorldLocation.z == 0.0)
-		return false;
-
-	if (CameraInfo.FOV <= 1.0f || CameraInfo.FOV > 179.0f)
-		return false;
-
-	Vector3 axisX{};
-	Vector3 axisY{};
-	Vector3 axisZ{};
-	RotationGetAxes(CameraInfo.Rotation, axisX, axisY, axisZ);
-
-	const Vector3 delta = WorldLocation - CameraInfo.Location;
-	const double transformedX =
-		delta.x * axisY.x + delta.y * axisY.y + delta.z * axisY.z;
-	const double transformedY =
-		delta.x * axisZ.x + delta.y * axisZ.y + delta.z * axisZ.z;
-	const double transformedZ =
-		delta.x * axisX.x + delta.y * axisX.y + delta.z * axisX.z;
-
-	if (transformedZ < 1.0)
-		return false;
-
 	const double overlayW = static_cast<double>(
 		g_projViewportW.load(std::memory_order_relaxed));
 	const double overlayH = static_cast<double>(
 		g_projViewportH.load(std::memory_order_relaxed));
-	const double centerX = overlayW * 0.5;
-	const double centerY = overlayH * 0.5;
-
-	constexpr double kPi = 3.14159265358979323846;
-	const double tanHalfFov = std::tan(static_cast<double>(CameraInfo.FOV) * kPi / 360.0);
-	if (tanHalfFov < 0.001)
-		return false;
-
-	const double scale = centerY / tanHalfFov;
-	screen.x = centerX + (transformedX * scale) / transformedZ;
-	screen.y = centerY - (transformedY * scale) / transformedZ;
-
-	if (!std::isfinite(screen.x) || !std::isfinite(screen.y))
-		return false;
-	if (screen.x < -overlayW * 0.5 || screen.x > overlayW * 1.5 ||
-		screen.y < -overlayH * 0.5 || screen.y > overlayH * 1.5)
-		return false;
-
-	return true;
+	return EngineProjection::ProjectWorldLocationToScreen(
+		WorldLocation,
+		screen,
+		CameraInfo.Location,
+		CameraInfo.Rotation,
+		CameraInfo.FOV,
+		overlayW,
+		overlayH);
 }
 
 bool Engine::ProjectWorldLocationToScreen(

@@ -177,7 +177,7 @@ namespace Offsets {
     constexpr std::ptrdiff_t Shield = 0x150;                    // == HealthComponent.Armor @ 0x150
     constexpr std::ptrdiff_t ShieldMax = 0x160;                 // SDK validated: FArmorSlot.CurrentMaxArmor @ Armor+0x10
     constexpr std::ptrdiff_t MaxDBNO = 0x310;                   // SDK validated
-    constexpr std::ptrdiff_t TeamID = 0x822;                    // live-pinned (not a dumped field — verified in-game)
+    constexpr std::ptrdiff_t TeamID = 0x822;                    // live-pinned on UEmbarkCharacterBase; actual range 4-10 (NOT SDK enum 0-2)
 
     constexpr std::ptrdiff_t CurrentItemActors = 0x4B0;         // SDK CL-1341255 InventoryComponent (was 0x4A0 — stale)
     constexpr std::ptrdiff_t LocalCurrentItemActors = 0x4D0;    // SDK CL-1341255 (was 0x4C0 — stale)

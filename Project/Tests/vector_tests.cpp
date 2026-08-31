@@ -5,6 +5,11 @@
 #include "tests_main.hpp"
 #include "Core/Vector.hpp"
 
+#pragma warning(push)
+#pragma warning(disable : 4201 4244 4459)
+#include "Core/Engine.h"
+#pragma warning(pop)
+
 // doctest's own headers trip C5285 (std::tuple specialization) under /W4 on
 // the VS 18.x compiler — ThirdParty must never fail the build.
 #pragma warning(push)
@@ -148,4 +153,54 @@ TEST_CASE("Vector3 Edge cases")
     Vector3 q = v / zeroVec.x;   // divide by 0.0
     CHECK(std::isinf(q.x));
 #pragma warning(pop)
+}
+
+TEST_CASE("ProjectWorldLocationToScreen validates front-facing geometry")
+{
+    Engine::CameraCache cam{};
+    cam.Location = Vector3(0.0, 0.0, 0.0);
+    cam.Rotation = Vector3(0.0, 0.0, 0.0);
+    cam.FOV = 90.0f;
+
+    Vector3 screen{};
+    CHECK(EngineProjection::ProjectWorldLocationToScreen(
+        Vector3(100.0, 0.0, 0.0), screen,
+        cam.Location, cam.Rotation, cam.FOV,
+        1920.0, 1080.0));
+    CHECK(screen.x == doctest::Approx(960.0));
+    CHECK(screen.y == doctest::Approx(540.0));
+
+    CHECK_FALSE(EngineProjection::ProjectWorldLocationToScreen(
+        Vector3(-100.0, 0.0, 0.0), screen,
+        cam.Location, cam.Rotation, cam.FOV,
+        1920.0, 1080.0));
+
+    // 45 deg yaw to the right: with vertical FOV 90 on a 16:9 viewport,
+    // scale = 540/tan(45) = 540, so x = 960 + 100*540/100 = 1500.
+    CHECK(EngineProjection::ProjectWorldLocationToScreen(
+        Vector3(100.0, 100.0, 100.0), screen,
+        cam.Location, cam.Rotation, cam.FOV,
+        1920.0, 1080.0));
+    CHECK(screen.x == doctest::Approx(1500.0));
+    CHECK(screen.y == doctest::Approx(0.0));
+}
+
+TEST_CASE("ProjectWorldLocationToScreen rejects invalid camera state")
+{
+    Engine::CameraCache cam{};
+    cam.Location = Vector3(0.0, 0.0, 0.0);
+    cam.Rotation = Vector3(0.0, 0.0, 0.0);
+    cam.FOV = 0.0f;
+
+    Vector3 screen{};
+    CHECK_FALSE(EngineProjection::ProjectWorldLocationToScreen(
+        Vector3(100.0, 0.0, 0.0), screen,
+        cam.Location, cam.Rotation, cam.FOV,
+        1920.0, 1080.0));
+
+    cam.FOV = 180.0f;
+    CHECK_FALSE(EngineProjection::ProjectWorldLocationToScreen(
+        Vector3(100.0, 0.0, 0.0), screen,
+        cam.Location, cam.Rotation, cam.FOV,
+        1920.0, 1080.0));
 }

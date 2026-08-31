@@ -101,6 +101,7 @@
     <ClCompile Include="Tests\aim_math_tests.cpp"/>
     <ClCompile Include="Tests\json_parser_tests.cpp"/>
     <ClCompile Include="Tests\memory_interface_tests.cpp"/>
+    <ClCompile Include="Tests\collision_mirror_tests.cpp"/>
     <ClCompile Include="Tests\dma_stubs.cpp"/>
   </ItemGroup>
   <ItemGroup>

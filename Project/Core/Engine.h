@@ -50,6 +50,77 @@ inline bool IsPlausibleWorldPos(const Vector3& p)
         && std::fabs(static_cast<double>(p.z)) < kMaxAxis;
 }
 
+namespace EngineProjection {
+inline void RotationGetAxes(const Vector3& rot, Vector3& axisX, Vector3& axisY, Vector3& axisZ)
+{
+    constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+    const double sp = std::sin(rot.x * kDegToRad);
+    const double cp = std::cos(rot.x * kDegToRad);
+    const double sy = std::sin(rot.y * kDegToRad);
+    const double cy = std::cos(rot.y * kDegToRad);
+    const double sr = std::sin(rot.z * kDegToRad);
+    const double cr = std::cos(rot.z * kDegToRad);
+
+    axisX = Vector3{ cy * cp, sy * cp, sp };
+    axisY = Vector3{ cy * sp * sr - sy * cr, sy * sp * sr + cy * cr, -cp * sr };
+    axisZ = Vector3{ -(cy * sp * cr + sy * sr), cy * sr - sy * sp * cr, cp * cr };
+}
+
+inline bool ProjectWorldLocationToScreen(
+    const Vector3& worldLocation,
+    Vector3& screen,
+    const Vector3& cameraLocation,
+    const Vector3& cameraRotation,
+    float cameraFov,
+    double overlayW,
+    double overlayH)
+{
+    if (worldLocation.x == 0.0 &&
+        worldLocation.y == 0.0 &&
+        worldLocation.z == 0.0)
+        return false;
+
+    if (cameraFov <= 1.0f || cameraFov > 179.0f)
+        return false;
+
+    Vector3 axisX{};
+    Vector3 axisY{};
+    Vector3 axisZ{};
+    RotationGetAxes(cameraRotation, axisX, axisY, axisZ);
+
+    const Vector3 delta = worldLocation - cameraLocation;
+    const double transformedX =
+        delta.x * axisY.x + delta.y * axisY.y + delta.z * axisY.z;
+    const double transformedY =
+        delta.x * axisZ.x + delta.y * axisZ.y + delta.z * axisZ.z;
+    const double transformedZ =
+        delta.x * axisX.x + delta.y * axisX.y + delta.z * axisX.z;
+
+    if (transformedZ < 1.0)
+        return false;
+
+    const double centerX = overlayW * 0.5;
+    const double centerY = overlayH * 0.5;
+
+    constexpr double kPi = 3.14159265358979323846;
+    const double tanHalfFov = std::tan(static_cast<double>(cameraFov) * kPi / 360.0);
+    if (tanHalfFov < 0.001)
+        return false;
+
+    const double scale = centerY / tanHalfFov;
+    screen.x = centerX + (transformedX * scale) / transformedZ;
+    screen.y = centerY - (transformedY * scale) / transformedZ;
+
+    if (!std::isfinite(screen.x) || !std::isfinite(screen.y))
+        return false;
+    if (screen.x < -overlayW * 0.5 || screen.x > overlayW * 1.5 ||
+        screen.y < -overlayH * 0.5 || screen.y > overlayH * 1.5)
+        return false;
+
+    return true;
+}
+} // namespace EngineProjection
+
 class Engine {
 public:
     struct WorldCacheEntry;
@@ -459,6 +530,17 @@ public:
     }
     bool IsCachedPlayer(uintptr_t actorKey) const {
         std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
+        return playerCache.contains(actorKey);
+    }
+    // Paint-thread variant: never block on the player scanner's exclusive
+    // DMA-backed cache write (same stall class as the radar lock). If the
+    // scanner is mid-write, report "not a player" for this frame — the bot
+    // box is drawn by the frame's own collect path, and the worker's
+    // IsCachedPlayer (above) stays authoritative at collect time.
+    bool IsCachedPlayerTry(uintptr_t actorKey) const {
+        std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex, std::defer_lock);
+        if (!lock.try_lock())
+            return false;
         return playerCache.contains(actorKey);
     }
     bool EntityListReady() const { return entityStarted.load(std::memory_order_acquire); }

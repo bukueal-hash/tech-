@@ -6,6 +6,7 @@
 #include "EspDraw.h"
 #include "WorldScanCommon.h"
 #include "LrtsVisibility.h"
+#include "CollisionMirror.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -26,6 +27,13 @@ static constexpr uint8_t kPlayerDistMissClearDrawing = 3;
 
 // LRTS per-mesh visibility state (persisted across frames)
 static std::unordered_map<uintptr_t, LrtsVis::MeshState> s_lrtsMeshStates;
+// Per-actor verdict smoothing: keyed on cache key (NOT mesh) so MeshState
+// Resets during scan retries cannot wipe verdict history and flicker the box.
+static std::unordered_map<uintptr_t, LrtsVis::VerdictSmoother> s_playerVisSmooth;
+// One Scan feed per pass while the session key is unverified (Scan's Phase 2
+// costs a handful of reads per candidate; one rendered mesh is enough to lock
+// the session-wide offset+key).
+static bool s_playerScanFedThisPass = false;
 
 static std::unordered_map<uintptr_t, uint8_t> s_playerRootMisses;
 static std::unordered_map<uintptr_t, uint8_t> s_playerPosMisses;
@@ -53,6 +61,14 @@ static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point>
 static constexpr size_t kPlayerAdmitSlices = 8;
 static constexpr size_t kPlayerAdmitPrioNewMax = 64;
 static size_t s_playerAdmitSliceCursor = 0;
+// B5 (Riventides mirror): the player ring used the pre-B4 pattern (unordered
+// probeSet, no resume frontier) and froze on slice 0 on 16K-actor maps,
+// surviving only on cached players. Deterministic band + resume frontier now
+// match the bot path; the serial PS-chase IS this list's verify stage, so
+// the processEnd frontier covers partial passes (RobotList's separate verify
+// backlog is not needed here).
+static size_t s_playerAdmitResumeRow = 0;
+static size_t s_playerAdmitLastDelta = 0;
 static uint64_t s_playerAdmitRingGen = 0;
 static uintptr_t s_playerAdmitRingActorsPtr = 0;
 static size_t s_playerAdmitRingActorCount = 0;
@@ -599,19 +615,24 @@ void Engine::EntityList()
     bool ringReset = false;
     if (s_playerAdmitRingGen != gen) {
         ringReset = true;
+        s_playerAdmitLastDelta = 0;
     } else if (sActors != 0 && s_playerAdmitRingActorsPtr != 0
         && sActors != s_playerAdmitRingActorsPtr) {
         ringReset = true;
+        s_playerAdmitLastDelta = 0;
     } else if (s_playerAdmitRingActorCount != 0) {
         const size_t delta = (N > s_playerAdmitRingActorCount)
             ? (N - s_playerAdmitRingActorCount)
             : (s_playerAdmitRingActorCount - N);
         const size_t thresh = (std::max)(static_cast<size_t>(64), N / 8);
-        if (delta > thresh)
+        if (delta > thresh) {
             ringReset = true;
+            s_playerAdmitLastDelta = delta;
+        }
     }
     if (ringReset) {
         s_playerAdmitSliceCursor = 0;
+        s_playerAdmitResumeRow = 0;
         s_playerAdmitCoveredMask = 0;
         s_playerAdmitPrevActors.clear();
         s_playerAdmitCycleStart = std::chrono::steady_clock::now();
@@ -631,28 +652,44 @@ void Engine::EntityList()
     const size_t sliceEnd = (N * (slice + 1)) / kPlayerAdmitSlices;
     dbgAdmitSlice = slice;
 
-    std::unordered_set<uintptr_t> probeSet;
-    probeSet.reserve((sliceEnd - sliceBase) + kPlayerAdmitPrioNewMax + 8);
+    // B5 (Riventides mirror): deterministic band order + bounded prio rows,
+    // exactly like the bot path. The old unordered probeSet reordered every
+    // pass, so no resume frontier could point at stable rows — the ring froze
+    // on slice 0 (cache survived, new players never admitted).
+    struct PlayerProbeRow {
+        uintptr_t actor = 0;
+        uint64_t ps = 0;
+        uint32_t typeId = 0;
+        uintptr_t root = 0;
+        double distSq = 0.0;
+        bool hasDist = false;
+    };
+    std::vector<PlayerProbeRow> bandRows;
+    bandRows.reserve(sliceEnd - sliceBase);
     for (size_t i = sliceBase; i < sliceEnd; ++i) {
         const uintptr_t actor = admitIndex[i];
         if (localCache.contains(actor))
             continue;
-        probeSet.insert(actor);
+        PlayerProbeRow row;
+        row.actor = actor;
+        bandRows.push_back(row);
     }
-    dbgAdmitSliceActors = static_cast<int>(probeSet.size());
+    dbgAdmitSliceActors = static_cast<int>(bandRows.size());
 
-    size_t prioAdded = 0;
+    std::vector<PlayerProbeRow> prioRows;
+    prioRows.reserve(kPlayerAdmitPrioNewMax);
     for (uintptr_t actor : admitIndex) {
-        if (prioAdded >= kPlayerAdmitPrioNewMax)
+        if (prioRows.size() >= kPlayerAdmitPrioNewMax)
             break;
         if (s_playerAdmitPrevActors.contains(actor))
             continue;
         if (localCache.contains(actor))
             continue;
-        if (probeSet.insert(actor).second)
-            ++prioAdded;
+        PlayerProbeRow row;
+        row.actor = actor;
+        prioRows.push_back(row);
     }
-    dbgAdmitPrioNew = static_cast<int>(prioAdded);
+    dbgAdmitPrioNew = static_cast<int>(prioRows.size());
 
     // P7b: batched pre-gate (mirrors RobotList P6b). One scatter exec reads
     // PlayerState@0x3C0 + ActorTypeId for the whole band; serial PS-chase and
@@ -667,21 +704,19 @@ void Engine::EntityList()
             typeOff = Offsets::ActorTypeId;
     }
 
-    struct PlayerProbeRow {
-        uintptr_t actor = 0;
-        uint64_t ps = 0;
-        uint32_t typeId = 0;
-    };
+    // Frontier: continue the band where the last pass stopped. Prio rows lead
+    // so brand-new spawns are still probed every pass. Neg-memo filtering
+    // moved into the screening loop so probeRows stays a 1:1 projection of
+    // prio+band — that keeps the resume frontier positionally exact.
+    const size_t bandResume = (std::min)(s_playerAdmitResumeRow, bandRows.size());
     std::vector<PlayerProbeRow> probeRows;
-    probeRows.reserve(probeSet.size());
-    for (uintptr_t actor : probeSet) {
-        if (localCache.contains(actor))
-            continue;
-        if (PlayerScanNegMemoHit(actor, dbgAdmitMemoSkip))
-            continue;
-        PlayerProbeRow row;
-        row.actor = actor;
-        probeRows.push_back(row);
+    probeRows.reserve(prioRows.size() + (bandRows.size() - bandResume));
+    probeRows.insert(probeRows.end(), prioRows.begin(), prioRows.end());
+    if (bandResume < bandRows.size()) {
+        probeRows.insert(
+            probeRows.end(),
+            bandRows.begin() + static_cast<std::ptrdiff_t>(bandResume),
+            bandRows.end());
     }
 
     // LAG1: cap this pass's DMA. Camera @8ms, position @16ms and the
@@ -693,8 +728,11 @@ void Engine::EntityList()
     // Small scatter chunks + yield after each exec so the HIGHEST-priority
     // camera thread (8ms) can slip onto the DMA link between batches; a
     // single huge batch starves it and boxes jump when rot-lead skips.
-    constexpr size_t kPlayerAdmitChunk = 128;
-    for (size_t base = 0; base < probeRows.size(); base += kPlayerAdmitChunk) {
+    // RIVENTIDES: 48-row chunks keep every execute short on a saturated bus
+    // (16K actors) so the process loop still runs this pass.
+    constexpr size_t kPlayerAdmitChunk = 48;
+    size_t base = 0;
+    for (; base < probeRows.size(); base += kPlayerAdmitChunk) {
         if (scanBudget.expired()) { slicePartial = true; break; }
         const size_t chunkEnd = (std::min)(base + kPlayerAdmitChunk, probeRows.size());
         ScatterSession scatter;
@@ -705,14 +743,87 @@ void Engine::EntityList()
             PlayerProbeRow& r = probeRows[i];
             prepOk = scatter.prepare(r.actor + kPawnPlayerState, r.ps) && prepOk;
             prepOk = scatter.prepare(r.actor + typeOff, r.typeId) && prepOk;
+            prepOk = scatter.prepare(r.actor + Offsets::RootComponent, r.root) && prepOk;
         }
         if (prepOk && scatter.execute())
             ++dbgAdmitScatterExecs;
         std::this_thread::yield();
     }
 
-    for (const PlayerProbeRow& row : probeRows) {
-        if (scanBudget.expired()) { slicePartial = true; break; }
+    // B5: only rows in [0, scatteredEnd) were scattered this pass; rows beyond
+    // still hold zero buffers and must never be screened (mass negative-memo
+    // blindness). The resume frontier is computed after screening (processEnd).
+    const size_t scatteredEnd = (std::min)(base, probeRows.size());
+
+    // Distance-priority admission: scatter each row's root WorldLocation and
+    // sort the slice nearest-first. Without this, admission order is the actor
+    // array order, so a player 300m away hides in a low-priority slice while
+    // far actors of earlier slices get admitted first — new ESP can take a full
+    // ring sweep to appear. With the sort, a budget-clipped pass still admits
+    // the nearest actors of this slice first.
+    // Only a fully-scattered sweep may distance-sort: a partial pass must keep
+    // [0, scatteredEnd) order aligned with the band resume frontier.
+    if (scatteredEnd >= probeRows.size() && !probeRows.empty()) {
+        const uintptr_t lroot = Memory::read<uintptr_t>(
+            sAcknowledgedPawn + Offsets::RootComponent);
+        Vector3 localPos{};
+        if (lroot && IsValidPointer(lroot))
+            localPos = Engine::ReadWorldLocationNocache(lroot, /*allowRelativeFallback=*/true);
+        if (IsPlausibleWorldPos(localPos)) {
+            std::vector<Engine::FVector3d> locBuf(probeRows.size());
+            for (size_t distBase = 0; distBase < probeRows.size(); distBase += kPlayerAdmitChunk) {
+                if (scanBudget.expired())
+                    break;
+                const size_t distEnd = (std::min)(distBase + kPlayerAdmitChunk, probeRows.size());
+                ScatterSession distScatter;
+                if (!distScatter.isValid())
+                    break;
+                bool distPrepOk = true;
+                for (size_t i = distBase; i < distEnd; ++i) {
+                    PlayerProbeRow& r = probeRows[i];
+                    if (!r.root) {
+                        distPrepOk = false;
+                        continue;
+                    }
+                    distPrepOk = distScatter.prepare(r.root + Offsets::WorldLocation, locBuf[i]) && distPrepOk;
+                }
+                if (distPrepOk && distScatter.execute())
+                    ++dbgAdmitScatterExecs;
+                std::this_thread::yield();
+            }
+            for (size_t i = 0; i < probeRows.size(); ++i) {
+                PlayerProbeRow& r = probeRows[i];
+                const Vector3 p = Engine::ToVector3(locBuf[i]);
+                if (!r.root || !IsPlausibleWorldPos(p))
+                    continue;
+                const double dx = p.x - localPos.x;
+                const double dy = p.y - localPos.y;
+                const double dz = p.z - localPos.z;
+                r.distSq = dx * dx + dy * dy + dz * dz;
+                r.hasDist = true;
+            }
+            std::stable_sort(
+                probeRows.begin(),
+                probeRows.end(),
+                [](const PlayerProbeRow& a, const PlayerProbeRow& b) {
+                    if (a.hasDist != b.hasDist)
+                        return a.hasDist > b.hasDist;
+                    return a.distSq < b.distSq;
+                });
+        }
+    }
+
+    // Fresh micro-budget (same as the bot path): the probe scatter may have
+    // consumed the pass budget under DMA load, but scattered rows must still
+    // be processed or the ring sticks and admission starves.
+    WorldScan::ScanBudget procBudget(std::chrono::milliseconds(40));
+    size_t processEnd = 0;
+    for (size_t ri = 0; ri < scatteredEnd; ++ri) {
+        const PlayerProbeRow& row = probeRows[ri];
+        if (procBudget.expired()) { slicePartial = true; break; }
+        processEnd = ri + 1;
+        if (PlayerScanNegMemoHit(row.actor, dbgAdmitMemoSkip))
+            continue;
         const uintptr_t actor = row.actor;
         const uint32_t masked = ArcActorType::MaskActorTypeId(row.typeId);
         const bool gate = (row.ps != 0
@@ -860,6 +971,28 @@ void Engine::EntityList()
         }
     }
 
+    // B5 (mirror): monotonic resume frontier from the screening frontier. A
+    // budget break anywhere persists progress; only a full scatter+screen
+    // sweep resets the resume and lets the ring advance.
+    {
+        const size_t prioCount = prioRows.size();
+        const bool sortedSweep = scatteredEnd >= probeRows.size();
+        if (sortedSweep && processEnd == scatteredEnd) {
+            s_playerAdmitResumeRow = 0;
+        } else if (sortedSweep) {
+            // probeRows were distance-sorted this pass; a broken sweep must
+            // not map processEnd back onto the unsorted band order.
+            s_playerAdmitResumeRow = 0;
+            slicePartial = true;
+        } else {
+            const size_t bandProcessed =
+                (processEnd > prioCount) ? (processEnd - prioCount) : 0;
+            s_playerAdmitResumeRow =
+                bandResume + (std::min)(bandProcessed, bandRows.size() - bandResume);
+            slicePartial = true;
+        }
+    }
+
     s_playerAdmitPrevActors.clear();
     s_playerAdmitPrevActors.insert(admitIndex.begin(), admitIndex.end());
     // A budgeted partial pass must not skip a ring band — the slice is
@@ -875,9 +1008,12 @@ void Engine::EntityList()
     // never matched, so hide_allies silently failed for Team1. Failed DMA
     // reads return 0 (= Team1), so BOTH sides must read a valid team (0..2)
     // before anyone is classified an ally — no wrong answers from garbage.
-    const bool myTeamValid = (myTeamId <= 2);
+    // TeamID values are 4-10 (NOT the SDK enum 0-2). Reject NoTeam (255)
+    // and zero (DMA garbage returns 0, which is NOT a valid team).
+    const bool myTeamValid = (myTeamId != 255 && myTeamId != 0);
 
     // Prefer mesh CompToWorld (bot parity); root fallback — root alone stays frozen on remotes.
+    s_playerScanFedThisPass = false;
     for (auto it = localCache.begin(); it != localCache.end(); ++it) {
         const uintptr_t key = it->first;
         if (key == sAcknowledgedPawn)
@@ -949,7 +1085,7 @@ void Engine::EntityList()
         const uint8_t enemyTeamId = Memory::read<uint8_t>(key + Offsets::TeamID);
         actor.enemyTeamId = enemyTeamId;
         actor.isAlly =
-            (myTeamValid && enemyTeamId <= 2 && myTeamId == enemyTeamId);
+            (myTeamValid && enemyTeamId != 255 && enemyTeamId != 0 && myTeamId == enemyTeamId);
         if (actor.isAlly && var::hide_allies) {
             ++dbgTeamEvict;
             WorldScan::MissCounterClear(s_playerDistMisses, key);
@@ -1138,16 +1274,53 @@ void Engine::EntityList()
             // resolve, never as the primary verdict.
             const char* stage = "unknown";
             float directVal = -1.f;
+            // Prefer the session-discovered offset/key pair — hardcoded pairs
+            // go stale every game build (the current one reads 0x4C4 as zero).
+            // Until Scan lands a discovery, fall back to the hardcoded constant.
+            uint32_t lrtsOff =
+                static_cast<uint32_t>(Offsets::Mesh_LastRenderTimeOnScreenEnc);
+            uint32_t lrtsKey = Offsets::Mesh_LastRenderTimeOnScreenKey;
+            {
+                // Read the shared session pair under its mutex: Scan publishes
+                // them asynchronously from the same worker, so an unlocked read
+                // could tear a half-published offset/key pair.
+                std::lock_guard<std::mutex> sk(LrtsVis::g_session.mu);
+                if (LrtsVis::g_session.lrtsOffset != 0
+                    && LrtsVis::g_session.keyCount > 0) {
+                    lrtsOff = static_cast<uint32_t>(LrtsVis::g_session.lrtsOffset);
+                    lrtsKey = LrtsVis::g_session.keys[0];
+                }
+            }
             auto vis = LrtsVis::CheckDirect(
                 [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
                 actor.actorMesh, LrtsVis::g_session, worldTime,
-                static_cast<uint32_t>(Offsets::Mesh_LastRenderTimeOnScreenEnc),
-                Offsets::Mesh_LastRenderTimeOnScreenKey);
+                lrtsOff, lrtsKey);
             if (vis != LrtsVis::Result::Unknown) {
                 stage = "direct";
                 std::lock_guard<std::mutex> dl(LrtsVis::g_session.mu);
                 directVal = LrtsVis::g_session.lastDirectValue;
             } else {
+                // Feed Scan while unverified: a rendered mesh (flag byte set)
+                // is the one thing Scan needs to rediscover the current
+                // build's offset+key. One mesh per pass — once verified,
+                // CheckDirect above is primary and this costs nothing.
+                if (!LrtsVis::g_session.verified
+                    && !s_playerScanFedThisPass) {
+                    const uint8_t brrFed = Memory::read_nocache<uint8_t>(
+                        actor.actorMesh + LrtsVis::BrrOffset);
+                    if (brrFed & LrtsVis::BrrMask) {
+                        auto& ms = s_lrtsMeshStates[actor.actorMesh];
+                        if (!ms.meshComp) ms.meshComp = actor.actorMesh;
+                        LrtsVis::Scan(ms, LrtsVis::g_session,
+                            [](uint64_t a) { return Memory::read_nocache<uint8_t>(a); },
+                            [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
+                            [](uint64_t a, void* b, uint32_t s) {
+                                return PCIMemory::ReadVirtualMemoryNoCache(a, b, s);
+                            },
+                            worldTime, sGWorld);
+                        s_playerScanFedThisPass = true;
+                    }
+                }
                 vis = LrtsVis::CheckRendered(
                     [](uint64_t a) { return Memory::read_nocache<uint8_t>(a); },
                     actor.actorMesh, LrtsVis::g_session,
@@ -1179,7 +1352,46 @@ void Engine::EntityList()
                 if (vis != LrtsVis::Result::Unknown)
                     stage = "scan";
             }
-            actor.isVisible = (vis != LrtsVis::Result::Occluded);
+            // Hysteresis: require 2 confirmed Occluded checks before hiding
+            // (kills flag-byte flicker + transient 0x00 reads); Unknown keeps
+            // the last verdict so read failures never pop boxes through walls.
+            const uint64_t nowMs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            // BRR-aware hysteresis: fast-hide ONLY on a successfully-read byte
+            // (non-zero) with the rendered bit clear. brr == 0x00 means the DMA
+            // read failed — falling back to the 2-check hysteresis keeps a
+            // transient flap from blinking the box (ghost-flicker regression).
+            const uint8_t brrSmooth = Memory::read_nocache<uint8_t>(
+                actor.actorMesh + LrtsVis::BrrOffset);
+            const bool confirmedNotRendered =
+                brrSmooth != 0 && (brrSmooth & LrtsVis::BrrMask) == 0;
+
+            // Stage 3: LRTS + collision combined voting. LRTS is primary;
+            // collision is the tie-breaker for stale stamps (Visible+blocked
+            // → Occluded) and the fallback for Unknown. Occluded wins outright
+            // (renderer truth). Fail-open when the tree isn't ready.
+            if (var::collision_vis_enabled && CollisionMirror::IsReady()
+                && (actor.WorldPos.x != 0.0 || actor.WorldPos.y != 0.0 || actor.WorldPos.z != 0.0)) {
+                const bool blocked = !CollisionMirror::QueryVisible(
+                    cam.Location, actor.WorldPos);
+                switch (vis) {
+                case LrtsVis::Result::Occluded:
+                    break;  // renderer truth wins
+                case LrtsVis::Result::Visible:
+                    if (blocked)
+                        vis = LrtsVis::Result::Occluded;  // stale stamp behind wall
+                    break;
+                case LrtsVis::Result::Unknown:
+                default:
+                    vis = blocked
+                        ? LrtsVis::Result::Occluded
+                        : LrtsVis::Result::Visible;  // collision fills LRTS gaps
+                    break;
+                }
+            }
+            actor.isVisible = s_playerVisSmooth[key].Update(
+                vis, nowMs, confirmedNotRendered);
 
             // Per-actor trace, 1 Hz. Answers two things the aggregate counters
             // cannot: whether distinct actors get distinct flag bytes, and how
@@ -1307,13 +1519,13 @@ void Engine::EntityList()
     {
         std::vector<uint8_t> uniqueTeams;
         for (const auto& [key, entry] : playerCache) {
-            if (!entry.isAlly && entry.enemyTeamId <= 2)
+            if (!entry.isAlly && entry.enemyTeamId != 255 && entry.enemyTeamId != 0)
                 uniqueTeams.push_back(entry.enemyTeamId);
         }
         std::sort(uniqueTeams.begin(), uniqueTeams.end());
         uniqueTeams.erase(std::unique(uniqueTeams.begin(), uniqueTeams.end()), uniqueTeams.end());
         for (auto& [key, entry] : playerCache) {
-            if (!entry.isAlly && entry.enemyTeamId <= 2) {
+            if (!entry.isAlly && entry.enemyTeamId != 255 && entry.enemyTeamId != 0) {
                 auto it = std::find(uniqueTeams.begin(), uniqueTeams.end(), entry.enemyTeamId);
                 if (it != uniqueTeams.end())
                     entry.squadIdx = static_cast<uint8_t>(std::distance(uniqueTeams.begin(), it) + 1);
@@ -1351,14 +1563,15 @@ void Engine::EntityList()
                 "\"ghostEvict\":%d,\"rootSkip\":%d,\"meshSkip\":%d,\"psSkip\":%d,"
                 "\"healthSkip\":%d,\"gsBot\":%d,\"gsPawnNull\":%d,\"gsEvict\":%d,"
                 "\"actorTypeAdmit\":%d,\"prioNew\":%d,\"checked\":%d,"
-                "\"memoSkip\":%d,\"slice\":%zu,\"cycleMs\":%d,\"ringResets\":%d}",
+                "\"memoSkip\":%d,\"slice\":%zu,\"cycleMs\":%d,\"ringResets\":%d,"
+                "\"admitN\":%zu,\"lastDelta\":%zu}",
                 dbgScanned, dbgAdmitted, playerCache.size(), dbgListEvict,
                 dbgTeamEvict, dbgPsEvict, dbgPosEvict, dbgDistSkip,
                 dbgGhostEvict, dbgRootSkip, dbgMeshSkip, dbgPsSkip,
                 dbgHealthSkip, dbgGsBot, dbgGsPawnNull, dbgGsEvict,
                 dbgActorTypeAdmit, dbgAdmitPrioNew, dbgAdmitChecked,
                 dbgAdmitMemoSkip, dbgAdmitSlice, s_playerAdmitLastCycleMs,
-                s_playerAdmitRingResets);
+                s_playerAdmitRingResets, dbgAdmitN, s_playerAdmitLastDelta);
             // player_admit_stats is a throttled (2s) verification tap — it must
             // reach the real log (kArcDebugLogPath is NUL by design).
             std::ofstream f(kArcVerifyPath, std::ios::app);

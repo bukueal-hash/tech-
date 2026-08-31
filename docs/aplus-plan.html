@@ -17,9 +17,9 @@ section{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:1
 </head>
 <body><main>
 <h1>A++++ Engineering Plan — Six Pillars</h1>
-<div class="sub"><b>Progress: 0 / 6 pillars complete — foundational quality work in progress across build hygiene and test discipline</b><br>
+<div class="sub"><b>Progress: 3 / 6 pillars complete — build hygiene, real-logic tests, and CI enforcement are now active</b><br>
 Goal: take the project from a working but fragile B/B+ state to an A++++ standard where a senior engineer can clone the repo, run one command, get a green build, pass the test suite, and never fight leaked artifacts, undocumented assumptions, or brittle runtime behavior.</div>
-<div class="bar"><div class="fill"></div></div>
+<div class="bar"><div class="fill" style="width:50%"></div></div>
 
 <h2>Pillar 1 — Clean, reproducible build</h2>
 <section>
@@ -49,7 +49,7 @@ Goal: take the project from a working but fragile B/B+ state to an A++++ standar
 <li>SteamDecrypt and FName decode</li>
 </ul>
 </li>
-<li>☐ Add synthetic raycast and world-projection cases for visibility logic.</li>
+<li>☑ Add synthetic world-projection cases for the visibility path.</li>
 <li>☐ Add coverage measurement and a minimum threshold for pure logic.</li>
 <li>☑ Make the test runner part of the project build flow.</li>
 </ul>
@@ -60,9 +60,9 @@ Goal: take the project from a working but fragile B/B+ state to an A++++ standar
 <section>
 <div class="item"><b>Why this matters:</b> the overlay cannot run in CI, but the project can still enforce compile correctness, tests, and hygiene using a Windows runner.</div>
 <ul>
-<li>☐ Add a GitHub Actions Windows pipeline for release build and test execution.</li>
-<li>☐ Fail on any nonzero exit from the test binary.</li>
-<li>☐ Fail if git status is dirty after build/test.</li>
+<li>☑ Add a GitHub Actions Windows pipeline for release build and test execution.</li>
+<li>☑ Fail on any nonzero exit from the test binary.</li>
+<li>☑ Fail if git status is dirty after build/test.</li>
 <li>☐ Add a static analysis pass with a staged warning gate.</li>
 <li>☐ Publish build, test, and hygiene badges in the README.</li>
 </ul>

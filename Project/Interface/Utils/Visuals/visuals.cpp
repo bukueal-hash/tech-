@@ -18,9 +18,9 @@ constexpr float kEspDistRefM = 30.f;
 // further out (floor 0.35), grow close in (ceiling 1.35). The box itself is
 // projected head/feet and already scales naturally; these bounds stop the
 // fixed-ish text from dwarfing far boxes or staying tiny up close.
-constexpr float kEspScaleMin = 0.35f;
+constexpr float kEspScaleMin = 0.50f;
 constexpr float kEspScaleMax = 1.35f;
-constexpr float kEspTextMinPx = 8.f;
+constexpr float kEspTextMinPx = 11.f;
 constexpr float kEspTextBasePx = 15.f;
 
 Visuals::EspDrawScale MakeScale(float espScale)
@@ -28,7 +28,9 @@ Visuals::EspDrawScale MakeScale(float espScale)
     Visuals::EspDrawScale s{};
     s.espScale = std::clamp(espScale, kEspScaleMin, kEspScaleMax);
     const float userText = std::clamp(var::esp_text_scale, 0.5f, 3.0f);
-    s.textPx = std::max(kEspTextMinPx, kEspTextBasePx * s.espScale * userText);
+    
+    // Snap font rendering size to integer boundaries to prevent sub-pixel blurring
+    s.textPx = std::floor(std::max(kEspTextMinPx, kEspTextBasePx * s.espScale * userText));
     s.lineThickness = std::clamp(0.45f + s.espScale * 0.65f, 0.5f, 1.8f);
     return s;
 }
@@ -87,20 +89,32 @@ void Visuals::DrawScaledLabel(
     const float fontSize = LabelTextPx(distanceMeters);
     const ImVec2 size = font->CalcTextSizeA(fontSize, FLT_MAX, 0.f, text);
 
-    float x = anchorX;
+    // Floor positions to exact pixels to eliminate subpixel smearing
+    float x = std::floor(anchorX);
     if (centerX)
-        x -= size.x * 0.5f;
-    const float y = aboveAnchor ? (anchorY - size.y - 2.f) : anchorY;
+        x = std::floor(anchorX - size.x * 0.5f);
+    const float y = std::floor(aboveAnchor ? (anchorY - size.y - 2.f) : anchorY);
 
-    const float outline = std::max(1.f, fontSize * 0.07f);
+    // Force thick 1px outline minimum for crisp contrast
+    const float outline = std::floor(std::max(1.f, fontSize * 0.08f));
     // Outline alpha follows the text alpha so distance-faded labels fade
     // completely instead of leaving a floating black outline.
     const unsigned textA = (color >> IM_COL32_A_SHIFT) & 0xFFu;
-    const ImU32 outlineColor = IM_COL32(0, 0, 0, 210u * textA / 255u);
+    const ImU32 outlineColor = IM_COL32(0, 0, 0, 245u * textA / 255u); // dark outline
+
+    // Draw rigid 1px full-outline
+    drawList->AddText(font, fontSize, ImVec2(x - outline, y - outline), outlineColor, text);
+    drawList->AddText(font, fontSize, ImVec2(x + outline, y - outline), outlineColor, text);
+    drawList->AddText(font, fontSize, ImVec2(x - outline, y + outline), outlineColor, text);
+    drawList->AddText(font, fontSize, ImVec2(x + outline, y + outline), outlineColor, text);
+    
+    // Cross stroke for full coverage
     drawList->AddText(font, fontSize, ImVec2(x - outline, y), outlineColor, text);
     drawList->AddText(font, fontSize, ImVec2(x + outline, y), outlineColor, text);
     drawList->AddText(font, fontSize, ImVec2(x, y - outline), outlineColor, text);
     drawList->AddText(font, fontSize, ImVec2(x, y + outline), outlineColor, text);
+    
+    // Primary text
     drawList->AddText(font, fontSize, ImVec2(x, y), color, text);
 }
 
@@ -459,17 +473,19 @@ void DrawHumanSilhouetteFilledImpl(
         headR = minHeadLift * 0.85f;
     headR = std::clamp(headR, headMin, headMax);
 
-    // Tighter proportions — less chalk blob.
-    const float wNeck = bodyH * 0.026f;
-    const float wChest = bodyH * 0.102f;
-    const float wWaist = bodyH * 0.062f;
-    const float wHip = bodyH * 0.088f;
-    const float wArm = bodyH * 0.034f;
-    const float wFore = bodyH * 0.026f;
-    const float wHand = bodyH * 0.018f;
-    const float wThigh = bodyH * 0.052f;
-    const float wCalf = bodyH * 0.036f;
-    const float wFoot = bodyH * 0.022f;
+    // Adjust proportions for an amazing aesthetic look:
+    // Slightly wider shoulders/chest, slightly thicker limbs, making models feel
+    // less like stringy chalk blobs and more like solid human silhouettes.
+    const float wNeck = bodyH * 0.035f;
+    const float wChest = bodyH * 0.120f;
+    const float wWaist = bodyH * 0.082f;
+    const float wHip = bodyH * 0.105f;
+    const float wArm = bodyH * 0.040f;
+    const float wFore = bodyH * 0.032f;
+    const float wHand = bodyH * 0.024f;
+    const float wThigh = bodyH * 0.065f;
+    const float wCalf = bodyH * 0.045f;
+    const float wFoot = bodyH * 0.030f;
 
     const int srcA = static_cast<int>((fill >> IM_COL32_A_SHIFT) & 0xFF);
     const int fillA = softFill
@@ -479,25 +495,28 @@ void DrawHumanSilhouetteFilledImpl(
         | (static_cast<ImU32>(fillA) << IM_COL32_A_SHIFT);
     // Head stays more opaque so soft fill doesn't erase the skull.
     const int headA = softFill
-        ? std::clamp(static_cast<int>(srcA * 0.75f), 90, 200)
-        : std::clamp(srcA, 120, 230);
+        ? std::clamp(static_cast<int>(srcA * 0.85f), 100, 220)
+        : std::clamp(srcA, 140, 245);
     const ImU32 fillHead = (fill & 0x00FFFFFFu)
         | (static_cast<ImU32>(headA) << IM_COL32_A_SHIFT);
-    const ImU32 strokeCol = IM_COL32(12, 12, 12, softFill ? 160 : 200);
-    const float strokeTh = std::clamp(bodyH * 0.012f, 1.15f, 2.4f);
+    
+    // Make outer strokes/shadows bolder for better pop against bright terrain
+    const ImU32 strokeCol = IM_COL32(12, 12, 12, softFill ? 190 : 230);
+    const float strokeTh = std::clamp(bodyH * 0.015f, 1.4f, 2.8f);
 
     auto tryFill = [&](ImVec2 a, ImVec2 b, float wa, float wb, float maxFrac = 0.55f) {
         if (!SegOk(a, b, bodyH, maxFrac))
             return;
+        // Stroke first (shadow), then fill (inside shape)
+        StrokeSegment(dl, a, b, wa, wb, strokeCol, strokeTh + 1.f);
         FillSegment(dl, a, b, wa, wb, fillBody);
-        StrokeSegment(dl, a, b, wa, wb, strokeCol, strokeTh);
     };
 
     FillTorsoAlongSpine(
         dl, in, wNeck, wChest, wWaist, wHip, fillBody, true, strokeCol, strokeTh);
 
     if (in.hasClavicleL && in.hasClavicleR)
-        tryFill(in.clavicleL, in.clavicleR, wNeck * 0.85f, wNeck * 0.85f, 0.45f);
+        tryFill(in.clavicleL, in.clavicleR, wNeck * 1.05f, wNeck * 1.05f, 0.45f);
 
     // Legs: pairwise only.
     if (in.hasLegL) {
@@ -520,9 +539,9 @@ void DrawHumanSilhouetteFilledImpl(
     // Arms: pairwise only.
     if (in.hasArmL) {
         if (in.hasClavicleL && in.hasUpperArmL)
-            tryFill(in.clavicleL, in.upperArmL, wArm * 0.9f, wArm);
+            tryFill(in.clavicleL, in.upperArmL, wArm * 1.15f, wArm);
         else if (in.hasChest && in.hasUpperArmL)
-            tryFill(in.chest, in.upperArmL, wChest * 0.32f, wArm);
+            tryFill(in.chest, in.upperArmL, wChest * 0.42f, wArm);
         if (in.hasUpperArmL && in.hasLowerArmL)
             tryFill(in.upperArmL, in.lowerArmL, wArm, wFore);
         if (in.hasLowerArmL && in.hasHandL)
@@ -531,9 +550,9 @@ void DrawHumanSilhouetteFilledImpl(
 
     if (in.hasArmR) {
         if (in.hasClavicleR && in.hasUpperArmR)
-            tryFill(in.clavicleR, in.upperArmR, wArm * 0.9f, wArm);
+            tryFill(in.clavicleR, in.upperArmR, wArm * 1.15f, wArm);
         else if (in.hasChest && in.hasUpperArmR)
-            tryFill(in.chest, in.upperArmR, wChest * 0.32f, wArm);
+            tryFill(in.chest, in.upperArmR, wChest * 0.42f, wArm);
         if (in.hasUpperArmR && in.hasLowerArmR)
             tryFill(in.upperArmR, in.lowerArmR, wArm, wFore);
         if (in.hasLowerArmR && in.hasHandR)
@@ -588,16 +607,26 @@ void Visuals::Names(const std::string& name, float center_x, float top_y, const 
         return;
 
     const ImVec2 text_size = font->CalcTextSizeA(scale.textPx, FLT_MAX, 0.f, name.c_str());
-    const float text_x = center_x - text_size.x * 0.5f;
-    const float text_y = top_y - text_size.y - 4.0f * scale.espScale;
+    // Flooring coordinates makes sure text renders along pixel boundaries, fixing subpixel jitter and blurriness
+    const float text_x = std::floor(center_x - text_size.x * 0.5f);
+    const float text_y = std::floor(top_y - text_size.y - 4.0f * scale.espScale);
 
     auto dl = ImGui::GetForegroundDrawList();
-    const float outline = std::max(1.f, scale.textPx * 0.08f);
-    const ImU32 outlineColor = IM_COL32(0, 0, 0, 200);
+    const float outline = std::floor(std::max(1.f, scale.textPx * 0.08f));
+    const ImU32 outlineColor = IM_COL32(0, 0, 0, 245);
+    
+    // Draw 8-way outline for a perfectly crisp rendering
+    dl->AddText(font, scale.textPx, ImVec2(text_x - outline, text_y - outline), outlineColor, name.c_str());
+    dl->AddText(font, scale.textPx, ImVec2(text_x + outline, text_y - outline), outlineColor, name.c_str());
+    dl->AddText(font, scale.textPx, ImVec2(text_x - outline, text_y + outline), outlineColor, name.c_str());
+    dl->AddText(font, scale.textPx, ImVec2(text_x + outline, text_y + outline), outlineColor, name.c_str());
+
     dl->AddText(font, scale.textPx, ImVec2(text_x - outline, text_y), outlineColor, name.c_str());
     dl->AddText(font, scale.textPx, ImVec2(text_x + outline, text_y), outlineColor, name.c_str());
     dl->AddText(font, scale.textPx, ImVec2(text_x, text_y - outline), outlineColor, name.c_str());
     dl->AddText(font, scale.textPx, ImVec2(text_x, text_y + outline), outlineColor, name.c_str());
+    
+    // Draw core foreground label over it
     dl->AddText(font, scale.textPx, ImVec2(text_x, text_y), color, name.c_str());
 }
 

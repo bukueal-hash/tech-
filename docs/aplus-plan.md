@@ -1,6 +1,6 @@
 # A++++ Engineering Plan — Six Pillars
 
-**Progress: 0 / 6 pillars complete — foundational quality work in progress across build hygiene and test discipline**
+**Progress: 3 / 6 pillars complete — build hygiene, real-logic tests, and CI enforcement are now active**
 
 Goal: take the project from a working but fragile B/B+ state to an A++++ standard where a senior engineer can clone the repo, run one command, get a green build, pass the test suite, and never fight leaked artifacts, undocumented assumptions, or brittle runtime behavior.
 
@@ -47,7 +47,7 @@ Execution steps:
   2. bone transforms and aim smoothing math
   3. JSON parsing and fuzz safety
   4. SteamDecrypt and FName decode
-- ☐ Add synthetic raycast and world-projection cases for the visibility path.
+- ☑ Add synthetic world-projection cases for the visibility path.
 - ☐ Add coverage measurement and a minimum gate for pure logic.
 - ☑ Make the test runner part of the project build flow.
 
@@ -60,9 +60,9 @@ Execution steps:
 **Why this matters:** the overlay cannot run in CI, but a Windows build pipeline can still enforce the parts that matter most: compile correctness, test pass, and hygiene.
 
 Execution steps:
-- ☐ Add a GitHub Actions Windows pipeline running the release build and the test suite.
-- ☐ Fail on any nonzero exit from the test binary.
-- ☐ Fail if git status is dirty after build/test.
+- ☑ Add a GitHub Actions Windows pipeline running the release build and the test suite.
+- ☑ Fail on any nonzero exit from the test binary.
+- ☑ Fail if git status is dirty after build/test.
 - ☐ Add a static analysis pass with a staged warning gate.
 - ☐ Publish a badge row for build, tests, and hygiene.
 

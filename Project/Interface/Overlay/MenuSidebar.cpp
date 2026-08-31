@@ -13,6 +13,7 @@
 #include "../../Core/Memory.h"
 #include "../../Core/Engine.h"
 #include "../../Functions/LrtsVisibility.h"
+#include "../../Functions/CollisionMirror.h"
 #include "../../Functions/WorldScanCommon.h"
 #include "../Render.h"
 #include "../OverlayHost.h"
@@ -415,6 +416,24 @@ void DrawArcEspTab()
                     ArcMenuHoverTooltip("Include per-component flag bytes in each vis_trace row (slot + children).");
                     ArcMenuLayout::Checkbox("Burst capture", &var::lrts_debug_burst);
                     ArcMenuHoverTooltip("Log every frame for the first bot it sees (~15s) to measure true LOS-to-verdict latency; auto-disables.");
+                    ArcMenuLayout::Checkbox("Draw collision blocks", &var::collision_debug_draw);
+                    ArcMenuHoverTooltip("Wireframe of the collision KD-tree triangles near the camera. Red = triangle a LOS ray actually hits.");
+                    ArcMenuLayout::Checkbox("Draw LOS rays", &var::collision_debug_rays);
+                    ArcMenuHoverTooltip("Green = ray clear, red = blocked by collision geometry. Camera to each bot.");
+                    ArcMenuLayout::Checkbox("Enable collision voting", &var::collision_vis_enabled);
+                    ArcMenuHoverTooltip("LRTS+collision combined visibility: Occluded wins, collision breaks stale-stamp ties and fills Unknown gaps. Verify rays look right before enabling.");
+                    {
+                        std::lock_guard<std::mutex> lk(LrtsVis::g_session.mu);
+                        ImGui::Separator();
+                        ArcMenuLayout::HoverableText("Collision tree");
+                        ImGui::Text("Ready: %s  tris: %zu  meshes: %d",
+                            CollisionMirror::IsReady() ? "yes" : "no",
+                            CollisionMirror::TriangleCount(),
+                            CollisionMirror::MeshCount());
+                        ImGui::Text("rebuilds: %d  lastMs: %d",
+                            CollisionMirror::RebuildCount(),
+                            CollisionMirror::LastRebuildMs());
+                    }
                     ImGui::BeginDisabled(!var::vis_enabled);
                     ImGui::Separator();
                     ArcMenuLayout::HoverableText("Status");
@@ -422,6 +441,11 @@ void DrawArcEspTab()
                         std::lock_guard<std::mutex> lk(LrtsVis::g_session.mu);
                         const char* state = LrtsVis::g_session.verified ? "LOCKED" : "scanning...";
                         ImGui::Text("Key: %s", state);
+                        ImGui::Separator();
+                        ImGui::Text("[Tuned] Hide: 2 checks | Reveal: instant");
+                        ImGui::Text("[Tuned] Freshness: 0.15s | BRR fast-hide: on");
+                        ImGui::Text("[Tuned] BRR+Occluded=fast | BRR+Vis=counts toward hide");
+                        ImGui::Separator();
                         ImGui::Text("WorldTime: %.1f", LrtsVis::g_session.lastWorldTime);
                         ImGui::Text("Raw Submit: %.3f  OnScreen: %.3f",
                             LrtsVis::g_session.lastRawSubmit,
@@ -443,9 +467,10 @@ void DrawArcEspTab()
                         ImGui::Text("brr0: %d  brrNoBit: %d",
                             LrtsVis::g_session.scanBrrZero,
                             LrtsVis::g_session.scanBrrNoBit);
-                        ImGui::Text("brrPass: %d  bulkFail: %d",
+                        ImGui::Text("brrPass: %d  bulkFail: %d  dropFull: %d",
                             LrtsVis::g_session.scanBrrPass,
-                            LrtsVis::g_session.scanBulkFail);
+                            LrtsVis::g_session.scanBulkFail,
+                            LrtsVis::g_session.scanDropFull);
                         ImGui::Text("directZero: %d  directInsane: %d",
                             LrtsVis::g_session.directReadZero,
                             LrtsVis::g_session.directInsane);
@@ -454,6 +479,18 @@ void DrawArcEspTab()
                         ImGui::Text("TimeSec: %.2f  RealTimeSec: %.2f",
                             LrtsVis::g_session.lastWorldTime,
                             LrtsVis::g_session.lastRealTime);
+                        // Hysteresis diagnostics: flips should stay near 0
+                        // during steady aim; unknownHolds counts how often a
+                        // read failure kept the previous verdict instead of
+                        // popping the box through a wall.
+                        ImGui::Text("Smooth flips: occ->vis %llu  vis->occ %llu",
+                            static_cast<unsigned long long>(
+                                LrtsVis::g_flipsToVisible.load(std::memory_order_relaxed)),
+                            static_cast<unsigned long long>(
+                                LrtsVis::g_flipsToOccluded.load(std::memory_order_relaxed)));
+                        ImGui::Text("Unknown keeps verdict: %llu",
+                            static_cast<unsigned long long>(
+                                LrtsVis::g_unknownHolds.load(std::memory_order_relaxed)));
                     }
                     ImGui::EndDisabled();
                     ImGui::EndTabItem();

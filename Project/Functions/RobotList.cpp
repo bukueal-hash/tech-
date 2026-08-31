@@ -8,6 +8,7 @@
 #include "RobotList.h"
 #include "WorldScanCommon.h"
 #include "LrtsVisibility.h"
+#include "CollisionMirror.h"
 
 #include <algorithm>
 #include <cctype>
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -27,6 +29,11 @@ namespace {
 
 // LRTS per-mesh visibility state for bots (persisted across frames)
 static std::unordered_map<uintptr_t, LrtsVis::MeshState> s_lrtsBotMeshStates;
+// Per-actor verdict smoothing: keyed on cache key (NOT mesh) so MeshState
+// Resets during scan retries cannot wipe verdict history and flicker the box.
+static std::unordered_map<uintptr_t, LrtsVis::VerdictSmoother> s_botVisSmooth;
+// One Scan feed per pass while the session key is unverified (see EntityList).
+static bool s_botScanFedThisPass = false;
 
 // Per-candidate observation history for the toggle-aware mesh resolver.
 // A render flag is proven live only by watching the 0x20 bit change (set AND
@@ -584,6 +591,18 @@ static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point>
 static constexpr size_t kAdmitSlices = 8;
 static constexpr size_t kAdmitPrioNewMax = 64;
 static size_t s_admitSliceCursor = 0;
+// RIVENTIDES resume frontier: with 16K actors the probe scatter cannot finish
+// a 2048-row slice inside one 90ms budget. Rows are scattered AND processed
+// in lockstep windows; the frontier persists across passes so every pass
+// makes forward progress instead of restarting at row 0 forever (the
+// "stuck slice, scanned:0, cache:0" deadlock).
+static size_t s_admitResumeRow = 0;
+// B5 (Stage 2): serial-verify backlog — candidates queued when the 60ms
+// verify budget overruns are drained FIRST on later passes. Verify never
+// gates ring advance, so a saturated bus defers the tail by one pass instead
+// of freezing the ring (the Riventides 16K-actor deadlock).
+static constexpr size_t kAdmitVerifyBacklogMax = 4096;
+static std::vector<uintptr_t> s_admitVerifyBacklog;
 static uint64_t s_admitRingGen = 0;
 static uintptr_t s_admitRingActorsPtr = 0;
 static size_t s_admitRingActorCount = 0;
@@ -754,8 +773,23 @@ bool VerifyBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fna
     if (HasWorldItemStructure(actor))
         return false;
 
-    if (!meshOk)
+    // Soft-mesh admit: if the actor has an EnemyTypeDataAsset pointer (even
+    // if the label hasn't decrypted yet) or an AITemplateData pointer, admit
+    // it — the retain loop's DiscoverNewBotType will resolve the label from
+    // the DA fname once it decrypts. Without this, 47+ candidates per pass
+    // with valid root + live DA pointer fail the mesh gate because their
+    // skeletal mesh hasn't bound yet (c190fb: close bots not detected).
+    if (!meshOk) {
+        const uintptr_t daPtr = Memory::read<uintptr_t>(
+            actor + Offsets::Constructable_EnemyTypeDataAsset);
+        if (daPtr && engine.IsValidPointer(daPtr))
+            return true;
+        const uintptr_t aiPtr = Memory::read<uintptr_t>(
+            actor + Offsets::Constructable_AITemplateData);
+        if (aiPtr && engine.IsValidPointer(aiPtr))
+            return true;
         return false;
+    }
 
     // Constructable enemy pointer still needs resolvable identity (no Camera leak).
     if (WorldScan::HasArcEnemyAssetPointer(actor) && ActorHasKnownBotIdentity(actor, fname))
@@ -1208,6 +1242,13 @@ static void ClearRobotListStaticMaps()
     s_botVisualMisses.clear();
     s_quickFnameNeg.clear();
     s_botVerifyNeg.clear();
+    // LRTS per-actor state is keyed by bot APawn/visMesh pointers that churn
+    // every raid — without clearing, s_botVisSmooth / s_lrtsBotMeshStates grew
+    // unbounded across a session (slow leak). s_botVisMeshResolve is capped
+    // at 8192 with an age guard, but clearing here is cheaper than the cap.
+    s_botVisSmooth.clear();
+    s_lrtsBotMeshStates.clear();
+    s_botVisMeshResolve.clear();
     s_admitSliceCursor = 0;
     s_admitRingGen = 0;
     s_admitRingActorsPtr = 0;
@@ -1424,7 +1465,8 @@ std::string ResolveBotTypeLabel(uintptr_t actor, const std::string& fname)
 std::string ResolveBotDrawLabel(
     uintptr_t actor,
     const std::string& cachedLabel,
-    const std::string& fnameHint)
+    const std::string& fnameHint,
+    bool allowDma)
 {
     auto acceptOrNormalize = [](const std::string& label, const std::string& hint) -> std::string {
         if (label.empty() || label == kBotStructAdmissionToken)
@@ -1446,6 +1488,14 @@ std::string ResolveBotDrawLabel(
 
     if (const std::string hit = acceptOrNormalize(cachedLabel, fnameHint); !hit.empty())
         return hit;
+
+    // DMA fallbacks are for the robot worker (allowDma=true) only. The paint
+    // thread must never run these: GetActorClassFName / ResolveEnemyAssetBotLabel
+    // / GetEnemyTypeDataAssetFName / GetActorFNameString / Memory::read(EmbarkMesh)
+    // are live DMA reads that stalled Present 100-440ms whenever a bot's fname
+    // decrypt flaked (Constructable token) — the ghost-copy flash.
+    if (!allowDma)
+        return {};
 
     if (const std::string resolved = ResolveBotTypeLabel(actor, fnameHint); !resolved.empty()) {
         if (const std::string hit = acceptOrNormalize(resolved, fnameHint); !hit.empty())
@@ -1723,9 +1773,9 @@ void Engine::RobotList()
     {
         std::shared_lock<std::shared_mutex> lock(m_robotCacheMutex);
         localCache = robotCache;
-    }
-
-    for (auto it = localCache.begin(); it != localCache.end(); ) {
+    }    s_botScanFedThisPass = false;
+    for (auto it = localCache.begin(); it != localCache.end(); )
+    {
         if (!currentActorSet.contains(it->first)) {
             ClearBotVisualMiss(it->first);
             s_botVisualEvicted.erase(it->first);
@@ -1761,6 +1811,7 @@ void Engine::RobotList()
     int dbgQuickPass = 0;
     int dbgVerifyFail = 0;
     int dbgReEvict = 0;
+    int dbgBrokenSkip = 0;
     int dbgAdmitAnyBot = 0;
     int dbgFailNoRoot = 0;
     int dbgFailNoMesh = 0;
@@ -1781,6 +1832,9 @@ void Engine::RobotList()
         uint64_t itemDa = 0;
         uint64_t hover = 0;
         uint64_t containerLoot = 0;
+        uintptr_t root = 0;
+        double distSq = 0.0;
+        bool hasDist = false;
     };
 
     std::vector<uintptr_t> admitCandidates;
@@ -1801,6 +1855,15 @@ void Engine::RobotList()
     // hogs it starves them all and bones lag behind moving targets.
     WorldScan::ScanBudget scanBudget(std::chrono::milliseconds(90));
     bool slicePartial = false;
+
+    // Retain must never be starved by admission: the retain loop is what
+    // sets Drawing=true for cached bots (the ESP itself), while admission is
+    // background discovery. Retain gets its OWN budget created FRESH right
+    // before the retain loop (debug-c190fb: drawing:0, visSkip:0, distSkip:0
+    // while sceneOk:46 = retain never ran). It must NOT be created here at
+    // the top: admission's scatters + serial loop burn 90-150ms, so a budget
+    // created before them is already expired when the retain loop checks it
+    // (drawing stays 0 even with a full cache).
 
     if (doAdmission) {
         // Resolve the runtime actor-type offset once (serial) so the batch
@@ -1865,6 +1928,8 @@ void Engine::RobotList()
         }
         if (ringReset) {
             s_admitSliceCursor = 0;
+            s_admitResumeRow = 0;
+            s_admitVerifyBacklog.clear();
             s_admitCoveredMask = 0;
             s_admitPrevActors.clear();
             s_admitCycleStart = std::chrono::steady_clock::now();
@@ -1885,41 +1950,68 @@ void Engine::RobotList()
         dbgAdmitSliceBase = sliceBase;
         dbgAdmitSliceEnd = sliceEnd;
 
-        std::unordered_set<uintptr_t> probeSet;
-        probeSet.reserve((sliceEnd - sliceBase) + kAdmitPrioNewMax + 8);
+        // B4 (RIVENTIDES resume-band): stable deterministic row order
+        // (admitIndex order) so the cross-pass resume frontier points at the
+        // same rows — unordered_set iteration reorders each pass.
+        std::unordered_set<uintptr_t> bandSet;
+        bandSet.reserve(sliceEnd - sliceBase);
+        std::vector<AdmitProbeRow> bandRows;
+        bandRows.reserve(sliceEnd - sliceBase);
         for (size_t i = sliceBase; i < sliceEnd; ++i) {
             const uintptr_t actor = admitIndex[i];
             // Cached bots are owned by retain + PositionRefreshPass.
             if (localCache.contains(actor))
                 continue;
-            probeSet.insert(actor);
+            if (!bandSet.insert(actor).second)
+                continue;
+            AdmitProbeRow row{};
+            row.actor = actor;
+            bandRows.push_back(row);
         }
-        dbgAdmitSliceActors = static_cast<int>(probeSet.size());
+        dbgAdmitSliceActors = static_cast<int>(bandRows.size());
 
         // Bounded newly-seen priority (CPU set-diff only — same scatter path).
-        size_t prioAdded = 0;
+        std::vector<AdmitProbeRow> prioRows;
+        prioRows.reserve(kAdmitPrioNewMax);
         for (uintptr_t actor : admitIndex) {
-            if (prioAdded >= kAdmitPrioNewMax)
+            if (prioRows.size() >= kAdmitPrioNewMax)
                 break;
             if (s_admitPrevActors.contains(actor))
                 continue;
             if (localCache.contains(actor))
                 continue;
-            if (probeSet.insert(actor).second)
-                ++prioAdded;
-        }
-        dbgAdmitPrioNew = static_cast<int>(prioAdded);
-
-        std::vector<AdmitProbeRow> probeRows;
-        probeRows.reserve(probeSet.size());
-        for (uintptr_t actor : probeSet) {
-            AdmitProbeRow row;
+            if (bandSet.contains(actor))
+                continue;   // covered by this band sweep
+            AdmitProbeRow row{};
             row.actor = actor;
-            probeRows.push_back(row);
+            prioRows.push_back(row);
+        }
+        dbgAdmitPrioNew = static_cast<int>(prioRows.size());
+
+        // Frontier: continue the band where the last pass stopped instead of
+        // restarting at row 0 every pass (stuck slice / cache:0 deadlock on
+        // 16K-actor maps). Prio rows lead so brand-new spawns are still probed
+        // every pass.
+        const size_t resume = (std::min)(s_admitResumeRow, bandRows.size());
+        std::vector<AdmitProbeRow> probeRows;
+        probeRows.reserve(prioRows.size() + (bandRows.size() - resume));
+        probeRows.insert(probeRows.end(), prioRows.begin(), prioRows.end());
+        if (resume < bandRows.size()) {
+            probeRows.insert(
+                probeRows.end(),
+                bandRows.begin() + static_cast<std::ptrdiff_t>(resume),
+                bandRows.end());
         }
 
-        constexpr size_t kAdmitChunk = 128;
-        for (size_t base = 0; base < probeRows.size(); base += kAdmitChunk) {
+        // RIVENTIDES: 48 rows x 9 preps = ~430 preps per exec. With the DMA
+        // bus saturated by the 16K-actor world scanners, a 128-row chunk's
+        // single execute blew the whole 90ms budget, the process loop then
+        // broke instantly (slicePartial) and the ring stayed on one slice
+        // forever -> cache:0, zero bots. Small chunks keep every execute
+        // short even on a loaded bus.
+        constexpr size_t kAdmitChunk = 48;
+        size_t base = 0;
+        for (; base < probeRows.size(); base += kAdmitChunk) {
             if (scanBudget.expired()) { slicePartial = true; break; }
             const size_t end = (std::min)(base + kAdmitChunk, probeRows.size());
             ScatterSession scatter;
@@ -1946,11 +2038,78 @@ void Engine::RobotList()
                 prepOk = scatter.prepare(
                              r.actor + Offsets::LootInteraction_Container, r.containerLoot)
                     && prepOk;
+                prepOk = scatter.prepare(r.actor + Offsets::RootComponent, r.root) && prepOk;
             }
             if (prepOk && scatter.execute())
                 ++dbgAdmitScatterExecs;
             // Short batches + yield so the 8ms camera thread keeps cadence.
             std::this_thread::yield();
+        }
+
+        // B5: only rows in [0, scatteredEnd) were scattered THIS pass and may
+        // be screened; rows beyond still hold zero buffers and must never hit
+        // the fname memo (mass negative-memoization = permanent blindness).
+        // The resume frontier itself is computed AFTER screening from
+        // processEnd so a screening break cannot rewind the band (Stage 1).
+        const size_t scatteredEnd = (std::min)(base, probeRows.size());
+
+        // Distance-priority admission (same as EntityList player path): scatter
+        // each row's root WorldLocation and sort the slice nearest-first so a
+        // budget-clipped pass still admits the bots closest to the player. Without
+        // it, admit order is actor-array order and nearby bots can wait multiple
+        // ring sweeps.
+        // Only a fully-scattered sweep may distance-sort: a partial pass must
+        // keep [0, scatteredEnd) order aligned with the resume frontier.
+        if (scatteredEnd >= probeRows.size() && !probeRows.empty()) {
+            const uintptr_t lroot = sAcknowledgedPawn
+                ? Memory::read<uintptr_t>(sAcknowledgedPawn + Offsets::RootComponent)
+                : 0;
+            Vector3 localPos{};
+            if (lroot && engine.IsValidPointer(lroot))
+                localPos = Engine::ReadWorldLocationNocache(lroot, /*allowRelativeFallback=*/true);
+            if (IsPlausibleWorldPos(localPos)) {
+                std::vector<Engine::FVector3d> locBuf(probeRows.size());
+                for (size_t distBase = 0; distBase < probeRows.size(); distBase += kAdmitChunk) {
+                    if (scanBudget.expired())
+                        break;
+                    const size_t distEnd = (std::min)(distBase + kAdmitChunk, probeRows.size());
+                    ScatterSession distScatter;
+                    if (!distScatter.isValid())
+                        break;
+                    bool distPrepOk = true;
+                    for (size_t i = distBase; i < distEnd; ++i) {
+                        AdmitProbeRow& r = probeRows[i];
+                        if (!r.root) {
+                            distPrepOk = false;
+                            continue;
+                        }
+                        distPrepOk = distScatter.prepare(r.root + Offsets::WorldLocation, locBuf[i])
+                            && distPrepOk;
+                    }
+                    if (distPrepOk && distScatter.execute())
+                        ++dbgAdmitScatterExecs;
+                    std::this_thread::yield();
+                }
+                for (size_t i = 0; i < probeRows.size(); ++i) {
+                    AdmitProbeRow& r = probeRows[i];
+                    const Vector3 p = Engine::ToVector3(locBuf[i]);
+                    if (!r.root || !IsPlausibleWorldPos(p))
+                        continue;
+                    const double dx = p.x - localPos.x;
+                    const double dy = p.y - localPos.y;
+                    const double dz = p.z - localPos.z;
+                    r.distSq = dx * dx + dy * dy + dz * dz;
+                    r.hasDist = true;
+                }
+                std::stable_sort(
+                    probeRows.begin(),
+                    probeRows.end(),
+                    [](const AdmitProbeRow& a, const AdmitProbeRow& b) {
+                        if (a.hasDist != b.hasDist)
+                            return a.hasDist > b.hasDist;
+                        return a.distSq < b.distSq;
+                    });
+            }
         }
 
         // Bots get PlayerStates from AI controllers — only the local player's
@@ -1961,8 +2120,16 @@ void Engine::RobotList()
             ? Memory::read<uintptr_t>(sAcknowledgedPawn + Offsets::APlayerState)
             : 0;
         admitCandidates.reserve(64);
-        for (const AdmitProbeRow& r : probeRows) {
-            if (scanBudget.expired()) { slicePartial = true; break; }
+        // Fresh micro-budget: the probe scatter may have consumed the pass
+        // budget under DMA load, but rows that WERE scattered must still be
+        // processed this pass or admission starves (stuck ring, cache:0).
+        // Only freshly-scattered rows [0, scatteredEnd) are processed.
+        WorldScan::ScanBudget procBudget(std::chrono::milliseconds(40));
+        size_t processEnd = 0;
+        for (size_t ri = 0; ri < scatteredEnd; ++ri) {
+            const AdmitProbeRow& r = probeRows[ri];
+            if (procBudget.expired()) { slicePartial = true; break; }
+            processEnd = ri + 1;
             const uint32_t masked = ArcActorType::MaskActorTypeId(r.typeId);
             if (ArcActorType::IsPlayerClassId(masked))
                 continue;
@@ -1994,6 +2161,30 @@ void Engine::RobotList()
             admitCandidates.push_back(r.actor);
         }
 
+        // B5 (Stage 1): monotonic resume frontier — computed AFTER screening so
+        // a screening budget break persists its position instead of rewinding
+        // the band. consumedAll (full scatter + full screen) resets the resume
+        // and lets the ring advance; a sorted sweep that didn't finish replays
+        // in distance order; anything else resumes from the screened prefix.
+        {
+            const size_t prioCount = prioRows.size();
+            const bool sortedSweep = scatteredEnd >= probeRows.size();
+            if (sortedSweep && processEnd == scatteredEnd) {
+                s_admitResumeRow = 0;
+            } else if (sortedSweep) {
+                // probeRows were distance-sorted this pass; a broken sweep must
+                // not map processEnd back onto the unsorted band order.
+                s_admitResumeRow = 0;
+                slicePartial = true;
+            } else {
+                const size_t bandProcessed =
+                    (processEnd > prioCount) ? (processEnd - prioCount) : 0;
+                s_admitResumeRow =
+                    resume + (std::min)(bandProcessed, bandRows.size() - resume);
+                slicePartial = true;
+            }
+        }
+
         // Snapshot current actors for next-pass new-actor diff. Cursor advances
         // only after gen-matched writeback so an aborted pass never skips a band.
         s_admitPrevActors.clear();
@@ -2004,8 +2195,39 @@ void Engine::RobotList()
     }
 
     if (doAdmission) {
-    for (uintptr_t actor : admitCandidates)
+    // LAG1 (c190fb): the admission loop is SERIAL — each candidate does
+    // fname + VerifyBotActor DMA. With ~1,000-1,500 candidates per slice
+    // band it blows the 90ms shared budget before the retain loop runs,
+    // so NO cached bot ever gets Drawing=true (drawing:0, visSkip:0,
+    // distSkip:0 while sceneOk:46). Cap admission and let retain breathe.
+    // Fresh budget HERE, not the shared scanBudget: the probe + distance
+    // scatters above already consume the whole 90ms, so checking
+    // scanBudget.expired() here broke on the first candidate every pass
+    // (quickPass:0, cache drained to 0, zero bot ESP).
+    WorldScan::ScanBudget admitBudget(std::chrono::milliseconds(60));
+    // B5 (Stage 2): verify is best-effort and never gates ring advance. On a
+    // budget overrun the tail re-enters via s_admitVerifyBacklog next pass;
+    // new spawns are unaffected (they are re-listed by the prio diff).
+    std::vector<uintptr_t> pending;
+    pending.reserve(s_admitVerifyBacklog.size() + admitCandidates.size());
+    pending.insert(pending.end(), s_admitVerifyBacklog.begin(), s_admitVerifyBacklog.end());
+    pending.insert(pending.end(), admitCandidates.begin(), admitCandidates.end());
+    s_admitVerifyBacklog.clear();
+    size_t vi = 0;
+    for (; vi < pending.size(); ++vi)
     {
+        if (admitBudget.expired()) {
+            const size_t rest = pending.size() - vi;
+            if (rest <= kAdmitVerifyBacklogMax)
+                s_admitVerifyBacklog.assign(
+                    pending.begin() + static_cast<std::ptrdiff_t>(vi), pending.end());
+            else
+                s_admitVerifyBacklog.assign(
+                    pending.end() - static_cast<std::ptrdiff_t>(kAdmitVerifyBacklogMax),
+                    pending.end());
+            break;  // NO slicePartial here — verify must not stall the ring
+        }
+        const uintptr_t actor = pending[vi];
         ++dbgQuickPass;
 
         // #region agent log
@@ -2303,11 +2525,46 @@ void Engine::RobotList()
         }
     }
 
-    for (auto it = localCache.begin(); it != localCache.end(); )
+    // Retain loop budget: fresh HERE (after admission + P1 batch), so a heavy
+    // admission pass can never starve the code that sets Drawing=true.
+    // Raised from 60→200ms: with 50+ cached bots at ~3ms each, 60ms only
+    // covered ~20 bots — the rest never got Drawing=true (drawing:11 with
+    // cache:53, sceneOk:51, distSkip:0, visSkip:0).
+    WorldScan::ScanBudget retainBudget(std::chrono::milliseconds(500));
+    // Retain nearest-first: the budget caps how many bots the loop can
+    // process per pass, and unordered_map iteration order is arbitrary but
+    // deterministic — so with a fixed hash order the SAME far-away bots were
+    // processed every pass (all distSkip) while nearby bots never got
+    // Drawing=true (drawing:0 with a full cache). Sort by distance so the
+    // bots actually on screen are processed first.
+    std::vector<uintptr_t> retainOrder;
+    retainOrder.reserve(localCache.size());
+    for (const auto& kv : localCache)
+        retainOrder.push_back(kv.first);
+    std::sort(retainOrder.begin(), retainOrder.end(),
+        [&localCache, &cam](uintptr_t a, uintptr_t b) {
+            const auto ia = localCache.find(a);
+            const auto ib = localCache.find(b);
+            const bool pa = ia != localCache.end()
+                && IsPlausibleWorldPos(ia->second.WorldPos);
+            const bool pb = ib != localCache.end()
+                && IsPlausibleWorldPos(ib->second.WorldPos);
+            if (pa != pb)
+                return pa > pb;
+            if (!pa)
+                return false;
+            const Vector3 da = ia->second.WorldPos - cam.Location;
+            const Vector3 db = ib->second.WorldPos - cam.Location;
+            return (da.x * da.x + da.y * da.y + da.z * da.z)
+                < (db.x * db.x + db.y * db.y + db.z * db.z);
+        });
+    for (uintptr_t key : retainOrder)
     {
+        auto it = localCache.find(key);
+        if (it == localCache.end())
+            continue;
         auto& actor = it->second;
-        const uintptr_t key = it->first;
-        if (scanBudget.expired())
+        if (retainBudget.expired())
             break;
 
         std::string fname = engine.GetActorFNameStringCached(key);
@@ -2425,6 +2682,7 @@ void Engine::RobotList()
         const uint8_t broken = ReadBotBrokenFlag(key);
         actor.IsBreaked = broken != 0;
         if (broken != 0 && !var::show_dead_bots) {
+            ++dbgBrokenSkip;
             // GRACE: keep cached with last Drawing while the flag flaps; a
             // truly-dead bot still climbs to kBotVisualMissEvict and evicts.
             if (!BotVisualMissShouldEvict(key, false)) {
@@ -2736,24 +2994,60 @@ void Engine::RobotList()
                         ++it;
                 }
             }
+            // Prefer the session-discovered offset/key pair — hardcoded pairs
+            // go stale every game build (the current one reads 0x4C4 as zero).
+            // Until Scan lands a discovery, fall back to the hardcoded constant.
+            uint32_t lrtsOff =
+                static_cast<uint32_t>(Offsets::Mesh_LastRenderTimeOnScreenEnc);
+            uint32_t lrtsKey = Offsets::Mesh_LastRenderTimeOnScreenKey;
+            {
+                // Read the shared session pair under its mutex: Scan publishes
+                // them asynchronously from the same worker, so an unlocked read
+                // could tear a half-published offset/key pair.
+                std::lock_guard<std::mutex> sk(LrtsVis::g_session.mu);
+                if (LrtsVis::g_session.lrtsOffset != 0
+                    && LrtsVis::g_session.keyCount > 0) {
+                    lrtsOff = static_cast<uint32_t>(LrtsVis::g_session.lrtsOffset);
+                    lrtsKey = LrtsVis::g_session.keys[0];
+                }
+            }
             auto vis = LrtsVis::CheckDirect(
                 [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
                 visMesh, LrtsVis::g_session, worldTime,
-                static_cast<uint32_t>(Offsets::Mesh_LastRenderTimeOnScreenEnc),
-                Offsets::Mesh_LastRenderTimeOnScreenKey);
+                lrtsOff, lrtsKey);
             if (vis == LrtsVis::Result::Unknown) {
                 const uintptr_t alt = Memory::read<uintptr_t>(actor.APawn + Offsets::EmbarkMesh);
                 if (alt && alt != visMesh && engine.IsValidPointer(alt)) {
                     vis = LrtsVis::CheckDirect(
                         [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
                         alt, LrtsVis::g_session, worldTime,
-                        static_cast<uint32_t>(Offsets::Mesh_LastRenderTimeOnScreenEnc),
-                        Offsets::Mesh_LastRenderTimeOnScreenKey);
+                        lrtsOff, lrtsKey);
                     if (vis != LrtsVis::Result::Unknown)
                         visMesh = alt;
                 }
             }
             if (vis == LrtsVis::Result::Unknown) {
+                // Feed Scan while unverified: a rendered mesh (flag byte set)
+                // is the one thing Scan needs to rediscover the current
+                // build's offset+key. One mesh per pass — once verified,
+                // CheckDirect above is primary and this costs nothing.
+                if (!LrtsVis::g_session.verified
+                    && !s_botScanFedThisPass && visMesh) {
+                    const uint8_t brrFed = Memory::read_nocache<uint8_t>(
+                        visMesh + LrtsVis::BrrOffset);
+                    if (brrFed & LrtsVis::BrrMask) {
+                        auto& ms = s_lrtsBotMeshStates[visMesh];
+                        if (!ms.meshComp) ms.meshComp = visMesh;
+                        LrtsVis::Scan(ms, LrtsVis::g_session,
+                            [](uint64_t a) { return Memory::read_nocache<uint8_t>(a); },
+                            [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
+                            [](uint64_t a, void* b, uint32_t s) {
+                                return PCIMemory::ReadVirtualMemoryNoCache(a, b, s);
+                            },
+                            worldTime, sGWorld);
+                        s_botScanFedThisPass = true;
+                    }
+                }
                 vis = LrtsVis::CheckRendered(
                     [](uint64_t a) { return Memory::read_nocache<uint8_t>(a); },
                     visMesh, LrtsVis::g_session,
@@ -2779,7 +3073,46 @@ void Engine::RobotList()
                     [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
                     worldTime, sGWorld);
             }
-            actor.isVisible = (vis != LrtsVis::Result::Occluded);
+            // Hysteresis: require 2 confirmed Occluded checks before hiding
+            // (kills flag-byte flicker + transient 0x00 reads); Unknown keeps
+            // the last verdict so read failures never pop boxes through walls.
+            const uint64_t nowMs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            // BRR-aware hysteresis: fast-hide ONLY on a successfully-read byte
+            // (non-zero) with the rendered bit clear. brr == 0x00 means the DMA
+            // read failed — falling back to the 2-check hysteresis keeps a
+            // transient flap from blinking the box (ghost-flicker regression).
+            const uint8_t brrSmooth = Memory::read_nocache<uint8_t>(
+                visMesh + LrtsVis::BrrOffset);
+            const bool confirmedNotRendered =
+                brrSmooth != 0 && (brrSmooth & LrtsVis::BrrMask) == 0;
+
+            // Stage 3: LRTS + collision combined voting. LRTS is primary;
+            // collision is the tie-breaker for stale stamps (Visible+blocked
+            // → Occluded) and the fallback for Unknown. Occluded wins outright
+            // (renderer truth). Fail-open when the tree isn't ready.
+            if (var::collision_vis_enabled && CollisionMirror::IsReady()
+                && (actor.WorldPos.x != 0.0 || actor.WorldPos.y != 0.0 || actor.WorldPos.z != 0.0)) {
+                const bool blocked = !CollisionMirror::QueryVisible(
+                    cam.Location, actor.WorldPos);
+                switch (vis) {
+                case LrtsVis::Result::Occluded:
+                    break;  // renderer truth wins
+                case LrtsVis::Result::Visible:
+                    if (blocked)
+                        vis = LrtsVis::Result::Occluded;  // stale stamp behind wall
+                    break;
+                case LrtsVis::Result::Unknown:
+                default:
+                    vis = blocked
+                        ? LrtsVis::Result::Occluded
+                        : LrtsVis::Result::Visible;  // collision fills LRTS gaps
+                    break;
+                }
+            }
+            actor.isVisible = s_botVisSmooth[key].Update(
+                vis, nowMs, confirmedNotRendered);
 
             // Burst capture: full-frame-rate rows for ONE (first) bot so the
             // true LOS->verdict latency is measurable. The shared 1 Hz trace
@@ -3002,20 +3335,20 @@ void Engine::RobotList()
                 std::shared_lock<std::shared_mutex> lock(m_robotCacheMutex);
                 botCacheSz = robotCache.size();
             }
-            char bbuf[640]{};
+            char bbuf[700]{};
             snprintf(bbuf, sizeof(bbuf),
                 "{\"scanned\":%d,\"admitted\":%d,\"cache\":%zu,\"drawing\":%d,"
                 "\"structHit\":%d,\"quickPass\":%d,\"verifyFail\":%d,\"reEvict\":%d,"
                 "\"admitAny\":%d,\"failRoot\":%d,\"failMesh\":%d,\"failId\":%d,"
                 "\"failOther\":%d,\"fnameMiss\":%d,\"visSkip\":%d,\"distSkip\":%d,"
                 "\"zeroPos\":%d,\"sceneOk\":%d,\"sceneFail\":%d,\"enemyCount\":%d,"
-                "\"slice\":%zu,\"prioNew\":%d,\"cycleMs\":%d}",
+                "\"slice\":%zu,\"prioNew\":%d,\"cycleMs\":%d,\"brokenSkip\":%d}",
                 dbgScanned, dbgAdmitted, botCacheSz, dbgDrawing,
                 dbgStructHit, dbgQuickPass, dbgVerifyFail, dbgReEvict,
                 dbgAdmitAnyBot, dbgFailNoRoot, dbgFailNoMesh, dbgFailNoId,
                 dbgFailOther, dbgFnameHit, dbgVisSkip, dbgDistSkip,
                 dbgZeroPos, dbgScenePosOk, dbgScenePosFail, dbgEnemyCount,
-                dbgAdmitSlice, dbgAdmitPrioNew, s_admitLastCycleMs);
+                dbgAdmitSlice, dbgAdmitPrioNew, s_admitLastCycleMs, dbgBrokenSkip);
             std::ofstream f(kArcVerifyPath, std::ios::app);
             if (f) {
                 const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(

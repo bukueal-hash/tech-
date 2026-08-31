@@ -59,6 +59,9 @@ namespace var {
     extern bool lrts_debug_trace; // append per-second vis trace NDJSON rows
     extern bool lrts_debug_tree;  // include component tree bytes in each row
     extern bool lrts_debug_burst; // full-frame-rate one-bot latency capture
+    extern bool collision_debug_draw; // draw collision KD-tree wireframe blocks
+    extern bool collision_debug_rays; // draw camera→target LOS rays (green/red)
+    extern bool collision_vis_enabled; // LRTS+collision combined voting
     extern AimVisMode aim_vis_mode;
 
     /** Run LRTS reads when ESP vis and/or aim visible-only need isVisible. */

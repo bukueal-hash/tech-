@@ -15,8 +15,14 @@ void RecordBotDrawLabelMiss();
 /** Full bot display name from actor + fname (shared by admission and draw). */
 std::string ResolveBotTypeLabel(uintptr_t actor, const std::string& fname);
 
-/** Use cached label when accepted; else one ResolveBotTypeLabel pass. */
+/** Use cached label when accepted; else one ResolveBotTypeLabel pass.
+ *  allowDma=false is for the PAINT thread: the fallback chain runs live DMA
+ *  (GetActorClassFName / GetEnemyTypeDataAssetFName / ResolveEnemyAssetBotLabel
+ *  / GetActorFNameString / Memory::read EmbarkMesh) which stalled Present
+ *  100-440ms whenever a bot's fname decrypt flaked. Paint must never DMA —
+ *  a bad cached label means skip the bot, the robot worker resolves names. */
 std::string ResolveBotDrawLabel(
     uintptr_t actor,
     const std::string& cachedLabel,
-    const std::string& fnameHint);
+    const std::string& fnameHint,
+    bool allowDma = true);

@@ -22,6 +22,9 @@ namespace var {
     bool lrts_debug_trace = false;
     bool lrts_debug_tree = true;
     bool lrts_debug_burst = false;
+    bool collision_debug_draw = false;
+    bool collision_debug_rays = false;
+    bool collision_vis_enabled = false;
 
     /* Bot ESP */
     bool bot_box = true;

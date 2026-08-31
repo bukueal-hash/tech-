@@ -272,6 +272,12 @@ void NoteFlickerGone(FlickerChannel channel, uintptr_t key);
 /** Emit flicker_score NDJSON at most once per 10s window when counts moved. */
 void MaybeFlushFlickerScore();
 
+/** Paint-thread screen-jump probe: count boxes whose painted screen position
+ *  leapt while the camera barely rotated between paints — a pure paint-space
+ *  instability signature (shimmer the eye reads as flicker) that the drawn
+ *  on/off flicker tracks cannot see. channel: 0 players, 1 bots. */
+void NotePaintOsc(int channel);
+
 // #endregion
 
 } // namespace WorldScan

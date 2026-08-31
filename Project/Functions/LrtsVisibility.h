@@ -10,6 +10,8 @@
 
 #include <cstdint>
 #include <array>
+#include <atomic>
+#include <fstream>
 #include <mutex>
 
 namespace LrtsVis {
@@ -46,11 +48,13 @@ struct MeshState {
         uint32_t key = 0;
         float worldTimeAtCapture = 0.f;
     };
-    // Must cover the whole 0x200 scan window (128 dwords). The Phase 1 filter
-    // cannot narrow anything down — its key derivation cancels out, so every
-    // non-zero dword qualifies — which meant a cap of 32 handed Phase 2 only
-    // the first quarter of the range and silently discarded the rest.
-    static constexpr int kMaxPending = 128;
+    // Must cover the whole scan window. The Phase 1 filter cannot narrow
+    // anything down — its key derivation cancels out, so every non-zero dword
+    // qualifies — which meant a cap of 32 handed Phase 2 only the first quarter
+    // of the range and silently discarded the rest. With the window widened to
+    // 0x800 (512 dwords), the cap must hold every dword in the range so a
+    // high-offset LRTS is never silently dropped.
+    static constexpr int kMaxPending = 512;
     std::array<PendingCandidate, kMaxPending> pending{};
     int pendingCount = 0;
 
@@ -83,6 +87,8 @@ struct SessionState {
     // Pending key verification (async, deferred)
     uint64_t pendMesh = 0;
     uint32_t pendKey = 0;
+    uint32_t pendRaw = 0;   // encrypted dword captured at derivation; verify
+                            // requires the value to move before accepting the key
     float pendTime = 0.f;
 
     // Diagnostics
@@ -104,6 +110,11 @@ struct SessionState {
     int scanBrrNoBit = 0;   // byte was non-zero but 0x20 was clear
     int scanBrrPass = 0;    // frustum gate passed
     int scanBulkFail = 0;   // bulk read of meshComp+0x400 failed
+    int scanDropFull = 0;   // Phase 1: qualifying dwords dropped because
+                            // pending[] hit kMaxPending. If this grows on a
+                            // new build, the LRTS offset may sit past the cap
+                            // and discovery will silently fail — raise the
+                            // cap or widen the window.
     int directReadZero = 0; // CheckDirect: encrypted dword read as zero
     int directInsane = 0;   // CheckDirect: decrypted to a non-time value
     uint64_t lastMesh = 0;        // last mesh checked; the tick probe watches it
@@ -127,6 +138,7 @@ struct SessionState {
         keyCount = 0;
         pendMesh = 0;
         pendKey = 0;
+        pendRaw = 0;
         pendTime = 0.f;
         visibleCount = 0;
         occludedCount = 0;
@@ -140,6 +152,7 @@ struct SessionState {
         scanBrrNoBit = 0;
         scanBrrPass = 0;
         scanBulkFail = 0;
+        scanDropFull = 0;
         directReadZero = 0;
         directInsane = 0;
         lastMesh = 0;
@@ -157,11 +170,144 @@ struct SessionState {
 // The one global session state
 inline SessionState g_session;
 
+// Aggregate verdict-flip counters (all VerdictSmoothers). Menu diagnostics:
+// flicker = flipsToOccluded (a box dropping behind-wall) and flipsToVisible
+// (a box popping through a wall); both should hover near zero during steady
+// aim after the hysteresis lands.
+inline std::atomic<uint64_t> g_flipsToVisible{ 0 };
+inline std::atomic<uint64_t> g_flipsToOccluded{ 0 };
+inline std::atomic<uint64_t> g_unknownHolds{ 0 };
+
+// ─── Persisted discovery ────────────────────────────────────────────────
+// The discovered offset+XOR key are stable within a game build but rotate
+// across builds. Save them (once locked) so restarts of the same build skip
+// the scan warmup; a stale file is harmless — runtime Scan replaces it within
+// a pass or two, exactly as if no file existed.
+inline constexpr const char* kPersistPath = "F:/Test/ARCs/lrts_key.txt";
+inline std::atomic<bool> g_persistTried{ false };
+
+inline void PersistDiscoveredKey(const SessionState& session)
+{
+    if (!session.lrtsOffset || session.keyCount <= 0)
+        return;
+    std::ofstream f(kPersistPath, std::ios::trunc);
+    if (!f)
+        return;
+    f << std::hex << session.lrtsOffset << '\n'
+      << session.keys[0] << '\n';
+}
+
+// Seed the session from the persisted file once per process. Never clobbers
+// live-discovered state, and never runs twice (scan/restart races both end in
+// the same seed).
+inline void EnsurePersistedLoaded(SessionState& session)
+{
+    if (g_persistTried.exchange(true, std::memory_order_relaxed))
+        return;
+    std::ifstream f(kPersistPath);
+    if (!f)
+        return;
+    uint32_t off = 0, key = 0;
+    f >> std::hex >> off >> key;
+    if (off && key && session.lrtsOffset == 0 && session.keyCount <= 0) {
+        session.lrtsOffset = off;
+        session.keys[0] = key;
+        session.keyCount = 1;
+        session.verified = true;
+    }
+}
+
 // Configuration
-inline constexpr float kVisibilityThreshold = 0.5f;   // seconds — LRTS must be within this of worldTime
+inline constexpr float kVisibilityThreshold = 0.15f;  // seconds — LRTS must be within this of worldTime
 inline constexpr int   kMaxScanAttempts = 10;
 inline constexpr float kPendingVerifyDelay = 0.12f;    // seconds — delay before verifying candidates
-inline constexpr float kPendingKeyVerifyDelay = 2.0f;  // seconds — delay before accepting new key
+inline constexpr float kPendingKeyVerifyDelay = 1.0f;  // seconds — delay before accepting new key
+
+// Verdict hysteresis: tuned for wall-pops vs flicker tradeoff.
+// 2 checks = ~400ms at 200ms cadence: fast enough for wall-pops,
+// slow enough to reject DMA glitches (ghost flicker).
+inline constexpr int kOccludedConfirmChecks = 2;
+inline constexpr int kVisibleConfirmChecks  = 1;
+
+struct VerdictSmoother {
+    // Smoothed verdict. Defaults to Visible (matches the call sites' existing
+    // Unknown-==-Visible bias) until the first confirmed Occluded flips it.
+    bool visible = true;
+    int pending = 0;              // consecutive occlusion-confirming checks
+    uint64_t lastFlipMs = 0;      // wall-clock of last visible<->occluded flip
+    int flipsToVisible = 0;       // lifetime flip counters (menu diagnostics)
+    int flipsToOccluded = 0;
+    int unknownHolds = 0;         // times an Unknown kept the current verdict
+
+    void Reset() {
+        visible = true;
+        pending = 0;
+    }
+
+    // Feed one raw check result; returns the smoothed isVisible.
+    // confirmedNotRendered = the bRecentlyRendered byte was READ SUCCESSFULLY
+    // (non-zero) and bit5 is clear: the mesh is alive but the renderer is not
+    // drawing it. In that state:
+    //   - Occluded  -> fast-hide now (wall-pop, no 2-check wait).
+    //   - Visible   -> CONTRADICTION. The LRTS stamp can keep tracking
+    //     worldTime for 30-70s after a mesh stops rendering (measured on
+    //     debug-c190fb: 199 runs, longest 71s — wasp stuck green behind a
+    //     wall). A raw Visible must therefore COUNT toward occlusion instead
+    //     of resetting the confirm counter, or the box never flips.
+    // Any other case (byte still rendering, or byte == 0x00 from a failed DMA
+    // read) keeps plain hysteresis: a 0x00 read must NEVER count as "not
+    // rendered" or every DMA flap would blink the box (94ms ghost flicker).
+    bool Update(Result r, uint64_t nowMs, bool confirmedNotRendered = false) {
+        switch (r) {
+        case Result::Visible:
+            if (confirmedNotRendered) {
+                // Stamp-vs-renderer contradiction: treat as occlusion evidence.
+                if (++pending >= kOccludedConfirmChecks && visible) {
+                    visible = false;
+                    lastFlipMs = nowMs;
+                    ++flipsToOccluded;
+                    g_flipsToOccluded.fetch_add(1, std::memory_order_relaxed);
+                }
+                break;
+            }
+            pending = 0;
+            if (!visible) {
+                visible = true;
+                lastFlipMs = nowMs;
+                ++flipsToVisible;
+                g_flipsToVisible.fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        case Result::Occluded:
+            // Fast path: mesh alive and genuinely not rendered — hide now.
+            if (confirmedNotRendered) {
+                if (visible) {
+                    visible = false;
+                    lastFlipMs = nowMs;
+                    ++flipsToOccluded;
+                    g_flipsToOccluded.fetch_add(1, std::memory_order_relaxed);
+                }
+                pending = 0;
+                break;
+            }
+            if (++pending >= kOccludedConfirmChecks && visible) {
+                visible = false;
+                lastFlipMs = nowMs;
+                ++flipsToOccluded;
+                g_flipsToOccluded.fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        case Result::Unknown:
+        default:
+            // Keep the current verdict: a transient read failure must not
+            // pop boxes visible through walls, nor hide a visible target.
+            ++unknownHolds;
+            g_unknownHolds.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+        return visible;
+    }
+};
 
 // Raw fast-path (ARC method): plain floats, no XOR. onScreen lags submit behind a wall.
 // Recently-rendered flag. Verified discriminating on CL-1341255: across one
@@ -188,6 +334,11 @@ void Scan(MeshState& ms, SessionState& session,
           float worldTime, uint64_t worldPtr)
 {
     std::lock_guard<std::mutex> lock(session.mu);
+
+    // Warm-start from the persisted key (once per process) so restarts of the
+    // same game build skip the scan warmup. Stale file is harmless — runtime
+    // discovery overwrites it within a pass or two.
+    EnsurePersistedLoaded(session);
 
     session.lastWorldTime = worldTime;
 
@@ -245,9 +396,12 @@ void Scan(MeshState& ms, SessionState& session,
         { float wf = worldTime; memcpy(&wtBits, &wf, 4); }
         const uint32_t wtSwapped = _byteswap_ulong(wtBits);
 
-        // Bulk read mesh+0x400..0x600
+        // Bulk read mesh+0x400..0xC00 (widened from 0x600: the encrypted
+        // render stamp moved outside the old 0x200 window on recent builds —
+        // every 0x4C4 read returned zero, so discovery could never find it.
+        // 0x800 covers 512 dwords; kMaxPending 512 holds the full range).
         constexpr uint32_t SCAN_LO = 0x400;
-        constexpr uint32_t SCAN_SIZE = 0x200;
+        constexpr uint32_t SCAN_SIZE = 0x800;
         uint8_t buf[SCAN_SIZE];
         if (!readBulk(ms.meshComp + SCAN_LO, buf, SCAN_SIZE)) {
             session.scanBulkFail++;
@@ -272,6 +426,12 @@ void Scan(MeshState& ms, SessionState& session,
                 ms.pending[ms.pendingCount++] = {
                     SCAN_LO + rel, raw, key, worldTime
                 };
+            } else {
+                // Array full: this dword qualifies but is silently discarded.
+                // On the current build the discovered LRTS sits at dword 451,
+                // so a non-zero drop count on a new build means discovery may
+                // be missing a high-offset stamp.
+                ++session.scanDropFull;
             }
         }
 
@@ -355,6 +515,10 @@ void Scan(MeshState& ms, SessionState& session,
             session.verified = true;
         }
 
+        // Persist the discovered offset+key so the next launch of this build
+        // starts with CheckDirect ready (no scan warmup). A moved stamp just
+        // gets rediscovered and this file rewritten — self-healing.
+        PersistDiscoveredKey(session);
         ms.pendingCount = 0;
         return;
     }
@@ -509,7 +673,12 @@ Result Check(MeshState& ms, SessionState& session,
         const uint32_t bits = _byteswap_ulong(pr ^ session.pendKey);
         float pv;
         memcpy(&pv, &bits, sizeof(float));
-        if (std::isfinite(pv) && std::fabs(worldTime - pv) < 1.5f) {
+        // pr must differ from the captured raw: a static dword (wrong/stale
+        // offset) decrypts with the derived key to exactly the capture-time
+        // worldTime, which would otherwise pass the 1.5s window ~1s later.
+        // Requiring the value to move is the same proof Scan Phase 2 uses.
+        if (pr != session.pendRaw && std::isfinite(pv)
+            && std::fabs(worldTime - pv) < 1.5f) {
             bool dup = false;
             for (int k = 0; k < session.keyCount; k++)
                 if (session.keys[k] == session.pendKey) { dup = true; break; }
@@ -529,14 +698,22 @@ Result Check(MeshState& ms, SessionState& session,
 
     float bestVal = 0.f;
     bool found = false;
+    float bestDist = 1e30f;
     for (int k = 0; k < session.keyCount; k++) {
         const uint32_t bits = _byteswap_ulong(raw ^ session.keys[k]);
         float v;
         memcpy(&v, &bits, sizeof(float));
+        // Prefer the key whose decrypt lands closest to worldTime: with up to
+        // six keys (one stale build key plus later re-discoveries), the first
+        // sane-looking value can come from a stale key and flip a verdict a
+        // fresher key would override.
         if (std::isfinite(v) && v > -2000.f && v < worldTime + 10.f) {
-            bestVal = v;
-            found = true;
-            break;
+            const float d = std::fabs(worldTime - v);
+            if (d < bestDist) {
+                bestDist = d;
+                bestVal = v;
+                found = true;
+            }
         }
     }
 
@@ -547,6 +724,7 @@ Result Check(MeshState& ms, SessionState& session,
             uint32_t wtBits;
             { float wf = worldTime; memcpy(&wtBits, &wf, 4); }
             session.pendKey = raw ^ _byteswap_ulong(wtBits);
+            session.pendRaw = raw;
             session.pendMesh = ms.meshComp;
             session.pendTime = worldTime;
         }

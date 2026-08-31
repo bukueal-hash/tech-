@@ -47,9 +47,10 @@ void ApplyOverlayMode(HWND hwnd, bool interactive)
     static bool s_hasApplied = false;
 
     if (!s_initialized) {
-        const MARGINS margins{ -1, -1, -1, -1 };
-        DwmExtendFrameIntoClientArea(hwnd, &margins);
-        SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
+        // Opaque overlay — no layered window, no DWM glass margins (the
+        // layered+glass combo ghost-composites a stale copy of the surface;
+        // see Project.cpp window creation). s_initialized marks that the
+        // one-time setup ran; nothing else is needed for an opaque window.
         s_initialized = true;
     }
 
@@ -60,7 +61,7 @@ void ApplyOverlayMode(HWND hwnd, bool interactive)
     s_lastInteractive = interactive;
 
     LONG style = GetWindowLong(hwnd, GWL_EXSTYLE);
-    style |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TOPMOST;
+    style |= WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
     if (interactive)
         style &= ~WS_EX_TRANSPARENT;
     else

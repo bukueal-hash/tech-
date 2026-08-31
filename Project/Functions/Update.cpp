@@ -4,6 +4,7 @@
 #include "../Core/IntervalTimer.h"
 #include "../Interface/Utils/Variables/index.h"
 #include "WorldScanCommon.h"
+#include "CollisionMirror.h"
 
 #include <chrono>
 #include <cctype>
@@ -422,8 +423,7 @@ static void TracePcDiscovery(
 }
 
 void Engine::Update() {
-	const uint64_t base = Memory::getBaseAddress();
-	const uintptr_t tGWorld = ResolveBestGWorld(base);
+	const uint64_t base = Memory::getBaseAddress();	const uintptr_t tGWorld = ResolveBestGWorld(base);
 	if (!tGWorld) {
 		HandleWorldLost();
 		TickRaidGate();
@@ -853,6 +853,14 @@ void Engine::Update() {
 	if (IsEspRaidActive()
 		&& tPlayerController && tAcknowledgedPawn && tRootComponent) {
 		entityStarted.store(true, std::memory_order_release);
+	}
+
+	// Collision mirror: throttled background rebuild of world static collision.
+	// Gate-checks inside (movement / 20s force / first build); the heavy DMA
+	// runs on its own spawned thread, never here.
+	if (IsEspRaidActive()) {
+		CollisionMirror::ScheduleRebuild(GWorld, PersistentLevel,
+			Vector3(g_Camera.Location.x, g_Camera.Location.y, g_Camera.Location.z));
 	}
 }
 

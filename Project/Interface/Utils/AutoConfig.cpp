@@ -240,6 +240,10 @@ struct Snapshot {
     std::string kmbox_uuid;
     int kmbox_minDelay{};
     int kmbox_monitorIndex{};
+
+    bool collision_debug_draw{};
+    bool collision_debug_rays{};
+    bool collision_vis_enabled{};
 };
 
 Snapshot s_last{};
@@ -448,6 +452,10 @@ Snapshot CaptureSnapshot()
     s.kmbox_uuid = g_kmbox.kmboxConfig.uuid;
     s.kmbox_minDelay = g_kmbox.kmboxConfig.minDelay;
     s.kmbox_monitorIndex = g_kmbox.kmboxConfig.monitorIndex;
+
+    s.collision_debug_draw = var::collision_debug_draw;
+    s.collision_debug_rays = var::collision_debug_rays;
+    s.collision_vis_enabled = var::collision_vis_enabled;
     return s;
 }
 
@@ -608,7 +616,10 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.kmbox_port == b.kmbox_port &&
         a.kmbox_uuid == b.kmbox_uuid &&
         a.kmbox_minDelay == b.kmbox_minDelay &&
-        a.kmbox_monitorIndex == b.kmbox_monitorIndex;
+        a.kmbox_monitorIndex == b.kmbox_monitorIndex &&
+        a.collision_debug_draw == b.collision_debug_draw &&
+        a.collision_debug_rays == b.collision_debug_rays &&
+        a.collision_vis_enabled == b.collision_vis_enabled;
 }
 
 bool ParseBool(const std::string& val, bool defaultVal)
@@ -925,6 +936,9 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
         g_kmbox.kmboxConfig.monitorIndex = std::atoi(val.c_str());
         OverlayDisplay_SetSelectedMonitor(g_kmbox.kmboxConfig.monitorIndex);
     }
+    else if (key == "collision_debug_draw") var::collision_debug_draw = ParseBool(val, var::collision_debug_draw);
+    else if (key == "collision_debug_rays") var::collision_debug_rays = ParseBool(val, var::collision_debug_rays);
+    else if (key == "collision_vis_enabled") var::collision_vis_enabled = ParseBool(val, var::collision_vis_enabled);
 }
 
 bool LoadIniFile(const std::string& path)
@@ -1142,6 +1156,10 @@ void WriteIni()
     file << "kmbox_uuid=" << g_kmbox.kmboxConfig.uuid << '\n';
     file << "kmbox_minDelay=" << g_kmbox.kmboxConfig.minDelay << '\n';
     file << "kmbox_monitorIndex=" << g_kmbox.kmboxConfig.monitorIndex << '\n';
+
+    file << "collision_debug_draw=" << (var::collision_debug_draw ? 1 : 0) << '\n';
+    file << "collision_debug_rays=" << (var::collision_debug_rays ? 1 : 0) << '\n';
+    file << "collision_vis_enabled=" << (var::collision_vis_enabled ? 1 : 0) << '\n';
 }
 
 } // namespace
