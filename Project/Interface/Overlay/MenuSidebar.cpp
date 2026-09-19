@@ -25,7 +25,6 @@
 #include "../../Input/KeyBind.h"
 #include "ImGuiKeybind.h"
 #include "../../Core/WorldItemCategory.h"
-#include "../../Dumper/Dumper.h"
 
 namespace {
 
@@ -1204,12 +1203,6 @@ void DrawArcHelpTab()
         {
             ArcMenuHoverTooltip("Feature overview and key bindings.");
             DrawArcHelpGuideTab();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Dumper"))
-        {
-            ArcMenuHoverTooltip("SDK / globals dumper tool and its output logs.");
-            Dumper::DrawHelpDumperTab();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();

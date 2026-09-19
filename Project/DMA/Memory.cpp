@@ -522,24 +522,6 @@ bool PCIMemory::RefreshModuleInfo()
     return moduleBase != 0 && moduleImageSize != 0;
 }
 
-bool PCIMemory::TryImproveModuleBaseForDumper()
-{
-    if (!hVMM || !processId || attachedExe.empty() || !moduleBase)
-        return false;
-
-    uintptr_t base = moduleBase;
-    DWORD size = moduleImageSize;
-    TryImproveModuleBase(hVMM, processId, attachedExe.c_str(), base, size);
-    if (base == moduleBase && size == moduleImageSize)
-        return false;
-
-    moduleBase = base;
-    moduleImageSize = size;
-    vmProcess.dwModBase = moduleBase;
-    vmProcess.dwImageSize = moduleImageSize;
-    return true;
-}
-
 bool PCIMemory::write(uintptr_t address, const void* buffer, size_t size) {
     if (hVMM && processId) {
         return VMMDLL_MemWrite(hVMM, processId, address, reinterpret_cast<PBYTE>(const_cast<void*>(buffer)), static_cast<DWORD>(size)) == TRUE;

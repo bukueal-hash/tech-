@@ -32,6 +32,7 @@ out/
 
 # Runtime-generated artifacts
 imgui.ini
+Project/Hardware/kmbox_config.json
 
 # Runtime logs & dumps (regenerated on demand)
 help/help.txt

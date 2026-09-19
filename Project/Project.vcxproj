@@ -163,17 +163,6 @@
     <!-- DMA -->
     <ClCompile Include="DMA\DmaKeyboard.cpp" />
     <ClCompile Include="DMA\Memory.cpp" />
-    <!-- Dumper -->
-    <ClCompile Include="Dumper\Dumper.cpp" />
-    <ClCompile Include="Dumper\DumperPaths.cpp" />
-    <ClCompile Include="Dumper\DumperState.cpp" />
-    <ClCompile Include="Dumper\DumperWorker.cpp" />
-    <ClCompile Include="Dumper\FNameDiscovery.cpp" />
-    <ClCompile Include="Dumper\GlobalDiscovery.cpp" />
-    <ClCompile Include="Dumper\ModuleImageCache.cpp" />
-    <ClCompile Include="Dumper\SdkDumper.cpp" />
-    <ClCompile Include="Dumper\WorldResolveDump.cpp" />
-    <ClCompile Include="Dumper\SigScanner.cpp" />
     <!-- Functions -->
     <ClCompile Include="Functions\EngineThreads.cpp" />
     <ClCompile Include="Functions\EntityList.cpp" />
@@ -244,17 +233,6 @@
     <ClInclude Include="DMA\DmaKeyboard.h" />
     <ClInclude Include="DMA\DmaVmm.h" />
     <ClInclude Include="DMA\Memory.h" />
-    <!-- Dumper -->
-    <ClInclude Include="Dumper\Dumper.h" />
-    <ClInclude Include="Dumper\DumperPaths.h" />
-    <ClInclude Include="Dumper\DumperState.h" />
-    <ClInclude Include="Dumper\DumperWorker.h" />
-    <ClInclude Include="Dumper\FNameDiscovery.h" />
-    <ClInclude Include="Dumper\GlobalDiscovery.h" />
-    <ClInclude Include="Dumper\ModuleImageCache.h" />
-    <ClInclude Include="Dumper\SdkDumper.h" />
-    <ClInclude Include="Dumper\WorldResolveDump.h" />
-    <ClInclude Include="Dumper\SigScanner.h" />
     <!-- Hardware -->
     <ClInclude Include="Hardware\HidTable.hpp" />
     <ClInclude Include="Hardware\KmBox.h" />

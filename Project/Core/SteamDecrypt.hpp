@@ -397,7 +397,7 @@ constexpr int      NarrowKeyShift = 3;
 
 inline uint16_t keyTable[256]{};
 inline bool ready = false;
-// Runtime pool override — Dumper injection; defaults to the compile-time v818 RVA.
+// Runtime pool override; defaults to the compile-time name-pool RVA.
 inline uint64_t gRuntimePoolRva = NamesOffset;
 
 inline uint32_t RotateLeft32(uint32_t value, int count) {

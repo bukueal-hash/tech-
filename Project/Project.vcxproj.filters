@@ -7,9 +7,6 @@
     <Filter Include="DMA">
       <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Dumper">
-      <UniqueIdentifier>{D1A2B3C4-E5F6-7890-ABCD-EF1234567890}</UniqueIdentifier>
-    </Filter>
     <Filter Include="Functions">
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
     </Filter>
@@ -35,33 +32,6 @@
     </ClCompile>
     <ClCompile Include="DMA\Memory.cpp">
       <Filter>DMA</Filter>
-    </ClCompile>
-    <ClCompile Include="Dumper\Dumper.cpp">
-      <Filter>Dumper</Filter>
-    </ClCompile>
-    <ClCompile Include="Dumper\DumperPaths.cpp">
-      <Filter>Dumper</Filter>
-    </ClCompile>
-    <ClCompile Include="Dumper\DumperState.cpp">
-      <Filter>Dumper</Filter>
-    </ClCompile>
-    <ClCompile Include="Dumper\DumperWorker.cpp">
-      <Filter>Dumper</Filter>
-    </ClCompile>
-    <ClCompile Include="Dumper\FNameDiscovery.cpp">
-      <Filter>Dumper</Filter>
-    </ClCompile>
-    <ClCompile Include="Dumper\GlobalDiscovery.cpp">
-      <Filter>Dumper</Filter>
-    </ClCompile>
-    <ClCompile Include="Dumper\ModuleImageCache.cpp">
-      <Filter>Dumper</Filter>
-    </ClCompile>
-    <ClCompile Include="Dumper\SdkDumper.cpp">
-      <Filter>Dumper</Filter>
-    </ClCompile>
-    <ClCompile Include="Dumper\SigScanner.cpp">
-      <Filter>Dumper</Filter>
     </ClCompile>
     <ClCompile Include="Functions\EntityList.cpp">
       <Filter>Functions</Filter>
@@ -185,33 +155,6 @@
     </ClInclude>
     <ClInclude Include="DMA\Memory.h">
       <Filter>DMA</Filter>
-    </ClInclude>
-    <ClInclude Include="Dumper\Dumper.h">
-      <Filter>Dumper</Filter>
-    </ClInclude>
-    <ClInclude Include="Dumper\DumperPaths.h">
-      <Filter>Dumper</Filter>
-    </ClInclude>
-    <ClInclude Include="Dumper\DumperState.h">
-      <Filter>Dumper</Filter>
-    </ClInclude>
-    <ClInclude Include="Dumper\DumperWorker.h">
-      <Filter>Dumper</Filter>
-    </ClInclude>
-    <ClInclude Include="Dumper\FNameDiscovery.h">
-      <Filter>Dumper</Filter>
-    </ClInclude>
-    <ClInclude Include="Dumper\GlobalDiscovery.h">
-      <Filter>Dumper</Filter>
-    </ClInclude>
-    <ClInclude Include="Dumper\ModuleImageCache.h">
-      <Filter>Dumper</Filter>
-    </ClInclude>
-    <ClInclude Include="Dumper\SdkDumper.h">
-      <Filter>Dumper</Filter>
-    </ClInclude>
-    <ClInclude Include="Dumper\SigScanner.h">
-      <Filter>Dumper</Filter>
     </ClInclude>
     <ClInclude Include="Hardware\HidTable.hpp">
       <Filter>Hardware</Filter>

@@ -71,9 +71,6 @@ public:
     /** Re-query module base/size from VMM (call before large module reads). */
     bool RefreshModuleInfo();
 
-    /** DTB / base correction (same path as attach). Returns true if base changed. */
-    bool TryImproveModuleBaseForDumper();
-
     static bool FullRefresh();
 
     static void* GetScatterHandle();

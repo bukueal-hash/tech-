@@ -23,8 +23,6 @@
 #include "Core/AssetNames.h"
 #include "Core/CrashHandler.h"
 #include "resource.h"
-#include "Dumper/Dumper.h"
-#include "Dumper/DumperWorker.h"
 
 static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
@@ -73,7 +71,6 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     std::cout << "[+] Controller: " << (g_controller.IsReady() ? "ready" : "not found — plug pad on target PC") << std::endl;
 
     engine.StartWorkerThreads();
-    Dumper::StartDump(Dumper::DumpMode::FullSdk);
 
     std::cout << "=========================" << std::endl;
     std::cout << "[*] Starting overlay..." << std::endl;
@@ -264,7 +261,6 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     }
 
     AutoConfig_SaveNow();
-    Dumper::Shutdown();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

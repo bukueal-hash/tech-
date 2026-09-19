@@ -9,7 +9,7 @@ namespace Offsets {
     // CL-1341255 / v20260818 FName pipeline (see SteamDecrypt.hpp GNames):
     constexpr uint64_t GNamePoolRva = 0xE35AB00ULL;       // RVA_GNAMEPOOL
     constexpr uint64_t FNameKeyTableRva = 0xE2997F4ULL;   // RVA_KEYSTREAM
-    constexpr uint64_t FNameBlockMaskRva = 0xB523C50ULL;  // legacy SSE block mask — Dumper fallback for older builds
+    constexpr uint64_t FNameBlockMaskRva = 0xB523C50ULL;  // legacy SSE block mask fallback
     constexpr uint64_t GUObjectArrayChunksRva = 0xE80BA10ULL;  // dumper relaxed validated
     constexpr uint64_t FFieldNameKey0Rva = 0xE7B5330ULL;
     constexpr uint64_t FFieldNameKey1Rva = 0xE6F0554ULL;
@@ -228,7 +228,7 @@ namespace Offsets {
 
     // ── Static mesh collision (StaticMeshComponent / UStaticMesh — CL-1341255) ─
     constexpr std::ptrdiff_t StaticMesh = 0x728;                // SDK validated
-    constexpr std::ptrdiff_t StaticMeshLegacy = 0x718;          // previous build's slot (Dumper fallback)
+    constexpr std::ptrdiff_t StaticMeshLegacy = 0x718;          // previous build's slot fallback
 
     // ── Encrypted render times / component internals ──────────────────────────
     constexpr std::ptrdiff_t Mesh_LastRenderTimeEnc = 0x4BC;
