@@ -2,6 +2,7 @@
 #include "../Core/AgentLog.h"
 #include "../Core/ActorType.h"
 #include "../Core/AssetNames.h"
+#include "../Core/EntityDiagnostics.hpp"
 #include "../Core/Offsets.h"
 #include "../Core/WorldItemCategory.h"
 #include "../Core/IntervalTimer.h"
@@ -24,8 +25,8 @@ namespace {
 
 inline bool AnyItemEspEnabled()
 {
-    return var::enable_world && (
-        var::droppedItems || var::showLoot ||
+    return var::enable_world && var::showLoot && (
+        var::droppedItems ||
         var::show_world_items || var::show_world_ammo || var::show_world_arc_loot ||
         var::show_world_backpack || var::show_world_grenade || var::show_world_medical ||
         var::show_world_harvestable || var::show_world_keys);
@@ -263,7 +264,7 @@ void Engine::ItemList()
 {
     if (!var::enable_world)
         return;
-    if (!AnyItemEspEnabled() && !var::showLoot && !var::show_radar)
+    if (!AnyItemEspEnabled() && !var::show_radar)
         return;
 
     WorldScanContext ctx{};
@@ -540,6 +541,15 @@ void Engine::ItemList()
         int lootValue = 0;
         const bool metaHit =
             ResolveItemMetaForActor(*this, key, fname, displayName, rarityTier, lootValue);
+        // Phase 2 rarity fallback: items_meta is not exhaustive - the game's
+        // own pickup resolution chain (data asset -> resolved class -> CDO ->
+        // ItemBase::QUALITY_LEVEL) fills gaps. Quality 0-3 maps to tier 1-4
+        // like the weapon/armor readers. Only when meta missed.
+        if (rarityTier <= 0) {
+            const int quality = ReadItemRarityFromPickup(key);
+            if (quality >= 0)
+                rarityTier = quality + 1;
+        }
 
         // Positive identification: a ground item must prove what it is from game
         // data — items_meta/asset tables (metaHit), the game's own hover name,
@@ -595,6 +605,19 @@ void Engine::ItemList()
         entry.lootRarityTier = rarityTier;
         entry.lootValue = lootValue;
         entry.WorldPos = worldPos;
+        // Stack count preview (" xN") - gated so the feature costs zero DMA
+        // while its toggle is off. Prefers the hover AMOUNT, then falls back to
+        // the drop-estimated Pickup::VISIBLE_AMOUNT.
+        if (var::show_stack_counts) {
+            int32_t amount = Memory::read<int32_t>(
+                key + static_cast<uint64_t>(Offsets::UIHoverData)
+                + static_cast<uint64_t>(Offsets::ItemUIHoverData_Amount));
+            if (amount <= 1 || !CrateContents::AmountPlausible(amount, 0))
+                amount = Memory::read<int32_t>(
+                    key + static_cast<uint64_t>(Offsets::Pickup_VisibleAmount));
+            if (1 < amount && CrateContents::AmountPlausible(amount, 0))
+                entry.stackAmount = amount;
+        }
         ++dbgAdmitted;
     }
 
@@ -678,6 +701,38 @@ void Engine::ItemList()
             ClearItemPosMiss(key);
             it = localCache.erase(it);
             continue;
+        }
+
+        // Stack count is a live label feature, not an admission-time property.
+        // The cache is retained across scans, so refresh it for existing pickups
+        // when the option is enabled; otherwise enabling the checkbox would only
+        // affect items discovered after the toggle.
+        if (var::show_stack_counts) {
+            const auto refreshedCat = static_cast<WorldItemCategory>(
+                it->second.worldCategory);
+            if (IsGroundPickupCategory(refreshedCat)) {
+                it->second.stackAmount = 0;
+                for (const std::ptrdiff_t hoverOff : {
+                         Offsets::UIHoverData,
+                         Offsets::UIHoverData_Pickup}) {
+                    const uint64_t hover = key + static_cast<uint64_t>(hoverOff);
+                    const int32_t amount = Memory::read<int32_t>(
+                        hover + static_cast<uint64_t>(Offsets::ItemUIHoverData_Amount));
+                    if (1 < amount && CrateContents::AmountPlausible(amount, 0)) {
+                        it->second.stackAmount = amount;
+                        break;
+                    }
+                }
+                if (it->second.stackAmount == 0) {
+                    const int32_t visible = Memory::read<int32_t>(
+                        key + static_cast<uint64_t>(Offsets::Pickup_VisibleAmount));
+                    if (1 < visible && CrateContents::AmountPlausible(visible, 0))
+                        it->second.stackAmount = visible;
+                }
+            }
+        } else if (!IsGroundPickupCategory(static_cast<WorldItemCategory>(
+                       it->second.worldCategory))) {
+            it->second.stackAmount = 0;
         }
 
         // Re-home stale Medical/Ammo/… categories so old cache entries cannot
@@ -969,6 +1024,24 @@ void Engine::ItemList()
     {
         std::unique_lock<std::shared_mutex> lock(m_itemCacheMutex);
         itemCache = std::move(localCache);
+    }
+
+    {
+        static IntervalTimer diagnosticTimer(2000);
+        if (diagnosticTimer.fire()) {
+            size_t cacheSize = 0;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_itemCacheMutex);
+                cacheSize = itemCache.size();
+            }
+            char stats[384]{};
+            std::snprintf(stats, sizeof(stats),
+                "{\"scanned\":%d,\"admitted\":%d,\"posSkip\":%d,"
+                "\"depleted\":%d,\"drawing\":%d,\"cache\":%zu}",
+                dbgScanned, dbgAdmitted, dbgPosSkip, dbgDepleted,
+                dbgDrawing, cacheSize);
+            EntityDiagnostics::LogScan("items", stats);
+        }
     }
 
     if (var::show_debug_overlay) {

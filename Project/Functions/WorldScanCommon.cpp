@@ -6,6 +6,7 @@
 #include "../Core/AgentLog.h"
 #include "../Core/WorldItemCategory.h"
 #include "../Interface/Utils/Variables/index.h"
+#include "../Interface/Utils/Threads/SyncedThread.h"
 #include "LrtsVisibility.h"
 
 #include <atomic>
@@ -144,8 +145,13 @@ bool ReadLevelActors(uintptr_t level, uintptr_t& outData, int32_t& outCount)
         }
     }
 
-    // Fallback: Level → direct Actors TArray (forum live-pinned 0x108/0x110/0x114)
-    // Non-UPROPERTY; not in SDK dump but confirmed by qwe900.
+    // Fallback: Level → direct Actors TArray. Non-UPROPERTY, so the property
+    // index has no entry for it, but the dumped SDK declares it:
+    //   sdk/CppSDK/SDK/Level_classes.hpp
+    //     class TArray<class AActor*> Actors;  // 0x0110(0x0010)
+    // i.e. data @ 0x110, num @ 0x118 — the old 0x108/0x110 pair read the pad
+    // for the pointer and the pointer's low dword for the count, which is why
+    // every heartbeat logged actors:-1.
     {
         const uintptr_t data = Memory::read<uintptr_t>(level + Offsets::AActors);
         const int32_t count = Memory::read<int32_t>(level + Offsets::ActorsCount);
@@ -282,14 +288,14 @@ bool HasArcEnemyAssetPointer(uintptr_t actor)
     if (!actor)
         return false;
 
-    auto validDa = [&](std::ptrdiff_t off) -> bool {
-        const uint64_t da =
-            Memory::read<uint64_t>(actor + static_cast<uint64_t>(off));
-        return da != 0 && Memory::IsValidPtrFast2(da);
-    };
-
-    return validDa(Offsets::Constructable_EnemyTypeDataAsset)
-        || validDa(Offsets::Constructable_AITemplateData);
+    // These are APioneerConstructablePawn fields, not AActor fields. The SDK
+    // places EnemyTypeDataAsset at 0x11C0 and AITemplateData at 0x11B0, but
+    // their slots are only meaningful for that class. Treating any in-range
+    // pointer at either offset as an ARC bot makes ordinary actors look like
+    // constructables, which is the direct path to ghost bot admissions.
+    // GetEnemyTypeDataAssetFName performs the typed UObject/FName validation
+    // used by the rest of the bot path instead of accepting a raw pointer.
+    return !GetEnemyTypeDataAssetFName(actor).empty();
 }
 
 // SHARED GATE — grep callers before edit
@@ -1145,6 +1151,7 @@ std::string JsonSafeName(const std::string& in)
 std::mutex g_aggProbeMu;
 AggGeomProbeResult g_aggProbe;
 std::atomic<bool> g_aggProbeRunning{ false };
+ManagedJob g_aggProbeJob;
 
 /**
  * Read the 7 inline TArray headers.
@@ -1339,6 +1346,7 @@ constexpr int kClockSampleMs = 1000;
 std::mutex g_clockProbeMu;
 TimeSecondsProbeResult g_clockProbe;
 std::atomic<bool> g_clockProbeRunning{ false };
+ManagedJob g_clockProbeJob;
 
 void RunTimeSecondsProbeJob()
 {
@@ -1472,6 +1480,7 @@ constexpr int kTickIntervalMs = 10;
 std::mutex g_tickProbeMu;
 TickProbeResult g_tickProbe;
 std::atomic<bool> g_tickProbeRunning{ false };
+ManagedJob g_tickProbeJob;
 
 void RunTickProbeJob()
 {
@@ -1575,9 +1584,13 @@ void StartTickProbe()
         g_tickProbe.running = true;
     }
 
-    std::thread([]() {
+    const bool started = g_tickProbeJob.start([]() {
         try {
             RunTickProbeJob();
+        } catch (const std::exception& ex) {
+            std::lock_guard<std::mutex> lock(g_tickProbeMu);
+            g_tickProbe.ran = true;
+            g_tickProbe.note = ex.what();
         } catch (...) {
             std::lock_guard<std::mutex> lock(g_tickProbeMu);
             g_tickProbe.ran = true;
@@ -1588,7 +1601,14 @@ void StartTickProbe()
             g_tickProbe.running = false;
         }
         g_tickProbeRunning.store(false);
-    }).detach();
+    });
+    if (!started) {
+        std::lock_guard<std::mutex> lock(g_tickProbeMu);
+        g_tickProbe.running = false;
+        g_tickProbe.ran = true;
+        g_tickProbe.note = "job already running";
+        g_tickProbeRunning.store(false);
+    }
 }
 
 TickProbeResult GetTickProbeResult()
@@ -1609,9 +1629,13 @@ void StartTimeSecondsProbe()
         g_clockProbe.running = true;
     }
 
-    std::thread([]() {
+    const bool started = g_clockProbeJob.start([]() {
         try {
             RunTimeSecondsProbeJob();
+        } catch (const std::exception& ex) {
+            std::lock_guard<std::mutex> lock(g_clockProbeMu);
+            g_clockProbe.ran = true;
+            g_clockProbe.note = ex.what();
         } catch (...) {
             std::lock_guard<std::mutex> lock(g_clockProbeMu);
             g_clockProbe.ran = true;
@@ -1622,7 +1646,14 @@ void StartTimeSecondsProbe()
             g_clockProbe.running = false;
         }
         g_clockProbeRunning.store(false);
-    }).detach();
+    });
+    if (!started) {
+        std::lock_guard<std::mutex> lock(g_clockProbeMu);
+        g_clockProbe.running = false;
+        g_clockProbe.ran = true;
+        g_clockProbe.note = "job already running";
+        g_clockProbeRunning.store(false);
+    }
 }
 
 TimeSecondsProbeResult GetTimeSecondsProbeResult()
@@ -1643,9 +1674,13 @@ void StartAggGeomProbe()
         g_aggProbe.running = true;
     }
 
-    std::thread([]() {
+    const bool started = g_aggProbeJob.start([]() {
         try {
             RunAggGeomProbeJob();
+        } catch (const std::exception& ex) {
+            std::lock_guard<std::mutex> lock(g_aggProbeMu);
+            g_aggProbe.ran = true;
+            g_aggProbe.note = ex.what();
         } catch (...) {
             std::lock_guard<std::mutex> lock(g_aggProbeMu);
             g_aggProbe.ran = true;
@@ -1656,13 +1691,30 @@ void StartAggGeomProbe()
             g_aggProbe.running = false;
         }
         g_aggProbeRunning.store(false);
-    }).detach();
+    });
+    if (!started) {
+        std::lock_guard<std::mutex> lock(g_aggProbeMu);
+        g_aggProbe.running = false;
+        g_aggProbe.ran = true;
+        g_aggProbe.note = "job already running";
+        g_aggProbeRunning.store(false);
+    }
 }
 
 AggGeomProbeResult GetAggGeomProbeResult()
 {
     std::lock_guard<std::mutex> lock(g_aggProbeMu);
     return g_aggProbe;
+}
+
+void StopBackgroundJobs()
+{
+    g_tickProbeJob.stop();
+    g_clockProbeJob.stop();
+    g_aggProbeJob.stop();
+    g_tickProbeRunning.store(false, std::memory_order_release);
+    g_clockProbeRunning.store(false, std::memory_order_release);
+    g_aggProbeRunning.store(false, std::memory_order_release);
 }
 
 } // namespace WorldScan

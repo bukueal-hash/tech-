@@ -8,6 +8,8 @@
 // Thread-safe: all state is behind a mutex. No Sleep() calls.
 // Non-blocking: scan verification is deferred across frames.
 
+#include "Core/Offsets.h"
+
 #include <cstdint>
 #include <array>
 #include <atomic>
@@ -313,11 +315,14 @@ struct VerdictSmoother {
 // Recently-rendered flag. Verified discriminating on CL-1341255: across one
 // raid the bit was set on 10 meshes and clear on 131, with the byte itself
 // non-zero throughout.
-inline constexpr uint32_t BrrOffset = 0x997;
-inline constexpr uint8_t  BrrMask   = 0x20;
+// 20260922 dump: USkinnedMeshComponent.bRecentlyRendered (0x9F0, mask 0x40) —
+// the 0x997/0x20 pair was the previous build's slot.
+inline constexpr uint32_t BrrOffset = static_cast<uint32_t>(Offsets::bRecentlyRendered);
+inline constexpr uint8_t  BrrMask   = Offsets::bRecentlyRenderedMask;
 
-inline constexpr uint32_t RawLastSubmitTime   = 0x4C4;
-inline constexpr uint32_t RawLastRenderTimeOnScreen = 0x4CC;
+inline constexpr uint32_t RawLastSubmitTime   = static_cast<uint32_t>(Offsets::LastSubmitTime);
+inline constexpr uint32_t RawLastRenderTimeOnScreen =
+    static_cast<uint32_t>(Offsets::LastRenderTimeOnScreen);
 inline constexpr float kRawFreshTolerance     = 0.06f; // seconds — submit vs on-screen gap
 inline constexpr float kRawSubmitWorldSkew    = 2.0f;  // seconds — submit must track worldTime
 

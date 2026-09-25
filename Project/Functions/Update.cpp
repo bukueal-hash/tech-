@@ -1,4 +1,5 @@
 #include "../Core/Engine.h"
+#include "../Core/Reflection.hpp"   // SDK FField/FProperty walker + FString self-check
 #include "../Core/AgentLog.h"
 #include "../Core/ActorType.h"
 #include "../Core/IntervalTimer.h"
@@ -21,110 +22,9 @@
 namespace {
 
 
-uintptr_t ReadWorldFromSlot(uint64_t base, std::ptrdiff_t slotOff)
-{
-	// Bypass VMM page cache — stale GWorld blocks raid re-entry until exe restart.
-	const uintptr_t slot = Memory::read_nocache<uintptr_t>(base + slotOff);
-	return Engine::IsPlausibleObjPtr(slot) ? slot : 0;
-}
-
-/** help/sdk.txt: PL @ 0x120, LevelCollections[i]+0x20, Levels[]. */
-bool LevelLooksOwnedByWorld(uintptr_t level, uintptr_t world)
-{
-	if (!Engine::IsPlausibleObjPtr(level) || !world)
-		return false;
-	const uintptr_t owning = Memory::read<uintptr_t>(level + Offsets::Level_OwningWorld);
-	if (owning == world)
-		return true;
-	uintptr_t data = 0;
-	int32_t count = 0;
-	return WorldScan::ReadLevelActors(level, data, count)
-		&& Engine::IsPlausibleObjPtr(data) && count > 0 && count <= 10000;
-}
-
-uintptr_t ResolvePersistentLevelHelp(uintptr_t world)
-{
-	if (!Engine::IsPlausibleObjPtr(world))
-		return 0;
-
-	// help/sdk.txt: PersistentLevel @ 0x120
-	static const std::ptrdiff_t kPlOffs[] = {
-		Offsets::PersistentLevel,
-	};
-	for (std::ptrdiff_t plOff : kPlOffs) {
-		const uintptr_t level = Memory::read<uintptr_t>(world + plOff);
-		if (LevelLooksOwnedByWorld(level, world))
-			return level;
-	}
-
-	const uintptr_t collectionsData =
-		Memory::read<uintptr_t>(world + Offsets::LevelCollections);
-	const int32_t collectionsNum =
-		Memory::read<int32_t>(world + Offsets::LevelCollections + 8);
-	if (Engine::IsPlausibleObjPtr(collectionsData) && collectionsNum > 0 && collectionsNum <= 16) {
-		const int limit = (collectionsNum > 4) ? 4 : collectionsNum;
-		for (int i = 0; i < limit; ++i) {
-			const uintptr_t collection =
-				collectionsData + static_cast<uintptr_t>(i) * Offsets::LevelCollection_Stride;
-			const uintptr_t level = Memory::read<uintptr_t>(
-				collection + Offsets::LevelCollection_PersistentLevel);
-			if (LevelLooksOwnedByWorld(level, world))
-				return level;
-		}
-	}
-
-	const uintptr_t levelsData = Memory::read<uintptr_t>(world + Offsets::Levels);
-	const int32_t levelsNum = Memory::read<int32_t>(world + Offsets::Levels + 8);
-	if (Engine::IsPlausibleObjPtr(levelsData) && levelsNum > 0 && levelsNum < 512) {
-		const int limit = (levelsNum > 8) ? 8 : levelsNum;
-		for (int i = 0; i < limit; ++i) {
-			const uintptr_t level = Memory::read<uintptr_t>(
-				levelsData + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
-			if (LevelLooksOwnedByWorld(level, world))
-				return level;
-		}
-	}
-
-	return 0;
-}
-
-/** Help GAME_STATE_GLOBAL_RVA — Outer-ish fields may point at UWorld when GWorld slot is stale. */
-uintptr_t TryWorldFromGameStateGlobal(uint64_t base)
-{
-	if (!base)
-		return 0;
-	const uintptr_t gs = Memory::read<uintptr_t>(base + Offsets::GameStateGlobalRva);
-	if (!Engine::IsPlausibleObjPtr(gs))
-		return 0;
-
-	const uintptr_t arrData = Memory::read<uintptr_t>(gs + Offsets::GameState_PlayerArray);
-	const int32_t arrNum = Memory::read<int32_t>(gs + Offsets::GameState_PlayerArray + 8);
-	if (!Engine::IsPlausibleObjPtr(arrData) || arrNum <= 0 || arrNum > 128)
-		return 0;
-
-	static const std::ptrdiff_t kOuterCands[] = { 0x20, 0x28, 0x18, 0x30, 0x10, 0x40 };
-	for (std::ptrdiff_t off : kOuterCands) {
-		const uintptr_t cand = Memory::read<uintptr_t>(gs + off);
-		if (ResolvePersistentLevelHelp(cand))
-			return cand;
-	}
-	return 0;
-}
-
-uintptr_t PickValidWorld(uintptr_t slot)
-{
-	if (!Engine::IsPlausibleObjPtr(slot))
-		return 0;
-	if (ResolvePersistentLevelHelp(slot))
-		return slot;
-	// Some builds store GWorld** (slot → UWorld*). Accept only if PL validates.
-	// NOCACHE: cached deref froze the world (log gwSrc:2 — MainMenu served
-	// mid-raid, TheDam served on home screen). Must track live memory.
-	const uintptr_t inner = Memory::read_nocache<uintptr_t>(slot);
-	if (Engine::IsPlausibleObjPtr(inner) && ResolvePersistentLevelHelp(inner))
-		return inner;
-	return 0;
-}
+// The world rungs these used to be live on Engine now (Functions/Utils.cpp), so
+// the ladder in Core/PlayerChain.hpp can order them: Engine::ReadWorldSlot,
+// Engine::ResolvePersistentLevel, Engine::WorldFromGameStateGlobal.
 
 bool ChainHasWorldPosition(uintptr_t pc, uintptr_t pawn, uintptr_t root)
 {
@@ -140,6 +40,9 @@ bool ChainHasWorldPosition(uintptr_t pc, uintptr_t pawn, uintptr_t root)
 static uintptr_t s_cachedPC = 0;
 static uintptr_t s_cachedPawn = 0;
 static uintptr_t s_cachedLocalPlayer = 0;
+// The world the ladder resolved last tick; it is the seed for the world hop's
+// cache rung (which re-proves it before trusting it).
+static uintptr_t s_lastWorld = 0;
 
 // Soft retain when a single Update() frame fails to re-resolve the PC chain.
 static uintptr_t s_retainPC = 0;
@@ -341,8 +244,6 @@ static const char* MatchHubToken(uintptr_t world, uintptr_t level)
 static bool s_backupScanPending = false;
 
 // #region agent log
-// GWorld source tag: 0=none, 1=slot direct, 2=slot inner deref, 3=game-state fallback.
-static std::atomic<int> g_gworldSrc{ 0 };
 static void AgentRaidLog(
 	const char* hypothesisId,
 	const char* location,
@@ -370,41 +271,6 @@ static void AgentRaidLog(
 
 } // namespace
 
-uintptr_t Engine::ResolveBestGWorld(uint64_t base)
-{
-	m_gWorldRaw.store(0, std::memory_order_relaxed);
-	m_gWorldFailStep.store(1, std::memory_order_relaxed);
-
-	if (!base)
-		return 0;
-
-	const uintptr_t slot = ReadWorldFromSlot(base, Offsets::UWorld);
-	m_gWorldRaw.store(slot, std::memory_order_relaxed);
-
-	uintptr_t world = PickValidWorld(slot);
-	// #region agent log
-	g_gworldSrc.store(world ? (world == slot ? 1 : 2) : 0, std::memory_order_relaxed);
-	// #endregion
-	if (!world) {
-		world = TryWorldFromGameStateGlobal(base);
-		// #region agent log
-		if (world)
-			g_gworldSrc.store(3, std::memory_order_relaxed);
-		// #endregion
-	}
-
-	if (world && ResolvePersistentLevelHelp(world)) {
-		m_gWorldFailStep.store(0, std::memory_order_relaxed);
-		return world;
-	}
-
-	if (!slot)
-		m_gWorldFailStep.store(1, std::memory_order_relaxed);
-	else
-		m_gWorldFailStep.store(2, std::memory_order_relaxed);
-	return 0;
-}
-
 static void TracePcDiscovery(
     const char* pcPath,
     uintptr_t pc, uintptr_t pawn, uintptr_t root, uintptr_t pcm,
@@ -423,20 +289,60 @@ static void TracePcDiscovery(
 }
 
 void Engine::Update() {
-	const uint64_t base = Memory::getBaseAddress();	const uintptr_t tGWorld = ResolveBestGWorld(base);
+	const uint64_t base = Memory::getBaseAddress();
+
+	// SDK FString self-check (one-shot per session): reads the game's
+	// verification FString (Offsets::FStringVerificationRva) and records which
+	// player-name scramble actually decodes it; the proven one is then tried
+	// first for every name read.
+	if (!m_fstrChecked && base) {
+		const Reflection::FStringCheck check = Reflection::CheckFStringPipeline(base);
+		m_fstrChecked = true;
+		m_fstrOk = check.readOk;
+		m_fstrKey = check.candidate;
+		m_fstrText = check.text;
+		// candidate 4 is the SDK drop's own FString pipeline (rol 14, state
+		// advance before the XOR) — see steam_decrypt::DecryptPlayerNameSdk.
+		if (check.candidate >= 0 && check.candidate <= 4)
+			steam_decrypt::SetPreferredNameKey(check.candidate);
+	}
+
+	// ── The player chain: one ladder, one state (Core/PlayerChain.hpp) ──
+	// The five overlapping passes are gone. The world (slot / inner / GameState),
+	// the GameInstance (owning slot / LP outer / decrypt / legacy / scan), the
+	// controller (flag / pair cache / camera manager / actor scan / GI array), the
+	// local player (GI array / PC decrypt / PC slot scan) and the pawn all live in
+	// one ordered walk that names the rung it used. This tick only seeds that walk
+	// from the previous one, then publishes what the ladder decided.
+	const auto nowRetain = std::chrono::steady_clock::now();
+	PlayerChain::Seed seed;
+	seed.base = base;
+	seed.world = s_lastWorld;
+	seed.worldStillValid = s_lastWorld != 0
+		&& ResolvePersistentLevel(s_lastWorld) != 0;
+	seed.pc = s_cachedPC;
+	seed.pawn = s_cachedPawn;
+	seed.gi = s_retainGI;
+	seed.lp = IsGoodLocalPlayer(s_cachedLocalPlayer) ? s_cachedLocalPlayer : s_retainLP;
+	seed.root = s_retainRoot;
+	seed.pcm = s_retainPCM;
+	seed.ps = s_retainPS;
+	seed.retainValid = s_retainPC != 0
+		&& (nowRetain - s_retainGoodAt) < kPcChainRetainMs;
+
+	uintptr_t tActors = 0;
+	int actorCount = 0;
+	ResolvePlayerChain(base, seed, tActors, actorCount);
+	const PlayerChain::State chain = GetChainState();
+
+	const uintptr_t tGWorld = chain.Ptr(PlayerChain::Hop::World);
 	if (!tGWorld) {
 		HandleWorldLost();
 		TickRaidGate();
 		return;
 	}
 
-	// --- Read entire pointer chain into locals (NO lock held, slow I/O here) ---
-	uintptr_t tGameInstance = GetGameInstance(tGWorld), tPersistentLevel = 0, tLocalPlayer = 0;
-	uintptr_t tPlayerController = 0, tAcknowledgedPawn = 0;
-	uintptr_t tRootComponent = 0, tActors = 0, tPlayerState = 0;
-
-	tPersistentLevel = ResolvePersistentLevelHelp(tGWorld);
-
+	const uintptr_t tPersistentLevel = chain.Ptr(PlayerChain::Hop::Level);
 	CheckWorldTransition(tGWorld, tPersistentLevel);
 	{
 		static uintptr_t s_lastGWorldForLp = 0;
@@ -445,345 +351,48 @@ void Engine::Update() {
 			s_lastGWorldForLp = tGWorld;
 		}
 	}
+	s_lastWorld = tGWorld;
 
-	int actorCount = 0;
-	if (tPersistentLevel)
-		ResolveLevelActors(tPersistentLevel, tActors, actorCount);
+	// Straight out of the ladder - nothing below may re-decide a hop.
+	uintptr_t tGameInstance = chain.Ptr(PlayerChain::Hop::GameInstance);
+	uintptr_t tLocalPlayer = chain.Ptr(PlayerChain::Hop::LocalPlayer);
+	uintptr_t tPlayerController = chain.Ptr(PlayerChain::Hop::Controller);
+	uintptr_t tAcknowledgedPawn = chain.Ptr(PlayerChain::Hop::Pawn);
+	uintptr_t tRootComponent = chain.Ptr(PlayerChain::Hop::Root);
+	uintptr_t tPlayerState = chain.Ptr(PlayerChain::Hop::State);
+	uintptr_t tPCM = chain.Ptr(PlayerChain::Hop::CameraManager);
 
-	// Resolve PC via actor scan (backup: Pioneer PC owns PCM @ PC+0x48).
-	const char* pcPath = "none";
-	float dbgPcmFov = 0.f;
-	uintptr_t dbgPcmPtr = 0;
-	const char* cacheInvalidateReason = "none";
-	bool cacheInvalidatedThisFrame = false;
-	{
-		// Keep cached PC while pawn root looks sane. Do NOT require
-		// ControllerHasValidPcm here — DefaultFOV/ViewTarget flap cleared cache
-		// every ~0.5s (pc_drop_fov_gate), forcing ResolvePcFromLevelCameraManager
-		// over ~1200 actors and ~1s DMA freezes (post-fix logs still 100+ drops).
-		if (s_cachedPC && s_cachedPawn
-			&& IsValidPointer(s_cachedPC) && IsValidPointer(s_cachedPawn)) {
-			const uintptr_t root =
-				Memory::read_nocache<uintptr_t>(s_cachedPawn + Offsets::RootComponent);
-			if (root && IsValidPointer(root)) {
-				Vector3 pos =
-					Memory::read_nocache<Vector3>(root + Offsets::RelativeLocation);
-				float magSq = static_cast<float>(
-					pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
-				if (magSq <= 10000.f || magSq >= 1.0e14f) {
-					const Engine::FVector3d w =
-						Memory::read_nocache<Engine::FVector3d>(
-							root + Offsets::ComponentToWorld + 0x20);
-					pos = Engine::ToVector3(w);
-					magSq = static_cast<float>(
-						pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
-				}
-				if (magSq > 10000.f && magSq < 1.0e14f) {
-					tPlayerController = s_cachedPC;
-					tAcknowledgedPawn = s_cachedPawn;
-					pcPath = "cached";
-					s_cacheFailStreak = 0;
-					if (s_cachedPC && IsValidPointer(s_cachedPC)) {
-						dbgPcmPtr = Memory::read_nocache<uintptr_t>(
-							s_cachedPC + Offsets::APlayerCameraManager);
-						if (dbgPcmPtr && Memory::IsValidPtrFast2(dbgPcmPtr))
-							dbgPcmFov = Memory::read_nocache<float>(
-								dbgPcmPtr + Offsets::DefaultFOV);
-					}
-				} else {
-					cacheInvalidateReason = "pos_magSq";
-					++s_cacheFailStreak;
-				}
-			} else {
-				cacheInvalidateReason = "pos_magSq";
-				++s_cacheFailStreak;
-			}
-			if (s_cacheFailStreak >= kCacheFailClearAfter
-				&& std::strcmp(cacheInvalidateReason, "pos_magSq") == 0) {
-				cacheInvalidatedThisFrame = true;
-				s_cachedPC = 0;
-				s_cachedPawn = 0;
-				s_cacheFailStreak = 0;
-			}
-		} else if (s_cachedPC || s_cachedPawn) {
-			cacheInvalidateReason = "pair_incomplete";
-			++s_cacheFailStreak;
-			if (s_cacheFailStreak >= kCacheFailClearAfter) {
-				cacheInvalidatedThisFrame = true;
-				s_cachedPC = 0;
-				s_cachedPawn = 0;
-				s_cacheFailStreak = 0;
-			}
-		}
-
-		// Prefer PCM FName → PCOwner@0x3A8 → AckPawn (help/esp.txt Step 4–5).
-		// LocalPlayer/GI→LP may be encrypted — never gate identity on LP.
-		if (!tPlayerController && tPersistentLevel && tActors) {
-			uintptr_t pcmPc = 0;
-			uintptr_t pcmPawn = 0;
-			uintptr_t pcmDummy = 0;
-			if (Engine::ResolvePcFromLevelCameraManager(
-				tPersistentLevel, tActors, pcmPc, pcmPawn, pcmDummy)) {
-				tPlayerController = s_cachedPC = pcmPc;
-				tAcknowledgedPawn = s_cachedPawn = pcmPawn;
-				pcPath = "cam_mgr";
-				dbgPcmPtr = pcmDummy;
-				if (dbgPcmPtr && Memory::IsValidPtrFast2(dbgPcmPtr))
-					dbgPcmFov = Memory::read<float>(dbgPcmPtr + Offsets::DefaultFOV);
-			}
-		}
-
-	if (!tPlayerController && tPersistentLevel && tActors && actorCount > 0) {
-		uintptr_t scannedPc = 0;
-		uintptr_t scannedPawn = 0;
-		if (ResolveLocalPlayerChainFromActors(
-			tPersistentLevel, tActors, actorCount, tGameInstance, scannedPc, scannedPawn)
-			&& Engine::ControllerHasValidPcm(scannedPc)) {
-			tPlayerController = s_cachedPC = scannedPc;
-			tAcknowledgedPawn = s_cachedPawn = scannedPawn;
-			pcPath = "actor_scan";
-		} else {
-			AgentRaidLog("TR", "Update.cpp", "actor_scan_fail",
-				"actors=" + std::to_string(actorCount) +
-				" scannedPc=" + std::to_string(scannedPc));
-		}
+	// The rung that won the controller hop is the path tag the panel and the raid
+	// logs used to get from a hand-maintained string.
+	const char* pcPath = PlayerChain::RungName(
+		chain.RungOf(PlayerChain::Hop::Controller));
+	const bool cacheInvalidatedThisFrame = m_pairCacheInvalidated;
+	if (cacheInvalidatedThisFrame) {
+		s_cachedPC = 0;
+		s_cachedPawn = 0;
+		m_pairCacheFailStreak = 0;
 	}
-
-	// Last resort: LocalPlayer → PlayerController (works without actors / in lobby).
-	// GI→LP may be encrypted on some builds — only use when LP is already resolved
-	// and all actor-dependent paths failed.
-	if (!tPlayerController && tGameInstance) {
-		const uintptr_t arrData =
-			Memory::read<uintptr_t>(tGameInstance + Offsets::LocalPlayers);
-		const int arrNum =
-			Memory::read<int>(tGameInstance + Offsets::LocalPlayers + 8);
-		// Diagnostic: log lp_chain attempt
-		{
-			static bool s_lpDiagDone = false;
-			if (!s_lpDiagDone) {
-				s_lpDiagDone = true;
-				char buf[256];
-				snprintf(buf, sizeof(buf),
-					"gi=%llX arrData=%llX arrNum=%d lpOffset=%llX",
-					(unsigned long long)tGameInstance,
-					(unsigned long long)arrData, arrNum,
-					(unsigned long long)Offsets::LocalPlayer_PlayerController);
-				AgentRaidLog("DIAG", "Update.cpp:lp_chain", "attempt", buf);
-			}
-		}
-		if (arrData && Memory::IsValidPtrFast2(arrData)
-			&& arrNum > 0 && arrNum <= 16) {
-			for (int i = 0; i < (arrNum > 4 ? 4 : arrNum); ++i) {
-				const uintptr_t lpSlot =
-					Memory::read<uintptr_t>(arrData + i * sizeof(uintptr_t));
-				if (!IsUsableObjectPtr(lpSlot))
-					continue;
-				const uintptr_t pc =
-					Memory::read<uintptr_t>(lpSlot + Offsets::LocalPlayer_PlayerController);
-				// Log each LP slot read
-				{
-					static bool s_lpSlotDiag = false;
-					if (!s_lpSlotDiag) {
-						s_lpSlotDiag = true;
-						char buf[256];
-						snprintf(buf, sizeof(buf),
-							"slot[%d]=%llX pc=%llX valid=%d",
-							i, (unsigned long long)lpSlot,
-							(unsigned long long)pc,
-							Engine::IsValidPointer(pc) ? 1 : 0);
-						AgentRaidLog("DIAG", "Update.cpp:lp_chain",
-							"lp_slot", buf);
-					}
-				}
-				if (!Engine::IsValidPointer(pc))
-					continue;
-				// Validate: PC→AckPawn→RootComp must look sane. Try all known
-				// AcknowledgedPawn slots so a wrong primary can't reject the PC.
-				const uintptr_t pawn = Engine::ReadAcknowledgedPawn(pc);
-				if (!pawn || !Engine::IsValidPointer(pawn))
-					continue;
-				const uintptr_t root =
-					Memory::read<uintptr_t>(pawn + Offsets::RootComponent);
-				if (!root || !Engine::IsValidPointer(root))
-					continue;
-				tPlayerController = s_cachedPC = pc;
-				tAcknowledgedPawn = s_cachedPawn = pawn;
-				pcPath = "lp_chain";
-				break;
-			}
-		}
-	}
-	}
-
-	if (tPlayerController && !tAcknowledgedPawn) {
-		// SDK dump: AController.Pawn @ 0x3F0 (primary). 0x3D8/0x408 are
-		// heuristic fallbacks only — validators gate on IsValidPointer.
-		for (std::ptrdiff_t off : { Offsets::AcknowledgedPawn,
-				Offsets::AcknowledgedPawn_Fallback, Offsets::Controller_Character }) {
-			const uintptr_t pawn = Memory::read<uintptr_t>(tPlayerController + off);
-			if (pawn && Engine::IsValidPointer(pawn)) {
-				tAcknowledgedPawn = pawn;
-				break;
-			}
-		}
-	}
-
+	if (tPlayerController)
+		s_cachedPC = tPlayerController;
 	if (tAcknowledgedPawn)
-		tRootComponent = Memory::read<uintptr_t>(tAcknowledgedPawn + Offsets::RootComponent);
-
-	if (tAcknowledgedPawn) {
-		// Help: Actor/PC PLAYER_STATE 0x3A8. LocalAckPlayerState(0x3F0) is CHARACTER on PC — not PS on pawn.
-		tPlayerState = Memory::read<uintptr_t>(tAcknowledgedPawn + Offsets::APlayerState);
-		if ((!tPlayerState || !IsValidPointer(tPlayerState)) && tPlayerController)
-			tPlayerState = Memory::read<uintptr_t>(
-				tPlayerController + Offsets::AController_PlayerState);
-		if (tPlayerState && !IsValidPointer(tPlayerState))
-			tPlayerState = 0;
-	}
-
-	// LP resolution is best-effort only (encrypted GI→LP is non-fatal).
-	// Camera / self identity already comes from PCM→PCOwner→AckPawn above.
-	if (tGameInstance) {
-		uintptr_t giLp = 0;
-		uintptr_t giPcDummy = 0;
-		if (ResolveLocalPlayerFromGameInstance(tGameInstance, giLp, giPcDummy)
-			&& IsGoodLocalPlayer(giLp)) {
-			tLocalPlayer = giLp;
-		}
-
-		if (!IsGoodLocalPlayer(tLocalPlayer) && tPlayerController) {
-			auto slotOwnsPc = [&](uintptr_t slot) -> bool {
-				if (!IsGoodLocalPlayer(slot))
-					return false;
-				return Memory::read<uintptr_t>(slot + Offsets::LocalPlayer_PlayerController)
-					== tPlayerController;
-			};
-
-			auto tryLpSlots = [&](uintptr_t data, int count) -> bool {
-				if (!data || !Memory::IsValidPtrFast2(data) || count <= 0)
-					return false;
-				const int limit = (count > 8) ? 8 : count;
-				for (int i = 0; i < limit; ++i) {
-					const uintptr_t slot = Memory::read<uintptr_t>(
-						data + static_cast<size_t>(i) * sizeof(uintptr_t));
-					if (slotOwnsPc(slot)) {
-						tLocalPlayer = slot;
-						return true;
-					}
-				}
-				return false;
-			};
-
-			const uintptr_t arrData = Memory::read<uintptr_t>(
-				tGameInstance + Offsets::LocalPlayers);
-			const int arrNum = Memory::read<int>(tGameInstance + Offsets::LocalPlayers + 8);
-			tryLpSlots(arrData, (arrNum > 0 && arrNum <= 16) ? arrNum : 4);
-		}
-	}
-
-	if (!IsGoodLocalPlayer(tLocalPlayer) && tPlayerController)
-		tLocalPlayer = ResolveLocalPlayerFromController(tPlayerController);
-
-	// Help GI@0x4D8 may be encrypted — recover from LP Outer once LP is known.
-	if (!tGameInstance && IsGoodLocalPlayer(tLocalPlayer))
-		tGameInstance = ResolveGameInstanceFromLocalPlayer(tLocalPlayer);
-
-	if (!IsGoodLocalPlayer(tLocalPlayer) && tGameInstance) {
-		const uintptr_t arrData = Memory::read<uintptr_t>(
-			tGameInstance + Offsets::LocalPlayers);
-		const int arrNum = Memory::read<int>(tGameInstance + Offsets::LocalPlayers + 8);
-		if (arrData && Memory::IsValidPtrFast2(arrData) && arrNum > 0 && arrNum <= 16) {
-			const uintptr_t slot0 = Memory::read<uintptr_t>(arrData);
-			if (IsGoodLocalPlayer(slot0))
-				tLocalPlayer = slot0;
-		}
-	}
-
-	if (!IsGoodLocalPlayer(tLocalPlayer) && IsGoodLocalPlayer(s_cachedLocalPlayer))
-		tLocalPlayer = s_cachedLocalPlayer;
-	else if (IsGoodLocalPlayer(tLocalPlayer))
+		s_cachedPawn = tAcknowledgedPawn;
+	if (IsGoodLocalPlayer(tLocalPlayer))
 		s_cachedLocalPlayer = tLocalPlayer;
 
-	uintptr_t tPCM = 0;
-	// Publish level/actors early so GetCameraManagerFromActors can FName-scan
-	// even when PC is still missing (LP=0 must not block camera).
-	{
-		std::unique_lock<std::shared_mutex> stateLock(m_stateMutex);
-		if (tPlayerController)
-			PlayerController = tPlayerController;
-		if (tAcknowledgedPawn)
-			AcknowledgedPawn = tAcknowledgedPawn;
-		if (tRootComponent)
-			RootComponent = tRootComponent;
-		if (tPlayerState)
-			PlayerState = tPlayerState;
-		PersistentLevel = tPersistentLevel;
-		Actors = tActors;
-		ActorsCount = actorCount;
-	}
-
-	tPCM = GetCameraManagerFromActors();
-	if (!tPCM && tPlayerController) {
-		const uintptr_t raw = Memory::read_nocache<uintptr_t>(
-			tPlayerController + Offsets::APlayerCameraManager);
-		if (raw && IsValidPointer(raw)
-			&& ControllerHasValidPcm(tPlayerController))
-			tPCM = raw;
-	}
-	if ((!tPCM || !tPlayerController) && tPersistentLevel && tActors) {
-		uintptr_t pcmPc = tPlayerController;
-		uintptr_t pcmPawn = tAcknowledgedPawn;
-		uintptr_t foundPcm = tPCM;
-		if (Engine::ResolvePcFromLevelCameraManager(
-			tPersistentLevel, tActors, pcmPc, pcmPawn, foundPcm)) {
-			tPCM = foundPcm;
-			tPlayerController = pcmPc;
-			tAcknowledgedPawn = pcmPawn;
-			s_cachedPC = pcmPc;
-			s_cachedPawn = pcmPawn;
-			if (std::strcmp(pcPath, "none") == 0 || std::strcmp(pcPath, "retain") == 0)
-				pcPath = "cam_mgr";
-			if (!tRootComponent && tAcknowledgedPawn)
-				tRootComponent = Memory::read<uintptr_t>(
-					tAcknowledgedPawn + Offsets::RootComponent);
-		}
-	}
-
-	// Retain last known-good PC chain for a short window so a transient FOV/PCM
-	// glitch cannot zero the entire local-player pipeline mid-raid.
-	const auto nowRetain = std::chrono::steady_clock::now();
-	bool usedRetain = false;
+	// Retain window: record what the ladder ended with. The ladder's own cached
+	// rungs replay these values, so this never publishes anything itself; the
+	// entries are dropped once the window has expired.
 	if (tPlayerController && tAcknowledgedPawn) {
 		s_retainPC = tPlayerController;
 		s_retainPawn = tAcknowledgedPawn;
 		s_retainRoot = tRootComponent;
 		s_retainGI = tGameInstance;
-		s_retainLP = tLocalPlayer;			if (tPCM) s_retainPCM = tPCM;  // only overwrite retain when PCM is valid
+		s_retainLP = tLocalPlayer;
+		if (tPCM)
+			s_retainPCM = tPCM;
 		s_retainPS = tPlayerState;
 		s_retainGoodAt = nowRetain;
-	} else if (s_retainPC && (nowRetain - s_retainGoodAt) < kPcChainRetainMs) {
-		if (!tPlayerController) {
-			tPlayerController = s_retainPC;
-			usedRetain = true;
-			pcPath = "retain";
-		}
-		if (!tAcknowledgedPawn)
-			tAcknowledgedPawn = s_retainPawn;
-		if (!tRootComponent)
-			tRootComponent = s_retainRoot;
-		if (!tGameInstance)
-			tGameInstance = s_retainGI;
-		if (!IsGoodLocalPlayer(tLocalPlayer) && IsGoodLocalPlayer(s_retainLP))
-			tLocalPlayer = s_retainLP;
-		if (!tPCM)
-			tPCM = s_retainPCM;
-		if (!tPlayerState)
-			tPlayerState = s_retainPS;
-		if (!s_cachedPC) {
-			s_cachedPC = s_retainPC;
-			s_cachedPawn = s_retainPawn;
-		}
-	} else if (!tPlayerController) {
+	} else if (nowRetain - s_retainGoodAt >= kPcChainRetainMs) {
 		s_retainPC = 0;
 		s_retainPawn = 0;
 		s_retainRoot = 0;
@@ -792,7 +401,7 @@ void Engine::Update() {
 		s_retainPCM = 0;
 		s_retainPS = 0;
 	}
-	(void)usedRetain;
+
 
 	// Log final PC discovery result
 	{
@@ -800,7 +409,7 @@ void Engine::Update() {
 		if (++s_traceCounter % 120 == 1) {  // log every ~2s at 60fps Update
 			TracePcDiscovery(pcPath, tPlayerController, tAcknowledgedPawn,
 				tRootComponent, tPCM, tGameInstance, tLocalPlayer, actorCount,
-				cacheInvalidatedThisFrame ? cacheInvalidateReason : nullptr);
+				cacheInvalidatedThisFrame ? "pairCache" : nullptr);
 		}
 	}
 
@@ -813,16 +422,47 @@ void Engine::Update() {
 		PersistentLevel = tPersistentLevel;
 		localplayer = tLocalPlayer;
 		PlayerController = tPlayerController;
-		// Only actor-scan finds the real PioneerPlayerController by fname;
-		// do not mirror generic GI/PCM PC into this field.
-		if (std::strcmp(pcPath, "actor_scan") == 0)
-			PioneerPlayerController = tPlayerController;        AcknowledgedPawn = tAcknowledgedPawn;
-        RootComponent = tRootComponent;
-        PlayerState = tPlayerState;
-        Actors = tActors;
-        ActorsCount = actorCount;
-        if (tPCM) PlayerCameraManager = tPCM;
+		// The ladder's controller rung is authoritative; no later camera scan
+		// or legacy pass may overwrite it.
+		if (chain.RungOf(PlayerChain::Hop::Controller) == PlayerChain::Rung::ActorScan)
+			PioneerPlayerController = tPlayerController;
+		AcknowledgedPawn = tAcknowledgedPawn;
+		RootComponent = tRootComponent;
+		PlayerState = tPlayerState;
+		Actors = tActors;
+		ActorsCount = actorCount;
+		if (tPCM)
+			PlayerCameraManager = tPCM;
 		AGameStateBase = ResolveGameStateFromWorld(tGWorld);
+		if (var::show_raid_hud || var::show_radar)
+			RefreshRaidDashboard();
+	}
+
+	// SDK reflection walker (Core/Reflection.hpp): when the pawn changes, decode
+	// its UClass through the SDK's FField/FProperty routines (SuperStruct chain +
+	// PropertyLink chain, property name + offset decoders). Bounded to the first
+	// properties so the walk stays cheap; DMA reads happen outside the lock.
+	if (base && tAcknowledgedPawn && tAcknowledgedPawn != m_reflectPawn) {
+		const uintptr_t uclass = Reflection::ClassOf(tAcknowledgedPawn);
+		const Reflection::ClassReport report =
+			Reflection::BuildReport(uclass, base, 48, /*wantTypes=*/false);
+
+		std::string sample;
+		for (size_t i = 0; i < report.properties.size() && i < 3; ++i) {
+			char line[128];
+			std::snprintf(line, sizeof(line), "%s%s=0x%X", i ? ", " : "",
+				report.properties[i].name.c_str(), report.properties[i].offset);
+			sample += line;
+		}
+
+		{
+			std::unique_lock<std::shared_mutex> stateLock(m_stateMutex);
+			m_reflectPawn = tAcknowledgedPawn;
+			m_reflectDepth = static_cast<int>(report.chain.size());
+			m_reflectProps = static_cast<int>(report.properties.size());
+			m_reflectOk = !report.chain.empty() && !report.properties.empty();
+			m_reflectSample = std::move(sample);
+		}
 	}
 
 	{
@@ -837,11 +477,11 @@ void Engine::Update() {
 		}
 	}
 
-	// Camera refresh does not require LocalPlayer. Prefer the active PCM
-	// ViewTarget POV (PCM + 0x4C8); the ladder recovers PC if needed.
-	if (IsEspRaidActive() && (tPlayerController || tPCM || (tPersistentLevel && tActors)))
-		RefreshCameraFromViewTarget();
-
+	// Camera refresh is owned by the dedicated 8ms camera worker. Running the
+	// same PCM discovery ladder here duplicated an unbounded actor scan inside
+	// the Update scan gate; one transient VMM stall held the gate for ~167s and
+	// starved EntityList/RobotList, leaving ESP caches empty until the stall
+	// ended. Keep Update focused on state publication and raid transitions.
 	TickRaidGate();
 	TickEspCacheReadiness();
 
@@ -939,8 +579,11 @@ Engine::EngineStateSnapshot Engine::GetStateSnapshot() const
 	EngineStateSnapshot snap{};
 	std::shared_lock<std::shared_mutex> lock(m_stateMutex);
 	snap.gWorld = GWorld;
-	snap.gWorldRaw = m_gWorldRaw.load(std::memory_order_relaxed);
-	snap.gWorldFailStep = m_gWorldFailStep.load(std::memory_order_relaxed);
+	// The whole chain in one shot: every hop's pointer, the rung that answered it,
+	// its identity proof and the rung counts. Replaces the four src tags.
+	snap.chain = m_chain;
+	snap.gWorldRaw = m_chain.worldRaw;
+	snap.gWorldFailStep = m_chain.worldFailStep;
 	snap.persistentLevel = PersistentLevel;
 	snap.actors = Actors;
 	snap.playerController = PlayerController;
@@ -949,6 +592,13 @@ Engine::EngineStateSnapshot Engine::GetStateSnapshot() const
 	snap.playerCameraManager = PlayerCameraManager;
 	snap.owningGameInstance = OwningGameInstance;
 	snap.localPlayer = localplayer;
+	snap.reflectOk = m_reflectOk;
+	snap.reflectDepth = m_reflectDepth;
+	snap.reflectProps = m_reflectProps;
+	snap.reflectSample = m_reflectSample;
+	snap.fstrOk = m_fstrOk;
+	snap.fstrKey = m_fstrKey;
+	snap.fstrText = m_fstrText;
 	return snap;
 }
 
@@ -1117,7 +767,10 @@ void Engine::ClearEspCaches()
 	{
 		std::unique_lock<std::shared_mutex> lock(m_espFrameMutex);
 		m_espFrameShared.reset();
+		m_espPaintFrame.store(nullptr);
+		m_espAimFrame.store(nullptr);
 	}
+	ResetEspFrameDiagnostics();
 	entityStarted.store(false, std::memory_order_release);
 	m_espDrawReady.store(false, std::memory_order_release);
 	m_lastEspFrameValid.store(false, std::memory_order_release);
@@ -1241,13 +894,17 @@ void Engine::TickRaidGate()
 				<< ",\"hubTok\":\"" << MatchHubToken(gw, pl) << "\""
 				<< ",\"wName\":\"" << RaidJsonEscape(PeekObjFName(gw)) << "\"";
 			// G1/G2/G3: which resolver produced GWorld + live slot value/name.
-			const uintptr_t slotRaw = m_gWorldRaw.load(std::memory_order_relaxed);
+			const PlayerChain::State chain = GetChainState();
+			const uintptr_t slotRaw = chain.worldRaw;
 			d << ",\"gw\":" << gw
 				<< ",\"gwRaw\":" << slotRaw
-				<< ",\"gwSrc\":" << g_gworldSrc.load(std::memory_order_relaxed)
+				<< ",\"gwSrc\":\"" << PlayerChain::RungName(
+					chain.RungOf(PlayerChain::Hop::World)) << "\""
+				// The whole ladder, hop by hop: winner, tries and rejects.
+				<< ",\"chain\":\"" << PlayerChain::Trace(chain) << "\""
 				// Resolver failure step during no_world voids: 1=no slot read,
 				// 2=slot read but level deref failed, 0=healthy.
-				<< ",\"fStep\":" << m_gWorldFailStep.load(std::memory_order_relaxed);
+				<< ",\"fStep\":" << chain.worldFailStep;
 			if (slotRaw && slotRaw != gw)
 				d << ",\"slotName\":\"" << RaidJsonEscape(PeekObjFName(slotRaw)) << "\"";
 			d << "}";

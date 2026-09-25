@@ -9,7 +9,15 @@
 #include "DMA/Memory.h"
 #pragma warning(pop)
 
+// Out-of-line PCIMemory state. Core/Memory.h reads these through
+// getBaseAddress()/GetModuleSize(), so the decode + reflection suites need them
+// to resolve even though no DMA backend is linked in.
+DWORD PCIMemory::processId = 0;
 VMM_HANDLE PCIMemory::hVMM = nullptr;
+uintptr_t PCIMemory::moduleBase = 0;
+DWORD PCIMemory::moduleImageSize = 0;
+bool PCIMemory::s_memMap = false;
+std::string PCIMemory::attachedExe;
 
 PCIMemory::~PCIMemory() {}
 

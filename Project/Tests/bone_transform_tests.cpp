@@ -176,3 +176,40 @@ TEST_CASE("FTransform layout matches engine stride")
     static_assert(offsetof(FTransform, Scale3D) == 0x40);
     static_assert(sizeof(FQuat) == 0x20, "FQuat must be 4 doubles");
 }
+
+// ── SDK drop bone pipeline ──────────────────────────────────────────────────
+// Bones::DecryptBoneArray decodes through
+// game::gasm::decode_bonearray_table_address_slot first (the v818 PSHUFB
+// pipeline stays as the fallback), so pin that contract here.
+
+TEST_CASE("SDK bone table address decrypt matches scalar reference")
+{
+    // Reference: two dwords at the seed slot, XOR + ROL32(3) + add per dword.
+    auto ref = [](const uint8_t s[8]) {
+        auto rol32 = [](uint32_t x, int n) { return (x << n) | (x >> (32 - n)); };
+        uint32_t lo = 0, hi = 0;
+        std::memcpy(&lo, s, 4);
+        std::memcpy(&hi, s + 4, 4);
+        lo = rol32(lo ^ 0x2B46E100u, 3) + 0xD4B91F00u;
+        hi = rol32(hi ^ 0xC05F2101u, 3) + 0x3FA0DEFFu;
+        return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+    };
+
+    const uint8_t seeds[][8] = {
+        { 0xDE, 0xAD, 0xBE, 0xEF, 0x13, 0x37, 0x00, 0x01 },
+        { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
+        { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 },
+    };
+
+    for (const auto& seed : seeds) {
+        const uint64_t expected = ref(seed);
+        CAPTURE(expected);
+        CHECK(game::gasm::decode_bonearray_table_address_slot(seed) == expected);
+
+        // The mesh-base wrapper must read that same slot at +0x7B0.
+        uint8_t mesh[0x7B8] = {};
+        std::memcpy(mesh + 0x7B0, seed, sizeof(seed));
+        CHECK(game::gasm::decode_bonearray_table_address(mesh) == expected);
+    }
+}

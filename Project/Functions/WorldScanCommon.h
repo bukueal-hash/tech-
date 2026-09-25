@@ -141,11 +141,14 @@ struct AggGeomProbeResult {
     std::string note;
 };
 
-/** Kick the probe on a detached thread. No-op while one is already running. */
+/** Kick the probe on an owned, joinable job. No-op while one is already running. */
 void StartAggGeomProbe();
 
 /** Snapshot of the last (or in-flight) probe run. */
 AggGeomProbeResult GetAggGeomProbeResult();
+
+/** Stop and join all diagnostic probe jobs before engine teardown. */
+void StopBackgroundJobs();
 
 /**
  * One-shot read-only probe for UWorld's clock fields. This build reorders
@@ -167,7 +170,7 @@ struct TimeSecondsProbeResult {
     std::string note;
 };
 
-/** Kick the probe on a detached thread. Takes ~1s. No-op while running. */
+/** Kick the probe on an owned, joinable job. Takes ~1s. No-op while running. */
 void StartTimeSecondsProbe();
 
 /** Snapshot of the last (or in-flight) probe run. */
@@ -193,7 +196,7 @@ struct TickProbeResult {
     std::string note;
 };
 
-/** Kick the probe on a detached thread. Takes ~2s. No-op while running. */
+/** Kick the probe on an owned, joinable job. Takes ~2s. No-op while running. */
 void StartTickProbe();
 
 /** Snapshot of the last (or in-flight) probe run. */
@@ -206,9 +209,11 @@ inline void BlendCachedVelocity(Vector3& cachedVelocity, const Vector3& newVel)
         + static_cast<double>(newVel.y) * newVel.y
         + static_cast<double>(newVel.z) * newVel.z;
     if (mag2 < (3000.0 * 3000.0)) {
-        cachedVelocity.x = cachedVelocity.x * 0.5f + newVel.x * 0.5f;
-        cachedVelocity.y = cachedVelocity.y * 0.5f + newVel.y * 0.5f;
-        cachedVelocity.z = cachedVelocity.z * 0.5f + newVel.z * 0.5f;
+        // Heavier damping keeps a single noisy DMA sample from moving the
+        // box sharply, while still following sustained bot motion.
+        cachedVelocity.x = cachedVelocity.x * 0.75f + newVel.x * 0.25f;
+        cachedVelocity.y = cachedVelocity.y * 0.75f + newVel.y * 0.25f;
+        cachedVelocity.z = cachedVelocity.z * 0.75f + newVel.z * 0.25f;
     } else {
         cachedVelocity = {};
     }

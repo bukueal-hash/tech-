@@ -20,6 +20,13 @@ void HighlightHoveredItem()
     }
 }
 
+// Row tooltip on whichever sub-widget of a composite row is hovered.
+void RowTooltip(const char* txt)
+{
+    if (txt && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", txt);
+}
+
 // Screen rect of the most recently drawn Label(). Consumed by
 // ArcMenuHoverTooltip() so the row tooltip also fires when the mouse is over
 // the label text instead of only the control itself.
@@ -163,21 +170,29 @@ bool ColorEditAtColumn(const char* colorId, float color[4])
     return ColorEditAtColumnPos(colorId, color);
 }
 
-bool CheckboxWithColorRow(const char* label, bool* enabled, float color[4], const char* colorId)
+bool CheckboxWithColorRow(
+    const char* label,
+    bool* enabled,
+    float color[4],
+    const char* colorId,
+    const char* rowTooltip)
 {
     const float startX = ImGui::GetCursorStartPos().x;
     ImGui::PushID(colorId);
     bool changed = false;
     if (ImGui::Checkbox("##cb", enabled))
         changed = true;
+    RowTooltip(rowTooltip);
     ImGui::SameLine(0.f, ImGui::GetStyle().ItemInnerSpacing.x);
     ImGui::SetCursorPosX(startX + ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x);
     ImGui::PushTextWrapPos(startX + kColorColumnX - 2.f);
     ImGui::TextUnformatted(label);
     ImGui::PopTextWrapPos();
     HighlightHoveredItem();
+    RowTooltip(rowTooltip);
     if (ColorEditAtColumn(colorId, color))
         changed = true;
+    RowTooltip(rowTooltip);
     ImGui::PopID();
     return changed;
 }
@@ -188,28 +203,33 @@ bool CheckboxWithDualColorRow(
     float colorA[4],
     const char* idA,
     float colorB[4],
-    const char* idB)
+    const char* idB,
+    const char* rowTooltip)
 {
     const float startX = ImGui::GetCursorStartPos().x;
     ImGui::PushID(idA);
     bool changed = false;
     if (ImGui::Checkbox("##cb", enabled))
         changed = true;
+    RowTooltip(rowTooltip);
     ImGui::SameLine(0.f, ImGui::GetStyle().ItemInnerSpacing.x);
     ImGui::SetCursorPosX(startX + ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x);
     ImGui::PushTextWrapPos(startX + kColorColumnX - 2.f);
     ImGui::TextUnformatted(label);
     ImGui::PopTextWrapPos();
     HighlightHoveredItem();
+    RowTooltip(rowTooltip);
     ImGui::SameLine();
     if (ColorEditAtColumnPos(idA, colorA))
         changed = true;
+    RowTooltip(rowTooltip);
     ImGui::SameLine();
     ImGui::SetCursorPosX(startX + kColorColumnX + kColorSwatchWidth + 8.f);
     if (ImGui::ColorEdit4(idB, colorB, kColorFlags)) {
         changed = true;
         AutoConfig_MarkDirty();
     }
+    RowTooltip(rowTooltip);
     ImGui::PopID();
     return changed;
 }

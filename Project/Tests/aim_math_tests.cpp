@@ -77,6 +77,38 @@ TEST_CASE("ApplyPullProfile clamps to [0.05, 0.97]")
     CHECK(approx(AimMath::ApplyPullProfile(0.01f, 0.5f, 0.55f, 0.5f, 0.5f), 0.05f));
 }
 
+TEST_CASE("Humanizer rearm requires a new large error or a real jump")
+{
+    // Entering a large-error region is a rearm condition. AimAssistence
+    // suppresses it on the first tick because Reset already armed the lock.
+    CHECK(AimMath::HumanizerShouldRearm(0.f, 31.f));
+    // Remaining far away must not restart the delay every polling interval.
+    CHECK(!AimMath::HumanizerShouldRearm(80.f, 75.f));
+    CHECK(!AimMath::HumanizerShouldRearm(80.f, 85.f));
+    // A new lock from close range, or a meaningful jump, does re-arm.
+    CHECK(AimMath::HumanizerShouldRearm(9.f, 31.f));
+    CHECK(AimMath::HumanizerShouldRearm(20.f, 35.f));
+    CHECK(!AimMath::HumanizerShouldRearm(20.f, 30.f));
+    CHECK(!AimMath::HumanizerShouldRearm(NAN, 40.f));
+}
+
+TEST_CASE("Humanizer offset is finite and magnitude bounded")
+{
+    CHECK(AimMath::kHumanizerMaxOffsetPx == 48.f);
+    auto [x, y] = AimMath::ClampHumanizerOffset(30.f, 40.f, AimMath::kHumanizerMaxOffsetPx);
+    CHECK(approx(x, 28.8f));
+    CHECK(approx(y, 38.4f));
+    CHECK(std::hypot(x, y) <= 48.001f);
+
+    auto [smallX, smallY] = AimMath::ClampHumanizerOffset(2.f, -3.f, AimMath::kHumanizerMaxOffsetPx);
+    CHECK(approx(smallX, 2.f));
+    CHECK(approx(smallY, -3.f));
+
+    auto [nanX, nanY] = AimMath::ClampHumanizerOffset(NAN, 3.f, AimMath::kHumanizerMaxOffsetPx);
+    CHECK(nanX == 0.f);
+    CHECK(nanY == 0.f);
+}
+
 TEST_CASE("OscDampPullFactor")
 {
     CHECK(approx(AimMath::OscDampPullFactor(0.f, AimMath::kOscPullFactor), 1.f));

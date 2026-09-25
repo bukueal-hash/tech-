@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <utility>
 
 namespace AimMath {
 
@@ -36,6 +37,7 @@ inline constexpr float kOscDampMax = 0.70f;
 inline constexpr float kOscRecoverStep = 0.05f;
 inline constexpr float kOscPullFactor = 0.5f;     // closeFrac multiplier at full damp
 inline constexpr float kOscSmoothFactor = 0.35f;  // EMA-alpha reduction at full damp
+inline constexpr float kHumanizerMaxOffsetPx = 48.0f;
 
 // ── closeFrac curve (fraction of remaining screen error closed this tick) ──
 inline float CloseFractionForDist(float dist)
@@ -80,6 +82,38 @@ inline float ApplyPullProfile(float closeFrac, float speed, float ramp,
     float sharp, float situ)
 {
     return (std::clamp)(closeFrac * speed * ramp * sharp * situ, 0.05f, 0.97f);
+}
+
+// Humanizer re-arms only for a newly acquired large error or a real jump.
+// Checking only `error > threshold` re-arms every 150ms while a target remains
+// far away, which turns one reaction delay into repeated stalls.
+inline bool HumanizerShouldRearm(
+    float previousError, float currentError,
+    float largeErrorThreshold = 30.f,
+    float jumpThreshold = 12.f)
+{
+    if (!std::isfinite(previousError) || !std::isfinite(currentError))
+        return false;
+    const bool enteredLargeError = previousError <= largeErrorThreshold
+        && currentError > largeErrorThreshold;
+    const bool grewByJump = currentError > largeErrorThreshold
+        && currentError - previousError >= jumpThreshold;
+    return enteredLargeError || grewByJump;
+}
+
+// Keep humanizer displacement a bounded perturbation. It must never become a
+// second aim controller, especially when the user raises intensity.
+inline std::pair<float, float> ClampHumanizerOffset(
+    float x, float y, float maxMagnitude)
+{
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(maxMagnitude)
+        || maxMagnitude <= 0.f)
+        return { 0.f, 0.f };
+    const float mag = std::hypot(x, y);
+    if (mag <= maxMagnitude || mag <= 0.001f)
+        return { x, y };
+    const float scale = maxMagnitude / mag;
+    return { x * scale, y * scale };
 }
 
 // Per-axis oscillation damping factor on the pull: 1 at damp=0 down to

@@ -15,6 +15,13 @@
 
 #ifdef _WIN64
 
+// Informational first-chance exceptions. Every thread that names itself raises
+// kThreadNameException, and OutputDebugString raises kDebugPrintException; both
+// are non-fatal. Logging them as crashes buried the real faults in the c190fb
+// log (all six "crash" pairs were code 0x406D1388 with rdi = the name magic).
+constexpr DWORD kThreadNameException = 0x406D1388u;  // MS_VC_EXCEPTION
+constexpr DWORD kDebugPrintException = 0x40010006u;  // DBG_PRINTEXCEPTION_C
+
 static const char* ExceptionName(DWORD code)
 {
     switch (code) {
@@ -28,6 +35,8 @@ static const char* ExceptionName(DWORD code)
     case EXCEPTION_GUARD_PAGE:           return "GUARD_PAGE";
     case STATUS_HEAP_CORRUPTION:         return "HEAP_CORRUPTION";
     case 0xE06D7363:                     return "CPP_EXCEPTION";   // MSVC C++ throw
+    case kThreadNameException:           return "THREAD_NAME";    // MS_VC_EXCEPTION
+    case kDebugPrintException:           return "DEBUG_PRINT";    // DBG_PRINTEXCEPTION_C
     default:                             return "UNKNOWN";
     }
 }
@@ -50,6 +59,10 @@ LONG CALLBACK ArcCrashHandler(EXCEPTION_POINTERS* ex)
 
     const EXCEPTION_RECORD* er = ex->ExceptionRecord;
     const CONTEXT* ctx = ex->ContextRecord;
+
+    if (er->ExceptionCode == kThreadNameException ||
+        er->ExceptionCode == kDebugPrintException)
+        return EXCEPTION_CONTINUE_SEARCH;   // informational — not a fault
 
     // Format timestamp
     const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -240,6 +240,15 @@ public:
         return baseAddress;
     }
 
+    /** Mapped size of the attached image — used to spot module-space pointers
+     *  (CDOs / .rdata) that must never be published as live objects. */
+    static uint64_t GetModuleSize()
+    {
+        if (g_mem.IsInitialized() && g_mem.GetBase())
+            return static_cast<uint64_t>(g_mem.GetImageSize());
+        return 0;
+    }
+
     static bool read(const void* address, void* buffer, DWORD64 size)
     {
         if (!g_mem.IsInitialized() || !address || !buffer || !size)

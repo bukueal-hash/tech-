@@ -31,7 +31,8 @@ namespace CollisionMirror {
 namespace {
 
 constexpr uintptr_t kStaticMesh_BodySetup = 0x1F0;
-constexpr uintptr_t kStaticMesh_ExtendedBounds = 0x308;    // FBoxSphereBounds
+constexpr uintptr_t kStaticMesh_ExtendedBounds =
+    static_cast<uintptr_t>(Offsets::StaticMesh_ExtendedBounds);   // FBoxSphereBounds
 constexpr uintptr_t kStaticMesh_PositiveBoundsExt = 0x2D8; // FVector
 constexpr uintptr_t kStaticMesh_NegativeBoundsExt = 0x2F0; // FVector
 constexpr uintptr_t kBodySetup_AggGeom = 0xB8;
@@ -87,9 +88,10 @@ static_assert(sizeof(FVec3d) == 24, "FVec3d must be 3 doubles");
 static_assert(sizeof(TArrayHeader) == 16, "TArrayHeader must be 16 bytes");
 
 // Component transform. Translation comes from the battle-tested WorldLocation
-// (0x390, the same slot the whole ESP uses for positions — never trust the
-// forum-pinned CTW layout for the anchor). Quat @ CTW+0x00, scale @ CTW+0x38
-// (UE LWC) with an identity fallback: static-mesh scale is ~1.0 and the
+// (= ComponentToWorld + Transform_Translation, the same slot the whole ESP uses
+// for positions — never trust a hand-pinned CTW layout for the anchor). Quat @
+// CTW+0x00, scale @ CTW+0x40 (dump: CoreUObject.Transform, size 0x60) with an
+// identity fallback: static-mesh scale is ~1.0 and the
 // element rotator carries rotation, so a sanitized identity is safe and
 // cannot poison the world-space transform the way a garbage scale would.
 struct C2W {
@@ -121,14 +123,15 @@ C2W ReadC2W(uintptr_t sceneComponent)
     if (!anchorOk)
         return out;
 
-    // Quat @ CTW+0x00; scale @ CTW+0x40 (FTransform: Quat4d 0x00 (0x20),
-    // FVector3d 0x20 (0x18), Scale3D 0x40 (0x18), pad @0x38 — help.txt
-    // Struct/Transform, size 0x60). Reading the pad slot misaligned the
-    // scale so most static-mesh triangles blew up past FilterSanity's cap
-    // and every body setup capsSkipped.
-    out.q = Memory::read<FQuat4d>(sceneComponent + Offsets::ComponentToWorld);
+    // Quat @ CTW+0x00; scale @ CTW+0x40 (dump: CoreUObject.Transform —
+    // Quat 0x00 (0x20), Translation 0x20 (0x18), pad 0x38, Scale3D 0x40 (0x18),
+    // size 0x60). Reading the pad slot misaligned the scale so most static-mesh
+    // triangles blew up past FilterSanity's cap and every body setup capsSkipped.
+    const std::ptrdiff_t ctwOffset =
+        Engine::ProbeComponentToWorldOffset(sceneComponent);
+    out.q = Memory::read<FQuat4d>(sceneComponent + ctwOffset);
     const FVec3d scale = Memory::read<FVec3d>(
-        sceneComponent + Offsets::ComponentToWorld + 0x40);
+        sceneComponent + ctwOffset + Offsets::Transform_Scale3D);
     const bool qFinite = std::isfinite(out.q.x) && std::isfinite(out.q.y)
         && std::isfinite(out.q.z) && std::isfinite(out.q.w);
     const bool sFinite = std::isfinite(scale.x) && std::isfinite(scale.y)
@@ -668,6 +671,7 @@ namespace {
 
 std::atomic<bool> s_rebuilding{ false };
 std::mutex s_stateMu;
+ManagedJob s_rebuildJob;
 Vector3 s_lastPos{};
 std::chrono::steady_clock::time_point s_lastTime{};
 
@@ -890,7 +894,8 @@ void RunRebuildJob(uintptr_t uworld, uintptr_t persistentLevel,
 
 } // namespace
 
-// Called from a low-cadence worker; spawns the actual rebuild on a thread.
+// Called from a low-cadence worker; schedules the actual rebuild on an owned,
+// joinable job. The job is stopped by StopBackgroundJobs during shutdown.
 void ScheduleRebuild(uintptr_t uworld, uintptr_t persistentLevel,
     const Vector3& localPos)
 {
@@ -919,11 +924,13 @@ void ScheduleRebuild(uintptr_t uworld, uintptr_t persistentLevel,
     if (s_rebuilding.exchange(true))
         return;
 
-    std::thread([uworld, persistentLevel, localPos]() {
+    const bool started = s_rebuildJob.start([uworld, persistentLevel, localPos]() {
         const auto t0 = std::chrono::steady_clock::now();
         try {
             RunRebuildJob(uworld, persistentLevel, localPos);
         } catch (...) {
+            s_rebuilding.store(false, std::memory_order_release);
+            throw;
         }
         g_lastRebuildMs.store(static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
@@ -933,7 +940,16 @@ void ScheduleRebuild(uintptr_t uworld, uintptr_t persistentLevel,
             s_lastTime = std::chrono::steady_clock::now();
         }
         s_rebuilding.store(false, std::memory_order_release);
-    }).detach();
+    });
+    if (!started) {
+        s_rebuilding.store(false, std::memory_order_release);
+    }
+}
+
+void StopBackgroundJobs()
+{
+    s_rebuildJob.stop();
+    s_rebuilding.store(false, std::memory_order_release);
 }
 
 void Clear()

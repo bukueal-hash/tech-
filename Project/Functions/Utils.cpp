@@ -314,11 +314,17 @@ bool Engine::RefreshCameraFromViewTarget()
 			rootComp = pawnRoot;
 	}
 	if (rootComp && IsValidPointer(rootComp)) {
+		// ComponentToWorld is non-UPROPERTY: probe the working 0x2D0 profile
+		// against the 0x310 alternate instead of trusting one fixed slot.
+		const std::ptrdiff_t ctwOff = Engine::ProbeComponentToWorldOffset(rootComp);
         const FVector3d pawnWorld = Memory::read_nocache<FVector3d>(
-			rootComp + Offsets::ComponentToWorld + 0x20);
+			rootComp + ctwOff + Offsets::Transform_Translation);
 		pawnPos = ToVector3(pawnWorld);
 		if (!::IsPlausibleWorldPos(pawnPos))
             pawnPos = Memory::read_nocache<Vector3>(rootComp + Offsets::RelativeLocation);
+		// Reflection-verified fallback: AActor::ReplicatedMovement -> Location.
+		if (!::IsPlausibleWorldPos(pawnPos))
+            pawnPos = Engine::ReadActorReplicatedLocation(pawn);
 	}
 
 	const bool pawnOk = ::IsPlausibleWorldPos(pawnPos);
@@ -564,10 +570,20 @@ static bool TryLocalPlayerChain(uintptr_t gi, std::ptrdiff_t localPlayersOff,
     return false;
 }
 
-static bool ValidateGameInstance(uintptr_t gi, uintptr_t* outLocalPlayer = nullptr,
-    uintptr_t* outPlayerController = nullptr)
+/** True for addresses inside the game image (CDOs, .rdata) — never a live object. */
+static bool IsModuleSpace(uintptr_t p)
 {
-    if (!IsUsableObjectPtr(gi) || Engine::LooksLikeUtf16Garbage(gi))
+    const uint64_t base = Memory::getBaseAddress();
+    if (!base || !p || p < base)
+        return false;
+    const uint64_t size = Memory::GetModuleSize();
+    return size ? (p < base + size) : false;
+}
+
+static bool ValidateGameInstance(uintptr_t gi, uintptr_t* outLocalPlayer = nullptr,
+    uintptr_t* outPlayerController = nullptr, uintptr_t world = 0)
+{
+    if (!IsUsableObjectPtr(gi) || Engine::LooksLikeUtf16Garbage(gi) || IsModuleSpace(gi))
         return false;
 
     uintptr_t lp = 0;
@@ -588,19 +604,22 @@ static bool ValidateGameInstance(uintptr_t gi, uintptr_t* outLocalPlayer = nullp
         }
     }
 
-    // Structural fallback: accept GI when LocalPlayers looks like a real TArray even
-    // if LP→PC validation failed (transient FOV/PCM glitch mid-raid). Still publish LP
-    // slot 0 when present so OwningGI/LocalPlayer do not go permanently red.
+    // The SDK drop does not define a GI->World back-reference field. Do not
+    // validate through the old guessed +0x2F0 slot; the LocalPlayers array and
+    // its LP->PC identity check are the available structural proof.
+    (void)world;
     for (std::ptrdiff_t off : kLpArrOffs) {
         const GITArrayHdr arr = ReadGIArray(gi, off);
-        if (!IsUsableObjectPtr(arr.Data))
+        if (!IsUsableObjectPtr(arr.Data) || IsModuleSpace(arr.Data))
             continue;
         if (arr.Num < 0 || arr.Num > 16)
             continue;
         if (arr.Max < arr.Num || arr.Max > 64)
             continue;
         const uintptr_t slot0 = Memory::read<uintptr_t>(arr.Data);
-        if (outLocalPlayer && IsUsableObjectPtr(slot0) && !Engine::LooksLikeUtf16Garbage(slot0))
+        if (!IsUsableObjectPtr(slot0) || IsModuleSpace(slot0) || Engine::LooksLikeUtf16Garbage(slot0))
+            continue;
+        if (outLocalPlayer)
             *outLocalPlayer = slot0;
         if (outPlayerController)
             *outPlayerController = 0;
@@ -610,12 +629,74 @@ static bool ValidateGameInstance(uintptr_t gi, uintptr_t* outLocalPlayer = nullp
     return false;
 }
 
-/** Once LP is known, recover GI via UObject Outer candidates (help has no GI decrypt). */
-uintptr_t Engine::ResolveGameInstanceFromLocalPlayer(uintptr_t localPlayer)
+bool Engine::LooksLikeActor(uintptr_t obj)
 {
+    // A component's Outer is its actor, and an actor's RootComponent points back
+    // at it the same way — see OuterLink::OwnerIsActor. The object itself is
+    // still filtered first, because that rule says nothing about UTF-16 garbage.
+    if (!IsPlausibleObjPtr(obj))
+        return false;
+
+    return OuterLink::OwnerIsActor(
+        &OuterLink::NoCacheReader, obj,
+        static_cast<uint64_t>(Offsets::RootComponent));
+}
+
+uintptr_t Engine::ResolveOwningActor(uintptr_t obj, int maxHops)
+{
+    if (!IsPlausibleObjPtr(obj))
+        return 0;
+
+    // A hop has to land on an object the tool can actually inspect — its class
+    // pointer resolves — or the first rung would shadow the others, because a
+    // wrong rung's mix is still a 64-bit number in range. The class pointer also
+    // fails on an unmapped address, which is what that mix usually is.
+    return OuterLink::ResolveOwner(
+        obj,
+        &OuterLink::NoCacheReader,
+        [](uintptr_t p) {
+            return Engine::IsPlausibleObjPtr(p) &&
+                steam_decrypt::GetActorClassPtr(p) != 0;
+        },
+        [](uintptr_t p) { return Engine::LooksLikeActor(p); },
+        maxHops);
+}
+
+// The OuterLink rung that reached a ULocalPlayer's GameInstance, spelled in the
+// ladder's vocabulary so the panel and the trace can name it.
+static PlayerChain::Rung MapOuterRung(OuterLink::Rung rung)
+{
+    switch (rung) {
+    case OuterLink::Rung::SdkSlot:    return PlayerChain::Rung::OuterSdkSlot;
+    case OuterLink::Rung::SdkSlotRol: return PlayerChain::Rung::OuterSdkSlotRol;
+    case OuterLink::Rung::DropCipher: return PlayerChain::Rung::OuterDrop;
+    case OuterLink::Rung::PlainOuter: return PlayerChain::Rung::OuterPlainA0;
+    case OuterLink::Rung::PlainSlot:  return PlayerChain::Rung::OuterPlain20;
+    default:                          return PlayerChain::Rung::None;
+    }
+}
+
+/**
+ * GameInstance rung: a ULocalPlayer's Outer *is* its GameInstance, so the
+ * decrypt turns this into one exact hop instead of a slot scan. `which` names
+ * the OuterLink rung that answered (the ladder reports it, nothing else does).
+ */
+static uintptr_t GiFromOuterRung(uintptr_t localPlayer, PlayerChain::Rung& which)
+{
+    which = PlayerChain::Rung::None;
     if (!IsUsableObjectPtr(localPlayer))
         return 0;
 
+    OuterLink::Rung rung = OuterLink::Rung::None;
+    const uintptr_t outer = OuterLink::GetOuterChecked(
+        localPlayer, [](uintptr_t p) { return ValidateGameInstance(p); }, &rung);
+    if (outer) {
+        which = MapOuterRung(rung);
+        return outer;
+    }
+
+    // Slot scan for whichever CL moved the outer field out of the schemes
+    // OuterLink knows about.
     static const std::ptrdiff_t kOuterCands[] = {
         0x20, 0x28, 0x18, 0x30, 0x10, 0x38, 0x40, 0x48, 0x50,
         0x58, 0x60, 0x68, 0x70, 0x78, 0x80,
@@ -624,6 +705,7 @@ uintptr_t Engine::ResolveGameInstanceFromLocalPlayer(uintptr_t localPlayer)
         const uintptr_t cand = Memory::read<uintptr_t>(localPlayer + off);
         if (!ValidateGameInstance(cand))
             continue;
+        which = PlayerChain::Rung::Scan;
         return cand;
     }
     return 0;
@@ -632,7 +714,8 @@ uintptr_t Engine::ResolveGameInstanceFromLocalPlayer(uintptr_t localPlayer)
 // CL-1341255: UWorld+0x478 (OwningGameInstance) is SIMD-encrypted — a plain
 // read returns 0. Decrypt: 16B blob @ world+0x478, PSHUFB with the 16-byte
 // mask @ base+0xB09C350, XOR qword lanes with keys @ base+0xB06C380/0xB06C390.
-// Validate via the GI struct's world back-ref @ GI+0x2F0.
+// Validate via the GI's SDK LocalPlayers chain; the drop does not define a
+// GI->World back-reference field.
 static uintptr_t DecryptGameInstancePointer(uintptr_t world)
 {
     const uint64_t base = Memory::getBaseAddress();
@@ -666,51 +749,73 @@ static uintptr_t DecryptGameInstancePointer(uintptr_t world)
     if (!IsUsableObjectPtr(gi))
         return 0;
 
-    // Strong check: the GI struct points back at its owning UWorld @ +0x2F0.
-    const uintptr_t backRef = Memory::read<uintptr_t>(
-        gi + Offsets::GameInstance_WorldBackRef);
-    if (backRef == world)
-        return gi;
-
-    // Back-ref mismatch — still accept when the full LP→PC chain validates.
-    return ValidateGameInstance(gi) ? gi : 0;
+    // The SDK's static decrypt has no GI->World back-reference read. Validate
+    // the result through the reflected LocalPlayers chain instead of the old
+    // guessed +0x2F0 field.
+    return ValidateGameInstance(gi, nullptr, nullptr, world) ? gi : 0;
 }
 
-uintptr_t Engine::GetGameInstance(uint64_t uworldAddr)
+// ── GameInstance rungs ───────────────────────────────────────────────────────
+// One function per rung of the ladder's GameInstance hop, each carrying its own
+// proof. Split out of the old single GetGameInstance() so the ladder can order
+// and report them; nothing else in the tool can publish a GameInstance.
+
+/** SDK UWorld::OwningGameInstance slot; `backRef` means the GI chain proved it. */
+static uintptr_t GiOwningSlotRung(uintptr_t world, bool& backRef)
 {
-    if (!uworldAddr || !Memory::IsValidPtrFast2(uworldAddr))
+    backRef = false;
+    const uintptr_t plain = Memory::read<uintptr_t>(world + Offsets::OwningGameInstance);
+    if (!IsUsableObjectPtr(plain))
         return 0;
-
-    auto tryGi = [&](uintptr_t gi) -> uintptr_t {
-        return ValidateGameInstance(gi) ? gi : 0;
-    };
-
-    // CL-1341255: the slot is SIMD-encrypted — decrypt first.
-    if (const uintptr_t giDec = DecryptGameInstancePointer(
-            static_cast<uintptr_t>(uworldAddr)); giDec)
-        return giDec;
-
-    // Help: GAME_INSTANCE 0x4D8 (was 0x3B0, may be encrypted at slot).
-    static const std::ptrdiff_t kGiOffs[] = {
-        Offsets::OwningGameInstance,
-        static_cast<std::ptrdiff_t>(0x3B0),
-    };
-    for (std::ptrdiff_t off : kGiOffs) {
-        const uintptr_t gi = Memory::read<uintptr_t>(uworldAddr + off);
-        if (const uintptr_t ok = tryGi(gi))
-            return ok;
+    // +0x478 is the SDK's UWorld::OwningGameInstance slot. The drop does not
+    // define a GI->World field at +0x2F0, so identity comes from LocalPlayers,
+    // not from that stale back-reference guess.
+    if (ValidateGameInstance(plain, nullptr, nullptr, world)) {
+        backRef = true;
+        return plain;
     }
+    return 0;
+}
 
-    // Encrypted slot: scan UWorld for any pointer that has help LocalPlayers→LP→PC@0xA0.
+/** Legacy CL-1341255 SIMD-obfuscated slot (data RVAs from the old build). */
+static uintptr_t GiFromDecryptSlot(uintptr_t world)
+{
+    // The 2026-09-22 drop's static decrypt is the primary source for this hop.
+    // It does not read an invented GI field or a legacy slot: it derives the
+    // result from GameInstanceStaticDecrypt::STAGE_ARRAY_RVA and returns
+    // *(seed_ptr + RESULT_DEREF). Keep the older world-slot decrypt only as a
+    // compatibility fallback for pre-drop targets.
+    const uint64_t base = Memory::getBaseAddress();
+    if (const uintptr_t gi = static_cast<uintptr_t>(GameInstanceLink::DecryptStatic(base));
+        gi && ValidateGameInstance(gi, nullptr, nullptr, world))
+        return gi;
+    return DecryptGameInstancePointer(world);
+}
+
+/** The previous build's slot (0x3B0). */
+static uintptr_t GiFromLegacySlotRung(uintptr_t world)
+{
+    const uintptr_t legacy = Memory::read<uintptr_t>(
+        world + static_cast<std::ptrdiff_t>(0x3B0));
+    if (!legacy || !ValidateGameInstance(legacy, nullptr, nullptr, world))
+        return 0;
+    return legacy;
+}
+
+/** Last resort: scan UWorld for a slot whose GI chain validates. */
+static uintptr_t GiFromScanRung(uintptr_t world)
+{
+    uintptr_t loose = 0;
     for (std::ptrdiff_t off = 0x80; off <= 0x700; off += 0x8) {
         if (off == Offsets::OwningGameInstance || off == 0x3B0)
             continue;
-        const uintptr_t gi = Memory::read<uintptr_t>(uworldAddr + off);
-        if (const uintptr_t ok = tryGi(gi))
-            return ok;
+        const uintptr_t gi = Memory::read<uintptr_t>(world + off);
+        if (!IsUsableObjectPtr(gi))
+            continue;
+        if (!loose && ValidateGameInstance(gi, nullptr, nullptr, world))
+            loose = gi;
     }
-
-    return 0;
+    return loose;
 }
 
 uintptr_t Engine::ResolveGameStateFromWorld(uintptr_t uworldAddr)
@@ -771,14 +876,15 @@ bool Engine::ResolveLevelActors(uintptr_t persistentLevel, uintptr_t& outActorsD
     return true;
 }
 
-bool Engine::ResolveLocalPlayerFromGameInstance(uintptr_t gameInstance, uintptr_t& outLocalPlayer,
-    uintptr_t& outPlayerController)
-{
-    return ValidateGameInstance(gameInstance, &outLocalPlayer, &outPlayerController);
-}
+// The rung's own primitives; the ladder names them (GiArrayBackRef / GiArraySlot0).
 
-uintptr_t Engine::ResolveLocalPlayerFromController(uintptr_t playerController)
+uintptr_t Engine::ResolveLocalPlayerFromController(uintptr_t playerController,
+    PlayerChain::Rung* outRung, bool* outBackRef)
 {
+    if (outRung)
+        *outRung = PlayerChain::Rung::None;
+    if (outBackRef)
+        *outBackRef = false;
     if (!playerController || !Memory::IsValidPtrFast2(playerController))
         return 0;
 
@@ -790,10 +896,47 @@ uintptr_t Engine::ResolveLocalPlayerFromController(uintptr_t playerController)
             == playerController;
     };
 
+    // 1. Dump-sourced path: the controller keeps its local player at +0x4B0
+    //    *encrypted* (APlayerController::GetLocalPlayer, sub_3680940), so the
+    //    plain-pointer scan below could never find it on this build. Decrypt,
+    //    then demand the 0xA0 back-pointer as identity proof.
+    const uintptr_t decrypted = PlayerLink::FromController(playerController);
+    if (IsUsableObjectPtr(decrypted)) {
+        if (lpPointsAtPc(decrypted)) {
+            if (outRung)
+                *outRung = PlayerChain::Rung::PcDecryptBackRef;
+            if (outBackRef)
+                *outBackRef = true;
+            return decrypted;
+        }
+        // Live object, but 0xA0 does not confirm it yet (lobby / pre-pair). Keep
+        // it as the weaker candidate and let the scan try to beat it.
+        const uintptr_t weakCandidate = decrypted;
+        for (std::ptrdiff_t off = 0x80; off <= 0x800; off += 0x8) {
+            const uintptr_t lp = Memory::read<uintptr_t>(playerController + off);
+            if (lpPointsAtPc(lp)) {
+                if (outRung)
+                    *outRung = PlayerChain::Rung::PcSlotScan;
+                if (outBackRef)
+                    *outBackRef = true;
+                return lp;
+            }
+        }
+        if (outRung)
+            *outRung = PlayerChain::Rung::PcDecryptOnly;
+        return weakCandidate;
+    }
+
+    // 2. Legacy fallback: scan the controller for a slot that points back at it.
     for (std::ptrdiff_t off = 0x80; off <= 0x800; off += 0x8) {
         const uintptr_t lp = Memory::read<uintptr_t>(playerController + off);
-        if (lpPointsAtPc(lp))
+        if (lpPointsAtPc(lp)) {
+            if (outRung)
+                *outRung = PlayerChain::Rung::PcSlotScan;
+            if (outBackRef)
+                *outBackRef = true;
             return lp;
+        }
     }
 
     return 0;
@@ -809,6 +952,41 @@ static bool PawnHasWorldPosition(uint64_t pawn)
     const float magSq = static_cast<float>(
         pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
     return magSq > 10000.f && magSq < 1.0e14f;
+}
+
+// Dump-verified identity for a player controller.
+//
+// sdk/SDK.txt (20260922) reflects APlayerController::bIsLocalPlayerController at
+// 0xD64 (byte 0xD64, mask 0x1), and Angelscript.PioneerPlayerController — the
+// class this game actually spawns — inherits it at the same offset. That flag is
+// the engine's own "this controller belongs to a local player" bit, set when the
+// controller is created from a ULocalPlayer, so it identifies the local PC on its
+// own: no pawn, no PlayerCameraManager, no FOV heuristics.
+//
+// The one caveat is that a random object read at +0xD64 can have the bit set by
+// chance, so the caller can require a second field (PlayerState) as a cheap
+// "this really is an AController" proof.
+bool Engine::IsLocalPlayerController(uintptr_t pc)
+{
+    if (!pc || !Memory::IsValidPtrFast2(pc))
+        return false;
+
+    const uint8_t flags = Memory::read<uint8_t>(
+        pc + Offsets::PlayerController_bIsLocalPlayerController);
+    return (flags & Offsets::PlayerController_bIsLocalPlayerController_Mask) != 0;
+}
+
+bool Engine::IsLocalPlayerControllerConfirmed(uintptr_t pc)
+{
+    if (!IsLocalPlayerController(pc))
+        return false;
+
+    // AController::PlayerState (Engine.Controller.PlayerState, 0x3D0) is non-null
+    // on every live controller — a live local PC always has one, so this drops the
+    // chance-coincidence reads without touching the camera slot.
+    const uintptr_t playerState =
+        Memory::read<uintptr_t>(pc + Offsets::AController_PlayerState);
+    return playerState != 0 && Memory::IsValidPtrFast2(playerState);
 }
 
 bool Engine::ControllerHasValidPcm(uintptr_t pc)
@@ -952,6 +1130,36 @@ bool Engine::ResolveLocalPlayerChainFromActors(uintptr_t persistentLevel, uintpt
 
     const int scanLimit = (actorCount < 2048) ? actorCount : 2048;
 
+    // Pass 0: dump-verified identity. APlayerController::bIsLocalPlayerController
+    // (0xD64) is the engine's own flag and the 20260922 dump reflects it for the
+    // class this game actually spawns (Angelscript.PioneerPlayerController), so it
+    // outranks every heuristic (camera FOV, name sniffing). PlayerState proves the
+    // actor is an AController; a placed pawn is a bonus, not a requirement, so a
+    // hub/lobby controller with no pawn still resolves.
+    uintptr_t flagPcNoPawn = 0;
+    for (int i = 0; i < scanLimit; ++i) {
+        const uint64_t actor = actors[static_cast<size_t>(i)];
+        if (!actor || !Engine::IsValidPointer(actor))
+            continue;
+        if (!Engine::IsLocalPlayerControllerConfirmed(actor))
+            continue;
+
+        const uintptr_t pawn = Engine::ReadAcknowledgedPawn(actor);
+        if (pawn && Engine::IsValidPointer(pawn) && PawnHasWorldPosition(pawn)) {
+            outController = actor;
+            outPawn = pawn;
+            return true;
+        }
+        if (!flagPcNoPawn)
+            flagPcNoPawn = actor;
+    }
+    if (flagPcNoPawn) {
+        outController = flagPcNoPawn;
+        const uintptr_t pawn = Engine::ReadAcknowledgedPawn(flagPcNoPawn);
+        outPawn = (pawn && Engine::IsValidPointer(pawn)) ? pawn : 0;
+        return true;
+    }
+
     // Pass 1: controllers with valid PCM @ PC+0x48 (backup strong path).
     for (int i = 0; i < scanLimit; ++i) {
         const uint64_t actor = actors[static_cast<size_t>(i)];
@@ -978,7 +1186,8 @@ bool Engine::ResolveLocalPlayerChainFromActors(uintptr_t persistentLevel, uintpt
     return false;
 }
 
-uintptr_t Engine::GetCameraManagerFromActors()
+uintptr_t Engine::GetCameraManagerFromActors(uintptr_t worldOverride,
+    uintptr_t levelOverride, uintptr_t pcOverride)
 {
 	// Camera discovery is called by Update, the camera worker, and frame building.
 	// Serialize the scan/cache so the static generation-scoped pointer is not
@@ -988,14 +1197,17 @@ uintptr_t Engine::GetCameraManagerFromActors()
 
 	// help/esp.txt: FName PCM over all Levels; LP not required; prefer PCOwner match;
 	// live POV FOV + location sanity (not DefaultFOV-only / FOV-scan).
-	uintptr_t pc = 0;
-	uintptr_t gworld = 0;
-	uintptr_t persistent = 0;
-	{
+	uintptr_t pc = pcOverride;
+	uintptr_t gworld = worldOverride;
+	uintptr_t persistent = levelOverride;
+	if (!pc || !gworld || !persistent) {
 		std::shared_lock<std::shared_mutex> lock(m_stateMutex);
-		pc = PlayerController;
-		gworld = GWorld;
-		persistent = PersistentLevel;
+		if (!pc)
+			pc = PlayerController;
+		if (!gworld)
+			gworld = GWorld;
+		if (!persistent)
+			persistent = PersistentLevel;
 	}
 	uintptr_t pcmDirect = 0;
 	if (pc) {
@@ -1202,8 +1414,16 @@ bool Engine::getAllowType(const std::string& actorName, int category) const
 
 bool Engine::getAllowWorldEntry(const WorldCacheEntry& entry) const
 {
-    if (!var::enable_world)
+    // NEAR-FIELD REVEAL ("standind in front of a crate, 2 min, no esp"): a
+    // world object within touching distance is what the user is looking at —
+    // category toggles and loot filters must never hide it. Toggles govern
+    // distance clutter only.
+    constexpr float kNearRevealM = 15.f;
+    // Master switches always win, including near-field reveal.
+    if (!var::enable_world || !var::showLoot)
         return false;
+    if (entry.Distance >= 0.f && entry.Distance <= kNearRevealM)
+        return true;
     if (!WorldCategoryEnabled(entry.worldCategory))
         return false;
 
@@ -1520,7 +1740,7 @@ inline std::string utf16_to_utf8(const uint16_t* data, size_t len) {
 
 namespace {
 
-std::string TryReadEnglishItemNameFromHover(uint64_t actor, std::ptrdiff_t hover_off)
+std::string ReadHoverDisplayNameAt(uint64_t hover_base)
 {
     auto accept = [](std::string s) -> std::string {
         if (s.empty())
@@ -1531,8 +1751,6 @@ std::string TryReadEnglishItemNameFromHover(uint64_t actor, std::ptrdiff_t hover
             return {};
         return s;
     };
-
-    const uint64_t hover_base = actor + static_cast<uint64_t>(hover_off);
 
     uint64_t l0 = Memory::read<uint64_t>(hover_base);
     if (!l0 || !Memory::IsValidPtrFast2(l0))
@@ -1608,6 +1826,11 @@ fallback:
     }
 
     return "";
+}
+
+std::string TryReadEnglishItemNameFromHover(uint64_t actor, std::ptrdiff_t hover_off)
+{
+    return ReadHoverDisplayNameAt(actor + static_cast<uint64_t>(hover_off));
 }
 
 std::string TryResolveLootObjectDisplay(uintptr_t object)
@@ -1793,6 +2016,290 @@ std::string Engine::GetEnglishItemName(uint64_t actor)
     return "";
 }
 
+// ---- crate contents preview (see Core/CrateContents.hpp) --------------------
+//
+// Best-effort walk of APickup::SpawnItems: each element is either an inline
+// FItemUIHoverData (ItemUIHoverData_Size bytes) or a pointer to one. Every read
+// is sanity-gated - a miss skips the stack and the crate just shows its plain
+// label, never garbage.
+
+// Rarity through the pickup resolution chain (CL ~1315578): data asset ->
+// resolved item class (PickupDataAsset::RESOLVED_ITEM_CLASS) -> CDO
+// (UClass::DEFAULT_OBJECT) -> ItemBase::QUALITY_LEVEL (0-3). Every hop is
+// pointer-gated, so a wrong or moved slot reads as -1 (unresolved), never as a
+// garbage rarity.
+static int RarityFromResolvedClass(uintptr_t dataAsset)
+{
+    if (!IsUsableObjectPtr(dataAsset))
+        return -1;
+    const uintptr_t cls = Memory::read_nocache<uintptr_t>(
+        dataAsset + Offsets::PickupDataAsset_ResolvedItemClass);
+    if (!IsUsableObjectPtr(cls))
+        return -1;
+    const uintptr_t cdo = Memory::read_nocache<uintptr_t>(
+        cls + Offsets::UClass_DefaultObjectSlot);
+    if (!IsUsableObjectPtr(cdo))
+        return -1;
+    const int32_t quality = Memory::read_nocache<int32_t>(
+        cdo + Offsets::ItemBase_Quality);
+    return (quality >= 0 && quality <= 3) ? quality : -1;
+}
+struct CrateTArrayHdr {
+    uintptr_t data = 0;
+    int32_t num = 0;
+    int32_t max = 0;
+};
+
+static bool PlausibleCrateArray(const CrateTArrayHdr& a)
+{
+    return a.num > 0 && a.num <= 24 && a.max >= a.num
+        && a.max <= 256 && Engine::IsPlausibleUsermodePtr(a.data);
+}
+
+static std::string ResolveCrateDataAssetName(uintptr_t dataAsset)
+{
+    if (!IsUsableObjectPtr(dataAsset))
+        return {};
+
+    std::string raw = engine.GetActorFNameStringCached(dataAsset);
+    if (raw.empty())
+        raw = steam_decrypt::GetActorFNameString(dataAsset);
+    if (raw.empty())
+        return {};
+
+    std::string resolved = LookupByAssetName(raw);
+    if (resolved.empty())
+        resolved = LookupWorldObjectByFName(raw);
+    if (resolved.empty()) {
+        for (const char* prefix : { "DA_", "WID_", "BP_", "Item_" }) {
+            if (raw.rfind(prefix, 0) == 0) {
+                raw.erase(0, std::strlen(prefix));
+                break;
+            }
+        }
+        for (char& c : raw) {
+            if (c == '_')
+                c = ' ';
+        }
+        resolved = raw;
+    }
+
+    resolved = FormatEspDisplayLabel(resolved);
+    if (resolved.empty() || IsJunkWorldEspLabel(resolved)
+        || IsGarbledEspLabel(resolved) || !IsPlausibleEspLabel(resolved))
+        return {};
+    return resolved;
+}
+
+static int PlausibleCrateAmount(uintptr_t element, uintptr_t stride)
+{
+    // FItemContainerItem is not fully reflected in the adopted SDK. Prefer the
+    // old hover slots first, then accept only small, non-negative stack values
+    // from the reflected item record. The default keeps the item name useful
+    // even when the quantity field is not exposed by the current dump.
+    for (uintptr_t off : { 0x18ull, 0x1Cull, 0x10ull, 0x08ull,
+                           0x20ull, 0x28ull, 0x30ull }) {
+        if (off + sizeof(int32_t) > stride)
+            continue;
+        const int32_t value = Memory::read_nocache<int32_t>(element + off);
+        if (value > 0 && value <= CrateContents::kMaxAmount)
+            return value;
+    }
+    for (uintptr_t off = 0; off + sizeof(int32_t) <= stride; off += 4) {
+        const int32_t value = Memory::read_nocache<int32_t>(element + off);
+        if (value > 0 && value <= 99)
+            return value;
+    }
+    return 1;
+}
+
+static bool ReadCrateItemElement(
+    uintptr_t element, uintptr_t stride, CrateContents::Stack& out)
+{
+    static constexpr uintptr_t kAssetOffsets[] = {
+        0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30,
+        0x38, 0x40, 0x48, 0x50, 0x58, 0x60
+    };
+    for (const uintptr_t off : kAssetOffsets) {
+        if (off + sizeof(uintptr_t) > stride)
+            continue;
+        const uintptr_t dataAsset =
+            Memory::read_nocache<uintptr_t>(element + off);
+        if (!IsUsableObjectPtr(dataAsset))
+            continue;
+        const std::string name = ResolveCrateDataAssetName(dataAsset);
+        if (name.empty())
+            continue;
+        out.name = name;
+        out.amount = PlausibleCrateAmount(element, stride);
+        out.maxStack = 0;
+        out.rarity = RarityFromResolvedClass(dataAsset);
+        return true;
+    }
+    return false;
+}
+
+static int ReadCrateArray(
+    const CrateTArrayHdr& array, CrateContents::Stack* out, int cap)
+{
+    // Current SDK: FItemContainerItem is 0x70 bytes. Keep the two hover layouts
+    // as compatibility fallbacks for pickup actors and older live containers.
+    static constexpr uintptr_t kStrides[] = { 0x70, 0x28, 0x10 };
+    int count = 0;
+    std::unordered_set<std::string> seen;
+    for (const uintptr_t stride : kStrides) {
+        for (int32_t i = 0; i < array.num && count < cap; ++i) {
+            const uintptr_t element = array.data
+                + static_cast<uintptr_t>(i) * stride;
+            CrateContents::Stack st;
+            if (!ReadCrateItemElement(element, stride, st)
+                || !seen.insert(st.name).second)
+                continue;
+            out[count++] = std::move(st);
+        }
+        if (count > 0)
+            break;
+    }
+    return count;
+}
+
+static int ReadCrateContentsFromComponent(
+    uintptr_t component, CrateContents::Stack* out, int cap)
+{
+    if (!IsUsableObjectPtr(component))
+        return 0;
+
+    // UItemContainerComponent is 0x520 bytes in the adopted SDK, but the
+    // content array is not emitted as a named property. Probe aligned TArray
+    // headers inside the component and accept only arrays whose elements yield
+    // a real item asset name. This avoids guessing another raw offset.
+    for (uintptr_t off = 0; off < 0x500; off += sizeof(uintptr_t)) {
+        const CrateTArrayHdr array = Memory::read_nocache<CrateTArrayHdr>(
+            component + off);
+        if (!PlausibleCrateArray(array))
+            continue;
+        const int count = ReadCrateArray(array, out, cap);
+        if (count > 0)
+            return count;
+    }
+    return 0;
+}
+
+static void AddCrateItemContainerCandidate(
+    uintptr_t actor, uintptr_t candidate,
+    std::unordered_set<uintptr_t>& seen,
+    std::vector<uintptr_t>& components)
+{
+    if (!IsUsableObjectPtr(candidate) || !seen.insert(candidate).second)
+        return;
+    const std::string cls = engine.GetActorClassFName(candidate);
+    const std::string lower = ToLowerCopy(cls);
+    if (lower.find("itemcontainercomponent") != std::string::npos
+        || engine.ResolveOwningActor(candidate, 3) == actor)
+        components.push_back(candidate);
+}
+
+static int ReadCrateContentsFromItemContainer(
+    uintptr_t actor, CrateContents::Stack* out, int cap)
+{
+    std::unordered_set<uintptr_t> seen;
+    std::vector<uintptr_t> components;
+    AddCrateItemContainerCandidate(actor,
+        Memory::read_nocache<uintptr_t>(actor + Offsets::LootContainer_ItemContainer),
+        seen, components);
+    // 0xBC0 is the current SDK slot; retain the runtime-profile 0xBD8 above as
+    // the primary candidate because both layouts have existed across drops.
+    AddCrateItemContainerCandidate(actor,
+        Memory::read_nocache<uintptr_t>(actor + 0xBC0), seen, components);
+    AddCrateItemContainerCandidate(actor,
+        Memory::read_nocache<uintptr_t>(actor + Offsets::SimpleLootActivity_ItemContainer),
+        seen, components);
+
+    const CrateTArrayHdr instance = Memory::read_nocache<CrateTArrayHdr>(
+        actor + Offsets::Actor_InstanceComponents);
+    if (instance.num > 0 && instance.num <= 64
+        && instance.max >= instance.num && instance.max <= 64
+        && Engine::IsPlausibleUsermodePtr(instance.data)) {
+        for (int32_t i = 0; i < instance.num; ++i) {
+            AddCrateItemContainerCandidate(actor,
+                Memory::read_nocache<uintptr_t>(
+                    instance.data + static_cast<uintptr_t>(i) * sizeof(uintptr_t)),
+                seen, components);
+        }
+    }
+
+    for (const uintptr_t component : components) {
+        const int count = ReadCrateContentsFromComponent(component, out, cap);
+        if (count > 0)
+            return count;
+    }
+    return 0;
+}
+
+int Engine::ReadCrateContents(uintptr_t actor, CrateContents::Stack* out, int cap)
+{
+    if (!actor || !out || cap <= 0 || !Memory::IsValidPtrFast2(actor))
+        return 0;
+
+    const CrateTArrayHdr items = Memory::read_nocache<CrateTArrayHdr>(
+        actor + static_cast<uint64_t>(Offsets::BP_PickupBase_SpawnItems));
+    if (PlausibleCrateArray(items)) {
+        int count = 0;
+        bool usedVisibleFallback = false;
+        for (int32_t i = 0; i < items.num && count < cap; ++i) {
+            // Layout (a): an inline FItemUIHoverData at element stride.
+            uint64_t hover = items.data
+                + static_cast<uint64_t>(i) * Offsets::ItemUIHoverData_Size;
+            uint64_t da = Memory::read<uint64_t>(
+                hover + static_cast<uint64_t>(Offsets::ItemUIHoverData_DataAsset));
+            if (!Engine::IsPlausibleUsermodePtr(da)) {
+                // Layout (b): the element is a pointer to the hover struct.
+                hover = Memory::read<uint64_t>(
+                    items.data + static_cast<uint64_t>(i) * sizeof(uint64_t));
+                if (!Engine::IsPlausibleUsermodePtr(hover))
+                    continue;
+                da = Memory::read<uint64_t>(
+                    hover + static_cast<uint64_t>(Offsets::ItemUIHoverData_DataAsset));
+                if (!Engine::IsPlausibleUsermodePtr(da))
+                    continue;
+            }
+
+            CrateContents::Stack st;
+            st.amount = Memory::read<int32_t>(
+                hover + static_cast<uint64_t>(Offsets::ItemUIHoverData_Amount));
+            st.maxStack = Memory::read<int32_t>(
+                hover + static_cast<uint64_t>(Offsets::ItemUIHoverData_MaxStack));
+            st.rarity = RarityFromResolvedClass(da);
+            if (!CrateContents::AmountPlausible(st.amount, st.maxStack)) {
+                if (usedVisibleFallback)
+                    continue;
+                const int32_t visible = Memory::read<int32_t>(
+                    actor + static_cast<uint64_t>(Offsets::Pickup_VisibleAmount));
+                if (visible <= 0 || !CrateContents::AmountPlausible(visible, 0))
+                    continue;
+                usedVisibleFallback = true;
+                st.amount = visible;
+                st.maxStack = 0;
+            }
+
+            st.name = ReadHoverDisplayNameAt(hover);
+            if (st.name.empty())
+                st.name = ResolveCrateDataAssetName(da);
+            if (st.name.empty() || IsJunkWorldEspLabel(st.name)
+                || IsGarbledEspLabel(st.name))
+                continue;
+            out[count++] = std::move(st);
+        }
+        if (count > 0)
+            return count;
+    }
+
+    // ALootContainerSingle does not inherit APickup::SpawnItems. Its content
+    // lives on the owned UItemContainerComponent, so the old path above can
+    // only ever describe ground loot. Resolve the component structurally here.
+    return ReadCrateContentsFromItemContainer(actor, out, cap);
+}
+
 // ---- game offsets -----------------------------------------------------------
 
 std::string Engine::GetActorFNameString(uint64_t actor_base)
@@ -1897,8 +2404,12 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
     int& outWeaponClip,
     std::string& outStowed0, int& outStowedQ0,
     std::string& outStowed1, int& outStowedQ1,
-    float& outArmorPlates, float& outArmorPerPlate)
+    float& outArmorPlates, float& outArmorPerPlate,
+    int& outArmorTier, std::string& outArmorName,
+    bool* outResolved)
 {
+    if (outResolved)
+        *outResolved = false;
     outWeaponName.clear();
     outWeaponQuality = -1;
     outWeaponClip = 0;
@@ -1908,6 +2419,8 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
     outStowedQ1 = -1;
     outArmorPlates = 0.f;
     outArmorPerPlate = 0.f;
+    outArmorTier = -1;
+    outArmorName.clear();
 
     if (!pawn)
         return;
@@ -1916,6 +2429,8 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
     const uintptr_t invComp = ResolveInventoryPtr(invRaw);
     if (!invComp)
         return;
+    if (outResolved)
+        *outResolved = true;
 
     // Stowed slot 0 @ +0x330 (FInventoryStowedWeaponActor, SDK CL-1341255)
     StowedWeaponInfo slot0 = Memory::read<StowedWeaponInfo>(invComp + Offsets::StowedWeaponSlot0);
@@ -2068,5 +2583,994 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
     if (armorItem) {
         outArmorPlates = static_cast<float>(Memory::read<int32_t>(armorItem + 0x264));
         outArmorPerPlate = static_cast<float>(Memory::read<float>(armorItem + 0x268));
+        // Armor tier + name for the loadout readout: the armor UItemBase* carries
+        // the same quality byte weapon actors use (0-3 = I-IV after the shift).
+        const int armorQ = GetWeaponQualityFromActor(armorItem);
+        if (armorQ >= 0 && armorQ <= 3)
+            outArmorTier = armorQ + 1;
+        outArmorName = GetEnglishItemName(armorItem);
     }
+}
+
+// Full kit readout (phase 2): the inventory slots the loadout line does not
+// cover - stowed tool actor, safe pouch item (+ rarity), belt/backpack slot
+// capacity. Best-effort: every miss just leaves the KitParts segment empty.
+void Engine::ReadPlayerKit(uintptr_t pawn, LoadoutFormat::KitParts& outKit)
+{
+    if (!pawn)
+        return;
+    const uintptr_t invRaw = Memory::read<uintptr_t>(pawn + Offsets::InventoryComponent);
+    const uintptr_t invComp = ResolveInventoryPtr(invRaw);
+    if (!invComp)
+        return;
+
+    // Stowed tool slot (InventoryComponent::STOWED_TOOL_ACTOR).
+    const uintptr_t tool = ResolveInventoryPtr(Memory::read<uintptr_t>(
+        invComp + Offsets::Inventory_StowedToolActor));
+    if (tool) {
+        std::string name = GetEnglishItemName(tool);
+        if (name.empty())
+            name = StripWeaponAssetName(GetActorFNameString(tool));
+        if (!name.empty())
+            outKit.tool = std::move(name);
+    }
+
+    // Safe pouch item (UItemBase*) + EItemRarity (ItemBase::QUALITY_LEVEL).
+    const uintptr_t pouch = ResolveInventoryPtr(Memory::read<uintptr_t>(
+        invComp + Offsets::Inventory_SafePouch));
+    if (pouch) {
+        outKit.pouch = GetEnglishItemName(pouch);
+        const int32_t quality = Memory::read_nocache<int32_t>(
+            pouch + Offsets::ItemBase_Quality);
+        if (quality >= 0 && quality <= 3)
+            outKit.pouchRarity = quality;
+    }
+
+    // Belt / backpack containers: UItemContainer::ItemLimit is the slot
+    // capacity ("how big is their bag" intel from across the room).
+    const uintptr_t belt = ResolveInventoryPtr(Memory::read<uintptr_t>(
+        invComp + Offsets::Inventory_Belt));
+    if (belt) {
+        const int32_t limit = Memory::read_nocache<int32_t>(
+            belt + Offsets::ItemContainer_ItemLimit);
+        if (limit >= 1 && limit <= 64)
+            outKit.beltSlots = limit;
+    }
+    const uintptr_t pack = ResolveInventoryPtr(Memory::read<uintptr_t>(
+        invComp + Offsets::Inventory_Backpack));
+    if (pack) {
+        const int32_t limit = Memory::read_nocache<int32_t>(
+            pack + Offsets::ItemContainer_ItemLimit);
+        if (limit >= 1 && limit <= 64)
+            outKit.packSlots = limit;
+    }
+}
+
+// ---- Player intel (DBNO / look arrows / identity) -----------------------------
+
+bool Engine::ReadPlayerDbnoState(uintptr_t playerState, bool& outBrokenArmor,
+    bool* outResolved)
+{
+    outBrokenArmor = false;
+    if (outResolved)
+        *outResolved = false;
+    if (!IsUsableObjectPtr(playerState))
+        return false;
+    // FPlayerHealthInfo is inline on PioneerPlayerState and the sources
+    // disagree on its base (0x550 probed vs 0x588 drop). Accept the first
+    // block whose (health, max) double pair is sane before trusting its flag
+    // bytes, so a mis-anchored read can never report "downed".
+    static const std::ptrdiff_t kBases[] = {
+        Offsets::PlayerHealthInfoBase, Offsets::HealthInfo };
+    for (const std::ptrdiff_t baseOff : kBases) {
+        const uintptr_t blk = playerState + baseOff;
+        const double maxHp =
+            Memory::read_nocache<double>(blk + Offsets::PHI_MaxHealth);
+        const double hp = Memory::read_nocache<double>(blk + Offsets::PHI_Health);
+        if (!(maxHp >= 1.0 && maxHp <= 5000.0))
+            continue;
+        if (!(hp >= -1.0 && hp <= maxHp + 250.0))
+            continue;
+        outBrokenArmor =
+            0 != Memory::read_nocache<uint8_t>(blk + Offsets::PHI_BrokenArmorByte);
+        if (outResolved)
+            *outResolved = true;
+        return 0 != Memory::read_nocache<uint8_t>(blk + Offsets::PHI_DBNOByte);
+    }
+    return false;
+}
+
+bool Engine::ReadReviveTimer(uintptr_t pawn, float& outElapsed, float& outTotal)
+{
+    outElapsed = 0.f;
+    outTotal = 0.f;
+    if (!IsUsableObjectPtr(pawn))
+        return false;
+    const uintptr_t comps =
+        Memory::read_nocache<uintptr_t>(pawn + Offsets::Actor_InstanceComponents);
+    const int32_t count = Memory::read_nocache<int32_t>(
+        pawn + Offsets::Actor_InstanceComponents + 0x8);
+    if (!IsUsableObjectPtr(comps) || count <= 0 || count > 96)
+        return false;
+    for (int32_t i = 0; i < count; ++i) {
+        const uintptr_t comp = Memory::read_nocache<uintptr_t>(
+            comps + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
+        if (!IsUsableObjectPtr(comp))
+            continue;
+        if (Memory::read_nocache<uint8_t>(
+                comp + Offsets::Interaction_CurrentInteractionState) > 16)
+            continue;
+        // Defib (revive) window first, bleedout window second. The pair order
+        // is not documented, so both orders run the plausibility gate.
+        for (const std::ptrdiff_t timerOff :
+             { Offsets::Interact_DefibTimerFloats, Offsets::Interact_DBNOTimerFloats }) {
+            const float a = Memory::read_nocache<float>(comp + timerOff);
+            const float b = Memory::read_nocache<float>(comp + timerOff + 0x4);
+            if (ReviveBadge::RemainSeconds(a, b) >= 0.f) {
+                outElapsed = a;
+                outTotal = b;
+                return true;
+            }
+            if (ReviveBadge::RemainSeconds(b, a) >= 0.f) {
+                outElapsed = b;
+                outTotal = a;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+uint64_t Engine::ReadPlayerSteamId(uintptr_t playerState, bool* outResolved)
+{
+    if (outResolved)
+        *outResolved = false;
+    if (!IsUsableObjectPtr(playerState))
+        return 0;
+    const uintptr_t comp = Memory::read_nocache<uintptr_t>(
+        playerState + Offsets::PS_PlatformIdComponent);
+    if (!IsUsableObjectPtr(comp))
+        return 0;
+    if (outResolved)
+        *outResolved = true;
+    const uintptr_t repl = comp + Offsets::PlatformId_Repl;
+    // FUniqueNetIdRepl TVariant: type index 0 is the shared-ptr alternative
+    // (walkable); anything else is the inline FAccountId, which replicates as
+    // TArray<uint8> ReplicationBytes holding the decimal account id (the drop:
+    // usually empty on PC clients, so this rarely fires). Digit-gated so
+    // garbage bytes can never mint an id.
+    if (0 != Memory::read_nocache<uint8_t>(repl + Offsets::NetIdRepl_TypeIndex)) {
+        const uintptr_t data = Memory::read_nocache<uintptr_t>(
+            repl + Offsets::NetIdRepl_ReplBytesData);
+        const int32_t num = Memory::read_nocache<int32_t>(
+            repl + Offsets::NetIdRepl_ReplBytesCount);
+        if (!IsUsableObjectPtr(data) || num < 5 || num > 20)
+            return 0;
+        uint8_t digits[20] = {};
+        for (int32_t i = 0; i < num; ++i)
+            digits[i] = Memory::read_nocache<uint8_t>(
+                data + static_cast<uintptr_t>(i));
+        return SquadRoster::ParseDecimalId(digits, num);
+    }
+    const uintptr_t netId =
+        Memory::read_nocache<uintptr_t>(repl + Offsets::NetIdRepl_Object);
+    if (!IsUsableObjectPtr(netId))
+        return 0;
+    const uint64_t payload =
+        Memory::read_nocache<uint64_t>(netId + Offsets::NetId_Payload);
+    return SquadRoster::PlausibleSteamId(payload) ? payload : 0;
+}
+
+// PlayerState status bits (phase 2): 1=bot, 2=spectator, 4=finished round.
+// The PioneerPlayerState extension block is only trusted when its achievement
+// component slot reads as null-or-valid - a wrong anchor must mean "no tags",
+// never "[Bot]" on a real player.
+uint8_t Engine::ReadPlayerStatusTags(uintptr_t playerState)
+{
+    if (!IsUsableObjectPtr(playerState))
+        return 0;
+    const uintptr_t achieve = Memory::read_nocache<uintptr_t>(
+        playerState + Offsets::PS_AchievementComponent);
+    if (achieve != 0 && !IsUsableObjectPtr(achieve))
+        return 0;
+    uint8_t flags = 0;
+    const uint8_t botByte = Memory::read_nocache<uint8_t>(
+        playerState + Offsets::PS_BotStateByte);
+    if ((botByte & Offsets::PS_BotStateBotMask) != 0)
+        flags |= 1u;
+    if ((botByte & Offsets::PS_BotStateSpectatorMask) != 0)
+        flags |= 2u;
+    const uint8_t finished = Memory::read_nocache<uint8_t>(
+        playerState + Offsets::PS_FinishedRoundByte);
+    if ((finished & Offsets::PS_FinishedRoundMask) != 0)
+        flags |= 4u;
+    return flags;
+}
+
+// Item rarity (0-3) for a ground pickup through the resolution chain, or -1
+// when the chain does not resolve.
+int Engine::ReadItemRarityFromPickup(uintptr_t actor)
+{
+    if (!IsUsableObjectPtr(actor))
+        return -1;
+    const uintptr_t dataAsset = Memory::read_nocache<uintptr_t>(
+        actor + Offsets::Pickup_DefaultDataAsset);
+    return RarityFromResolvedClass(dataAsset);
+}
+
+// Container dispenser state (phase 2): how many dispenser drop ports the
+// container ejects loot from (0 = none or unresolved), plus whether its
+// socket-loot mesh (LootContainerSingle::SOCKET_LOOT_CONTAINER_MESH) resolved.
+int Engine::ReadContainerDispenserPorts(uintptr_t actor, bool& outSocketMeshOk)
+{
+    outSocketMeshOk = false;
+    if (!IsUsableObjectPtr(actor))
+        return 0;
+    const uintptr_t mesh = Memory::read_nocache<uintptr_t>(
+        actor + Offsets::LootContainer_SocketMesh);
+    outSocketMeshOk = IsUsableObjectPtr(mesh);
+
+    const uintptr_t li = Memory::read_nocache<uintptr_t>(
+        actor + Offsets::LootInteractionComponent);
+    if (!IsUsableObjectPtr(li))
+        return 0;
+
+    // Block coherence before trusting the dispenser array: the acquisition
+    // enum byte (values are not in the dump - it only gates) and the loot-ping
+    // icon offset (LWC double Vector) must read sane.
+    const uint8_t method = Memory::read_nocache<uint8_t>(
+        li + Offsets::LootInteract_AcquisitionMethod);
+    if (method > 16)
+        return 0;
+    const double kMaxIconOffset = 5000.0; // 50 m local offset ceiling
+    for (int axis = 0; axis < 3; ++axis) {
+        const double v = Memory::read_nocache<double>(
+            li + Offsets::LootInteract_PingIconOffset
+            + static_cast<uintptr_t>(axis) * 0x8);
+        if (!(v >= -kMaxIconOffset && v <= kMaxIconOffset))
+            return 0;
+    }
+
+    // TArray<Vector> DispenserLocations: one Vector per dispenser drop port.
+    const uintptr_t data = Memory::read_nocache<uintptr_t>(
+        li + Offsets::LootInteract_DispenserLocations);
+    const int32_t num = Memory::read_nocache<int32_t>(
+        li + Offsets::LootInteract_DispenserLocations + 0x8);
+    const int32_t max = Memory::read_nocache<int32_t>(
+        li + Offsets::LootInteract_DispenserLocations + 0xC);
+    if (num <= 0 || num > 32 || max < num || 256 < max)
+        return 0;
+    if (!IsUsableObjectPtr(data))
+        return 0;
+    return num;
+}
+
+// ---- Bot intel (vision cones / per-part damage) -------------------------------
+
+bool Engine::ReadBotVision(uintptr_t actor, float& outRadiusCm, float& outHalfAngleDeg,
+    uint8_t& outAlertness, uint8_t& outCombatPhase)
+{
+    outRadiusCm = 0.f;
+    outHalfAngleDeg = 0.f;
+    outAlertness = 0;
+    outCombatPhase = 0;
+    if (!IsUsableObjectPtr(actor))
+        return false;
+
+    float halfDeg = 0.f;
+    // Primary: the live-verified AIStateService block on the constructable.
+    if (const uintptr_t svc = Memory::read_nocache<uintptr_t>(
+            actor + Offsets::Constructable_AIStateService);
+        IsUsableObjectPtr(svc)) {
+        outAlertness =
+            Memory::read_nocache<uint8_t>(svc + Offsets::AIState_Alertness);
+        outCombatPhase =
+            Memory::read_nocache<uint8_t>(svc + Offsets::AIState_CombatPhase);
+        const float rangeCm =
+            Memory::read_nocache<float>(svc + Offsets::AIState_SightRange);
+        const uint8_t halfByte =
+            Memory::read_nocache<uint8_t>(svc + Offsets::AIState_SightHalfAngle);
+        if (VisionCone::PlausibleSight(rangeCm, static_cast<float>(halfByte))
+            || (rangeCm > 100.f && rangeCm < 200000.f)) {
+            if (rangeCm > 100.f && rangeCm < 200000.f) {
+                outRadiusCm = rangeCm;
+                // Compressed degrees: the byte reads as whole degrees when it
+                // lands in a plausible half-angle range.
+                if (halfByte >= 5 && halfByte <= 180)
+                    halfDeg = static_cast<float>(halfByte);
+            }
+        }
+    }
+    // Secondary: AISenseConfigSight (real floats win when the chain resolves).
+    if (const uintptr_t ctrl =
+            Memory::read_nocache<uintptr_t>(actor + Offsets::Pawn_Controller);
+        IsUsableObjectPtr(ctrl)) {
+        const uintptr_t percep = Memory::read_nocache<uintptr_t>(
+            ctrl + Offsets::AIController_Perception);
+        if (IsUsableObjectPtr(percep)) {
+            const uintptr_t arr = Memory::read_nocache<uintptr_t>(
+                percep + Offsets::AIPerception_SensesConfig);
+            const int32_t count = Memory::read_nocache<int32_t>(
+                percep + Offsets::AIPerception_SensesConfig + 0x8);
+            if (IsUsableObjectPtr(arr) && count > 0 && count <= 8) {
+                for (int32_t i = 0; i < count; ++i) {
+                    const uintptr_t cfg = Memory::read_nocache<uintptr_t>(
+                        arr + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
+                    if (!IsUsableObjectPtr(cfg))
+                        continue;
+                    const float radius = Memory::read_nocache<float>(
+                        cfg + Offsets::AISight_SightRadius);
+                    const float loseRadius = Memory::read_nocache<float>(
+                        cfg + Offsets::AISight_LoseSightRadius);
+                    const float deg = Memory::read_nocache<float>(
+                        cfg + Offsets::AISight_PeripheralDeg);
+                    if (VisionCone::PlausibleSight(radius, deg)
+                        && loseRadius >= radius * 0.5f) {
+                        outRadiusCm = radius;
+                        halfDeg = deg;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    outHalfAngleDeg = halfDeg;
+    return outRadiusCm > 0.f;
+}
+
+int Engine::ReadBotPartHp(uintptr_t actor, float* out, int cap, int& outDestroyedParts)
+{
+    outDestroyedParts = 0;
+    if (!out || cap <= 0 || !IsUsableObjectPtr(actor))
+        return 0;
+    const uintptr_t svc = Memory::read_nocache<uintptr_t>(
+        actor + Offsets::Constructable_HealthService);
+    if (!IsUsableObjectPtr(svc))
+        return 0;
+    const uintptr_t data =
+        Memory::read_nocache<uintptr_t>(svc + Offsets::PartHpArray);
+    const int32_t count =
+        Memory::read_nocache<int32_t>(svc + Offsets::PartHpArray + 0x8);
+    if (!IsUsableObjectPtr(data) || count <= 0 || count > 512)
+        return 0;
+    const int n = count < cap ? count : cap;
+    for (int i = 0; i < n; ++i) {
+        const float hp = Memory::read_nocache<float>(
+            data + static_cast<uintptr_t>(i) * sizeof(float));
+        out[i] = (hp >= 0.f && hp <= 4.f) ? hp : -1.f;  // -1 = unreadable slot
+    }
+    // Style drivers: per-part destroyed flags (best-effort aggregate count).
+    const uintptr_t drivers =
+        Memory::read_nocache<uintptr_t>(actor + Offsets::StyleDrivers);
+    const int32_t driverCount =
+        Memory::read_nocache<int32_t>(actor + Offsets::StyleDrivers + 0x8);
+    if (IsUsableObjectPtr(drivers) && driverCount > 0 && driverCount <= 32) {
+        for (int32_t i = 0; i < driverCount; ++i) {
+            const uintptr_t drv = Memory::read_nocache<uintptr_t>(
+                drivers + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
+            if (!IsUsableObjectPtr(drv))
+                continue;
+            if (0 != Memory::read_nocache<uint8_t>(
+                    drv + Offsets::Style_IsDestroyedByte))
+                ++outDestroyedParts;
+        }
+    }
+    return n;
+}
+
+// ---- Raid intel (dashboard / activity feed / map radar) -----------------------
+
+void Engine::RefreshRadarBounds()
+{
+    // AWorldPartitionMiniMap is an AInfo in the level: find it via the cached
+    // actor array (worker-side only), at most one rescan per 10s while absent.
+    if (!m_miniMapActor || !IsValidPointer(m_miniMapActor)) {
+        m_miniMapActor = 0;
+        static uint64_t s_scanStampMs = 0;
+        const uint64_t nowMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        const uintptr_t actors = Actors;
+        const int count = ActorsCount;
+        if (actors && count > 0 && count <= 400000
+            && (s_scanStampMs == 0 || nowMs - s_scanStampMs >= 10000)) {
+            s_scanStampMs = nowMs;
+            for (int i = 0; i < count && !m_miniMapActor; ++i) {
+                const uintptr_t actor = Memory::read<uintptr_t>(
+                    actors + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
+                if (!IsUsableObjectPtr(actor))
+                    continue;
+                const std::string fname = toLower(GetActorFNameStringCached(actor));
+                if (fname.find("worldpartitionminimap") == std::string::npos
+                    && fname.find("minimap") == std::string::npos)
+                    continue;
+                m_miniMapActor = actor;
+            }
+        }
+    }
+    if (!m_miniMapActor)
+        return;
+
+    // FBox::Min @ +0x00, FBox::Max @ +0x18 as doubles (LWC). The float layout
+    // is tried when the double block reads as garbage.
+    auto readBounds = [&](bool asDouble) {
+        RadarProjection::Bounds b;
+        auto readOff = [&](std::ptrdiff_t off) -> double {
+            return asDouble
+                ? Memory::read_nocache<double>(m_miniMapActor + off)
+                : static_cast<double>(
+                    Memory::read_nocache<float>(m_miniMapActor + off));
+        };
+        b.minX = readOff(Offsets::MiniMap_WorldBounds);
+        b.minY = readOff(Offsets::MiniMap_WorldBounds + 0x8);
+        b.maxX = readOff(Offsets::MiniMap_WorldBounds + 0x18);
+        b.maxY = readOff(Offsets::MiniMap_WorldBounds + 0x20);
+        return b;
+    };
+    RadarProjection::Bounds bounds = readBounds(true);
+    if (!RadarProjection::BoundsPlausible(bounds))
+        bounds = readBounds(false);
+    // WORLD_UNITS_PER_PIXEL calibrates the map scale - a plausible value is
+    // the second proof that this really is the minimap block before the radar
+    // trusts its bounds.
+    const float unitsPerPixel = Memory::read_nocache<float>(
+        m_miniMapActor + Offsets::MiniMap_UnitsPerPixel);
+    if (!(unitsPerPixel > 0.1f && unitsPerPixel < 10000.f))
+        return;
+    if (!RadarProjection::BoundsPlausible(bounds))
+        return;
+    std::unique_lock<std::shared_mutex> lock(m_radarBoundsMutex);
+    m_radarBounds = bounds;
+    m_radarBoundsValid = true;
+}
+
+void Engine::RefreshRaidDashboard()
+{
+    // 500ms throttle: the HUD extrapolates the clock between refreshes.
+    static std::atomic<uint64_t> s_lastMs{ 0 };
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    const uint64_t lastMs = s_lastMs.load(std::memory_order_relaxed);
+    if (nowMs < lastMs || nowMs - lastMs < 500)
+        return;
+    s_lastMs.store(nowMs, std::memory_order_relaxed);
+
+    if (var::show_radar)
+        RefreshRadarBounds();
+    if (!var::show_raid_hud)
+        return;
+
+    const uintptr_t gs = AGameStateBase;
+    if (!IsUsableObjectPtr(gs))
+        return;
+
+    RaidHudState st;
+    // FStageInfo is inline at game_state + STAGE_INFO per the drop. When that
+    // block reads as a pointer instead, the deref form is tried before the
+    // clock is declared unknown.
+    st.timeLeftS = Memory::read_nocache<double>(
+        gs + Offsets::GameState_StageInfoRef + Offsets::StageInfo_TimeLeftOff);
+    st.graceS = Memory::read_nocache<double>(
+        gs + Offsets::GameState_StageInfoRef + Offsets::StageInfo_GraceTimeOff);
+    if (!RaidClock::ClockPlausible(st.timeLeftS)) {
+        const uintptr_t stagePtr = Memory::read_nocache<uintptr_t>(
+            gs + Offsets::GameState_StageInfoRef);
+        if (IsUsableObjectPtr(stagePtr)) {
+            const double timeLeft = Memory::read_nocache<double>(
+                stagePtr + Offsets::StageInfo_TimeLeftOff);
+            const double grace = Memory::read_nocache<double>(
+                stagePtr + Offsets::StageInfo_GraceTimeOff);
+            if (RaidClock::ClockPlausible(timeLeft)) {
+                st.timeLeftS = timeLeft;
+                st.graceS = grace;
+            }
+        }
+    }
+    if (!RaidClock::ClockPlausible(st.timeLeftS))
+        st.timeLeftS = -1.0;
+    if (!(st.graceS >= 0.0 && st.graceS < 3600.0))
+        st.graceS = -1.0;
+
+    st.gamePhase =
+        Memory::read_nocache<int32_t>(gs + Offsets::GameState_GamePhase);
+    st.enemyCount =
+        Memory::read_nocache<int32_t>(gs + Offsets::GameState_EnemyCount);
+    st.pickupCount =
+        Memory::read_nocache<int32_t>(gs + Offsets::GameState_PickupCount);
+    if (!(st.gamePhase >= 0 && st.gamePhase <= 16))
+        st.gamePhase = -1;
+    if (!(st.enemyCount >= 0 && st.enemyCount <= 100000))
+        st.enemyCount = -1;
+    if (!(st.pickupCount >= 0 && st.pickupCount <= 1000000))
+        st.pickupCount = -1;
+    st.stampMs = nowMs;
+    st.valid =
+        st.timeLeftS >= 0.0 || st.enemyCount >= 0 || st.gamePhase >= 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(m_raidHudMutex);
+        m_raidHud = st;
+    }
+}
+
+Engine::RaidHudState Engine::GetRaidHud() const
+{
+    std::shared_lock<std::shared_mutex> lock(m_raidHudMutex);
+    return m_raidHud;
+}
+
+RadarProjection::Bounds Engine::GetRadarBounds(bool& outValid) const
+{
+    std::shared_lock<std::shared_mutex> lock(m_radarBoundsMutex);
+    outValid = m_radarBoundsValid;
+    return m_radarBounds;
+}
+
+void Engine::PushActivity(uint64_t key, const char* text)
+{
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    std::unique_lock<std::shared_mutex> lock(m_feedMutex);
+    m_activityFeed.Push(nowMs, key, text);
+    m_activityFeed.Expire(nowMs, 45000);
+}
+
+ActivityFeed::Feed Engine::GetActivityFeed() const
+{
+    std::shared_lock<std::shared_mutex> lock(m_feedMutex);
+    return m_activityFeed;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// World rungs
+//
+// These were file-local helpers in Update.cpp, which is exactly why the chain's
+// resolution order could not live in one place: the ladder in
+// Core/PlayerChain.hpp can only own the order when every rung is reachable from
+// it. help/sdk.txt: PL @ 0x120, LevelCollections[i]+0x20, Levels[].
+// ═════════════════════════════════════════════════════════════════════════════
+
+uintptr_t Engine::ReadWorldSlot(uint64_t base)
+{
+    if (!base)
+        return 0;
+    // Bypass the VMM page cache - a stale GWorld slot blocks raid re-entry until
+    // the exe is restarted.
+    const uintptr_t slot = Memory::read_nocache<uintptr_t>(
+        base + static_cast<uint64_t>(Offsets::UWorld));
+    // Preserve the literal slot value for the ladder/overlay even when it is
+    // not a valid UWorld pointer. The next rung owns validation; discarding it
+    // here made the documented intermediary dereference unreachable and lied
+    // about the raw value (GWorldRaw became zero).
+    return slot == UINTPTR_MAX ? 0 : slot;
+}
+
+uintptr_t Engine::WorldSlotInner(uintptr_t slot)
+{
+    if (!IsPlausibleObjPtr(slot))
+        return 0;
+    // NOCACHE: a cached deref froze the world (log gwSrc:2 - MainMenu served
+    // mid-raid, TheDam served on the home screen).
+    const uintptr_t inner = Memory::read_nocache<uintptr_t>(slot);
+    return IsPlausibleObjPtr(inner) ? inner : 0;
+}
+
+bool Engine::LevelLooksOwnedByWorld(uintptr_t level, uintptr_t world)
+{
+    if (!IsPlausibleObjPtr(level) || !world)
+        return false;
+    const uintptr_t owning = Memory::read<uintptr_t>(level + Offsets::Level_OwningWorld);
+    if (owning == world)
+        return true;
+    uintptr_t data = 0;
+    int32_t count = 0;
+    return WorldScan::ReadLevelActors(level, data, count)
+        && IsPlausibleObjPtr(data) && count > 0 && count <= 10000;
+}
+
+uintptr_t Engine::ResolvePersistentLevel(uintptr_t world)
+{
+    if (!IsPlausibleObjPtr(world))
+        return 0;
+
+    const uintptr_t level = Memory::read<uintptr_t>(world + Offsets::PersistentLevel);
+    if (LevelLooksOwnedByWorld(level, world))
+        return level;
+
+    const uintptr_t collectionsData =
+        Memory::read<uintptr_t>(world + Offsets::LevelCollections);
+    const int32_t collectionsNum =
+        Memory::read<int32_t>(world + Offsets::LevelCollections + 8);
+    if (IsPlausibleObjPtr(collectionsData) && collectionsNum > 0 && collectionsNum <= 16) {
+        const int limit = (collectionsNum > 4) ? 4 : collectionsNum;
+        for (int i = 0; i < limit; ++i) {
+            const uintptr_t collection =
+                collectionsData + static_cast<uintptr_t>(i) * Offsets::LevelCollection_Stride;
+            const uintptr_t candidate = Memory::read<uintptr_t>(
+                collection + Offsets::LevelCollection_PersistentLevel);
+            if (LevelLooksOwnedByWorld(candidate, world))
+                return candidate;
+        }
+    }
+
+    const uintptr_t levelsData = Memory::read<uintptr_t>(world + Offsets::Levels);
+    const int32_t levelsNum = Memory::read<int32_t>(world + Offsets::Levels + 8);
+    if (IsPlausibleObjPtr(levelsData) && levelsNum > 0 && levelsNum < 512) {
+        const int limit = (levelsNum > 8) ? 8 : levelsNum;
+        for (int i = 0; i < limit; ++i) {
+            const uintptr_t candidate = Memory::read<uintptr_t>(
+                levelsData + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
+            if (LevelLooksOwnedByWorld(candidate, world))
+                return candidate;
+        }
+    }
+
+    return 0;
+}
+
+uintptr_t Engine::WorldFromGameStateGlobal(uint64_t base)
+{
+    if (!base)
+        return 0;
+    const uintptr_t gs = Memory::read<uintptr_t>(base + Offsets::GameStateGlobalRva);
+    if (!IsPlausibleObjPtr(gs))
+        return 0;
+
+    const uintptr_t arrData = Memory::read<uintptr_t>(gs + Offsets::GameState_PlayerArray);
+    const int32_t arrNum = Memory::read<int32_t>(gs + Offsets::GameState_PlayerArray + 8);
+    if (!IsPlausibleObjPtr(arrData) || arrNum <= 0 || arrNum > 128)
+        return 0;
+
+    // A GameState's Outer is the world it belongs to. The decrypt gives that one
+    // hop; the slot scan below stays for the CLs where it fails.
+    const OuterLink::Hop hop = OuterLink::FromObject(gs);
+    if (hop.ptr && ResolvePersistentLevel(hop.ptr))
+        return hop.ptr;
+
+    static const std::ptrdiff_t kOuterCands[] = { 0x20, 0x28, 0x18, 0x30, 0x10, 0x40 };
+    for (std::ptrdiff_t off : kOuterCands) {
+        const uintptr_t cand = Memory::read<uintptr_t>(gs + off);
+        if (ResolvePersistentLevel(cand))
+            return cand;
+    }
+    return 0;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// The ladder's host
+//
+// One primitive per rung (the contract lives in Core/PlayerChain.hpp). Every one
+// of them applies its own proof and returns 0 when that proof fails, so the
+// ladder's fixed order is the only thing that decides which value wins - and a
+// rung that answers is named in the trace instead of an integer tag.
+// ═════════════════════════════════════════════════════════════════════════════
+
+static bool IsGoodLocalPlayerPtr(uintptr_t lp)
+{
+    return lp != 0 && lp != UINTPTR_MAX
+        && lp >= 0x1000 && lp < 0x7FFFFFFFFFFF
+        && Memory::IsValidPtrFast2(lp);
+}
+
+struct LadderHost {
+    Engine& eng;
+    uint64_t base = 0;
+    uintptr_t actors = 0;
+    int actorCount = 0;
+    // What the ladder resolved so far, so the camera-manager rung can scan the
+    // level it is actually looking at instead of the previous tick's publish.
+    uintptr_t world = 0;
+    uintptr_t level = 0;
+    uintptr_t pcSeen = 0;
+
+    // ── World ──
+    uintptr_t WorldSlot(uint64_t b) { return eng.ReadWorldSlot(b); }
+    bool IsWorld(uintptr_t w)
+    {
+        if (!eng.ResolvePersistentLevel(w))
+            return false;
+        world = w;
+        return true;
+    }
+    uintptr_t WorldSlotInner(uintptr_t slot)
+    {
+        const uintptr_t inner = eng.WorldSlotInner(slot);
+        return (inner && eng.ResolvePersistentLevel(inner)) ? inner : 0;
+    }
+    uintptr_t WorldFromGameStateGlobal(uint64_t b)
+    {
+        return eng.WorldFromGameStateGlobal(b);
+    }
+    uintptr_t LevelOfWorld(uintptr_t w)
+    {
+        world = w;
+        level = eng.ResolvePersistentLevel(w);
+        return level;
+    }
+    bool LevelActors(uintptr_t level, uintptr_t& outActors, int& outCount)
+    {
+        if (!eng.ResolveLevelActors(level, outActors, outCount)) {
+            outActors = 0;
+            outCount = 0;
+            actors = 0;
+            actorCount = 0;
+            return false;
+        }
+        actors = outActors;
+        actorCount = outCount;
+        return true;
+    }
+
+    // ── GameInstance ──
+    uintptr_t GiOwningSlot(uintptr_t world, bool& backRef)
+    {
+        return GiOwningSlotRung(world, backRef);
+    }
+    uintptr_t GiFromOuter(uintptr_t lp, PlayerChain::Rung& which)
+    {
+        return GiFromOuterRung(lp, which);
+    }
+    uintptr_t GiFromDecrypt(uintptr_t world) { return GiFromDecryptSlot(world); }
+    uintptr_t GiFromLegacySlot(uintptr_t world) { return GiFromLegacySlotRung(world); }
+    uintptr_t GiFromScan(uintptr_t world) { return GiFromScanRung(world); }
+    bool IsGameInstance(uintptr_t gi) { return ValidateGameInstance(gi) != 0; }
+
+    // ── Controller ──
+    // Dump-verified cache: bIsLocalPlayerController (SDK 0xD64) keeps the PC
+    // across hub ticks and pawn-less lobbies, where the pair cache cannot hit.
+    bool PcFromCachedFlag(uintptr_t cachedPc, uintptr_t& pc)
+    {
+        if (!cachedPc || !eng.IsValidPointer(cachedPc)
+            || !eng.IsLocalPlayerControllerConfirmed(cachedPc))
+            return false;
+        pc = cachedPc;
+        pcSeen = cachedPc;
+        return true;
+    }
+
+    /**
+     * Keep the cached pair while the pawn's root still sits at a sane world
+     * position. DefaultFOV/ViewTarget flap must NOT be part of this gate: it
+     * cleared the cache every ~0.5s and forced the ~1200-actor camera-manager
+     * scan (~1s of DMA freezes) on every flap.
+     */
+    bool PcFromCachedPair(uintptr_t cachedPc, uintptr_t cachedPawn,
+        uintptr_t& pc, uintptr_t& pawn)
+    {
+        if (!cachedPc || !cachedPawn
+            || !eng.IsValidPointer(cachedPc) || !eng.IsValidPointer(cachedPawn))
+            return false;
+        const uintptr_t root =
+            Memory::read_nocache<uintptr_t>(cachedPawn + Offsets::RootComponent);
+        if (!root || !eng.IsValidPointer(root)) {
+            ++eng.m_pairCacheFailStreak;
+            return false;
+        }
+        Vector3 pos = Memory::read_nocache<Vector3>(root + Offsets::RelativeLocation);
+        float magSq = static_cast<float>(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
+        if (magSq <= 10000.f || magSq >= 1.0e14f) {
+            const std::ptrdiff_t ctw = Engine::ProbeComponentToWorldOffset(root);
+            pos = Engine::ToVector3(Memory::read_nocache<Engine::FVector3d>(
+                root + ctw + Offsets::Transform_Translation));
+            magSq = static_cast<float>(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
+        }
+        if (magSq <= 10000.f || magSq >= 1.0e14f) {
+            pos = Engine::ReadActorReplicatedLocation(cachedPawn);
+            magSq = static_cast<float>(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
+        }
+        if (magSq <= 10000.f || magSq >= 1.0e14f) {
+            ++eng.m_pairCacheFailStreak;
+            return false;
+        }
+        eng.m_pairCacheFailStreak = 0;
+        pc = cachedPc;
+        pawn = cachedPawn;
+        pcSeen = cachedPc;
+        return true;
+    }
+
+    bool PcFromCamManager(uintptr_t level, uintptr_t actorsArr, int count,
+        uintptr_t& pc, uintptr_t& pawn, uintptr_t& pcm)
+    {
+        (void)count;
+        if (!level || !actorsArr)
+            return false;
+        uintptr_t foundPc = 0, foundPawn = 0, foundPcm = 0;
+        if (!eng.ResolvePcFromLevelCameraManager(
+                level, actorsArr, foundPc, foundPawn, foundPcm))
+            return false;
+        pc = foundPc;
+        pawn = foundPawn;
+        pcm = foundPcm;
+        pcSeen = foundPc;
+        return true;
+    }
+
+    bool PcFromActorScan(uintptr_t level, uintptr_t actorsArr, int count,
+        uintptr_t gi, uintptr_t& pc, uintptr_t& pawn)
+    {
+        (void)gi;
+        if (!level || !actorsArr || count <= 0)
+            return false;
+        uintptr_t scannedPc = 0, scannedPawn = 0;
+        // IsLocalPlayerController is the dump-reflected flag (0xD64): it accepts
+        // the controller even when the live-pinned PC+0x4D0 camera slot is
+        // garbage on this build.
+        // A failed scan is not logged here any more: the ladder's own state says
+        // which rung the controller came from and how many were rejected.
+        if (!eng.ResolveLocalPlayerChainFromActors(
+                level, actorsArr, count, 0, scannedPc, scannedPawn)
+            || !(eng.IsLocalPlayerController(scannedPc)
+                 || eng.ControllerHasValidPcm(scannedPc)))
+            return false;
+        pc = scannedPc;
+        pawn = scannedPawn;
+        pcSeen = scannedPc;
+        return true;
+    }
+
+    /** UGameInstance::LocalPlayers -> ULocalPlayer[0] -> PlayerController. */
+    bool PcFromGiArray(uintptr_t gi, uintptr_t& pc, uintptr_t& pawn, bool& flagProved)
+    {
+        flagProved = false;
+        if (!gi)
+            return false;
+        const uintptr_t arrData = Memory::read<uintptr_t>(gi + Offsets::LocalPlayers);
+        const int arrNum = Memory::read<int>(gi + Offsets::LocalPlayers + 8);
+        if (!arrData || !Memory::IsValidPtrFast2(arrData) || arrNum <= 0 || arrNum > 16)
+            return false;
+        const int limit = (arrNum > 4) ? 4 : arrNum;
+        for (int i = 0; i < limit; ++i) {
+            const uintptr_t slot =
+                Memory::read<uintptr_t>(arrData + static_cast<size_t>(i) * sizeof(uintptr_t));
+            if (!IsUsableObjectPtr(slot))
+                continue;
+            const uintptr_t candidate =
+                Memory::read<uintptr_t>(slot + Offsets::LocalPlayer_PlayerController);
+            if (!eng.IsValidPointer(candidate))
+                continue;
+            const bool engineSaysLocal = eng.IsLocalPlayerControllerConfirmed(candidate);
+            const uintptr_t ackPawn = Engine::ReadAcknowledgedPawn(candidate);
+            bool pawnOk = false;
+            if (ackPawn && eng.IsValidPointer(ackPawn)) {
+                const uintptr_t root =
+                    Memory::read<uintptr_t>(ackPawn + Offsets::RootComponent);
+                pawnOk = root && eng.IsValidPointer(root);
+            }
+            if (!engineSaysLocal && !pawnOk)
+                continue;
+            pc = candidate;
+            pawn = pawnOk ? ackPawn : 0;
+            flagProved = engineSaysLocal;
+            pcSeen = candidate;
+            return true;
+        }
+        return false;
+    }
+
+    uintptr_t PcmFromPc(uintptr_t pc)
+    {
+        if (!pc || !eng.ControllerHasValidPcm(pc))
+            return 0;
+        const uintptr_t raw =
+            Memory::read_nocache<uintptr_t>(pc + Offsets::APlayerCameraManager);
+        return (raw && eng.IsValidPointer(raw)) ? raw : 0;
+    }
+    uintptr_t PcmFromActors()
+    {
+        return eng.GetCameraManagerFromActors(world, level, pcSeen);
+    }
+
+    // ── LocalPlayer ──
+    /** UGameInstance::LocalPlayers slot: the full chain, or one that owns `pc`. */
+    uintptr_t LpFromGiArray(uintptr_t gi, uintptr_t pc, bool& backRef)
+    {
+        backRef = false;
+        uintptr_t lp = 0;
+        uintptr_t pcFromChain = 0;
+        if (ValidateGameInstance(gi, &lp, &pcFromChain) && IsGoodLocalPlayerPtr(lp)) {
+            backRef = (pc == 0)
+                || Memory::read<uintptr_t>(lp + Offsets::LocalPlayer_PlayerController) == pc;
+            return lp;
+        }
+        if (!pc)
+            return 0;
+        const uintptr_t arrData = Memory::read<uintptr_t>(gi + Offsets::LocalPlayers);
+        const int arrNum = Memory::read<int>(gi + Offsets::LocalPlayers + 8);
+        if (!arrData || !Memory::IsValidPtrFast2(arrData) || arrNum <= 0 || arrNum > 16)
+            return 0;
+        const int limit = (arrNum > 8) ? 8 : arrNum;
+        for (int i = 0; i < limit; ++i) {
+            const uintptr_t slot =
+                Memory::read<uintptr_t>(arrData + static_cast<size_t>(i) * sizeof(uintptr_t));
+            if (!IsGoodLocalPlayerPtr(slot))
+                continue;
+            if (Memory::read<uintptr_t>(slot + Offsets::LocalPlayer_PlayerController) == pc) {
+                backRef = true;
+                return slot;
+            }
+        }
+        return 0;
+    }
+
+    uintptr_t LpFromController(uintptr_t pc, PlayerChain::Rung& which, bool& backRef)
+    {
+        return eng.ResolveLocalPlayerFromController(pc, &which, &backRef);
+    }
+
+    // ── Pawn / PlayerState / Root ──
+    uintptr_t PawnFromPc(uintptr_t pc, PlayerChain::Rung& which)
+    {
+        which = PlayerChain::Rung::None;
+        if (!pc)
+            return 0;
+        // SDK dump: AController.Pawn @ 0x3F0 is primary; 0x3D8/0x408 are
+        // heuristic fallbacks only, and every candidate is pointer-gated.
+        struct Cand { std::ptrdiff_t off; PlayerChain::Rung rung; };
+        static const Cand kCands[] = {
+            { Offsets::AcknowledgedPawn, PlayerChain::Rung::PcAcknowledged },
+            { Offsets::AcknowledgedPawn_Fallback, PlayerChain::Rung::PcAcknowledgedAlt },
+            { Offsets::Controller_Character, PlayerChain::Rung::PcCharacter },
+        };
+        for (const Cand& c : kCands) {
+            const uintptr_t pawn = Memory::read<uintptr_t>(pc + c.off);
+            if (pawn && eng.IsValidPointer(pawn)) {
+                which = c.rung;
+                return pawn;
+            }
+        }
+        return 0;
+    }
+
+    /** AController::PlayerState (0x3D0) - the pawn's own, then the PC's. */
+    uintptr_t StateFromPawn(uintptr_t pawn)
+    {
+        if (!pawn)
+            return 0;
+        const uintptr_t ps = Memory::read<uintptr_t>(pawn + Offsets::APlayerState);
+        return (ps && eng.IsValidPointer(ps)) ? ps : 0;
+    }
+    uintptr_t StateFromPc(uintptr_t pc)
+    {
+        if (!pc)
+            return 0;
+        const uintptr_t ps = Memory::read<uintptr_t>(pc + Offsets::AController_PlayerState);
+        return (ps && eng.IsValidPointer(ps)) ? ps : 0;
+    }
+    uintptr_t RootFromPawn(uintptr_t pawn)
+    {
+        if (!pawn)
+            return 0;
+        const uintptr_t root = Memory::read<uintptr_t>(pawn + Offsets::RootComponent);
+        return (root && eng.IsValidPointer(root)) ? root : 0;
+    }
+};
+
+void Engine::ResolvePlayerChain(uint64_t base, const PlayerChain::Seed& seed,
+    uintptr_t& outActors, int& outActorCount)
+{
+    LadderHost host{ *this, base };
+    PlayerChain::State st;
+    PlayerChain::Resolve(st, host, seed);
+
+    outActors = host.actors;
+    outActorCount = host.actorCount;
+    m_pairCacheInvalidated = m_pairCacheFailStreak >= 8;
+
+    std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+    st.tick = m_chain.tick + 1;
+    m_chain = st;
+}
+
+PlayerChain::State Engine::GetChainState() const
+{
+    std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+    return m_chain;
+}
+
+std::string Engine::GetChainTrace() const
+{
+    std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+    return PlayerChain::Trace(m_chain);
 }

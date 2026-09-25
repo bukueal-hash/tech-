@@ -4,9 +4,11 @@ namespace var {
     /* Esp */
     bool enableesp = true;
     bool box = true;
-    bool health = false;
-    bool names = false;
-    bool show_weapon = false;
+    // Player data is part of the baseline ESP presentation. These can still
+    // be disabled in the menu, but a fresh profile should not look empty.
+    bool health = true;
+    bool names = true;
+    bool show_weapon = true;
     bool snaplines = false;
     bool skeleton = true;
     bool silhouette = false;
@@ -148,6 +150,23 @@ namespace var {
     float color_loot[4] = { 1.0f, 165.f / 255.f, 0.0f, 1.0f };
     bool loot_rarity_color = true;
     bool show_loot_value = false;
+    bool show_crate_contents = false;
+    bool show_stack_counts = false;
+    bool grey_looted_containers = false;
+    bool show_armor_line = true;
+    bool show_player_kit = true;
+    bool show_bot_loadout = false;
+    bool show_dbno_badge = false;
+    bool show_look_arrows = true;
+    bool show_steam_ids = false;
+    float color_look_arrow[4] = { 1.f, 1.f, 1.f, 0.9f };
+    bool show_bot_vision = false;
+    bool show_bot_alertness = false;
+    bool show_bot_parts = false;
+    bool show_raid_hud = false;
+    bool show_activity_feed = false;
+    bool radar_map_mode = false;
+    bool radar_underground_dim = false;
     float loot_min_value = 0.f;
     int loot_min_rarity = 0;
 
@@ -162,6 +181,7 @@ namespace var {
     bool debug_skeleton_lag = false;
     bool debug_aim_shake = false;
     bool debug_hatch_detect = false;
+    bool debug_ghost_bots = false;
 
 
     /* Camera debug */

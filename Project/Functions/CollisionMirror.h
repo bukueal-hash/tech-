@@ -199,10 +199,13 @@ inline bool IsVisible(const KDNode* tree,
 
 // ── Public API (implemented in CollisionMirror.cpp) ────────────────────────
 // Rebuild the world collision tree. Throttled internally (movement / 20s
-// force / first build); the heavy DMA runs on a spawned worker thread, so
+// force / first build); the heavy DMA runs on an owned, joinable worker, so
 // this returns immediately and is safe to call from Update.
-void ScheduleRebuild(uintptr_t uworld, uintptr_t persistentLevel,
-    const Vector3& localPos);
+void ScheduleRebuild(uintptr_t uworld, uintptr_t persistentLevel, const Vector3& localPos);
+
+/** Stop and join the background rebuild before engine teardown. */
+void StopBackgroundJobs();
+
 
 // Segment visibility against the published tree. try_lock + fail-open: never
 // blocks the caller; no tree yet → true. Safe from paint or workers.

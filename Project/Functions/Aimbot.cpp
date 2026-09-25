@@ -1,6 +1,7 @@
 // Aimbot.cpp — baseline cache + ESP-matched screen aim, KmBox hardware output only.
 #include "../Core/Engine.h"
 #include "../Core/AimMath.hpp"
+#include "../Core/FeaturePolicy.hpp"
 #include "../Core/AgentLog.h"
 #include "../Core/AssetNames.h"
 #include "../Functions/EspDraw.h"
@@ -417,6 +418,8 @@ public:
         m_reactStartMs = GetTimeMs();
         m_lastJumpMs = m_reactStartMs;
         m_reaimEndMs = m_reactStartMs; // micro re-aim armed
+        m_reaimStartMs = -1.0;
+        m_prevError = 0.0;
         std::uniform_real_distribution<double> phaseDist(0.0, 2.0 * std::numbers::pi);
         m_tremorPhaseX = phaseDist(m_rng);
         m_tremorPhaseY = phaseDist(m_rng);
@@ -452,17 +455,27 @@ public:
         m_lastJx = 0.0;
         m_lastJy = 0.0;
         m_lastPhase = 0; // 0 none, 1 reacting, 2 settling, 3 held
+        m_lastLimiterActive = false;
     }
 
     // Called each aim tick BEFORE Apply so the caller can log it. Error
     // jumps (target teleport / bone switch) re-arm the reaction ramp.
     void NotifyError(double dx, double dy)
     {
+        if (!std::isfinite(dx) || !std::isfinite(dy))
+            return;
+
         const double error = std::sqrt(dx * dx + dy * dy);
         const double now = GetTimeMs();
         // A sudden large error after being close = the target moved / we lost
         // the lock axis — treat like a fresh lock (short, scaled reaction).
-        if (error > kSettleOverJumpsRe && now - m_lastJumpMs > 150.0) {
+        // Do not re-arm merely because the target is still far away: the old
+        // test did that every 150ms and repeatedly restarted the reaction ramp.
+        const bool rearms = m_initialized
+            && AimMath::HumanizerShouldRearm(
+                static_cast<float>(m_prevError), static_cast<float>(error));
+        m_prevError = error;
+        if (rearms && now - m_lastJumpMs > 150.0) {
             m_lastJumpMs = now;
             m_reactStartMs = now;
             {
@@ -481,6 +494,14 @@ public:
     // offset to dx/dy in place. Larger error = more visible slop.
     void Apply(float& dx, float& dy)
     {
+        if (!std::isfinite(dx) || !std::isfinite(dy)) {
+            m_lastJx = 0.0;
+            m_lastJy = 0.0;
+            m_lastPhase = 0;
+            m_lastLimiterActive = false;
+            return;
+        }
+
         const double now = GetTimeMs();
         if (!m_initialized) {
             m_lastTimeMs = now;
@@ -557,7 +578,8 @@ public:
         }
 
         // ── 6. Micro re-aim (settled locks randomly drift & re-fix) ───
-        double reaim = 0.0;
+        double reaimX = 0.0;
+        double reaimY = 0.0;
         if (phase == 3 && error < kReaimErr) {
             const double rngV = std::uniform_real_distribution<double>(0.0, 1.0)(m_rng);
             const double nowMs = now;
@@ -573,23 +595,48 @@ public:
             const double sinceR = nowMs - m_reaimStartMs;
             if (sinceR >= 0.0 && sinceR < m_reaimHoldMs) {
                 const double env = std::exp(-kReaimDecay / 1000.0 * sinceR);
-                reaim = env * (std::abs(m_reaimNx) + std::abs(m_reaimNy));
-                settleX += m_reaimNx * env;
-                settleY += m_reaimNy * env;
+                // Preserve the vector direction. The old scalar
+                // abs(nx)+abs(ny) was added to X as well, creating a constant
+                // rightward bias during every re-aim.
+                reaimX = m_reaimNx * env;
+                reaimY = m_reaimNy * env;
             }
         }
 
         // ── Combine (scaled by the user's intensity slider) ──────────
-        const double intensity = (std::clamp)(static_cast<double>(var::humanizer_intensity), 0.0, 3.0);
-        m_lastJx = ((settleX + reaim) * react + tremorX + m_driftX * driftScale + speedNoiseX) * intensity;
-        m_lastJy = ((settleY + reaim) * react + tremorY + m_driftY * driftScale + speedNoiseY) * intensity;
+        const double configuredIntensity = static_cast<double>(var::humanizer_intensity);
+        const double intensity = std::isfinite(configuredIntensity)
+            ? (std::clamp)(configuredIntensity, 0.0, 3.0)
+            : 1.0;
+        double jx = (settleX * react + reaimX + tremorX
+            + m_driftX * driftScale + speedNoiseX) * intensity;
+        double jy = (settleY * react + reaimY + tremorY
+            + m_driftY * driftScale + speedNoiseY) * intensity;
+
+        // Humanization is a bounded perturbation, not a second high-gain aim
+        // controller. This also protects the hardware path from extreme slider
+        // combinations and transient invalid values.
+        const auto bounded = AimMath::ClampHumanizerOffset(
+            static_cast<float>(jx), static_cast<float>(jy),
+            AimMath::kHumanizerMaxOffsetPx);
+        m_lastLimiterActive = std::isfinite(jx) && std::isfinite(jy)
+            && std::hypot(jx, jy) > AimMath::kHumanizerMaxOffsetPx;
+        m_lastJx = bounded.first;
+        m_lastJy = bounded.second;
         m_lastPhase = phase;
         dx += static_cast<float>(m_lastJx);
         dy += static_cast<float>(m_lastJy);
     }
 
     // Debug inspection: the jitter this class injected on the last tick.
-    struct PhaseOut { int phase = 0; float jx = 0.f; float jy = 0.f; float react = 0.f; bool reaim = false; };
+    struct PhaseOut {
+        int phase = 0;
+        float jx = 0.f;
+        float jy = 0.f;
+        float react = 0.f;
+        bool reaim = false;
+        bool limited = false;
+    };
     PhaseOut Last() const
     {
         PhaseOut o;
@@ -597,6 +644,7 @@ public:
         o.jx = static_cast<float>(m_lastJx);
         o.jy = static_cast<float>(m_lastJy);
         o.reaim = m_reaimStartMs > m_lastJumpMs && (m_lastPhase == 3);
+        o.limited = m_lastLimiterActive;
         return o;
     }
 
@@ -652,11 +700,13 @@ private:
     double m_reaimStartMs = -1.0;
     double m_reaimNx = 0.0;
     double m_reaimNy = 0.0;
+    double m_prevError = 0.0;
 
     // Last-tick debug output.
     double m_lastJx = 0.0;
     double m_lastJy = 0.0;
     int m_lastPhase = 0;
+    bool m_lastLimiterActive = false;
 };
 
 // ============================================
@@ -762,7 +812,7 @@ static float VelocityMag(const Vector3& v)
 static bool ComputeVelocityLeadDelta(
     Vector3& outDelta,
     const Vector3& vel,
-    float lastVelocityUpdate,
+    uint64_t lastVelocityUpdate,
     float maxDtSec)
 {
     outDelta = {};
@@ -819,7 +869,7 @@ static void ExtrapolateRobotWorldPosToNow(Engine::WorldCacheEntry& entry)
 static void ExtrapolatePlayerAimWorldToNow(
     Vector3& worldPos,
     const Vector3& cachedVelocity,
-    float lastVelocityUpdate)
+    uint64_t lastVelocityUpdate)
 {
     if (!IsPlausibleWorldPos(worldPos))
         return;
@@ -1178,6 +1228,7 @@ struct AimDebugSnapshot {
     int hnPhase = 0;           // 0 none, 1 reacting, 2 settling, 3 held
     float hnJx = 0.f;          // last injected jitter (px), X
     float hnJy = 0.f;          // last injected jitter (px), Y
+    bool hnLimited = false;   // safety cap was active for the injected offset
     float hnReact = 0.f;       // reaction ease-in scalar (0..1) this tick
     // Per-lock randomized pull profile (surfaced so the log can confirm the
     // speed/asym differ per engagement rather than staying fixed).
@@ -1227,6 +1278,20 @@ static void ResetAimMotionState()
     s_inDeadzone = false;
     s_oscDampX = {};
     s_oscDampY = {};
+}
+
+// Trigger hold is process-wide aim state. Keeping it outside the trigger
+// block lets every early return release the hardware before leaving AimAssistence.
+static bool s_triggerHolding = false;
+static uint64_t s_lastFireMs = 0;
+static FeaturePolicy::TriggerToggleState s_triggerToggleState;
+
+static void ReleaseTriggerHold()
+{
+    if (!s_triggerHolding)
+        return;
+    g_kmbox.HoldEnd();
+    s_triggerHolding = false;
 }
 
 // ── AUTO PREDICTION (no bullet-speed slider) ───────────────────────
@@ -1581,7 +1646,8 @@ float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain =
                        << ",\"shakeDeg\":" << s_dbgShakeDeg
                        << ",\"suppress\":" << (s_dbgSuppress ? 1 : 0)
                        << ",\"damp\":[" << s_oscDampX.damp << "," << s_oscDampY.damp << "]"
-                       << ",\"hn\":[" << s_aimDbg.hnPhase << "," << s_aimDbg.hnJx << "," << s_aimDbg.hnJy << "]"
+                       << ",\"hn\":[" << s_aimDbg.hnPhase << "," << s_aimDbg.hnJx << "," << s_aimDbg.hnJy
+                       << "," << (s_aimDbg.hnLimited ? 1 : 0) << "]"
                        << ",\"pp\":[" << s_aimDbg.ppSpeed << "," << s_aimDbg.ppAccel << "," << s_aimDbg.ppAsym << "," << s_aimDbg.ppSharp << "," << s_aimDbg.ppSitu << "," << s_leadScale << "]"
                        << ",\"velMag\":" << s_aimDbg.velMag
                        << ",\"posSrc\":" << static_cast<int>(s_aimDbg.posSrc)
@@ -1622,6 +1688,23 @@ float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain =
 
 } // namespace
 
+void Engine::PublishHumanizerDebug(const HumanizerDebugState& state)
+{
+    std::lock_guard<std::mutex> lock(m_humanizerDebugMutex);
+    m_humanizerDebug = state;
+}
+
+Engine::HumanizerDebugState Engine::GetHumanizerDebug() const
+{
+    std::lock_guard<std::mutex> lock(m_humanizerDebugMutex);
+    return m_humanizerDebug;
+}
+
+void Engine::ReleaseAimOutputs()
+{
+    ReleaseTriggerHold();
+}
+
 void Engine::AimAssistence()
 {
     static uint64_t lockedTarget = 0;
@@ -1630,6 +1713,7 @@ void Engine::AimAssistence()
     static float lastTargetScore = 0.f;
     static bool lockedIsRobot = false;
     static Humanizer humanizer;
+    static bool humanizerWasActive = false;
     static int kmboxFailStreak = 0;
     static bool kmboxFailLogged = false;
     static AimTarget s_graceTarget{};
@@ -1637,33 +1721,92 @@ void Engine::AimAssistence()
     static bool s_graceActive = false;
     static Vector3 s_graceVelocity{};
     static uint64_t s_graceStampMs = 0;
+    static uint64_t s_aimGeneration = UINT64_MAX;
 
+    auto resetHumanizer = [&]() {
+        humanizer.Reset();
+        humanizerWasActive = false;
+        PublishHumanizerDebug({});
+    };
+
+    const uint64_t currentGeneration =
+        m_worldGeneration.load(std::memory_order_acquire);
+    if (s_aimGeneration != currentGeneration) {
+        ReleaseTriggerHold();
+        lockedTarget = 0;
+        previousTarget = 0;
+        resetHumanizer();
+        ResetAimMotionState();
+        s_leadScale = 1.0f;
+        s_leadKey = 0;
+        s_leadOverCount = 0;
+        s_leadUnderCount = 0;
+        s_leadWinMs = 0;
+        s_leadErrAcc = 0.f;
+        s_leadErrN = 0;
+        s_pullProf = {};
+        s_lastFireMs = 0;
+        s_triggerToggleState = {};
+        s_graceActive = false;
+        s_graceVelocity = {};
+        s_graceStampMs = 0;
+        s_aimGeneration = currentGeneration;
+    }
+    g_aimEspFrame = nullptr;
+    g_playerAimLockedKey = 0;
 
     s_aimDbg = {};
     g_aimStickyKey = 0;
     g_aimStickyExtraFovPx = 0.f;
     g_aimFastPath = 0;
 
-    const bool playerAimEnabled = var::enable_aimbot;
-    const bool robotAimEnabled = var::robotAimEnabled;
+    const FeaturePolicy::AimFeatures features{
+        var::enable_aimbot,
+        var::robotAimEnabled,
+        var::enable_triggerbot};
+    const bool playerAimEnabled = features.playerAim;
+    const bool robotAimEnabled = features.robotAim;
 
-    if (!playerAimEnabled && !robotAimEnabled)
+    if (!FeaturePolicy::ShouldRunAimPass(features))
     {
         lockedTarget = 0;
         previousTarget = 0;
-        humanizer.Reset();
+        resetHumanizer();
         kmboxFailStreak = 0;
         s_graceActive = false;
+        s_triggerToggleState = {};
+        ReleaseTriggerHold();
         return;
     }
 
     const int bindAim = var::aim_hold_key ? var::aim_hold_key : VK_SHIFT;
-    const bool keyPressed = KeyBindIsHeld(bindAim);
+    const bool aimKeyPressed = KeyBindIsHeld(bindAim);
+    const int triggerBind = var::trigger_hold_key ? var::trigger_hold_key : VK_SHIFT;
+    const bool triggerKeyHeld = KeyBindIsHeld(triggerBind);
+    const bool triggerActive = FeaturePolicy::UpdateTriggerActivation(
+        features.trigger, var::trigger_hold_mode, triggerKeyHeld,
+        s_triggerToggleState);
+
+    // Movement is controlled only by the aim feature/key. Trigger-only mode
+    // may acquire and fire on a target, but must never move the pointer.
+    const bool sendAimHardware = FeaturePolicy::ShouldSendAimHardware(features)
+        && aimKeyPressed;
+    if (!sendAimHardware && !triggerActive)
+    {
+        lockedTarget = 0;
+        previousTarget = 0;
+        g_playerAimClosePhase = false;
+        resetHumanizer();
+        kmboxFailStreak = 0;
+        s_graceActive = false;
+        ReleaseTriggerHold();
+        return;
+    }
 
     // Shake probe: measure aim tick cadence. Slow/irregular ticks make the
     // pull stutter; combined with flip/overshoot counts it separates "control
     // loop oscillation" from "DMA timing jitter".
-    if (keyPressed) {
+    if (sendAimHardware) {
         static std::chrono::steady_clock::time_point s_lastAimInvoke{};
         const auto invokeNow = std::chrono::steady_clock::now();
         if (s_lastAimInvoke.time_since_epoch().count() != 0)
@@ -1672,16 +1815,6 @@ void Engine::AimAssistence()
         s_lastAimInvoke = invokeNow;
     }
 
-    if (!keyPressed)
-    {
-        lockedTarget = 0;
-        previousTarget = 0;
-        g_playerAimClosePhase = false;
-        humanizer.Reset();
-        kmboxFailStreak = 0;
-        s_graceActive = false;
-        return;
-    }
 
     uintptr_t sGWorld, sPersistentLevel, sAcknowledgedPawn, sPlayerController;
     {
@@ -1696,8 +1829,9 @@ void Engine::AimAssistence()
     {
         lockedTarget = 0;
         previousTarget = 0;
-        humanizer.Reset();
+        resetHumanizer();
         s_graceActive = false;
+        ReleaseTriggerHold();
         return;
     }
 
@@ -1705,8 +1839,9 @@ void Engine::AimAssistence()
     {
         lockedTarget = 0;
         previousTarget = 0;
-        humanizer.Reset();
+        resetHumanizer();
         s_graceActive = false;
+        ReleaseTriggerHold();
         return;
     }
 
@@ -1714,10 +1849,14 @@ void Engine::AimAssistence()
     {
         const Vector3 testRead = Memory::read<Vector3>(sPlayerController + Offsets::ControlRotation);
         if (std::isnan(testRead.x) || std::isnan(testRead.y) || std::isnan(testRead.z))
+        {
+            ReleaseTriggerHold();
             return;
+        }
     }
     catch (...)
     {
+        ReleaseTriggerHold();
         return;
     }
 
@@ -1740,12 +1879,26 @@ void Engine::AimAssistence()
 
     std::shared_ptr<const EspRenderFrame> espFrameShared;
     {
-        // Never block publish — same try_lock + last-good policy as paint.
-        static std::shared_ptr<const EspRenderFrame> s_lastGoodAimFrame;
+        // Never block the aim thread on publication. Retain only a current,
+        // fresh snapshot; ClearEspCaches resets the atomic retained pointer.
         std::shared_lock<std::shared_mutex> lock(m_espFrameMutex, std::try_to_lock);
-        if (lock.owns_lock() && m_espFrameShared && m_espFrameShared->valid)
-            s_lastGoodAimFrame = m_espFrameShared;
-        espFrameShared = s_lastGoodAimFrame;
+        const uint64_t nowMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        const uint64_t generation =
+            m_worldGeneration.load(std::memory_order_acquire);
+        if (lock.owns_lock()) {
+            if (m_espFrameShared && EspFramePolicy::IsAcceptable(
+                    {m_espFrameShared->valid,
+                     m_espFrameShared->worldGeneration,
+                     m_espFrameShared->collectStampMs},
+                    generation,
+                    nowMs))
+                m_espAimFrame.store(m_espFrameShared);
+            else
+                m_espAimFrame.store(nullptr);
+        }
+        espFrameShared = m_espAimFrame.load();
     }
     // Bind to a valid frame or an immutable empty one; no deep copy either way.
     static const EspRenderFrame kInvalidAimFrame{};
@@ -1774,12 +1927,14 @@ void Engine::AimAssistence()
     if (!IsPlausibleWorldPos(aimProjCam.Location))
     {
         g_aimEspFrame = nullptr;
+        ReleaseTriggerHold();
         return;
     }
 
     if (aimProjCam.FOV <= 1.f || aimProjCam.FOV > 179.f)
     {
         g_aimEspFrame = nullptr;
+        ReleaseTriggerHold();
         return;
     }
 
@@ -1787,6 +1942,7 @@ void Engine::AimAssistence()
     if (screenCenter.x <= 0.0 || screenCenter.y <= 0.0)
     {
         g_aimEspFrame = nullptr;
+        ReleaseTriggerHold();
         return;
     }
 
@@ -1795,6 +1951,7 @@ void Engine::AimAssistence()
     if (fovRadius < 4.f)
     {
         g_aimEspFrame = nullptr;
+        ReleaseTriggerHold();
         return;
     }
 
@@ -1820,10 +1977,10 @@ void Engine::AimAssistence()
     std::vector<AimTarget> allTargets;
     allTargets.reserve(64);
 
-    if (playerAimEnabled)
+    if (FeaturePolicy::ShouldCollectPlayerTargets(features))
         AimAssistPlayer(screenCenter, fovRadius, bulletSpeed, currentTime, allTargets);
 
-    if (robotAimEnabled)
+    if (FeaturePolicy::ShouldCollectRobotTargets(features))
         AimAssistRobot(screenCenter, fovRadius, currentTime, allTargets);
 
     g_aimEspFrame = nullptr;
@@ -1915,22 +2072,24 @@ void Engine::AimAssistence()
                 } else {
                     lockedTarget = 0;
                     previousTarget = 0;
-                    humanizer.Reset();
+                    resetHumanizer();
                     s_graceActive = false;
                     s_graceVelocity = {};
                     s_graceStampMs = 0;
                     s_aimDbg.locked = 0;
                     s_aimDbg.grace = 0;
+                    ReleaseTriggerHold();
                     return;
                 }
             } else {
                 lockedTarget = 0;
                 previousTarget = 0;
-                humanizer.Reset();
+                resetHumanizer();
                 s_graceActive = false;
                 s_graceVelocity = {};
                 s_graceStampMs = 0;
                 s_aimDbg.locked = 0;
+                ReleaseTriggerHold();
                 return;
             }
         }
@@ -1960,9 +2119,10 @@ void Engine::AimAssistence()
     {
         lockedTarget = 0;
         previousTarget = 0;
-        humanizer.Reset();
+        resetHumanizer();
         s_graceActive = false;
         s_aimDbg.locked = 0;
+        ReleaseTriggerHold();
         return;
     }
 
@@ -1977,7 +2137,10 @@ void Engine::AimAssistence()
     }
 
     if (bestTarget->worldPos.x == 0.0 && bestTarget->worldPos.y == 0.0 && bestTarget->worldPos.z == 0.0)
+    {
+        ReleaseTriggerHold();
         return;
+    }
 
     if (lockedTarget != bestTarget->entityKey)
     {
@@ -2023,7 +2186,7 @@ void Engine::AimAssistence()
             lockedIsRobot = bestTarget->isRobot;
             lastSwitchTime = currentTime;
             lastTargetScore = bestTarget->score;
-            humanizer.Reset();
+            resetHumanizer();
             ResetAimMotionState();
             s_graceActive = false;
             s_graceTarget = *bestTarget;
@@ -2046,6 +2209,7 @@ void Engine::AimAssistence()
     s_aimDbg.locked = lockedTarget;
 
     if (!g_kmbox.EnsureReady()) {
+        ReleaseTriggerHold();
         ++kmboxFailStreak;
         s_aimDbg.kmbox = 0;
         if (kmboxFailStreak >= 3) {
@@ -2055,8 +2219,9 @@ void Engine::AimAssistence()
             }
             lockedTarget = 0;
             previousTarget = 0;
-            humanizer.Reset();
+            resetHumanizer();
             s_graceActive = false;
+            ReleaseTriggerHold();
         }
         return;
     }
@@ -2097,68 +2262,57 @@ void Engine::AimAssistence()
         suppressAimOutput = true;
     }
 
-    if (var::humanizer) {
+    const bool humanizerActive = var::humanizer && sendAimHardware;
+    if (humanizerActive) {
+        // Re-arm when the feature is toggled back on or resumes after a
+        // trigger-only interval; stale phase/time state must not leak across.
+        if (!humanizerWasActive)
+            resetHumanizer();
+        humanizerWasActive = true;
         humanizer.NotifyError(dx, dy);
         humanizer.Apply(dx, dy);
         const Humanizer::PhaseOut hn = humanizer.Last();
         s_aimDbg.hnPhase = hn.phase;
         s_aimDbg.hnJx = hn.jx;
         s_aimDbg.hnJy = hn.jy;
+        s_aimDbg.hnLimited = hn.limited;
+        PublishHumanizerDebug({
+            hn.phase, hn.jx, hn.jy, hn.limited, nowMs, true });
     } else {
+        if (humanizerWasActive)
+            resetHumanizer();
+        humanizerWasActive = false;
         s_aimDbg.hnPhase = 0;
         s_aimDbg.hnJx = 0.f;
         s_aimDbg.hnJy = 0.f;
+        s_aimDbg.hnLimited = false;
     }
 
     // Reload / flinch moves the view — skip hardware pull for this tick (keep lock).
     s_dbgSuppress = suppressAimOutput;
     s_dbgShakeDeg = viewShakeDeg;
-    if (!suppressAimOutput)
+    if (sendAimHardware && !suppressAimOutput)
         s_aimDbg.lastGain = SendKmAimDelta(dx, dy, pullScale, &s_aimDbg.lastGain);
 
     // ============================================
     // TRIGGERBOT
     // ============================================
     {
-        static uint64_t s_lastFireMs = 0;
-        static bool s_isHolding = false;
-
-        const bool trigEnabled = var::enable_triggerbot;
+        const bool trigEnabled = features.trigger;
         const bool aimLocked = (lockedTarget != 0);
 
-        // Hotkey check
-        bool trigKeyActive = false;
-        if (var::trigger_hold_mode == 2) {
-            trigKeyActive = true; // Always on
-        } else {
-            const int bindTrig = var::trigger_hold_key ? var::trigger_hold_key : VK_SHIFT;
-            if (var::trigger_hold_mode == 1) {
-                // Toggle
-                static bool trigToggled = false;
-                static bool trigPrevHeld = false;
-                const bool trigNowHeld = KeyBindIsHeld(bindTrig);
-                if (trigNowHeld && !trigPrevHeld)
-                    trigToggled = !trigToggled;
-                trigPrevHeld = trigNowHeld;
-                trigKeyActive = trigToggled;
-            } else {
-                // Hold
-                trigKeyActive = KeyBindIsHeld(bindTrig);
-            }
-        }
-
-        if (trigEnabled && aimLocked && trigKeyActive && !suppressAimOutput) {
+        if (trigEnabled && aimLocked && triggerActive && !suppressAimOutput) {
             const float trigDistPx = hypotf(
                 static_cast<float>(bestTarget->aimPos.x - screenCenter.x),
                 static_cast<float>(bestTarget->aimPos.y - screenCenter.y));
 
             if (trigDistPx <= var::trigger_deadzone_px) {
-                if (true) {
+                {
                     const uint64_t nowMsTrig = NowMs();
                     if (var::trigger_auto_hold) {
-                        if (!s_isHolding) {
+                        if (!s_triggerHolding) {
                             g_kmbox.HoldStart();
-                            s_isHolding = true;
+                            s_triggerHolding = true;
                         }
                     } else {
                         if (nowMsTrig - s_lastFireMs >= static_cast<uint64_t>(var::trigger_fire_delay_ms)) {
@@ -2171,16 +2325,10 @@ void Engine::AimAssistence()
                     }
                 }
             } else {
-                if (s_isHolding) {
-                    g_kmbox.HoldEnd();
-                    s_isHolding = false;
-                }
+                ReleaseTriggerHold();
             }
         } else {
-            if (s_isHolding) {
-                g_kmbox.HoldEnd();
-                s_isHolding = false;
-            }
+            ReleaseTriggerHold();
         }
     }
 
@@ -2212,6 +2360,9 @@ void Engine::AimAssistence()
                 << " worldAgeMs=" << s_aimDbg.worldAgeMs
                 << " camFov=" << aimProjCam.FOV
                 << " frameValid=" << (espFrame.valid ? 1 : 0)
+                << " hnPhase=" << s_aimDbg.hnPhase
+                << " hnOffset=(" << s_aimDbg.hnJx << "," << s_aimDbg.hnJy << ")"
+                << " hnLimiter=" << (s_aimDbg.hnLimited ? "active" : "off")
                 << std::endl;
 
             if (var::debug_aim_shake) {

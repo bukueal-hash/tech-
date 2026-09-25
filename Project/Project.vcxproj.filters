@@ -141,6 +141,9 @@
     <ClInclude Include="Core\Cache.hpp">
       <Filter>Core</Filter>
     </ClInclude>
+    <ClInclude Include="Core\EntityDiagnostics.hpp">
+      <Filter>Core</Filter>
+    </ClInclude>
     <ClInclude Include="Core\Engine.h">
       <Filter>Core</Filter>
     </ClInclude>
@@ -148,6 +151,9 @@
       <Filter>Core</Filter>
     </ClInclude>
     <ClInclude Include="Core\Offsets.h">
+      <Filter>Core</Filter>
+    </ClInclude>
+    <ClInclude Include="Core\SDK.hpp">
       <Filter>Core</Filter>
     </ClInclude>
     <ClInclude Include="Core\Vector.hpp">

@@ -39,11 +39,13 @@ inline bool ResolveBotHeadFeetWorld(
     Vector3& headWorld,
     Vector3& feetWorld)
 {
-    // Live pawn motion comes through WorldPos (scene root + PositionRefresh).
-    // BotPartPos is filled from mesh/child CTW in PopulateBotPartCache; those
-    // transforms often stay at the spawn footprint while the root moves — so
-    // preferring parts planted the ESP box and left it behind the body.
-    if (!IsPlausibleWorldPos(robot.WorldPos))
+    // Live pawn motion normally comes through WorldPos. Some constructables
+    // expose only a valid mesh/center position while their scene-root sample is
+    // unavailable; keep those bots visible instead of rejecting them at the
+    // shared ESP gate. BotPartPos is still only used for height refinement.
+    const Vector3 anchor = IsPlausibleWorldPos(robot.WorldPos)
+        ? robot.WorldPos : robot.CenterWorldPos;
+    if (!IsPlausibleWorldPos(anchor))
         return false;
 
     constexpr float kHalfHeightCm = 90.f;
@@ -58,8 +60,8 @@ inline bool ResolveBotHeadFeetWorld(
             if (!IsPlausibleWorldPos(part))
                 continue;
             // Reject frozen mesh parts that drifted away from live WorldPos.
-            const double dx = part.x - robot.WorldPos.x;
-            const double dy = part.y - robot.WorldPos.y;
+            const double dx = part.x - anchor.x;
+            const double dy = part.y - anchor.y;
             if ((dx * dx + dy * dy) > (250.0 * 250.0))
                 continue;
             const float z = static_cast<float>(part.z);
@@ -77,8 +79,8 @@ inline bool ResolveBotHeadFeetWorld(
         }
     }
 
-    headWorld = robot.WorldPos;
-    feetWorld = robot.WorldPos;
+    headWorld = anchor;
+    feetWorld = anchor;
     headWorld.z += halfH;
     feetWorld.z -= halfH;
     return true;

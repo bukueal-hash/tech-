@@ -98,8 +98,10 @@ bool IsSalvageContainerActor(const std::string& fname, uintptr_t actor);
 bool PointerIsLootInteractionComponent(uintptr_t obj);
 /**
  * True when a component pointer at a loot-interaction slot is owned by `actor`
- * (UObject::OuterPrivate @ 0x20). Does not require class-FName decrypt — DMA
- * decrypt flakes were causing identical lockers/drawers to admit unevenly.
+ * (UObject::Outer, resolved through every OuterLink rung — the pointer lives in
+ * one of the four encrypted slots at +0x20 on this build). Does not require
+ * class-FName decrypt — DMA decrypt flakes were causing identical
+ * lockers/drawers to admit unevenly.
  */
 bool LootInteractionOwnedByActor(uintptr_t component, uintptr_t actor);
 /** Zipline anchors, corpses, pioneer characters — never container/open-container targets. */

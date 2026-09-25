@@ -94,7 +94,8 @@ inline void PaintSubPhaseNote(int phase, float ms)
 // Called by the paint (Present) loop once per iteration.
 // worstPhase = which paint phase consumed the stall ("New" NewFrame,
 // "Rend" app Render, "Draw" ImGui RenderDrawData, "Pres" Present).
-inline void PaintStallNote(float iterMs, const char* worstPhase, float worstPhaseMs)
+inline void PaintStallNote(float iterMs, const char* worstPhase,
+                           [[maybe_unused]] float worstPhaseMs)
 {
     PaintStallFrameCount().fetch_add(1, std::memory_order_relaxed);
     PaintStallSumMs().fetch_add(iterMs, std::memory_order_relaxed);

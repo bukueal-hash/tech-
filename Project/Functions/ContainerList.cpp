@@ -2,6 +2,7 @@
 #include "../Core/AgentLog.h"
 #include "../Core/ActorType.h"
 #include "../Core/AssetNames.h"
+#include "../Core/EntityDiagnostics.hpp"
 #include "../Core/Offsets.h"
 #include "../Core/WorldItemCategory.h"
 #include "../Core/IntervalTimer.h"
@@ -23,8 +24,8 @@ namespace {
 
 inline bool AnyContainerEspEnabled()
 {
-    return var::enable_world && (
-        var::raiderStock || var::showArc || var::showDeadPlayers || var::showLoot ||
+    return var::enable_world && var::showLoot && (
+        var::raiderStock || var::showArc || var::showDeadPlayers ||
         var::show_world_crate || var::show_world_furniture || var::show_world_harvestable ||
         var::show_world_industrial || var::show_world_other || var::show_world_probe ||
         var::show_world_vehicles || var::show_world_weapon_case || var::show_world_field_crate ||
@@ -94,12 +95,26 @@ bool ContainerScanNegMemoHit(uintptr_t actor, int& outMemoSkip)
 // eventual admit of that same actor can be logged as a memo lockout.
 std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> s_containerMemoHistory;
 
+// FIRST-REJECT PROBATION ("standind in front of a crate, 2 min, no esp"): a
+// one-shot screen can race the stream-in — name/root/pos not readable yet —
+// and the 20-35s blind memo punished the crate for it pass after pass. A
+// FIRST reject routes to the 8s prio-retry window instead (re-probed at the
+// front of every pass until it settles); only a SECOND reject memoizes.
+// Same transient-vs-definitive rule as BotAdmitQueue.
+std::unordered_set<uintptr_t> s_contRejectOnce;
+
 void ContainerScanNegMemoize(uintptr_t actor)
 {
     if (s_containerScanNeg.size() > 16384)
         s_containerScanNeg.clear();
     if (s_containerMemoHistory.size() > 16384)
         s_containerMemoHistory.clear();
+    if (s_contRejectOnce.size() > 16384)
+        s_contRejectOnce.clear();
+    if (s_contRejectOnce.insert(actor).second) {
+        ContainerPrioRetryMark(actor);
+        return;
+    }
     const auto now = std::chrono::steady_clock::now();
     s_containerScanNeg[actor] = now;
     s_containerMemoHistory.emplace(actor, now);
@@ -335,7 +350,7 @@ void Engine::ContainerList()
 {
     if (!var::enable_world)
         return;
-    if (!AnyContainerEspEnabled() && !var::showLoot
+    if (!AnyContainerEspEnabled()
         && !(var::show_radar && var::show_radar_special))
         return;
 
@@ -841,7 +856,8 @@ void Engine::ContainerList()
         }
 
         if (ContainerLootLooksOpened(key, fname.empty() ? classFname : fname)
-            && !var::show_world_open_container)
+            && !var::show_world_open_container
+            && !var::grey_looted_containers)
             continue;
 
         // Phase 3E: bare hasLootInteraction/hasContainerLoot alone admitted
@@ -1024,6 +1040,16 @@ void Engine::ContainerList()
         entry.lootRarityTier = 0;
         entry.lootValue = 0;
         entry.WorldPos = worldPos;
+        // Crate contents preview (the "[...]" label summary) - gated so the
+        // feature costs zero DMA while its toggle is off.
+        if (var::show_crate_contents) {
+            entry.crateStackCount = static_cast<uint8_t>(ReadCrateContents(
+                key, entry.crateStacks, CrateContents::kMaxStacks));
+            bool socketMesh = false;
+            entry.dispenserPorts =
+                static_cast<uint8_t>(ReadContainerDispenserPorts(key, socketMesh));
+            entry.socketLootMesh = socketMesh ? 1 : 0;
+        }
         ++dbgAdmitted;
 
         // #region agent log
@@ -1188,6 +1214,22 @@ void Engine::ContainerList()
             }
         }
         // #endregion
+
+        // Crate contents are read at admission, but cache entries survive many
+        // scan cycles. Refresh the preview for existing entries when the option
+        // is enabled so toggling it does not require a raid restart.
+        if (var::show_crate_contents && doMetadata) {
+            it->second.crateStackCount = static_cast<uint8_t>(ReadCrateContents(
+                key, it->second.crateStacks, CrateContents::kMaxStacks));
+            bool socketMesh = false;
+            it->second.dispenserPorts = static_cast<uint8_t>(
+                ReadContainerDispenserPorts(key, socketMesh));
+            it->second.socketLootMesh = socketMesh ? 1 : 0;
+        } else if (!var::show_crate_contents) {
+            it->second.crateStackCount = 0;
+            it->second.dispenserPorts = 0;
+            it->second.socketLootMesh = 0;
+        }
 
         retainIters.push_back(it);
         retainRoots.push_back(0);
@@ -1445,7 +1487,7 @@ void Engine::ContainerList()
                 }
             }
             // #endregion
-            if (!var::show_world_open_container)
+            if (!var::show_world_open_container && !var::grey_looted_containers)
                 eraseOpened.insert(row.key);
         }
         for (uintptr_t key : eraseOpened)
@@ -1489,6 +1531,29 @@ void Engine::ContainerList()
     {
         std::unique_lock<std::shared_mutex> lock(m_containerCacheMutex);
         containerCache = std::move(localCache);
+    }
+
+    {
+        static IntervalTimer diagnosticTimer(2000);
+        if (diagnosticTimer.fire()) {
+            size_t cacheSize = 0;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_containerCacheMutex);
+                cacheSize = containerCache.size();
+            }
+            char stats[512]{};
+            std::snprintf(stats, sizeof(stats),
+                "{\"scanned\":%d,\"admitted\":%d,\"admitSkip\":%d,"
+                "\"preSkip\":%d,\"structHit\":%d,\"admitLooks\":%d,"
+                "\"admitGate\":%d,\"rootSkip\":%d,\"posSkip\":%d,"
+                "\"drawing\":%d,\"cache\":%zu,\"actors\":%zu,"
+                "\"ringSlice\":%zu,\"prioNew\":%d}",
+                dbgScanned, dbgAdmitted, dbgAdmitSkip, dbgPreSkip,
+                dbgStructHit, dbgAdmitLooks, dbgAdmitGate, dbgRootSkip,
+                dbgPosSkip, dbgDrawing, cacheSize, contN,
+                dbgRingSlice, dbgRingPrioNew);
+            EntityDiagnostics::LogScan("containers", stats);
+        }
     }
 
     if (var::show_debug_overlay) {

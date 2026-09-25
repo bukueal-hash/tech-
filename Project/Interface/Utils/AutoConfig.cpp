@@ -81,6 +81,10 @@ struct Snapshot {
     bool health{};
     bool names{};
     bool show_weapon{};
+    bool show_dbno_badge{};
+    bool show_look_arrows{};
+    bool show_steam_ids{};
+    float color_look_arrow[4]{};
     bool snaplines{};
     bool skeleton{};
     bool silhouette{};
@@ -94,6 +98,7 @@ struct Snapshot {
     bool debug_skeleton_lag{};
     bool debug_aim_shake{};
     bool debug_hatch_detect{};
+    bool debug_ghost_bots{};
     float esp_text_scale{};
     float radar_scale{};
     float radar_range{};
@@ -101,10 +106,15 @@ struct Snapshot {
     float radar_pos_y_norm{};
     int radar_loot_min_rarity{};
     bool show_radar_special{};
+    bool show_raid_hud{};
+    bool show_activity_feed{};
     bool radar_shape_circle{};
+    bool radar_map_mode{};
+    bool radar_underground_dim{};
     bool radar_ally_arrows{};
     float esp_distance{};
     float esp_color_visible[4]{};
+    // (color_look_arrow lives next to its toggle in the block above)
     float esp_color_invisible[4]{};
     bool vis_enabled{};
 
@@ -133,6 +143,7 @@ struct Snapshot {
     int aimbot_priority{};
     bool show_fov{};
     bool show_crosshair{};
+    bool camPovUsePending{};
     int crosshair_style{};
     float crosshair_color[4]{};
     float crosshair_size{};
@@ -226,6 +237,15 @@ struct Snapshot {
     float color_loot[4]{};
     bool loot_rarity_color{};
     bool show_loot_value{};
+    bool show_crate_contents{};
+    bool show_stack_counts{};
+    bool grey_looted_containers{};
+    bool show_armor_line{};
+    bool show_player_kit{};
+    bool show_bot_loadout{};
+    bool show_bot_vision{};
+    bool show_bot_alertness{};
+    bool show_bot_parts{};
     float loot_min_value{};
     int loot_min_rarity{};
     bool loot_min_val_sp{};
@@ -295,6 +315,10 @@ Snapshot CaptureSnapshot()
     s.health = var::health;
     s.names = var::names;
     s.show_weapon = var::show_weapon;
+    s.show_dbno_badge = var::show_dbno_badge;
+    s.show_look_arrows = var::show_look_arrows;
+    s.show_steam_ids = var::show_steam_ids;
+    std::memcpy(s.color_look_arrow, var::color_look_arrow, sizeof(s.color_look_arrow));
     s.snaplines = var::snaplines;
     s.skeleton = var::skeleton;
     s.silhouette = var::silhouette;
@@ -308,6 +332,7 @@ Snapshot CaptureSnapshot()
     s.debug_skeleton_lag = var::debug_skeleton_lag;
     s.debug_aim_shake = var::debug_aim_shake;
     s.debug_hatch_detect = var::debug_hatch_detect;
+    s.debug_ghost_bots = var::debug_ghost_bots;
     s.esp_text_scale = var::esp_text_scale;
     s.radar_scale = var::radar_scale;
     s.radar_range = var::radar_range;
@@ -315,7 +340,11 @@ Snapshot CaptureSnapshot()
     s.radar_pos_y_norm = var::radar_pos_y_norm;
     s.radar_loot_min_rarity = var::radar_loot_min_rarity;
     s.show_radar_special = var::show_radar_special;
+    s.show_raid_hud = var::show_raid_hud;
+    s.show_activity_feed = var::show_activity_feed;
     s.radar_shape_circle = var::radar_shape_circle;
+    s.radar_map_mode = var::radar_map_mode;
+    s.radar_underground_dim = var::radar_underground_dim;
     s.radar_ally_arrows = var::radar_ally_arrows;
     s.esp_distance = var::esp_distance;
     std::memcpy(s.esp_color_visible, var::esp_color_visible, sizeof(s.esp_color_visible));
@@ -346,6 +375,7 @@ Snapshot CaptureSnapshot()
     s.aimbot_priority = static_cast<int>(var::aimbot_priority);
     s.show_fov = var::show_fov;
     s.show_crosshair = var::show_crosshair;
+    s.camPovUsePending = var::camPovUsePending;
     s.crosshair_style = var::crosshair_style;
     std::memcpy(s.crosshair_color, var::crosshair_color, sizeof(s.crosshair_color));
     s.crosshair_size = var::crosshair_size;
@@ -437,6 +467,15 @@ Snapshot CaptureSnapshot()
     std::memcpy(s.color_loot, var::color_loot, sizeof(s.color_loot));
     s.loot_rarity_color = var::loot_rarity_color;
     s.show_loot_value = var::show_loot_value;
+    s.show_crate_contents = var::show_crate_contents;
+    s.show_stack_counts = var::show_stack_counts;
+    s.grey_looted_containers = var::grey_looted_containers;
+    s.show_armor_line = var::show_armor_line;
+    s.show_player_kit = var::show_player_kit;
+    s.show_bot_loadout = var::show_bot_loadout;
+    s.show_bot_vision = var::show_bot_vision;
+    s.show_bot_alertness = var::show_bot_alertness;
+    s.show_bot_parts = var::show_bot_parts;
     s.loot_min_value = var::loot_min_value;
     s.loot_min_rarity = var::loot_min_rarity;
     s.loot_min_val_sp = var::loot_min_val_sp;
@@ -466,6 +505,10 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.health == b.health &&
         a.names == b.names &&
         a.show_weapon == b.show_weapon &&
+        a.show_dbno_badge == b.show_dbno_badge &&
+        a.show_look_arrows == b.show_look_arrows &&
+        a.show_steam_ids == b.show_steam_ids &&
+        ColorsEqual(a.color_look_arrow, b.color_look_arrow) &&
         a.snaplines == b.snaplines &&
         a.skeleton == b.skeleton &&
         a.silhouette == b.silhouette &&
@@ -479,6 +522,7 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.debug_skeleton_lag == b.debug_skeleton_lag &&
         a.debug_aim_shake == b.debug_aim_shake &&
         a.debug_hatch_detect == b.debug_hatch_detect &&
+        a.debug_ghost_bots == b.debug_ghost_bots &&
         a.esp_text_scale == b.esp_text_scale &&
         a.radar_scale == b.radar_scale &&
         a.radar_range == b.radar_range &&
@@ -486,7 +530,11 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.radar_pos_y_norm == b.radar_pos_y_norm &&
         a.radar_loot_min_rarity == b.radar_loot_min_rarity &&
         a.show_radar_special == b.show_radar_special &&
+        a.show_raid_hud == b.show_raid_hud &&
+        a.show_activity_feed == b.show_activity_feed &&
         a.radar_shape_circle == b.radar_shape_circle &&
+        a.radar_map_mode == b.radar_map_mode &&
+        a.radar_underground_dim == b.radar_underground_dim &&
         a.radar_ally_arrows == b.radar_ally_arrows &&
         a.esp_distance == b.esp_distance &&
         ColorsEqual(a.esp_color_visible, b.esp_color_visible) &&
@@ -516,6 +564,7 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.aimbot_priority == b.aimbot_priority &&
         a.show_fov == b.show_fov &&
         a.show_crosshair == b.show_crosshair &&
+        a.camPovUsePending == b.camPovUsePending &&
         a.crosshair_style == b.crosshair_style &&
         ColorsEqual(a.crosshair_color, b.crosshair_color) &&
         a.crosshair_size == b.crosshair_size &&
@@ -604,6 +653,15 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         ColorsEqual(a.color_loot, b.color_loot) &&
         a.loot_rarity_color == b.loot_rarity_color &&
         a.show_loot_value == b.show_loot_value &&
+        a.show_crate_contents == b.show_crate_contents &&
+        a.show_stack_counts == b.show_stack_counts &&
+        a.grey_looted_containers == b.grey_looted_containers &&
+        a.show_armor_line == b.show_armor_line &&
+        a.show_player_kit == b.show_player_kit &&
+        a.show_bot_loadout == b.show_bot_loadout &&
+        a.show_bot_vision == b.show_bot_vision &&
+        a.show_bot_alertness == b.show_bot_alertness &&
+        a.show_bot_parts == b.show_bot_parts &&
         a.loot_min_value == b.loot_min_value &&
         a.loot_min_rarity == b.loot_min_rarity &&
         a.loot_min_val_sp == b.loot_min_val_sp &&
@@ -654,6 +712,15 @@ bool ApplyLootConfigKey(const std::string& key, const std::string& val)
     if (key == "color_loot") { ParseColor4(val, var::color_loot); return true; }
     if (key == "loot_rarity_color") { var::loot_rarity_color = ParseBool(val, var::loot_rarity_color); return true; }
     if (key == "show_loot_value") { var::show_loot_value = ParseBool(val, var::show_loot_value); return true; }
+    if (key == "show_crate_contents") { var::show_crate_contents = ParseBool(val, var::show_crate_contents); return true; }
+    if (key == "show_stack_counts") { var::show_stack_counts = ParseBool(val, var::show_stack_counts); return true; }
+    if (key == "grey_looted_containers") { var::grey_looted_containers = ParseBool(val, var::grey_looted_containers); return true; }
+    if (key == "show_armor_line") { var::show_armor_line = ParseBool(val, var::show_armor_line); return true; }
+    if (key == "show_player_kit") { var::show_player_kit = ParseBool(val, var::show_player_kit); return true; }
+    if (key == "show_bot_loadout") { var::show_bot_loadout = ParseBool(val, var::show_bot_loadout); return true; }
+    if (key == "show_bot_vision") { var::show_bot_vision = ParseBool(val, var::show_bot_vision); return true; }
+    if (key == "show_bot_alertness") { var::show_bot_alertness = ParseBool(val, var::show_bot_alertness); return true; }
+    if (key == "show_bot_parts") { var::show_bot_parts = ParseBool(val, var::show_bot_parts); return true; }
     if (key == "loot_min_value") { var::loot_min_value = static_cast<float>(std::atof(val.c_str())); return true; }
     if (key == "loot_min_rarity") { var::loot_min_rarity = std::atoi(val.c_str()); return true; }
     if (key == "loot_min_val_sp") { var::loot_min_val_sp = ParseBool(val, var::loot_min_val_sp); return true; }
@@ -828,6 +895,10 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     else if (key == "health") var::health = ParseBool(val, var::health);
     else if (key == "names") var::names = ParseBool(val, var::names);
     else if (key == "show_weapon") var::show_weapon = ParseBool(val, var::show_weapon);
+    else if (key == "show_dbno_badge") var::show_dbno_badge = ParseBool(val, var::show_dbno_badge);
+    else if (key == "show_look_arrows") var::show_look_arrows = ParseBool(val, var::show_look_arrows);
+    else if (key == "show_steam_ids") var::show_steam_ids = ParseBool(val, var::show_steam_ids);
+    else if (key == "color_look_arrow") ParseColor4(val, var::color_look_arrow);
     else if (key == "snaplines") var::snaplines = ParseBool(val, var::snaplines);
     else if (key == "skeleton") var::skeleton = ParseBool(val, var::skeleton);
     else if (key == "silhouette") var::silhouette = ParseBool(val, var::silhouette);
@@ -843,6 +914,7 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     else if (key == "debug_skeleton_lag") var::debug_skeleton_lag = ParseBool(val, var::debug_skeleton_lag);
     else if (key == "debug_aim_shake") var::debug_aim_shake = ParseBool(val, var::debug_aim_shake);
     else if (key == "debug_hatch_detect") var::debug_hatch_detect = ParseBool(val, var::debug_hatch_detect);
+    else if (key == "debug_ghost_bots") var::debug_ghost_bots = ParseBool(val, var::debug_ghost_bots);
     else if (key == "esp_text_scale") var::esp_text_scale = static_cast<float>(std::atof(val.c_str()));
     else if (key == "radar_scale") var::radar_scale = static_cast<float>(std::atof(val.c_str()));
     else if (key == "radar_range") {
@@ -852,7 +924,11 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     else if (key == "radar_pos_y_norm") var::radar_pos_y_norm = static_cast<float>(std::atof(val.c_str()));
     else if (key == "radar_loot_min_rarity") var::radar_loot_min_rarity = std::atoi(val.c_str());
     else if (key == "show_radar_special") var::show_radar_special = ParseBool(val, var::show_radar_special);
+    else if (key == "show_raid_hud") var::show_raid_hud = ParseBool(val, var::show_raid_hud);
+    else if (key == "show_activity_feed") var::show_activity_feed = ParseBool(val, var::show_activity_feed);
     else if (key == "radar_shape_circle") var::radar_shape_circle = ParseBool(val, var::radar_shape_circle);
+    else if (key == "radar_map_mode") var::radar_map_mode = ParseBool(val, var::radar_map_mode);
+    else if (key == "radar_underground_dim") var::radar_underground_dim = ParseBool(val, var::radar_underground_dim);
     else if (key == "radar_ally_arrows") var::radar_ally_arrows = ParseBool(val, var::radar_ally_arrows);
     else if (key == "esp_distance") {
         var::esp_distance = std::clamp(static_cast<float>(std::atof(val.c_str())), 50.f, var::kMaxDistanceSliderM);
@@ -990,6 +1066,10 @@ void WriteIni()
     file << "health=" << (var::health ? 1 : 0) << '\n';
     file << "names=" << (var::names ? 1 : 0) << '\n';
     file << "show_weapon=" << (var::show_weapon ? 1 : 0) << '\n';
+    file << "show_dbno_badge=" << (var::show_dbno_badge ? 1 : 0) << '\n';
+    file << "show_look_arrows=" << (var::show_look_arrows ? 1 : 0) << '\n';
+    file << "show_steam_ids=" << (var::show_steam_ids ? 1 : 0) << '\n';
+    WriteColor4(file, "color_look_arrow", var::color_look_arrow);
     file << "snaplines=" << (var::snaplines ? 1 : 0) << '\n';
     file << "skeleton=" << (var::skeleton ? 1 : 0) << '\n';
     file << "silhouette=" << (var::silhouette ? 1 : 0) << '\n';
@@ -1003,6 +1083,7 @@ void WriteIni()
     file << "debug_skeleton_lag=" << (var::debug_skeleton_lag ? 1 : 0) << '\n';
     file << "debug_aim_shake=" << (var::debug_aim_shake ? 1 : 0) << '\n';
     file << "debug_hatch_detect=" << (var::debug_hatch_detect ? 1 : 0) << '\n';
+    file << "debug_ghost_bots=" << (var::debug_ghost_bots ? 1 : 0) << '\n';
     file << "esp_text_scale=" << var::esp_text_scale << '\n';
     file << "radar_scale=" << var::radar_scale << '\n';
     file << "radar_range=" << var::radar_range << '\n';
@@ -1010,7 +1091,11 @@ void WriteIni()
     file << "radar_pos_y_norm=" << var::radar_pos_y_norm << '\n';
     file << "radar_loot_min_rarity=" << var::radar_loot_min_rarity << '\n';
     file << "show_radar_special=" << (var::show_radar_special ? 1 : 0) << '\n';
+    file << "show_raid_hud=" << (var::show_raid_hud ? 1 : 0) << '\n';
+    file << "show_activity_feed=" << (var::show_activity_feed ? 1 : 0) << '\n';
     file << "radar_shape_circle=" << (var::radar_shape_circle ? 1 : 0) << '\n';
+    file << "radar_map_mode=" << (var::radar_map_mode ? 1 : 0) << '\n';
+    file << "radar_underground_dim=" << (var::radar_underground_dim ? 1 : 0) << '\n';
     file << "radar_ally_arrows=" << (var::radar_ally_arrows ? 1 : 0) << '\n';
     file << "esp_distance=" << var::esp_distance << '\n';
     WriteColor4(file, "esp_color_visible", var::esp_color_visible);
@@ -1142,6 +1227,15 @@ void WriteIni()
     WriteColor4(file, "color_loot", var::color_loot);
     file << "loot_rarity_color=" << (var::loot_rarity_color ? 1 : 0) << '\n';
     file << "show_loot_value=" << (var::show_loot_value ? 1 : 0) << '\n';
+    file << "show_crate_contents=" << (var::show_crate_contents ? 1 : 0) << '\n';
+    file << "show_stack_counts=" << (var::show_stack_counts ? 1 : 0) << '\n';
+    file << "grey_looted_containers=" << (var::grey_looted_containers ? 1 : 0) << '\n';
+    file << "show_armor_line=" << (var::show_armor_line ? 1 : 0) << '\n';
+    file << "show_player_kit=" << (var::show_player_kit ? 1 : 0) << '\n';
+    file << "show_bot_loadout=" << (var::show_bot_loadout ? 1 : 0) << '\n';
+    file << "show_bot_vision=" << (var::show_bot_vision ? 1 : 0) << '\n';
+    file << "show_bot_alertness=" << (var::show_bot_alertness ? 1 : 0) << '\n';
+    file << "show_bot_parts=" << (var::show_bot_parts ? 1 : 0) << '\n';
     file << "loot_min_value=" << var::loot_min_value << '\n';
     file << "loot_min_rarity=" << var::loot_min_rarity << '\n';
     file << "loot_min_val_sp=" << (var::loot_min_val_sp ? 1 : 0) << '\n';

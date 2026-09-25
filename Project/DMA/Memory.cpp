@@ -43,18 +43,19 @@ static void ApplyVmmCacheTiming(VMM_HANDLE h)
     VMMDLL_ConfigSet(h, VMMDLL_OPT_CONFIG_PROCCACHE_TICKS_TOTAL, 200);   // ~20s
 }
 
-// CL-1341255 (2026-08-18) struct offsets — matches Offsets.h.
-// CL-1335610: UWorldRva 0xEAAF3E0 / PersistentLevel 0x120 / OwningWorld 0x128 /
-//   ActorCluster 0x148 / ContainerActors 0x90 / ActorCount 0x98 / LevelCollections 0x2A8
-static constexpr uint64_t kHelpUWorldRva = 0xE782D78ULL;
-static constexpr uint64_t kHelpPersistentLevel = 0x110ULL;
-static constexpr uint64_t kHelpLevelOwningWorld = 0x130ULL;
-static constexpr uint64_t kHelpActorCluster = 0x150ULL;
-static constexpr uint64_t kHelpContainerActors = 0x98ULL;
-static constexpr uint64_t kHelpContainerActorCount = 0xA0ULL;
-static constexpr uint64_t kHelpLevelCollections = 0x240ULL;
-static constexpr uint64_t kHelpLevelCollectionStride = 0x78ULL;
-static constexpr uint64_t kHelpCollectionPersistentLevel = 0x20ULL;
+// World-probe offsets — every one of them from the dumped SDK (Offsets.h), so
+// this file can never drift from the rest of the tool again. It used to carry
+// its own copy of the previous build's numbers (OwningWorld 0x130, ActorCluster
+// 0x150, LevelCollections 0x240), which let a *wrong* module base validate.
+static constexpr uint64_t kHelpUWorldRva = Offsets::UWorld;
+static constexpr uint64_t kHelpPersistentLevel = Offsets::PersistentLevel;
+static constexpr uint64_t kHelpLevelOwningWorld = Offsets::Level_OwningWorld;
+static constexpr uint64_t kHelpActorCluster = Offsets::ActorCluster;
+static constexpr uint64_t kHelpContainerActors = Offsets::LevelActorContainer_Actors;
+static constexpr uint64_t kHelpContainerActorCount = Offsets::LevelActorContainer_ActorCount;
+static constexpr uint64_t kHelpLevelCollections = Offsets::LevelCollections;
+static constexpr uint64_t kHelpLevelCollectionStride = Offsets::LevelCollection_Stride;
+static constexpr uint64_t kHelpCollectionPersistentLevel = Offsets::LevelCollection_PersistentLevel;
 
 static uint64_t g_dtbFileSize = 0x80000;
 
@@ -95,8 +96,13 @@ static bool LevelOwnedByWorld(VMM_HANDLE h, DWORD pid, uint64_t level, uint64_t 
     if (!level || Engine::LooksLikeUtf16Garbage(static_cast<uintptr_t>(level)) || level < 0x10000)
         return false;
     uint64_t owning = 0;
-    if (ReadU64(h, pid, level + kHelpLevelOwningWorld, owning) && owning == world)
-        return true;
+    if (ReadU64(h, pid, level + kHelpLevelOwningWorld, owning) && owning)
+        // ULevel::OwningWorld is dump-confirmed on this build: a level that
+        // names a *different* world means the base we are probing is wrong.
+        // The old code fell through to the loose actor-cluster guess here and
+        // accepted the wrong base, which is how every RVA read ended up in
+        // heap space (GWorldRaw = garbage, OwningGI = garbage).
+        return owning == world;
     uint64_t cluster = 0;
     if (!ReadU64(h, pid, level + kHelpActorCluster, cluster)
         || Engine::LooksLikeUtf16Garbage(static_cast<uintptr_t>(cluster))

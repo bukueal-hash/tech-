@@ -10,6 +10,7 @@
 
 #include "Core/Memory.h"
 #include "Core/SessionLog.h"
+#include "Core/EntityDiagnostics.hpp"
 #include "DMA/Memory.h"
 #include "DMA/DmaKeyboard.h"
 #include "Hardware/KmBox.h"
@@ -46,6 +47,9 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
     InstallCrashHandler();  // VEH — log crash context before dying
     SessionLog::Init();
+    EntityDiagnostics::Init();
+    std::cout << "[diag] entity log: "
+              << EntityDiagnostics::GetPath().string() << std::endl;
     timeBeginPeriod(1);
 
     // No AllocConsole — Release is Windows subsystem; keep overlay-only (no black console).
@@ -265,6 +269,7 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     engine.StopWorkerThreads();
+    EntityDiagnostics::Shutdown();
     ImGui::DestroyContext();
 
     CleanupDeviceD3D();

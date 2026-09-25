@@ -5,8 +5,10 @@
 *.sdf
 *.sln.docstates
 
-# Build output (any depth: root Build/, Project/Build/, ...)
-**/Build/
+# Build output (any depth: root Build/, Project/Build/, ...).
+# Root Build/ is shipped with a ready-to-run exe + DLLs + data so a fresh clone
+# works without compiling; see the whitelist at the bottom of this file.
+**/Build/*
 **/Intermediate/
 dist/
 out/
@@ -47,3 +49,28 @@ debug-*.log
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# --- Shipped build (root Build/ only) -------------------------------------
+# Committed so a clone can run Build/ArcRaiders.exe directly. Declared last so
+# these negations override the generic *.exe / *.dll / *.pdb rules above.
+!Build/ArcRaiders.exe
+!Build/*.dll
+!Build/*.db
+!Build/*.ini
+!Build/*.yes
+!Build/Data/
+
+# --- Local-only corpora & generated reports (not needed to build or run) ---
+sdk/
+help/
+tools/__pycache__/
+tools/sdk_index.json
+tools/build_gate_summary.txt
+tools/probe_result.txt
+sdk_gap_report.html
+QUALITY_PLAN_PREVIEW.html
+sdk_vs_project_comparison.txt
+sdk_vs_project_detailed.txt
+.freebuff/
+.vscode/
+

@@ -200,6 +200,33 @@ namespace var {
     extern float color_loot[4];
     extern bool loot_rarity_color;
     extern bool show_loot_value;
+    /** Crate contents preview: "[Bandage x2, ...]" listing on container labels. */
+    extern bool show_crate_contents;
+    /** Ground-loot stack size: append " xN" when the stack has more than one. */
+    extern bool show_stack_counts;
+    /** Looted containers draw grey + "(Looted)" instead of hiding/re-homing. */
+    extern bool grey_looted_containers;
+    // Loadout readout (guns/armor/ammo feature): armor tier + plate line for
+    // players, best-effort weapon/armor line for bots.
+    extern bool show_armor_line;
+    /** Full kit readout: stowed guns/tool, safe pouch (rarity), belt/pack slots. */
+    extern bool show_player_kit;
+    extern bool show_bot_loadout;
+    // Player intel (features #4-#6): DBNO badge + revive ring, look arrows,
+    // permanent SteamID64 labels (+ arrow color).
+    extern bool show_dbno_badge;
+    extern bool show_look_arrows;
+    extern bool show_steam_ids;
+    extern float color_look_arrow[4];
+    // Bot intel (features #7-#8): vision cones + alertness tag, part pips.
+    extern bool show_bot_vision;
+    extern bool show_bot_alertness;
+    extern bool show_bot_parts;
+    // Raid intel (features #9-#11): dashboard panel, activity feed, map radar.
+    extern bool show_raid_hud;
+    extern bool show_activity_feed;
+    extern bool radar_map_mode;
+    extern bool radar_underground_dim;
     extern float loot_min_value;
     extern int loot_min_rarity;
     extern bool loot_min_val_sp;
@@ -214,6 +241,8 @@ namespace var {
     extern bool debug_skeleton_lag;
     extern bool debug_aim_shake;
     extern bool debug_hatch_detect;
+    /** Log each bot rejection/ghost decision to entity_diagnostics.ndjson. */
+    extern bool debug_ghost_bots;
 
 
     /* Camera debug */
@@ -235,7 +264,10 @@ bool WorldCategoryEnabled(int category);
 
 inline bool AnyWorldEspEnabled()
 {
-    return var::enable_world && (
+    // The menu defines Show loot as the world-draw master switch. Keep scanner,
+    // frame collection, and renderer on the same gate; radar has its own
+    // independent world-blip path.
+    return var::enable_world && var::showLoot && (
         var::droppedItems || var::raiderStock || var::showArc ||
         var::showDeadPlayers || var::showLoot ||
         var::show_world_items || var::show_world_ammo || var::show_world_arc_loot ||

@@ -1,15 +1,25 @@
 #include "../Core/Engine.h"
 #include "../Core/AgentLog.h"
+#include "../Core/EntityDiagnostics.hpp"
+#include "../Core/ScanGatePolicy.hpp"
 #include "../../DMA/Memory.h"
 #include "../Interface/Utils/Variables/index.h"
+#include "CollisionMirror.h"
+#include "WorldScanCommon.h"
 
 #include <chrono>
+#include <condition_variable>
+#include <cstring>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 extern bool showmenu;
 
@@ -174,7 +184,6 @@ static CadenceStats g_aimCadence;
 // RobotList, ContainerList/ItemList) so only one touches the DMA bus at a
 // time. Latency-critical passes (PositionRefreshPass, FrameBuilder, Aim)
 // stay ungated so positions/camera never wait behind a long scan.
-std::mutex g_scanGateMu;
 std::atomic<int> g_scanGateWaiters{0};
 std::atomic<const char*> g_scanGateHolder{nullptr};
 
@@ -231,38 +240,292 @@ void LogScanGate(const char* scanner, int waitMs, int heldMs, int waiters, const
 //             gap sleep fired — NOT a contention event (threshold filters it).
 //   A waitMs ≫ 12ms with non-empty blockedBy = real gate queueing.
 constexpr auto kGateIdleGap = std::chrono::milliseconds(12);
-std::chrono::steady_clock::time_point g_lastGateRelease{};
+
+// #region agent log
+// LogGateTurn (verify log): one line per scanner turn, throttled 250ms per
+// scanner. sinceMs is the start-to-start gap — the number that answers "is
+// RobotList actually running at its cadence".
+void LogGateTurn(const char* scanner, int cadenceMs, int waitMs, int heldMs,
+                 int gapMs, int64_t sinceMs)
+{
+    thread_local std::unordered_map<std::string, std::chrono::steady_clock::time_point> s_lastTurn;
+    const auto now = std::chrono::steady_clock::now();
+    auto& last = s_lastTurn[scanner];
+    if (last.time_since_epoch().count() != 0
+        && now - last < std::chrono::milliseconds(250))
+        return;
+    last = now;
+
+    std::ofstream f(kArcVerifyPath, std::ios::app);
+    if (!f)
+        return;
+    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    f << "{\"sessionId\":\"c190fb\",\"runId\":\"gate\","
+      << "\"location\":\"EngineThreads.cpp:gate\",\"message\":\"gate_turn\","
+      << "\"data\":{\"scanner\":\"" << scanner << "\",\"cadenceMs\":" << cadenceMs
+      << ",\"waitMs\":" << waitMs
+      << ",\"heldMs\":" << heldMs
+      << ",\"gapMs\":" << gapMs
+      << ",\"sinceMs\":" << sinceMs << "}"
+      << ",\"timestamp\":" << ts << "}\n";
+}
+// #endregion
+
+// Fair scan gate: one scan on the DMA bus at a time, but turn grants follow
+// ScanGatePolicy instead of raw mutex order. The old std::mutex let the 16ms
+// Update thread barge RobotList's 200ms admission pass into multi-second
+// queues; the policy bounds every scanner's wait (~2x its cadence) and
+// otherwise runs whoever is most due.
+class ScanGate {
+public:
+    template <typename Fn>
+    void Run(const char* scanner, int cadenceMs, Fn&& fn)
+    {
+        const auto w0 = std::chrono::steady_clock::now();
+        const char* blockedBy = nullptr;
+        int64_t sinceMs = -1;
+        int gapMs = 0;
+        std::chrono::steady_clock::time_point t_acquired;
+        {
+            std::unique_lock<std::mutex> lock(m_mu);
+            blockedBy = m_holder;
+            const auto lastStart = LastStartLocked(scanner);
+            if (lastStart.time_since_epoch().count() != 0)
+                sinceMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    w0 - lastStart).count();
+            m_queue.push_back({ scanner, cadenceMs, w0, lastStart });
+            g_scanGateWaiters.fetch_add(1, std::memory_order_relaxed);
+            m_cv.wait(lock, [&] { return !m_busy && IsMyTurnLocked(scanner); });
+            g_scanGateWaiters.fetch_sub(1, std::memory_order_relaxed);
+            t_acquired = std::chrono::steady_clock::now();
+            // N1 idle gap: the bus must rest between turns. Enforced under the
+            // lock so no other scan fills the gap.
+            if (m_lastRelease.time_since_epoch().count() != 0) {
+                const auto sinceRelease = t_acquired - m_lastRelease;
+                if (sinceRelease < kGateIdleGap) {
+                    std::this_thread::sleep_for(kGateIdleGap - sinceRelease);
+                    gapMs = static_cast<int>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t_acquired).count());
+                }
+            }
+            RemoveLocked(scanner);
+            m_busy = true;
+            m_holder = scanner;
+            m_lastStarts[scanner] = std::chrono::steady_clock::now();
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        g_scanGateHolder.store(scanner, std::memory_order_relaxed);
+        fn();
+        const auto t1 = std::chrono::steady_clock::now();
+        g_scanGateHolder.store(nullptr, std::memory_order_relaxed);
+
+        {
+            std::lock_guard<std::mutex> lock(m_mu);
+            m_lastRelease = std::chrono::steady_clock::now();
+            m_busy = false;
+            m_holder = nullptr;
+        }
+        m_cv.notify_all();
+
+        // #region agent log
+        const int waitMs = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(t_acquired - w0).count());
+        const int heldMs = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+        LogScanGate(scanner, waitMs, heldMs,
+            g_scanGateWaiters.load(std::memory_order_relaxed), blockedBy);
+        LogGateTurn(scanner, cadenceMs, waitMs, heldMs, gapMs, sinceMs);
+        // #endregion
+    }
+
+private:
+    struct Waiter {
+        const char* name;
+        int cadenceMs;
+        std::chrono::steady_clock::time_point enqueue;
+        std::chrono::steady_clock::time_point lastStart;
+    };
+
+    std::chrono::steady_clock::time_point LastStartLocked(const char* scanner) const
+    {
+        const auto it = m_lastStarts.find(scanner);
+        return it == m_lastStarts.end()
+            ? std::chrono::steady_clock::time_point{}
+            : it->second;
+    }
+
+    bool IsMyTurnLocked(const char* scanner) const
+    {
+        if (m_queue.empty())
+            return false;
+        std::vector<ScanGatePolicy::Candidate> cands;
+        cands.reserve(m_queue.size());
+        for (const Waiter& w : m_queue) {
+            ScanGatePolicy::Candidate c;
+            c.cadenceMs = w.cadenceMs;
+            c.lastStartMs = (w.lastStart.time_since_epoch().count() == 0)
+                ? ScanGatePolicy::Candidate::kNeverRan()
+                : std::chrono::duration_cast<std::chrono::milliseconds>(
+                      w.lastStart.time_since_epoch()).count();
+            c.enqueueMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                w.enqueue.time_since_epoch()).count();
+            cands.push_back(c);
+        }
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int pick = ScanGatePolicy::PickNext(cands, nowMs);
+        return pick >= 0
+            && std::strcmp(m_queue[static_cast<size_t>(pick)].name, scanner) == 0;
+    }
+
+    void RemoveLocked(const char* scanner)
+    {
+        for (auto it = m_queue.begin(); it != m_queue.end(); ++it) {
+            if (std::strcmp(it->name, scanner) == 0) {
+                m_queue.erase(it);
+                return;
+            }
+        }
+    }
+
+    mutable std::mutex m_mu;
+    std::condition_variable m_cv;
+    bool m_busy = false;
+    const char* m_holder = nullptr;
+    std::vector<Waiter> m_queue;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> m_lastStarts;
+    std::chrono::steady_clock::time_point m_lastRelease{};
+};
+
+static ScanGate g_scanGate;
 
 template <typename Fn>
-void RunGatedScan(const char* scanner, Fn&& fn)
+void RunGatedScan(const char* scanner, int cadenceMs, Fn&& fn)
 {
-    const auto w0 = std::chrono::steady_clock::now();
-    const char* blockedBy = g_scanGateHolder.load(std::memory_order_relaxed);
-    g_scanGateWaiters.fetch_add(1, std::memory_order_relaxed);
-    std::unique_lock<std::mutex> lock(g_scanGateMu);
-    g_scanGateWaiters.fetch_sub(1, std::memory_order_relaxed);
-    const auto t_acquired = std::chrono::steady_clock::now();
-    if (g_lastGateRelease.time_since_epoch().count() != 0) {
-        const auto sinceRelease = t_acquired - g_lastGateRelease;
-        if (sinceRelease < kGateIdleGap)
-            std::this_thread::sleep_for(kGateIdleGap - sinceRelease);
-    }
-    const auto t0 = std::chrono::steady_clock::now();
-    g_scanGateHolder.store(scanner, std::memory_order_relaxed);
-    fn();
-    g_lastGateRelease = std::chrono::steady_clock::now();
-    g_scanGateHolder.store(nullptr, std::memory_order_relaxed);
-    // #region agent log
-    const auto t1 = std::chrono::steady_clock::now();
-    LogScanGate(scanner,
-        static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(t_acquired - w0).count()),
-        static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()),
-        g_scanGateWaiters.load(std::memory_order_relaxed),
-        blockedBy);
-    // #endregion
+    g_scanGate.Run(scanner, cadenceMs, fn);
 }
 
+// Scanner cadences: single source for the SyncedThread pacing AND the scan
+// gate's fairness policy so the two cannot drift apart.
+constexpr int kUpdateCadenceMs = 16;
+constexpr int kEntityCadenceMs = 220;
+constexpr int kRobotCadenceMs = 200;
+constexpr int kContainerCadenceMs = 250;
+constexpr int kItemCadenceMs = 250;
+
 } // namespace
+
+void Engine::LogEntityDiagnostics()
+{
+    using namespace EntityDiagnostics;
+
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count());
+    size_t cursors[4]{};
+    CategorySummary players;
+    CategorySummary bots;
+    CategorySummary containers;
+    CategorySummary items;
+    players.kind = "player";
+    bots.kind = "bot";
+    containers.kind = "container";
+    items.kind = "item";
+
+    const auto emitSamples = [&](const char* kind, auto& cache,
+        size_t& cursor, CategorySummary& summary) {
+        using Entry = typename std::decay_t<decltype(cache)>::mapped_type;
+        constexpr bool isPlayer = std::is_same_v<Entry, PlayerCacheEntry>;
+        std::shared_lock<std::shared_mutex> lock(
+            isPlayer ? m_playerCacheMutex
+                : std::is_same_v<Entry, WorldCacheEntry> && kind[0] == 'b'
+                    ? m_robotCacheMutex
+                    : kind[0] == 'c' ? m_containerCacheMutex : m_itemCacheMutex);
+        summary.total = cache.size();
+        if (cache.empty())
+            return;
+
+        constexpr size_t kMaxSamplesPerKind = 32;
+        const size_t size = cache.size();
+        const size_t start = cursor % size;
+        size_t emitted = 0;
+        for (size_t step = 0; step < size && emitted < kMaxSamplesPerKind; ++step) {
+            auto it = cache.begin();
+            std::advance(it, static_cast<std::ptrdiff_t>((start + step) % size));
+            const uintptr_t key = it->first;
+            const Entry& entry = it->second;
+            if (entry.Drawing)
+                ++summary.drawing;
+
+            const bool positionValid = IsPlausiblePosition(
+                static_cast<float>(entry.WorldPos.x),
+                static_cast<float>(entry.WorldPos.y),
+                static_cast<float>(entry.WorldPos.z));
+            const uint64_t sampledAt = entry.positionSampleMs;
+            const uint64_t age = sampledAt && nowMs > sampledAt ? nowMs - sampledAt : 0;
+            const bool initialized = [&]() {
+                if constexpr (isPlayer)
+                    return entry.positionInitialized;
+                else
+                    return sampledAt != 0 || positionValid;
+            }();
+            const uint32_t issues = BuildIssueFlags(
+                !entry.ActorName.empty(), positionValid, initialized,
+                entry.Drawing, entry.health, entry.maxhealth, age);
+            if (issues)
+                ++summary.issues;
+
+            if (emitted >= kMaxSamplesPerKind)
+                break;
+            EntitySample sample;
+            sample.kind = kind;
+            sample.actorKey = key;
+            sample.name = entry.ActorName;
+            if constexpr (isPlayer) {
+                sample.detail = entry.weaponName;
+                sample.category = entry.statusFlags;
+            } else {
+                sample.detail = entry.ItemType;
+                if (sample.detail.empty())
+                    sample.detail = entry.weaponName;
+                sample.category = entry.worldCategory;
+            }
+            sample.distance = entry.Distance;
+            sample.health = entry.health;
+            sample.maxHealth = entry.maxhealth;
+            sample.x = static_cast<float>(entry.WorldPos.x);
+            sample.y = static_cast<float>(entry.WorldPos.y);
+            sample.z = static_cast<float>(entry.WorldPos.z);
+            sample.positionAgeMs = age;
+            sample.issueFlags = issues;
+            sample.drawing = entry.Drawing;
+            sample.visible = entry.isVisible;
+            sample.positionInitialized = initialized;
+            LogEntity(sample);
+            ++emitted;
+        }
+        cursor = start + emitted;
+    };
+
+    emitSamples("player", playerCache, cursors[0], players);
+    emitSamples("bot", robotCache, cursors[1], bots);
+    emitSamples("container", containerCache, cursors[2], containers);
+    emitSamples("item", itemCache, cursors[3], items);
+
+    std::ostringstream features;
+    features << "world=" << (var::enable_world && var::showLoot)
+        << ",playerEsp=" << var::enableesp
+        << ",botEsp=" << var::showRobots
+        << ",radar=" << var::show_radar
+        << ",loot=" << (var::raiderStock || var::droppedItems
+            || var::show_world_items || var::show_world_crate);
+    LogSummary("live", features.str(), players, bots, containers, items,
+        m_worldGeneration.load(std::memory_order_acquire));
+}
 
 void Engine::StartWorkerThreads()
 {
@@ -275,24 +538,24 @@ void Engine::StartWorkerThreads()
         // #region agent log
         const auto t0 = std::chrono::steady_clock::now();
         // #endregion
-        RunGatedScan("Update", [this] { Update(); });
+        RunGatedScan("Update", kUpdateCadenceMs, [this] { Update(); });
         // #region agent log
         LogPerfSpike("Update", static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count()));
         // #endregion
-    }, 16);
+    }, kUpdateCadenceMs);
     m_entityThread = std::make_unique<SyncedThread>([this] {
         if (!IsEspRaidActive())
             return;
         // #region agent log
         const auto t0 = std::chrono::steady_clock::now();
         // #endregion
-        RunGatedScan("EntityList", [this] { EntityList(); });
+        RunGatedScan("EntityList", kEntityCadenceMs, [this] { EntityList(); });
         // #region agent log
         LogPerfSpike("EntityList", static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count()));
         // #endregion
-    }, 220);
+    }, kEntityCadenceMs);
     // Phase 1.5: RobotList was the worst LAG1 offender (baseline ~622ms avg /
     // 1267ms max). Positions stay on PositionRefreshPass @16ms; lengthen this
     // admission/visual pass so FPGA bus contention drops. 200ms cadence + the
@@ -304,30 +567,30 @@ void Engine::StartWorkerThreads()
         // #region agent log
         const auto t0 = std::chrono::steady_clock::now();
         // #endregion
-        RunGatedScan("RobotList", [this] { RobotList(); });
+        RunGatedScan("RobotList", kRobotCadenceMs, [this] { RobotList(); });
         // #region agent log
         LogPerfSpike("RobotList", static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count()));
         // #endregion
-    }, 200);
+    }, kRobotCadenceMs);
     m_worldEspThread = std::make_unique<SyncedThread>([this] {
         if (!IsEspRaidActive())
             return;
         // #region agent log
         const auto t0 = std::chrono::steady_clock::now();
         // #endregion
-        RunGatedScan("ContainerList", [this] { ContainerList(); });
+        RunGatedScan("ContainerList", kContainerCadenceMs, [this] { ContainerList(); });
         // #region agent log
         LogPerfSpike("ContainerList", static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count()));
         const auto tItem0 = std::chrono::steady_clock::now();
         // #endregion
-        RunGatedScan("ItemList", [this] { ItemList(); });
+        RunGatedScan("ItemList", kItemCadenceMs, [this] { ItemList(); });
         // #region agent log
         LogPerfSpike("ItemList", static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - tItem0).count()));
         // #endregion
-    }, 250);
+    }, kContainerCadenceMs);
     // CAM2 (Fix #3): camera shared m_positionThread with PositionRefreshPass,
     // whose 100-200ms scatter stalls delayed the next UpdateCamera by the same
     // amount (cam_refresh_gap 200-560ms every 3s window). A stale projection
@@ -356,13 +619,22 @@ void Engine::StartWorkerThreads()
             return;
         const auto t0 = std::chrono::steady_clock::now();
         BuildEspRenderFrameWorker();
+        static std::chrono::steady_clock::time_point s_lastEntityDiagnostics{};
+        if (s_lastEntityDiagnostics.time_since_epoch().count() == 0
+            || std::chrono::steady_clock::now() - s_lastEntityDiagnostics
+                >= std::chrono::seconds(2)) {
+            s_lastEntityDiagnostics = std::chrono::steady_clock::now();
+            LogEntityDiagnostics();
+        }
         const int totalMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         LogPerfSpike("FrameBuilder", totalMs);
     }, 12);
     m_aimThread = std::make_unique<SyncedThread>([this] {
-        if (!IsEspRaidActive() || showmenu)
+        if (!IsEspRaidActive() || showmenu) {
+            ReleaseAimOutputs();
             return;
+        }
         g_aimCadence.tick();
         AimAssistence();
     }, 4);
@@ -383,12 +655,20 @@ void Engine::StopWorkerThreads()
     g_posCadence.dump();
     g_aimCadence.dump();
 
+    // Stop the scheduler that can submit background jobs before joining the
+    // other workers. This prevents a world/ESP pass from racing shutdown.
+    m_worldThread.reset();
+    m_entityThread.reset();
+    m_robotEspThread.reset();
+    m_worldEspThread.reset();
     m_aimThread.reset();
     m_frameBuilderThread.reset();
     m_cameraThread.reset();
     m_positionThread.reset();
-    m_robotEspThread.reset();
-    m_worldEspThread.reset();
-    m_entityThread.reset();
-    m_worldThread.reset();
+    ReleaseAimOutputs();
+
+    // All engine workers are now stopped, so no new background job can be
+    // submitted. Join diagnostic/rebuild jobs before destroying dependencies.
+    CollisionMirror::StopBackgroundJobs();
+    WorldScan::StopBackgroundJobs();
 }

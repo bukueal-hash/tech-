@@ -3,6 +3,9 @@
 #include "../Core/IntervalTimer.h"
 #include "../Core/AssetNames.h"
 #include "../Core/AgentLog.h"
+#include "../Core/BotAdmitQueue.hpp"
+#include "../Core/EntityDiagnostics.hpp"
+#include "../Core/PlayerEspMissLog.hpp"
 #include "EspDraw.h"
 #include "WorldScanCommon.h"
 #include "LrtsVisibility.h"
@@ -24,6 +27,12 @@ namespace {
 // scans before clearing Drawing (stops ESP blink at esp_distance boundary).
 static std::unordered_map<uintptr_t, uint8_t> s_playerDistMisses;
 static constexpr uint8_t kPlayerDistMissClearDrawing = 3;
+
+// Actor-array snapshots can briefly omit a live pawn while the DMA ring is
+// being rebuilt. Do not evict a player on one missing snapshot; the normal
+// root/position ghost counters still remove genuinely departed actors.
+static std::unordered_map<uintptr_t, uint8_t> s_playerActorSetMisses;
+static constexpr uint8_t kPlayerActorSetGracePasses = 5;
 
 // LRTS per-mesh visibility state (persisted across frames)
 static std::unordered_map<uintptr_t, LrtsVis::MeshState> s_lrtsMeshStates;
@@ -59,7 +68,12 @@ static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point>
 // gives the camera/position threads more air — less rot-lead skip, no player
 // box jumps.
 static constexpr size_t kPlayerAdmitSlices = 8;
-static constexpr size_t kPlayerAdmitPrioNewMax = 64;
+// P10: persistent pending lane (Core/BotAdmitQueue.hpp, shared with the bot
+// path). Newly-seen actors stay queued until a definitive outcome instead of
+// being "new" for one pass — a player that missed its single priority window
+// (64 cap / budget clip / undecrypted name) used to wait a full ring sweep
+// before being probed again.
+static AdmitQueue::PendingQueue s_playerAdmitQueue;
 static size_t s_playerAdmitSliceCursor = 0;
 // B5 (Riventides mirror): the player ring used the pre-B4 pattern (unordered
 // probeSet, no resume frontier) and froze on slice 0 on 16K-actor maps,
@@ -100,27 +114,26 @@ static void PlayerScanNegMemoize(uintptr_t actor)
     s_playerScanNeg[actor] = std::chrono::steady_clock::now();
 }
 
-// help/sdk.txt: prefer CompToWorld, then net snapshots.
-// EmbarkCharacterBase: StateInterpolator 0x7c0 → ReplicatedRootTransform 0x1f8
-// AActor: ReplicatedMovement 0x150; FRepMovement::Location 0x30
-// ACharacter: Mesh 0x420, CharacterMovement 0x428, Capsule 0x430
-// CMC: LastUpdateLocation 0x3e0
-constexpr std::ptrdiff_t kACharacterMesh = 0x420;
-constexpr std::ptrdiff_t kACharacterMovement = 0x428;
-constexpr std::ptrdiff_t kACharacterCapsule = 0x430;
-constexpr std::ptrdiff_t kCmcLastUpdateLocation = 0x3e0;
-constexpr std::ptrdiff_t kReplicatedMovement = 0x150;
-constexpr std::ptrdiff_t kRepMovLocation = 0x30;
-constexpr std::ptrdiff_t kStateInterpolator = 0x7c0;
-constexpr std::ptrdiff_t kReplicatedRootTransform = 0x1f8;
+// All slots below come from the dumped SDK (Project/Core/Offsets.h) — nothing
+// here is a hand-pinned literal any more, so a new dump moves them together.
+// Prefer CompToWorld, then net snapshots.
+// AActor: ReplicatedMovement; FRepMovement::Location @ +0x30.
+constexpr std::ptrdiff_t kACharacterMesh = Offsets::USkeletalMeshComponent;
+constexpr std::ptrdiff_t kACharacterMovement = Offsets::CharacterMovement;
+constexpr std::ptrdiff_t kACharacterCapsule = Offsets::Character_CapsuleComponent;
+constexpr std::ptrdiff_t kCmcLastUpdateLocation = Offsets::CMC_LastUpdateLocation;
+constexpr std::ptrdiff_t kReplicatedMovement = Offsets::ReplicatedMovement;
+constexpr std::ptrdiff_t kRepMovLocation = 0x30;   // FRepMovement::Location
+constexpr std::ptrdiff_t kStateInterpolator = Offsets::StateInterpolator;
+constexpr std::ptrdiff_t kReplicatedRootTransform = Offsets::ReplicatedRootTransform;
 
-// PioneerPlayerState: PioneerCharacter 0x528, CurrentPawn 0x530
-// Controller::PlayerState 0x3A0; PlayerState::PawnPrivate 0x410
-constexpr std::ptrdiff_t kPawnPlayerState = 0x3A0;
-constexpr std::ptrdiff_t kPsPawnPrivate = 0x428;
-constexpr std::ptrdiff_t kPsPawnPrivateAlt = 0x428;
-constexpr std::ptrdiff_t kPioneerCharacter = 0x548;
-constexpr std::ptrdiff_t kPioneerCurrentPawn = 0x550;
+// APawn::PlayerState is 0x3E0 in the SDK. Do not use the controller's
+// PlayerState slot (0x3D0) here; that pointer belongs to AController.
+constexpr std::ptrdiff_t kPawnPlayerState = Offsets::APlayerState;
+constexpr std::ptrdiff_t kPsPawnPrivate = Offsets::PlayerState_PawnPrivate;
+constexpr std::ptrdiff_t kPsPawnPrivateAlt = Offsets::PlayerState_PawnPrivate;
+constexpr std::ptrdiff_t kPioneerCharacter = Offsets::PioneerPlayerState_PioneerCharacter;
+constexpr std::ptrdiff_t kPioneerCurrentPawn = Offsets::PioneerPlayerState_CurrentPawn;
 
 bool PsBacklinksToPawn(uintptr_t ps, uintptr_t pawn)
 {
@@ -180,8 +193,11 @@ bool TryResolvePlayerStateAny(uintptr_t pawn, uintptr_t& outPs, bool& outViaActo
     return true;
 }
 
-constexpr std::ptrdiff_t kPlayerStateBIsABot = 0x3aa;
-constexpr uint8_t kPlayerStateBIsABotMask = 0x8;
+// Use the SDK-backed PlayerState status byte already defined in Offsets.h.
+// The old local 0x3AA probe could classify ordinary remote players as bots
+// and silently remove them before they ever entered the ESP cache.
+constexpr std::ptrdiff_t kPlayerStateBIsABot = Offsets::PS_BotStateByte;
+constexpr uint8_t kPlayerStateBIsABotMask = Offsets::PS_BotStateBotMask;
 
 bool PlayerStateIsBot(uintptr_t ps)
 {
@@ -451,6 +467,40 @@ void Engine::EntityList()
 
     const float maxDistSq =
         static_cast<float>(var::esp_distance * var::esp_distance * 10000.0f);
+    // Keep the scanner's Drawing state hysteretic. Without this, a player near
+    // the configured edge flips Drawing every other EntityList pass and the
+    // frame builder reports a readmit even though the target never left.
+    const float maxDistOffSq = maxDistSq * 1.1025f; // 5% hold band
+
+    // A newly admitted actor must get a first position before it is published.
+    // Otherwise Drawing remains false, PositionRefreshPass skips it, and the
+    // frame collector can never select it (the PlayerCache:3/EspDraw:0 bug).
+    auto initializePlayerEntry = [&](PlayerCacheEntry& entry,
+                                     uintptr_t actor,
+                                     uintptr_t root,
+                                     uintptr_t mesh) {
+        entry.APawn = actor;
+        entry.rootComponent = root;
+        entry.actorMesh = mesh;
+        const Vector3 pos = ResolvePlayerWorldPos(actor, root, mesh);
+        if (!IsPlausibleWorldPos(pos)) {
+            entry.positionInitialized = false;
+            entry.Drawing = false;
+            PlayerEspMiss::Global().Note(actor, entry.ActorName, -1.f,
+                PlayerEspMiss::Reason::AdmitPosInvalid);
+            return;
+        }
+        entry.WorldPos = pos;
+        entry.lastWorldPos = pos;
+        entry.positionInitialized = true;
+        entry.positionSampleMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        const Vector3 delta = pos - cam.Location;
+        entry.Distance = static_cast<float>(std::sqrt(
+            delta.x * delta.x + delta.y * delta.y + delta.z * delta.z) / 100.0);
+        entry.Drawing = entry.Distance >= 2.f && entry.Distance <= var::esp_distance;
+    };
 
     std::unordered_map<uintptr_t, PlayerCacheEntry> localCache;
     {
@@ -458,13 +508,32 @@ void Engine::EntityList()
         localCache = playerCache;
     }
 
-    for (auto it = localCache.begin(); it != localCache.end(); ) {
-        if (!currentActorSet.contains(it->first)) {
-            ++dbgListEvict;
-            WorldScan::MissCounterClear(s_playerDistMisses, it->first);
-            it = localCache.erase(it);
-        } else
+    for (auto it = localCache.begin(); it != localCache.end(); )
+    {
+        const uintptr_t key = it->first;
+        if (currentActorSet.contains(key)) {
+            s_playerActorSetMisses.erase(key);
             ++it;
+            continue;
+        }
+
+        if (currentActorSet.empty()) {
+            ++it;
+            continue;
+        }
+
+        auto& misses = s_playerActorSetMisses[key];
+        if (++misses < kPlayerActorSetGracePasses) {
+            ++it;
+            continue;
+        }
+
+        ++dbgListEvict;
+        PlayerEspMiss::Global().Note(key, it->second.ActorName,
+            it->second.Distance, PlayerEspMiss::Reason::EvictListGone);
+        s_playerActorSetMisses.erase(key);
+        WorldScan::MissCounterClear(s_playerDistMisses, key);
+        it = localCache.erase(it);
     }
 
     uintptr_t localPlayerState = 0;
@@ -484,12 +553,20 @@ void Engine::EntityList()
             continue;
         if (PlayerStateIsBot(ps)) {
             ++dbgGsBot;
+            // A real player misclassified as a bot is exactly the "missing
+            // ESP" failure mode — surface it with a lazy name read.
+            PlayerEspMiss::Global().NoteLazy(ps, -1.f,
+                PlayerEspMiss::Reason::AdmitBotClassified,
+                [this, ps] { return GetPlayerName(ps); });
             continue;
         }
 
         const uintptr_t backPawn = ResolvePawnFromPlayerState(ps);
         if (!backPawn) {
             ++dbgGsPawnNull;
+            PlayerEspMiss::Global().NoteLazy(ps, -1.f,
+                PlayerEspMiss::Reason::AdmitPawnMissing,
+                [this, ps] { return GetPlayerName(ps); });
             continue;
         }
         if (backPawn == sAcknowledgedPawn)
@@ -505,6 +582,9 @@ void Engine::EntityList()
                 ++dbgFwdMismatch;
         } else {
             ++dbgGsPawnMiss;
+            PlayerEspMiss::Global().NoteLazy(backPawn, -1.f,
+                PlayerEspMiss::Reason::AdmitPawnNotInLevels,
+                [this, ps, backPawn] { return GetPlayerName(ps, backPawn); });
             continue; // need pawn in all-Levels actor union for cache key / prune
         }
 
@@ -522,6 +602,9 @@ void Engine::EntityList()
             Memory::read<uintptr_t>(backPawn + Offsets::RootComponent);
         if (!root) {
             ++dbgRootSkip;
+            PlayerEspMiss::Global().NoteLazy(backPawn, -1.f,
+                PlayerEspMiss::Reason::AdmitRootMissing,
+                [this, ps, backPawn] { return GetPlayerName(ps, backPawn); });
             continue;
         }
 
@@ -530,6 +613,9 @@ void Engine::EntityList()
         const uintptr_t charMesh = ResolvePlayerSkeletalMesh(backPawn);
         if (!charMesh && !mesh) {
             ++dbgMeshSkip;
+            PlayerEspMiss::Global().NoteLazy(backPawn, -1.f,
+                PlayerEspMiss::Reason::AdmitMeshMissing,
+                [this, ps, backPawn] { return GetPlayerName(ps, backPawn); });
             continue;
         }
 
@@ -573,6 +659,8 @@ void Engine::EntityList()
                 charMesh ? charMesh : mesh));
         if (inserted) {
             it->second.actorState = ps;
+            initializePlayerEntry(it->second, backPawn, root,
+                charMesh ? charMesh : mesh);
             ++dbgAdmitted;
         }
     }
@@ -596,6 +684,8 @@ void Engine::EntityList()
         else
             ++it;
     }
+    s_playerAdmitQueue.Prune(
+        [&](uint64_t a) { return currentActorSet.contains(a); });
 
     // Cheap CPU index of valid non-local actors. DMA only hits the slice.
     std::vector<uintptr_t> admitIndex;
@@ -640,12 +730,32 @@ void Engine::EntityList()
         ++s_playerAdmitRingEpoch;
         ++s_playerAdmitRingResets;
         s_playerScanNeg.clear();
+        // A world-generation change invalidates every pointer; a plain ring
+        // reset (N jump / array identity) must KEEP the pending lane — its
+        // actors are still unclassified and would be lost again.
+        if (s_playerAdmitRingGen != gen)
+            s_playerAdmitQueue.Clear();
     }
     s_playerAdmitRingGen = gen;
     s_playerAdmitRingActorsPtr = sActors;
     s_playerAdmitRingActorCount = N;
     if (s_playerAdmitCycleStart.time_since_epoch().count() == 0)
         s_playerAdmitCycleStart = std::chrono::steady_clock::now();
+
+    // P10 pending lane: every newly-seen actor joins the queue and STAYS until
+    // a definitive outcome (admitted / proven non-player / memoized reject /
+    // try budget spent / left the world). The one-shot diff lost actors that
+    // missed their single priority window to a full ring sweep.
+    for (uintptr_t actor : admitIndex) {
+        if (s_playerAdmitQueue.Contains(actor))
+            continue;
+        if (localCache.contains(actor) || s_playerAdmitPrevActors.contains(actor))
+            continue;
+        int memoSink = 0;
+        if (PlayerScanNegMemoHit(actor, memoSink))
+            continue; // fresh definitive reject — the TTL memo owns the retry
+        s_playerAdmitQueue.NoteNew(actor);
+    }
 
     const size_t slice = s_playerAdmitSliceCursor % kPlayerAdmitSlices;
     const size_t sliceBase = (N * slice) / kPlayerAdmitSlices;
@@ -670,24 +780,32 @@ void Engine::EntityList()
         const uintptr_t actor = admitIndex[i];
         if (localCache.contains(actor))
             continue;
+        // The pending lane owns unclassified actors (probed first, every
+        // pass, until they settle) — never let the band double-probe them.
+        if (s_playerAdmitQueue.Contains(actor))
+            continue;
         PlayerProbeRow row;
         row.actor = actor;
         bandRows.push_back(row);
     }
     dbgAdmitSliceActors = static_cast<int>(bandRows.size());
 
+    // P10: priority rows come from the PENDING QUEUE (not a one-shot diff).
+    // Deterministic admitIndex order; the cap rises with the backlog so a
+    // streaming burst drains in a pass or two.
     std::vector<PlayerProbeRow> prioRows;
-    prioRows.reserve(kPlayerAdmitPrioNewMax);
-    for (uintptr_t actor : admitIndex) {
-        if (prioRows.size() >= kPlayerAdmitPrioNewMax)
-            break;
-        if (s_playerAdmitPrevActors.contains(actor))
-            continue;
-        if (localCache.contains(actor))
-            continue;
-        PlayerProbeRow row;
-        row.actor = actor;
-        prioRows.push_back(row);
+    {
+        const size_t prioCap = s_playerAdmitQueue.Cap();
+        prioRows.reserve(prioCap);
+        for (uintptr_t actor : admitIndex) {
+            if (prioRows.size() >= prioCap)
+                break;
+            if (!s_playerAdmitQueue.Contains(actor))
+                continue;
+            PlayerProbeRow row;
+            row.actor = actor;
+            prioRows.push_back(row);
+        }
     }
     dbgAdmitPrioNew = static_cast<int>(prioRows.size());
 
@@ -822,8 +940,11 @@ void Engine::EntityList()
         const PlayerProbeRow& row = probeRows[ri];
         if (procBudget.expired()) { slicePartial = true; break; }
         processEnd = ri + 1;
-        if (PlayerScanNegMemoHit(row.actor, dbgAdmitMemoSkip))
+        if (PlayerScanNegMemoHit(row.actor, dbgAdmitMemoSkip)) {
+            // Fresh definitive reject — its TTL memo owns the retry.
+            s_playerAdmitQueue.Settle(row.actor);
             continue;
+        }
         const uintptr_t actor = row.actor;
         const uint32_t masked = ArcActorType::MaskActorTypeId(row.typeId);
         const bool gate = (row.ps != 0
@@ -853,9 +974,14 @@ void Engine::EntityList()
 
             if (!containsPioneer(fn) && !containsPioneer(classFn)) {
                 // Memoize only when a name decoded; undecrypted actors retry
-                // next ring pass so late spawns are never permanently skipped.
-                if (!fn.empty() || !classFn.empty())
+                // next pass via the pending lane (bounded tries) so late
+                // spawns are never permanently skipped.
+                if (!fn.empty() || !classFn.empty()) {
                     PlayerScanNegMemoize(actor);
+                    s_playerAdmitQueue.Settle(actor);
+                } else {
+                    (void)s_playerAdmitQueue.NoteTransient(actor);
+                }
                 continue;
             }
             // Pioneer-looking without gate signal — fall through to full check.
@@ -872,14 +998,21 @@ void Engine::EntityList()
 
             if (localPlayerState && playerState == localPlayerState) {
                 ++dbgGhostEvict;
+                s_playerAdmitQueue.Settle(actor);
                 continue;
             }
 
             if (PlayerStateIsBot(playerState)) {
                 ++dbgGsBot;
+                PlayerEspMiss::Global().NoteLazy(actor, -1.f,
+                    PlayerEspMiss::Reason::AdmitBotClassified,
+                    [this, playerState, actor] {
+                        return GetPlayerName(playerState, actor);
+                    });
                 // Bots never become players — memoize so their PS chase does
                 // not repeat serially every ring pass (TTL still re-checks).
                 PlayerScanNegMemoize(actor);
+                s_playerAdmitQueue.Settle(actor);
                 continue;
             }
 
@@ -899,6 +1032,12 @@ void Engine::EntityList()
                 Memory::read<uintptr_t>(actor + Offsets::RootComponent);
             if (!root) {
                 ++dbgRootSkip;
+                PlayerEspMiss::Global().NoteLazy(actor, -1.f,
+                    PlayerEspMiss::Reason::AdmitRootMissing,
+                    [this, playerState, actor] {
+                        return GetPlayerName(playerState, actor);
+                    });
+                (void)s_playerAdmitQueue.NoteTransient(actor); // spawn not ready
                 continue;
             }
 
@@ -907,6 +1046,12 @@ void Engine::EntityList()
             const uintptr_t charMesh = ResolvePlayerSkeletalMesh(actor);
             if (!charMesh && !mesh) {
                 ++dbgMeshSkip;
+                PlayerEspMiss::Global().NoteLazy(actor, -1.f,
+                    PlayerEspMiss::Reason::AdmitMeshMissing,
+                    [this, playerState, actor] {
+                        return GetPlayerName(playerState, actor);
+                    });
+                (void)s_playerAdmitQueue.NoteTransient(actor); // mesh not ready
                 continue;
             }
 
@@ -917,8 +1062,11 @@ void Engine::EntityList()
                     playerName.c_str(), root, actor, charMesh ? charMesh : mesh));
             if (inserted) {
                 it->second.actorState = playerState;
+                initializePlayerEntry(it->second, actor, root,
+                    charMesh ? charMesh : mesh);
                 ++dbgAdmitted;
             }
+            s_playerAdmitQueue.Settle(actor); // in the cache — retain owns it now
             continue;
         }
 
@@ -926,8 +1074,12 @@ void Engine::EntityList()
 
         // U8: BP_PioneerCharacter_C class FName backup when PS chase missed.
         const std::string classFname = GetActorClassFName(actor);
-        if (classFname.empty())
-            continue; // undecrypted — retry next ring pass, do not memoize
+        if (classFname.empty()) {
+            // Undecrypted — retry via the pending lane (bounded tries), no
+            // memoize.
+            (void)s_playerAdmitQueue.NoteTransient(actor);
+            continue;
+        }
 
         std::string cl = classFname;
         for (char& c : cl)
@@ -935,28 +1087,40 @@ void Engine::EntityList()
         if (cl.find("pioneercharacter") == std::string::npos
             && cl.find("bp_pioneercharacter") == std::string::npos) {
             PlayerScanNegMemoize(actor);
+            s_playerAdmitQueue.Settle(actor);
             continue;
         }
 
         playerState = 0;
         viaActorType = false;
         TryResolvePlayerStateAny(actor, playerState, viaActorType);
-        if (localPlayerState && playerState == localPlayerState)
+        if (localPlayerState && playerState == localPlayerState) {
+            s_playerAdmitQueue.Settle(actor);
             continue;
+        }
         if (playerState && PlayerStateIsBot(playerState)) {
             PlayerScanNegMemoize(actor);
+            s_playerAdmitQueue.Settle(actor);
             continue;
         }
 
         const uintptr_t root =
             Memory::read<uintptr_t>(actor + Offsets::RootComponent);
-        if (!root)
+        if (!root) {
+            PlayerEspMiss::Global().Note(actor, std::string(), -1.f,
+                PlayerEspMiss::Reason::AdmitRootMissing);
+            (void)s_playerAdmitQueue.NoteTransient(actor); // spawn not ready
             continue;
+        }
         const uintptr_t mesh =
             Memory::read<uintptr_t>(actor + Offsets::USkeletalMeshComponent);
         const uintptr_t charMesh = ResolvePlayerSkeletalMesh(actor);
-        if (!charMesh && !mesh)
+        if (!charMesh && !mesh) {
+            PlayerEspMiss::Global().Note(actor, std::string(), -1.f,
+                PlayerEspMiss::Reason::AdmitMeshMissing);
+            (void)s_playerAdmitQueue.NoteTransient(actor); // mesh not ready
             continue;
+        }
 
         const std::string playerName =
             playerState ? GetPlayerName(playerState, actor) : std::string("Player");
@@ -966,9 +1130,12 @@ void Engine::EntityList()
                 playerName.c_str(), root, actor, charMesh ? charMesh : mesh));
         if (inserted) {
             it->second.actorState = playerState;
+            initializePlayerEntry(it->second, actor, root,
+                charMesh ? charMesh : mesh);
             ++dbgAdmitted;
             ++dbgActorTypeAdmit;
         }
+        s_playerAdmitQueue.Settle(actor); // in the cache — retain owns it now
     }
 
     // B5 (mirror): monotonic resume frontier from the screening frontier. A
@@ -1069,9 +1236,13 @@ void Engine::EntityList()
                 ClearPlayerGhostMisses(key);
                 WorldScan::MissCounterClear(s_playerDistMisses, key);
                 ++dbgGhostEvict;
+                PlayerEspMiss::Global().Note(key, actor.ActorName,
+                    actor.Distance, PlayerEspMiss::Reason::EvictRootStale);
                 it = localCache.erase(it);
             } else {
                 actor.Drawing = false;
+                PlayerEspMiss::Global().Note(key, actor.ActorName,
+                    actor.Distance, PlayerEspMiss::Reason::EvictRootStale);
                 ++it;
             }
             continue;
@@ -1079,8 +1250,44 @@ void Engine::EntityList()
         WorldScan::MissCounterClear(s_playerRootMisses, key);
         actor.rootComponent = freshRoot;
 
-        actor.facingYaw = static_cast<float>(
-            Memory::read<double>(freshRoot + Offsets::RelativeRotation + 8));
+        const bool wantFacingYaw =
+            var::show_look_arrows || (var::show_radar && var::radar_ally_arrows);
+        actor.facingYaw = wantFacingYaw
+            ? static_cast<float>(Memory::read<double>(
+                freshRoot + Offsets::RelativeRotation + 8))
+            : 0.f;
+
+        // Look direction (feature #5): where they AIM is their controller's
+        // ControlRotation yaw; body facing stays the fallback. The camera
+        // manager's view clamps gate free-cam garbage rotations. No toggle means
+        // no controller/PCM reads on the player worker.
+        actor.hasAimYaw = false;
+        if (var::show_look_arrows) {
+            const uintptr_t ctrl =
+                Memory::read<uintptr_t>(key + Offsets::Pawn_Controller);
+            if (ctrl && IsValidPointer(ctrl)) {
+                const double aimPitch =
+                    Memory::read_nocache<double>(ctrl + Offsets::ControlRotation);
+                const double aimYaw = Memory::read_nocache<double>(
+                    ctrl + Offsets::ControlRotation + 0x8);
+                double clampMin = 0.0, clampMax = 0.0;
+                if (PlayerCameraManager && IsValidPointer(PlayerCameraManager)) {
+                    clampMin = static_cast<double>(Memory::read_nocache<float>(
+                        PlayerCameraManager + Offsets::PCM_ViewPitchMin));
+                    clampMax = static_cast<double>(Memory::read_nocache<float>(
+                        PlayerCameraManager + Offsets::PCM_ViewPitchMax));
+                }
+                if (std::isfinite(aimYaw)
+                    && LookArrow::AimPitchValid(aimPitch, clampMin, clampMax)) {
+                    actor.aimYawDeg = static_cast<float>(aimYaw);
+                    actor.hasAimYaw = true;
+                }
+            }
+            if (!actor.hasAimYaw && std::isfinite(actor.facingYaw)) {
+                actor.aimYawDeg = actor.facingYaw;
+                actor.hasAimYaw = true;
+            }
+        }
 
         const uint8_t enemyTeamId = Memory::read<uint8_t>(key + Offsets::TeamID);
         actor.enemyTeamId = enemyTeamId;
@@ -1088,6 +1295,8 @@ void Engine::EntityList()
             (myTeamValid && enemyTeamId != 255 && enemyTeamId != 0 && myTeamId == enemyTeamId);
         if (actor.isAlly && var::hide_allies) {
             ++dbgTeamEvict;
+            PlayerEspMiss::Global().Note(key, actor.ActorName,
+                actor.Distance, PlayerEspMiss::Reason::EvictAllyHidden);
             WorldScan::MissCounterClear(s_playerDistMisses, key);
             it = localCache.erase(it);
             continue;
@@ -1098,6 +1307,8 @@ void Engine::EntityList()
             bool viaActorType = false;
             if (!TryResolvePlayerStateAny(key, playerState, viaActorType)) {
                 ++dbgPsEvict;
+                PlayerEspMiss::Global().Note(key, actor.ActorName,
+                    actor.Distance, PlayerEspMiss::Reason::EvictPsLost);
                 WorldScan::MissCounterClear(s_playerDistMisses, key);
                 it = localCache.erase(it);
                 continue;
@@ -1114,6 +1325,8 @@ void Engine::EntityList()
 
         if (PlayerStateIsBot(playerState)) {
             ++dbgGsBot;
+            PlayerEspMiss::Global().Note(key, actor.ActorName,
+                actor.Distance, PlayerEspMiss::Reason::EvictBotReclassified);
             WorldScan::MissCounterClear(s_playerDistMisses, key);
             it = localCache.erase(it);
             continue;
@@ -1125,6 +1338,23 @@ void Engine::EntityList()
 
         actor.actorState = playerState;
 
+        // Identity (feature #6): permanent SteamID64 + real UEmbarkSquad*
+        // membership (the TeamID grouping stays the fallback).
+        bool steamPathResolved = false;
+        actor.steamId64 = var::show_steam_ids
+            ? ReadPlayerSteamId(playerState, &steamPathResolved) : 0;
+        actor.steamIdResolved = var::show_steam_ids && steamPathResolved;
+        // Status tags ([Bot]/[Spec]/[Done]) ride the identity toggle so the
+        // PioneerPlayerState block reads cost zero DMA while it is off.
+        actor.statusFlags =
+            var::show_steam_ids ? ReadPlayerStatusTags(playerState) : 0;
+        actor.squadPtr = var::show_squad_idx
+            ? Memory::read_nocache<uintptr_t>(playerState + Offsets::PS_Squad)
+            : 0;
+        if (!IsValidPointer(actor.squadPtr))
+            actor.squadPtr = 0;
+        actor.squadResolved = var::show_squad_idx && actor.squadPtr != 0;
+
         const std::string liveName = GetPlayerName(playerState, key);
         if (!liveName.empty())
             actor.ActorName = liveName;
@@ -1134,10 +1364,18 @@ void Engine::EntityList()
             actor.actorMesh = charMesh;
 
         actor.WorldPos = ResolvePlayerWorldPos(key, freshRoot, actor.actorMesh);
+        if (IsPlausibleWorldPos(actor.WorldPos)) {
+            actor.positionInitialized = true;
+            actor.positionSampleMs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+        }
 
         if (!IsPlausibleWorldPos(actor.WorldPos))
         {
             ++dbgPosEvict;
+            PlayerEspMiss::Global().Note(key, actor.ActorName,
+                actor.Distance, PlayerEspMiss::Reason::EvictPosInvalid);
             if (WorldScan::MissCounterShouldEvict(
                     s_playerPosMisses, key, false, kPlayerGhostEvict)) {
                 ClearPlayerGhostMisses(key);
@@ -1158,47 +1396,109 @@ void Engine::EntityList()
 
         actor.Distance = sqrtf(distanceSq) / 100.0f;
 
-        if (distanceSq > maxDistSq) {
+        if (distanceSq > maxDistSq
+            && !(actor.Drawing && distanceSq <= maxDistOffSq)) {
             ++dbgDistSkip;
-            // Soft flap: keep Drawing for a few out-of-range scans so boxes don't
-            // blink at the distance edge. Hard erase paths (ghost/pos) unchanged.
-            if (WorldScan::MissCounterShouldEvict(
-                    s_playerDistMisses, key, false, kPlayerDistMissClearDrawing)) {
-                actor.Drawing = false;
-            } else {
-                actor.Drawing = true;
-            }
+            PlayerEspMiss::Global().Note(key, actor.ActorName,
+                actor.Distance, PlayerEspMiss::Reason::DrawClearedDistance);
+            // Keep a valid entry alive through the 5% edge band. Only a
+            // sustained move beyond that band clears Drawing.
+            actor.Drawing = false;
+            WorldScan::MissCounterClear(s_playerDistMisses, key);
             ++it;
             continue;
         }
         WorldScan::MissCounterClear(s_playerDistMisses, key);
+        WorldScan::MissCounterClear(s_playerDistMisses, key);
 
-        actor.health = static_cast<float>(get_health(key));
-        actor.maxhealth = static_cast<float>(get_maxhealth(key));
-        actor.shield = static_cast<float>(get_armor(key));
-        actor.maxshield = static_cast<float>(get_maxarmor(key));
+        const double liveHealth = get_health(key);
+        const double liveMaxHealth = get_maxhealth(key);
+        // A valid bar requires both values. Do not leave a stale/zero max in
+        // the frame when the current-health read succeeds alone.
+        const bool healthPairOk =
+            std::isfinite(liveHealth) && std::isfinite(liveMaxHealth)
+            && liveHealth >= 0.0 && liveHealth < 100000.0
+            && liveMaxHealth > 0.0 && liveMaxHealth < 100000.0
+            && liveHealth <= liveMaxHealth + 250.0;
+        actor.healthResolved = healthPairOk;
+        if (healthPairOk) {
+            actor.health = static_cast<float>(liveHealth);
+            actor.maxhealth = static_cast<float>(liveMaxHealth);
+        }
+        const bool wantArmor = var::health || var::show_armor_line;
+        const double liveArmor = wantArmor ? get_armor(key) : 0.0;
+        const double liveMaxArmor = wantArmor ? get_maxarmor(key) : 0.0;
+        // Unknown health is not evidence that a live player should be removed.
+        // Keep the cache entry alive; the custom bar simply receives the last
+        // known pair until a later scan resolves a fresh one.
+        const bool armorPairOk =
+            std::isfinite(liveArmor) && std::isfinite(liveMaxArmor)
+            && liveArmor >= 0.0 && liveArmor < 100000.0
+            && liveMaxArmor > 0.0 && liveMaxArmor < 100000.0
+            && liveArmor <= liveMaxArmor + 250.0;
+        actor.armorResolved = armorPairOk;
+        if (std::isfinite(liveArmor) && liveArmor >= 0.0 && liveArmor < 100000.0)
+            actor.shield = static_cast<float>(liveArmor);
+        if (std::isfinite(liveMaxArmor) && liveMaxArmor > 0.0 && liveMaxArmor < 100000.0)
+            actor.maxshield = static_cast<float>(liveMaxArmor);
 
-        if (actor.health < 1.0f) {
-            ++dbgHealthSkip;
-            if (WorldScan::MissCounterShouldEvict(
-                    s_playerHealthZeroMisses, key, false, kPlayerGhostEvict)) {
-                ClearPlayerGhostMisses(key);
-                WorldScan::MissCounterClear(s_playerDistMisses, key);
-                ++dbgGhostEvict;
-                it = localCache.erase(it);
-                continue;
+        // DBNO badge + revive countdown (feature #4) + activity feed (#10).
+        // When every consumer is off, preserve no stale DBNO presentation state
+        // and skip the PlayerState/HealthComponent/timer DMA chain.
+        const bool wasDbno = actor.isDbno;
+        if (var::show_dbno_badge || var::show_activity_feed) {
+            bool dbnoPathResolved = false;
+            actor.isDbno = ReadPlayerDbnoState(
+                playerState, actor.hasBrokenArmor, &dbnoPathResolved);
+            actor.dbnoResolved = dbnoPathResolved;
+            if (actor.isDbno != wasDbno) {
+                char feedText[80];
+                snprintf(feedText, sizeof(feedText), "%.40s %s",
+                    actor.ActorName.empty() ? "A raider" : actor.ActorName.c_str(),
+                    actor.isDbno ? "is DOWN" : "is back up");
+                PushActivity(key, feedText);
             }
         } else {
-            WorldScan::MissCounterClear(s_playerHealthZeroMisses, key);
+            actor.isDbno = false;
+            actor.hasBrokenArmor = false;
+            actor.dbnoResolved = false;
+        }
+        if (var::show_dbno_badge) {
+            float timerElapsed = 0.f, timerTotal = 0.f;
+            if (actor.isDbno && ReadReviveTimer(key, timerElapsed, timerTotal)) {
+                actor.reviveTotalS = timerTotal;
+                actor.reviveRemainS =
+                    ReviveBadge::RemainSeconds(timerElapsed, timerTotal);
+            } else {
+                actor.reviveRemainS = -1.f;
+                actor.reviveTotalS = -1.f;
+            }
+        } else {
+            actor.reviveRemainS = -1.f;
+            actor.reviveTotalS = -1.f;
         }
 
+        // Do not evict or suppress a live player because one health read is
+        // zero/NaN. Position and distance are the ESP liveness gates; health
+        // only controls the custom bar's fill.
+        WorldScan::MissCounterClear(s_playerHealthZeroMisses, key);
 
-        // Read weapon system from InventoryComponent (stowed slots + equipped + armor)
-        std::string invWeapon, invStowed0, invStowed1;
+
+        // Read weapon system from InventoryComponent only when a presentation
+        // feature consumes it. Aimbot target scoring can use weapon quality.
+        std::string invWeapon, invStowed0, invStowed1, invArmorName;
         int invWq = -1, invSq0 = -1, invSq1 = -1, invClip = 0;
+        int invArmorTier = -1;
         float invArmorPlates = 0.f, invArmorPerPlate = 0.f;
-        ReadPlayerInventory(key, invWeapon, invWq, invClip, invStowed0, invSq0, invStowed1, invSq1,
-            invArmorPlates, invArmorPerPlate);
+        bool inventoryResolved = false;
+        const bool wantInventory = var::show_weapon || var::show_armor_line
+            || var::show_player_kit || var::enable_aimbot;
+        if (wantInventory) {
+            ReadPlayerInventory(key, invWeapon, invWq, invClip, invStowed0, invSq0, invStowed1, invSq1,
+                invArmorPlates, invArmorPerPlate, invArmorTier, invArmorName,
+                &inventoryResolved);
+        }
+        actor.inventoryResolved = inventoryResolved;
         // Only show Unarmed when there is no real gun in primary or stowed.
         if (!invWeapon.empty())
             actor.weaponName = invWeapon;
@@ -1214,6 +1514,25 @@ void Engine::EntityList()
         actor.stowedQuality1 = invSq1;
         actor.armorPlates = invArmorPlates;
         actor.armorPerPlate = invArmorPerPlate;
+        actor.armorTier = invArmorTier;
+        actor.armorName = invArmorName;
+
+        // Full kit readout (phase 2) - zero DMA while its toggle is off.
+        if (var::show_player_kit) {
+            LoadoutFormat::KitParts kit;
+            ReadPlayerKit(key, kit);
+            actor.kitTool = std::move(kit.tool);
+            actor.kitPouch = std::move(kit.pouch);
+            actor.kitPouchRarity = kit.pouchRarity;
+            actor.kitBeltSlots = kit.beltSlots;
+            actor.kitPackSlots = kit.packSlots;
+        } else {
+            actor.kitTool.clear();
+            actor.kitPouch.clear();
+            actor.kitPouchRarity = -1;
+            actor.kitBeltSlots = -1;
+            actor.kitPackSlots = -1;
+        }
 
         // Skeleton refresh is owned by CollectEspRenderFrame (up to 16 nearest).
         // Calling GetBones here doubled NOCACHE scatter load and drove FPGA hitch storms.
@@ -1412,9 +1731,9 @@ void Engine::EntityList()
                     // correct XOR key can be derived offline (CheckDirect's
                     // key is stale for this build — direct stays -1).
                     const uint32_t raw4c4 = Memory::read_nocache<uint32_t>(
-                        actor.actorMesh + 0x4C4);
+                        actor.actorMesh + Offsets::LastSubmitTime);
                     const uint32_t raw4cc = Memory::read_nocache<uint32_t>(
-                        actor.actorMesh + 0x4CC);
+                        actor.actorMesh + Offsets::LastRenderTimeOnScreen);
                     std::ofstream vf(kArcVerifyPath, std::ios::app);
                     if (vf) {
                         const auto vts = std::chrono::duration_cast<
@@ -1511,24 +1830,68 @@ void Engine::EntityList()
         return;
 
     {
+        PlayerPipelineStats diag{};
+        diag.scanned = dbgScanned;
+        diag.gsCandidates = static_cast<int>(gsPlayerStates.size());
+        diag.gsPawnHit = dbgGsPawnHit;
+        diag.gsPawnMiss = dbgGsPawnMiss;
+        diag.rootFail = dbgRootSkip + dbgRootStale;
+        diag.meshFail = dbgMeshSkip;
+        diag.playerStateFail = dbgPsSkip + dbgPsEvict;
+        diag.botClassified = dbgGsBot;
+        diag.admitted = dbgAdmitted;
+        for (const auto& [key, entry] : localCache) {
+            (void)key;
+            if (entry.positionInitialized)
+                ++diag.initialized;
+            else
+                ++diag.uninitialized;
+            if (entry.Drawing)
+                ++diag.drawing;
+        }
+        std::unique_lock<std::shared_mutex> lock(m_playerDiagMutex);
+        m_playerDiag = diag;
+    }
+
+    {
         std::unique_lock<std::shared_mutex> lock(m_playerCacheMutex);
         playerCache = std::move(localCache);
     }
 
-    // Map unique enemy TeamIDs to squad indices (1-based, sorted ascending)
+    // Squad indices (1-based, sorted ascending so they are stable per session).
+    // Real UEmbarkSquad* membership wins (feature #6: real squad rosters); the
+    // old TeamID mapping stays as the fallback when no squad pointer resolved.
     {
+        std::vector<uintptr_t> uniqueSquads;
         std::vector<uint8_t> uniqueTeams;
         for (const auto& [key, entry] : playerCache) {
-            if (!entry.isAlly && entry.enemyTeamId != 255 && entry.enemyTeamId != 0)
+            if (entry.isAlly)
+                continue;
+            if (entry.squadPtr)
+                uniqueSquads.push_back(entry.squadPtr);
+            else if (entry.enemyTeamId != 255 && entry.enemyTeamId != 0)
                 uniqueTeams.push_back(entry.enemyTeamId);
         }
+        std::sort(uniqueSquads.begin(), uniqueSquads.end());
+        uniqueSquads.erase(
+            std::unique(uniqueSquads.begin(), uniqueSquads.end()), uniqueSquads.end());
         std::sort(uniqueTeams.begin(), uniqueTeams.end());
-        uniqueTeams.erase(std::unique(uniqueTeams.begin(), uniqueTeams.end()), uniqueTeams.end());
+        uniqueTeams.erase(
+            std::unique(uniqueTeams.begin(), uniqueTeams.end()), uniqueTeams.end());
         for (auto& [key, entry] : playerCache) {
-            if (!entry.isAlly && entry.enemyTeamId != 255 && entry.enemyTeamId != 0) {
-                auto it = std::find(uniqueTeams.begin(), uniqueTeams.end(), entry.enemyTeamId);
+            if (entry.isAlly)
+                continue;
+            if (entry.squadPtr) {
+                auto it = std::lower_bound(
+                    uniqueSquads.begin(), uniqueSquads.end(), entry.squadPtr);
+                entry.squadIdx = static_cast<uint8_t>(
+                    std::distance(uniqueSquads.begin(), it) + 1);
+            } else if (entry.enemyTeamId != 255 && entry.enemyTeamId != 0) {
+                auto it = std::find(
+                    uniqueTeams.begin(), uniqueTeams.end(), entry.enemyTeamId);
                 if (it != uniqueTeams.end())
-                    entry.squadIdx = static_cast<uint8_t>(std::distance(uniqueTeams.begin(), it) + 1);
+                    entry.squadIdx = static_cast<uint8_t>(
+                        std::distance(uniqueTeams.begin(), it) + 1);
             }
         }
     }
@@ -1556,7 +1919,7 @@ void Engine::EntityList()
     {
         static IntervalTimer playerFileTimer(2000);
         if (playerFileTimer.fire()) {
-            char pbuf[768]{};
+            char pbuf[840]{};
             snprintf(pbuf, sizeof(pbuf),
                 "{\"scanned\":%d,\"admitted\":%d,\"cache\":%zu,\"listEvict\":%d,"
                 "\"teamEvict\":%d,\"psEvict\":%d,\"posEvict\":%d,\"distSkip\":%d,"
@@ -1564,14 +1927,26 @@ void Engine::EntityList()
                 "\"healthSkip\":%d,\"gsBot\":%d,\"gsPawnNull\":%d,\"gsEvict\":%d,"
                 "\"actorTypeAdmit\":%d,\"prioNew\":%d,\"checked\":%d,"
                 "\"memoSkip\":%d,\"slice\":%zu,\"cycleMs\":%d,\"ringResets\":%d,"
-                "\"admitN\":%zu,\"lastDelta\":%zu}",
+                "\"admitN\":%zu,\"lastDelta\":%zu,"
+                "\"pend\":%zu,\"tries\":%zu}",
                 dbgScanned, dbgAdmitted, playerCache.size(), dbgListEvict,
                 dbgTeamEvict, dbgPsEvict, dbgPosEvict, dbgDistSkip,
                 dbgGhostEvict, dbgRootSkip, dbgMeshSkip, dbgPsSkip,
                 dbgHealthSkip, dbgGsBot, dbgGsPawnNull, dbgGsEvict,
                 dbgActorTypeAdmit, dbgAdmitPrioNew, dbgAdmitChecked,
                 dbgAdmitMemoSkip, dbgAdmitSlice, s_playerAdmitLastCycleMs,
-                s_playerAdmitRingResets, dbgAdmitN, s_playerAdmitLastDelta);
+                s_playerAdmitRingResets, dbgAdmitN, s_playerAdmitLastDelta,
+                s_playerAdmitQueue.Size(), s_playerAdmitQueue.TrySize());
+            EntityDiagnostics::LogScan("players", pbuf);
+            // player_miss_summary: WHO is missing and WHICH gate dropped them
+            // (PlayerEspMissLog) — the per-actor answer to "player ran up, no
+            // ESP" that the aggregate player_admit_stats cannot give.
+            std::ofstream mf(kArcVerifyPath, std::ios::app);
+            if (mf) {
+                mf << PlayerEspMiss::Global().FormatSummaryLine(
+                    PlayerEspMiss::NowMs(), 16)
+                   << "\n";
+            }
             // player_admit_stats is a throttled (2s) verification tap — it must
             // reach the real log (kArcDebugLogPath is NUL by design).
             std::ofstream f(kArcVerifyPath, std::ios::app);
@@ -1620,6 +1995,7 @@ void Engine::EntityList()
                 << " slice=" << dbgAdmitSlice << "/" << kPlayerAdmitSlices
                 << " sliceActors=" << dbgAdmitSliceActors
                 << " prioNew=" << dbgAdmitPrioNew
+                << " pend=" << s_playerAdmitQueue.Size()
                 << " checked=" << dbgAdmitChecked
                 << " fnameChecked=" << dbgAdmitFnameChecked
                 << " scatterExecs=" << dbgAdmitScatterExecs
@@ -1628,6 +2004,10 @@ void Engine::EntityList()
                 << " cycleMs=" << s_playerAdmitLastCycleMs
                 << " cover=0x" << std::hex << s_playerAdmitCoveredMask << std::dec
                 << " ringResets=" << s_playerAdmitRingResets
+                << std::endl;
+            std::cout << "[debugPlayerMiss] "
+                << PlayerEspMiss::Global().FormatConsoleSummary(
+                    PlayerEspMiss::NowMs(), 8)
                 << std::endl;
         }
     }

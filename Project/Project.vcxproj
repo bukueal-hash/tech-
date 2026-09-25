@@ -224,10 +224,31 @@
   <ItemGroup>
     <!-- Core -->
     <ClInclude Include="Core\AssetNames.h" />
+    <ClInclude Include="Core\BoneRoster.hpp" />
+    <ClInclude Include="Core\BotAdmitQueue.hpp" />
+    <ClInclude Include="Core\BotEspExpiry.hpp" />
+    <ClInclude Include="Core\BotMotion.hpp" />
     <ClInclude Include="Core\Cache.hpp" />
+    <ClInclude Include="Core\CrateContents.hpp" />
+    <ClInclude Include="Core\LoadoutFormat.hpp" />
+    <ClInclude Include="Core\ReviveBadge.hpp" />
+    <ClInclude Include="Core\LookArrow.hpp" />
+    <ClInclude Include="Core\SquadRoster.hpp" />
+    <ClInclude Include="Core\VisionCone.hpp" />
+    <ClInclude Include="Core\PartDamage.hpp" />
+    <ClInclude Include="Core\RaidClock.hpp" />
+    <ClInclude Include="Core\ActivityFeed.hpp" />
+    <ClInclude Include="Core\RadarProjection.hpp" />
+    <ClInclude Include="Core\EspFramePolicy.hpp" />
+    <ClInclude Include="Core\FeaturePolicy.hpp" />
+    <ClInclude Include="Core\EntityDiagnostics.hpp" />
+    <ClInclude Include="Core\PlayerEspMissLog.hpp" />
+    <ClInclude Include="Core\BotEspPosition.hpp" />
     <ClInclude Include="Core\Engine.h" />
     <ClInclude Include="Core\Memory.h" />
     <ClInclude Include="Core\Offsets.h" />
+    <ClInclude Include="Core\SDK.hpp" />
+    <ClInclude Include="Core\ScanGatePolicy.hpp" />
     <ClInclude Include="Core\Vector.hpp" />
     <!-- DMA -->
     <ClInclude Include="DMA\DmaKeyboard.h" />

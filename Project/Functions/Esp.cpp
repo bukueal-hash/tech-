@@ -1,6 +1,12 @@
 #include "../Core/Engine.h"
+#include "../Core/FeaturePolicy.hpp"
 #include "../Core/AgentLog.h"
 #include "../Core/ActorType.h"
+#include "../Core/BotMotion.hpp"
+#include "../Core/BotEspExpiry.hpp"
+#include "../Core/BotEspPosition.hpp"
+#include "../Core/EntityDiagnostics.hpp"
+#include "../Core/PlayerEspMissLog.hpp"
 #include "../Core/AssetNames.h"
 #include "../Core/Memory.h"
 #include "../Core/WorldItemCategory.h"
@@ -41,6 +47,131 @@ struct WorldEspDebugStats {
 };
 
 WorldEspDebugStats g_worldEspDbg{};
+
+static void LogGhostBotDecision(
+    uintptr_t actorKey, const Engine::WorldCacheEntry& entry,
+    const char* reason, float distanceM = -1.f)
+{
+    if (!var::debug_ghost_bots)
+        return;
+
+    // The paint path can evaluate a bot many times per second. Keep one
+    // decision per actor/reason per second so the log remains useful instead
+    // of flooding the asynchronous diagnostic queue.
+    static std::unordered_map<uintptr_t, std::pair<const char*, uint64_t>> last;
+    const uint64_t now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    auto& state = last[actorKey];
+    if (state.first == reason && now >= state.second && now - state.second < 1000)
+        return;
+    state = { reason, now };
+    if (last.size() > 4096)
+        last.clear();
+
+    const bool positionValid = IsPlausibleWorldPos(entry.WorldPos);
+    const uint64_t age = entry.positionSampleMs != 0 && now >= entry.positionSampleMs
+        ? now - entry.positionSampleMs : 0;
+    EntityDiagnostics::LogBotDecision(
+        actorKey, entry.ActorName, reason, entry.Drawing,
+        entry.botIdentityProven, entry.IsBreaked, positionValid, age,
+        distanceM >= 0.f ? distanceM : entry.Distance);
+}
+
+static const char* EspFrameResultName(int result)
+{
+    switch (static_cast<Engine::EspFrameResult>(result)) {
+    case Engine::EspFrameResult::Published: return "published";
+    case Engine::EspFrameResult::Inactive: return "inactive";
+    case Engine::EspFrameResult::ScatterInitFailed: return "scatter-init";
+    case Engine::EspFrameResult::ScatterExecuteFailed: return "scatter-exec";
+    case Engine::EspFrameResult::CameraFailed: return "camera";
+    case Engine::EspFrameResult::GenerationChanged: return "generation";
+    case Engine::EspFrameResult::None:
+    default: return "none";
+    }
+}
+
+static uint64_t SteadyNowMs()
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+struct RenderCamDebug {
+    const char* src = "none";
+    bool leadApplied = false;
+    bool leadSkipped = false;
+    float leadYaw = 0.f;
+    float leadPitch = 0.f;
+};
+
+static bool IsCurrentFreshEspFrame(
+    const Engine::EspRenderFrame& frame,
+    uint64_t nowMs = SteadyNowMs())
+{
+    return EspFramePolicy::IsAcceptable(
+        {frame.valid, frame.worldGeneration, frame.collectStampMs},
+        engine.m_worldGeneration.load(std::memory_order_acquire),
+        nowMs);
+}
+
+static void RenderEspFrameHealthFallback(
+    const Engine::EspRenderFrame* frame,
+    const RenderCamDebug* camDbg)
+{
+    if (!var::show_debug_overlay)
+        return;
+    ImDrawList* drawList = ImGui::GetForegroundDrawList();
+    if (!drawList)
+        return;
+
+    const auto& diag = engine.m_espFrameDiagnostics;
+    const uint64_t nowMs = SteadyNowMs();
+    const uint64_t generation =
+        engine.m_worldGeneration.load(std::memory_order_acquire);
+    const uint64_t publishMs = diag.lastPublishMs.load(std::memory_order_acquire);
+    const int publishAge = publishMs != 0 && nowMs >= publishMs
+        ? static_cast<int>(nowMs - publishMs) : -1;
+    const uint64_t failureMs = diag.lastFailureMs.load(std::memory_order_acquire);
+    const int failureAge = failureMs != 0 && nowMs >= failureMs
+        ? static_cast<int>(nowMs - failureMs) : -1;
+    const int frameAge = frame && frame->collectStampMs != 0
+        && nowMs >= frame->collectStampMs
+        ? static_cast<int>(nowMs - frame->collectStampMs) : -1;
+    const char* frameState = !frame
+        ? "none"
+        : (IsCurrentFreshEspFrame(*frame, nowMs) ? "fresh" : "stale");
+    const char* cameraState = camDbg ? camDbg->src : "unavailable";
+
+    char line[320];
+    drawList->AddRectFilled(
+        ImVec2(20.f, 60.f), ImVec2(620.f, 150.f), IM_COL32(0, 0, 0, 220));
+    drawList->AddText(
+        ImGui::GetFont(), 16.f, ImVec2(28.f, 65.f),
+        IM_COL32(255, 200, 100, 255), "ESP FRAME HEALTH");
+    std::snprintf(line, sizeof(line),
+        "state %s | result %s | frameAge %dms | publishAge %dms",
+        frameState,
+        EspFrameResultName(diag.lastResult.load(std::memory_order_acquire)),
+        frameAge, publishAge);
+    drawList->AddText(
+        ImGui::GetFont(), 14.f, ImVec2(28.f, 88.f),
+        IM_COL32(200, 220, 255, 255), line);
+    std::snprintf(line, sizeof(line),
+        "gen cur %llu | failAge %dms x%d | cam %s | counts p%d b%d w%d",
+        static_cast<unsigned long long>(generation),
+        failureAge,
+        diag.consecutiveFailures.load(std::memory_order_acquire),
+        cameraState,
+        diag.lastPlayerCount.load(std::memory_order_relaxed),
+        diag.lastRobotCount.load(std::memory_order_relaxed),
+        diag.lastWorldCount.load(std::memory_order_relaxed));
+    drawList->AddText(
+        ImGui::GetFont(), 14.f, ImVec2(28.f, 110.f),
+        IM_COL32(200, 220, 255, 255), line);
+}
 
 // Clean, human-readable category label for a container. Never empty, never a
 // raw fname or number — used whenever a specific name can't be resolved so a
@@ -236,16 +367,6 @@ static bool CameraOkForEsp(const Engine::CameraCache& cam)
 
 static int g_camLeadSkips = 0;  // ghost-guard skips, surfaced in [debugCam]
 
-// #region agent log
-// Which camera the paint actually used, and how much rotation lead it got.
-struct RenderCamDebug {
-    const char* src = "none";
-    bool leadApplied = false;
-    bool leadSkipped = false;
-    float leadYaw = 0.f;
-    float leadPitch = 0.f;
-};
-
 // Points that failed with the paint camera and were re-projected with
 // g_Camera instead - two cameras placing entities inside one paint.
 static int g_ghostProjFallback = 0;
@@ -392,6 +513,17 @@ static ImU32 BotEspColor(bool visible, bool isBreaked = false)
     return EspDraw::ColorFromRGBA(c);
 }
 
+static ImVec2 LabelTextSize(const char* text, float distanceM)
+{
+    if (!text || !text[0])
+        return ImVec2(0.f, 0.f);
+    ImFont* font = ImGui::GetFont();
+    const float px = Visuals::LabelTextPx(distanceM);
+    if (font)
+        return font->CalcTextSizeA(px, FLT_MAX, 0.f, text);
+    return ImGui::CalcTextSize(text);
+}
+
 static float LabelTextHeight(const char* text, float distanceM)
 {
     if (!text || !text[0])
@@ -436,8 +568,10 @@ static void DrawWeaponLabel(
     // Active weapon — centered on head X.
     if (!active.empty()) {
         std::string weaponLabel = active;
-        if (actor.weaponClip > 0 && active != "Unarmed") {
-            weaponLabel += " (" + std::to_string(actor.weaponClip) + ")";
+        if (active != "Unarmed") {
+            const std::string clip = LoadoutFormat::ClipText(actor.weaponClip);
+            if (!clip.empty())
+                weaponLabel += " " + clip;
         }
         const ImU32 wColor = (active != "Unarmed" && actor.weaponQuality > 0)
             ? static_cast<ImU32>(RarityTierColor(actor.weaponQuality))
@@ -480,6 +614,7 @@ static float StackPlayerLabels(
     const Engine::PlayerCacheEntry& actor,
     float headX,
     float& labelStackY,
+    double camYawDeg,
     const Visuals::EspDrawScale& scale)
 {
     // 1. Group Name, Squad, and Distance onto a single clear line closest to the player's head.
@@ -487,7 +622,9 @@ static float StackPlayerLabels(
         std::string topText;
         
         if (var::show_squad_idx && !actor.isAlly && actor.squadIdx > 0) {
-            topText += "[T" + std::to_string((unsigned)actor.squadIdx) + "] ";
+            const std::string tag = SquadRoster::SquadTag(actor.squadIdx);
+            if (!tag.empty())
+                topText += "[" + tag + "] ";
         }
         
         if (var::names) {
@@ -520,9 +657,128 @@ static float StackPlayerLabels(
         }
     }
 
+    // 1.5. DBNO badge + revive countdown ring (feature #4).
+    if (var::show_dbno_badge && actor.isDbno) {
+        EspDraw::DrawLabelEsp(
+            drawList,
+            ImVec2(headX, labelStackY),
+            "DOWNED",
+            IM_COL32(255, 70, 70, 240),
+            actor.Distance);
+        labelStackY -= LabelTextHeight("DOWNED", actor.Distance) + 2.f;
+        const float remain = actor.reviveRemainS;
+        if (remain > 0.f && actor.reviveTotalS > 0.f) {
+            const std::string timerText = ReviveBadge::FormatCountdown(remain);
+            EspDraw::DrawLabelEsp(
+                drawList,
+                ImVec2(headX, labelStackY),
+                timerText.c_str(),
+                IM_COL32(255, 180, 80, 240),
+                actor.Distance);
+            // Countdown ring to the left of the timer text.
+            const float frac =
+                ReviveBadge::RingFraction(remain, actor.reviveTotalS);
+            const ImVec2 textSize = LabelTextSize(timerText.c_str(), actor.Distance);
+            const ImVec2 ringC(
+                headX - textSize.x * 0.5f - 9.f,
+                labelStackY - textSize.y * 0.5f);
+            drawList->AddCircle(ringC, 5.5f, IM_COL32(70, 70, 70, 200), 16, 1.5f);
+            drawList->PathClear();
+            drawList->PathArcTo(
+                ringC, 5.5f, -1.5707963f, -1.5707963f + 6.2831853f * frac, 24);
+            drawList->PathStroke(
+                IM_COL32(255, 140, 60, 255), ImDrawFlags_None, 2.f);
+            labelStackY -= textSize.y + 2.f;
+        }
+    }
+
     // 2. Weapons stack logically above the name block.
     if (var::show_weapon) {
         DrawWeaponLabel(drawList, actor, headX, labelStackY);
+    }
+
+    // 3. Armor tier + plate count (loadout readout) - independent of the
+    // weapon line so the armor state is visible even when it is the only thing
+    // that resolved.
+    if (var::show_armor_line) {
+        const std::string armorLine =
+            LoadoutFormat::ArmorText(actor.armorTier, actor.armorPlates);
+        if (!armorLine.empty()) {
+            EspDraw::DrawLabelEsp(
+                drawList,
+                ImVec2(headX, labelStackY),
+                armorLine.c_str(),
+                IM_COL32(150, 200, 255, 210),
+                actor.Distance);
+            labelStackY -= LabelTextHeight(armorLine.c_str(), actor.Distance) + 1.f;
+        }
+    }
+
+    // 3.5. Full kit readout (phase 2): stowed tool, safe pouch (rarity) and
+    // belt/pack slot capacity. Stowed guns join only when the weapon line is
+    // off, so nothing is printed twice.
+    if (var::show_player_kit) {
+        LoadoutFormat::KitParts kit;
+        if (!var::show_weapon) {
+            kit.stowed0 = actor.stowedWeapon0;
+            kit.stowed1 = actor.stowedWeapon1;
+        }
+        kit.tool = actor.kitTool;
+        kit.pouch = actor.kitPouch;
+        kit.pouchRarity = actor.kitPouchRarity;
+        kit.beltSlots = actor.kitBeltSlots;
+        kit.packSlots = actor.kitPackSlots;
+        const std::string kitLine = LoadoutFormat::KitText(kit, 90);
+        if (!kitLine.empty()) {
+            EspDraw::DrawLabelEsp(
+                drawList,
+                ImVec2(headX, labelStackY),
+                kitLine.c_str(),
+                IM_COL32(200, 200, 170, 200),
+                actor.Distance);
+            labelStackY -= LabelTextHeight(kitLine.c_str(), actor.Distance) + 1.f;
+        }
+    }
+
+    // 4. Identity (feature #6) + status tags (phase 2): permanent SteamID64
+    // and [Bot]/[Spec]/[Done] under the loadout block.
+    {
+        std::string idText;
+        if (var::show_steam_ids && actor.steamId64 != 0)
+            idText = SquadRoster::SteamLabel(actor.steamId64);
+        const std::string tags = SquadRoster::StatusTag(
+            (actor.statusFlags & 1u) != 0,
+            (actor.statusFlags & 2u) != 0,
+            (actor.statusFlags & 4u) != 0);
+        if (!tags.empty()) {
+            if (!idText.empty())
+                idText += " ";
+            idText += tags;
+        }
+        if (!idText.empty()) {
+            EspDraw::DrawLabelEsp(
+                drawList,
+                ImVec2(headX, labelStackY),
+                idText.c_str(),
+                IM_COL32(170, 170, 190, 190),
+                actor.Distance);
+            labelStackY -= LabelTextHeight(idText.c_str(), actor.Distance) + 1.f;
+        }
+    }
+
+    // 5. Look arrow (feature #5): points where the player is actually aiming.
+    if (var::show_look_arrows && actor.hasAimYaw) {
+        const double angleRad =
+            LookArrow::ArrowAngleRad(actor.aimYawDeg, camYawDeg);
+        LookArrow::Point tip, left, right;
+        LookArrow::ArrowPoints(
+            headX, labelStackY - 6.f, angleRad, 7.f, tip, left, right);
+        drawList->AddTriangleFilled(
+            ImVec2(tip.x, tip.y),
+            ImVec2(left.x, left.y),
+            ImVec2(right.x, right.y),
+            EspDraw::ColorFromRGBA(var::color_look_arrow));
+        labelStackY -= 14.f;
     }
 
     return labelStackY;
@@ -577,7 +833,11 @@ static void DrawPlayerSkeletonFromCache(
 
 bool Engine::ShouldDrawPlayerEsp(const PlayerCacheEntry& entry) const
 {
-    if (!entry.Drawing) {
+    // Drawing is the scanner's admission flag, but it can be false when a new
+    // entry was inserted after the bounded EntityList refresh frontier. A
+    // validated first position is sufficient for frame admission; distance and
+    // ally filters below remain authoritative.
+    if (!entry.Drawing && !entry.positionInitialized) {
         if (!var::show_radar)
             return false;
         const float radarM = EffectiveRadarRangeM();
@@ -587,16 +847,14 @@ bool Engine::ShouldDrawPlayerEsp(const PlayerCacheEntry& entry) const
     if (entry.isAlly && var::hide_allies)
         return false;
     // HealthInfo@PS+0x530 is wrong on PioneerPS; health may read 0 — still draw.
-    if (entry.Distance < 2.f)
+    // Do not use the stale scanner distance as a hard render gate; the frame
+    // collector recomputes current distance after the camera sample.
+    if (entry.Distance < 0.f)
         return false;
-    // Distance hysteresis: use 105% of max distance for the "keep drawing"
-    // check. An entity must move 5% beyond the threshold before it disappears,
-    // preventing the distance-edge flicker that caused 41% of all logged
-    // flickers (315/408). The scanner's Drawing flag uses the strict distance,
-    // so new entities still appear at the correct range.
-    const float maxM = PlayerCollectMaxM();
-    if (maxM > 0.f && entry.Distance > maxM * 1.05f)
-        return false;
+    // Do not use the scanner's cached distance here. It is sampled by a slower
+    // worker and can be stale for a flying/fast-moving target. The frame
+    // collector recomputes distance from the current camera below; applying
+    // the range gate before that drops a bot that is actually close now.
     if (!IsPlausibleWorldPos(entry.WorldPos))
         return false;
     return true;
@@ -604,10 +862,33 @@ bool Engine::ShouldDrawPlayerEsp(const PlayerCacheEntry& entry) const
 
 bool Engine::ShouldDrawRobotEsp(uintptr_t actorKey, const WorldCacheEntry& entry) const
 {
-    if (var::showRobots || var::robotAimEnabled) {
-        if (!entry.Drawing)
+    // A slow scanner flag must not promote an actor that has not been observed
+    // in the current actor array. A plausible position alone is not liveness:
+    // stale roots can continue returning a plausible vector after despawn.
+    // The high-frequency position sampler is the independent current-actor
+    // proof; if it has not succeeded recently, keep the entry out of the frame.
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    const bool currentDrawProof = BotEspExpiry::CurrentBotDrawProof(
+        entry.lastActorSeenMs, entry.livePositionSampleMs, nowMs);
+    Vector3 selectedPosition{};
+    const bool hasDrawablePosition = BotEspPosition::Select(
+        entry.WorldPos, entry.CenterWorldPos,
+        [](const Vector3& p) { return IsPlausibleWorldPos(p); },
+        selectedPosition);
+    if (!currentDrawProof) {
+        const bool actorSeenRecently = entry.lastActorSeenMs != 0
+            && (nowMs < entry.lastActorSeenMs
+                || nowMs - entry.lastActorSeenMs
+                    <= BotEspExpiry::kMaxActorSeenAgeMs);
+        LogGhostBotDecision(actorKey, entry,
+            !actorSeenRecently ? "actor_not_current" : "no_live_position");
+        return false;
+    }
+    if (!entry.Drawing && !(entry.botIdentityProven && hasDrawablePosition)) {
+        if (var::showRobots || var::robotAimEnabled)
             return false;
-    } else if (!entry.Drawing) {
         if (!var::show_radar)
             return false;
         const float radarM = EffectiveRadarRangeM();
@@ -623,13 +904,28 @@ bool Engine::ShouldDrawRobotEsp(uintptr_t actorKey, const WorldCacheEntry& entry
         return false;
     if (IsCachedPlayer(actorKey))
         return false;
-    // Same 5% distance hysteresis as player ESP.
-    const float maxM = BotCollectMaxM();
-    if (maxM > 0.f && entry.Distance > maxM * 1.05f)
-        return false;
+    // The robot scanner's distance is also stale for fast/flying targets. Keep
+    // admission independent of it; CollectEspRenderFrame recomputes the
+    // distance from the frame camera before the paint path applies range.
     if (entry.IsBreaked && !var::show_dead_bots)
         return false;
-    if (WorldScan::LooksLikeContainerActor(actorKey, entry.ActorName)
+    // Ghost-box kill (BotEspExpiry): a proven bot whose position sample is
+    // frozen is a corpse husk or a despawned actor ("ghost bots, nothing
+    // there"). Normal samples are <= ~2.1s old even under DMA load, so a 3s
+    // stale sample means the sampler stopped updating that entry.
+    {
+        if (!BotEspExpiry::PosSampleFresh(
+                entry.positionSampleMs, entry.admittedMs, nowMs)) {
+            LogGhostBotDecision(actorKey, entry, "stale_sample");
+            return false;
+        }
+    }
+    // Structural container evidence is a fallback veto for unclassified
+    // entries. Once RobotList has positively verified the actor, a temporary
+    // empty/garbled display label must not reclassify it as loot and erase the
+    // bot from the frame.
+    if (!entry.botIdentityProven
+        && WorldScan::LooksLikeContainerActor(actorKey, entry.ActorName)
         && !IsAcceptedBotEspLabel(*const_cast<Engine*>(this), entry.ActorName))
         return false;
     return true;
@@ -653,45 +949,173 @@ bool Engine::ShouldDrawWorldEsp(const WorldCacheEntry& entry) const
 	return allowEsp || allowRadar;
 }
 
+// Extraction hatch countdown (SDK FExtractionInfo): refresh State + timer on
+// the frame-build copy so a timer that STARTS after admission lights up.
+//
+// FExtractionInfo { double startedTs; double time; } is ambiguous by design:
+// the drop calls +0x8 "duration in seconds", but the game's own marker widget
+// ticks a live remaining. Let the data decide — sample twice:
+//   decreasing at local rate -> live remaining (use directly)
+//   constant                -> duration (subtract elapsed since the observed
+//                              startedTs transition / first sight)
+namespace {
+struct ExtractTimerState {
+    double prevField = -1.0;
+    double lastStartedTs = -1.0;
+    uint64_t prevMs = 0;
+    uint64_t startObsMs = 0;
+};
+std::unordered_map<uintptr_t, ExtractTimerState> s_extractTimerState;
+} // namespace
+
+static void RefreshExtractionTimer(Engine::WorldCacheEntry& e)
+{
+    const uintptr_t actor = e.APawn; // hatch entries stash the actor key here
+    if (!actor)
+        return;
+    e.extractState = static_cast<int8_t>(
+        Memory::read<uint8_t>(actor + Offsets::ExtractionPoint_State));
+
+    const double startedTs = Memory::read<double>(
+        actor + Offsets::ExtractionPoint_ExtractionInfo);
+    const double timeField = Memory::read<double>(
+        actor + Offsets::ExtractionPoint_ExtractionInfo + 8);
+
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+
+    if (timeField <= 0.0 || timeField > 600.0) {
+        e.extractRemainS = -1.0;
+        e.extractRemainStampMs = 0;
+        return; // no timer (or implausible garbage)
+    }
+
+    if (s_extractTimerState.size() > 512)
+        s_extractTimerState.clear();
+    ExtractTimerState& st = s_extractTimerState[actor];
+
+    double remain = timeField; // default: live-remaining semantics
+    if (st.prevMs != 0 && st.prevField > 0.0) {
+        const double dtS = static_cast<double>(nowMs - st.prevMs) / 1000.0;
+        const double drop = st.prevField - timeField;
+        const bool ticking =
+            dtS > 0.0 && drop >= dtS * 0.25 && drop <= dtS * 4.0 + 1.0;
+        if (!ticking) {
+            // Constant field: duration semantics — anchor elapsed on the
+            // observed start (a startedTs transition means it just began).
+            if (st.startObsMs == 0 || startedTs != st.lastStartedTs)
+                st.startObsMs = nowMs;
+            remain = timeField - static_cast<double>(nowMs - st.startObsMs) / 1000.0;
+        }
+    } else {
+        st.startObsMs = nowMs; // first sight — anchor for duration mode
+    }
+
+    st.prevField = timeField;
+    st.lastStartedTs = startedTs;
+    st.prevMs = nowMs;
+
+    e.extractRemainS = remain > 0.0 ? remain : 0.0;
+    e.extractRemainStampMs = nowMs;
+}
+
 bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
 {
     out = {};
     out.frameSeq = m_espFrameSeq.fetch_add(1, std::memory_order_relaxed) + 1;
+    out.worldGeneration = m_worldGeneration.load(std::memory_order_acquire);
+    m_espFrameDiagnostics.lastCollectStartMs.store(
+        SteadyEspNowMs(), std::memory_order_release);
 
-    if (!IsEspRaidActive())
+    if (!IsEspRaidActive()) {
+        RecordEspFrameFailure(EspFrameResult::Inactive);
         return false;
+    }
 
     if (!g_scatter.valid())
         g_scatter.init();
-    if (!g_scatter.valid())
+    if (!g_scatter.valid()) {
+        RecordEspFrameFailure(EspFrameResult::ScatterInitFailed);
         return false;
+    }
 
-    if (var::enableesp || var::show_radar || var::enable_aimbot) {
+    const FeaturePolicy::AimFeatures frameAimFeatures{
+        var::enable_aimbot,
+        var::robotAimEnabled,
+        var::enable_triggerbot};
+    if (var::enableesp || var::show_radar
+        || FeaturePolicy::ShouldRunAimPass(frameAimFeatures)) {
         std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
         out.players.reserve(playerCache.size());
+        const uint64_t missNowMs = PlayerEspMiss::NowMs();
+        int frameNotDrawing = 0;
+        int frameNotInitialized = 0;
+        int frameAlly = 0;
+        int frameDistance = 0;
+        int framePosition = 0;
         for (const auto& [key, entry] : playerCache) {
+            if (!entry.Drawing)
+                ++frameNotDrawing;
+            if (!entry.positionInitialized)
+                ++frameNotInitialized;
+            if (entry.isAlly && var::hide_allies)
+                ++frameAlly;
+            if (entry.Distance < 2.f || entry.Distance > PlayerCollectMaxM() * 1.05f)
+                ++frameDistance;
+            if (!IsPlausibleWorldPos(entry.WorldPos))
+                ++framePosition;
             bool include = false;
+            bool espSelected = false;
             if (var::enableesp || var::show_radar) {
-                if (ShouldDrawPlayerEsp(entry))
+                if (ShouldDrawPlayerEsp(entry)) {
                     include = true;
+                    espSelected = true;
+                }
             }
-            if (!include && var::enable_aimbot) {
+            if (!include && FeaturePolicy::ShouldCollectPlayerTargets(frameAimFeatures)) {
                 if (!entry.isAlly && !entry.bIsDead
                     && entry.Distance <= var::aimbot_distance
                     && IsPlausibleWorldPos(entry.WorldPos))
                     include = true;
             }
+            if ((var::enableesp || var::show_radar) && !espSelected) {
+                // Per-player miss reason (first failing gate wins) — the
+                // PlayerEspMissLog answer to "which player is missing and why".
+                // An aimbot-only collect still counts as an ESP miss; with ESP
+                // fully off nothing is "missing", so no notes are recorded.
+                PlayerEspMiss::Reason reason =
+                    PlayerEspMiss::Reason::FrameGateReject;
+                if (!IsPlausibleWorldPos(entry.WorldPos))
+                    reason = PlayerEspMiss::Reason::FramePosition;
+                else if (entry.isAlly && var::hide_allies)
+                    reason = PlayerEspMiss::Reason::FrameAllyHidden;
+                else if (!entry.positionInitialized)
+                    reason = PlayerEspMiss::Reason::FrameNotInitialized;
+                else if (entry.Distance < 2.f
+                    || entry.Distance > PlayerCollectMaxM() * 1.05f)
+                    reason = PlayerEspMiss::Reason::FrameDistance;
+                else if (!entry.Drawing)
+                    reason = PlayerEspMiss::Reason::FrameNotDrawing;
+                PlayerEspMiss::Global().NoteAt(missNowMs, key, entry.ActorName,
+                    entry.Distance, reason);
+            }
             if (!include)
                 continue;
+            if (espSelected)
+                PlayerEspMiss::Global().NoteSelectedAt(
+                    missNowMs, key, entry.ActorName);
 
             EspFramePlayer framePlayer{};
             framePlayer.actorKey = key;
             framePlayer.entry = entry;
             out.players.push_back(std::move(framePlayer));
         }
+        SetPlayerFrameResult(out.players.size(), frameNotDrawing,
+            frameNotInitialized, frameAlly, frameDistance, framePosition);
     }
 
-    if (AnyWorldEspEnabled() || var::show_radar) {
+    if (AnyWorldEspEnabled() || var::show_radar || var::enableesp) { // near-field reveal: collect world frames while ESP is on
         size_t worldReserve = 0;
         {
             std::shared_lock<std::shared_mutex> lock(m_containerCacheMutex);
@@ -720,6 +1144,11 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
                 EspFrameWorld frameWorld{};
                 frameWorld.actorKey = key;
                 frameWorld.entry = entry;
+                // Extraction hatches: refresh SDK state + countdown every frame
+                // build so timers that start after admission light up live.
+                if (frameWorld.entry.worldCategory ==
+                    static_cast<uint8_t>(WorldItemCategory::Hatch))
+                    RefreshExtractionTimer(frameWorld.entry);
                 out.world.push_back(std::move(frameWorld));
             }
         };
@@ -738,8 +1167,10 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         std::shared_lock<std::shared_mutex> lock(m_robotCacheMutex);
         out.robots.reserve(robotCache.size());
         for (const auto& [key, entry] : robotCache) {
-            if (!ShouldDrawRobotEsp(key, entry))
+            if (!ShouldDrawRobotEsp(key, entry)) {
+                LogGhostBotDecision(key, entry, "collect_gate");
                 continue;
+            }
 
             EspFrameWorld frameRobot{};
             frameRobot.actorKey = key;
@@ -788,23 +1219,37 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         g_scatter.prepare(pcm + Offsets::DefaultFOV, defFov);
     }
     if (rootComp && IsValidPointer(rootComp)) {
+        // ComponentToWorld has two candidate slots on this build (live-pinned
+        // 0x310, derived fallback 0x2D0) — the probe keeps the pawn scatter on the
+        // slot that actually holds a plausible world position, and the read is the
+        // FTransform translation inside that block.
         g_scatter.prepare(
-            rootComp + Offsets::ComponentToWorld + 0x20,
+            rootComp + Engine::ProbeComponentToWorldOffset(rootComp)
+                + Offsets::Transform_Translation,
             pawnWorld);
     }
     if (pc && IsValidPointer(pc))
         g_scatter.prepare(pc + Offsets::ControlRotation, ctrlRot);
 
-    if (!g_scatter.execute())
-        return false;
-
+    const bool scatterOk = g_scatter.execute();
+    if (!scatterOk) {
+        // The cache snapshots above are still useful. If the live camera is
+        // valid, publish them instead of dropping bots and loot for one failed
+        // camera scatter batch.
+        std::shared_lock<std::shared_mutex> lock(m_cameraMutex);
+        if (!CameraOkForEsp(g_Camera)) {
+            RecordEspFrameFailure(EspFrameResult::ScatterExecuteFailed);
+            return false;
+        }
+        out.camera = g_Camera;
+    }
 
     Vector3 pawnPos = Engine::ToVector3(pawnWorld);
     if (!IsPlausibleWorldPos(pawnPos) && rootComp && IsValidPointer(rootComp))
         pawnPos = Memory::read<Vector3>(rootComp + Offsets::RelativeLocation);
 
     const bool pawnOk = IsPlausibleWorldPos(pawnPos);
-    if (!BuildCameraCacheFromPovReads(
+    if (scatterOk && !BuildCameraCacheFromPovReads(
             pcmOk,
             povFov,
             defFov,
@@ -816,8 +1261,17 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             ctrlRot,
             pc && IsValidPointer(pc),
             out.camera,
-            nullptr))
-        return false;
+            nullptr)) {
+        // Entity snapshots are already collected. If the dedicated camera
+        // worker has a valid live camera, keep publishing the frame rather
+        // than throwing away bots and loot for one failed camera build.
+        std::shared_lock<std::shared_mutex> lock(m_cameraMutex);
+        if (!CameraOkForEsp(g_Camera)) {
+            RecordEspFrameFailure(EspFrameResult::CameraFailed);
+            return false;
+        }
+        out.camera = g_Camera;
+    }
 
     const uint64_t nowMs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -826,7 +1280,7 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
     // Intentional ESP-only lead: tighter 0.12s clamp and no velMag boost
     // (Aimbot uses ComputeVelocityLeadDelta with 0.20/0.25 + velMag). Keep
     // separate so paint frames stay conservative vs aim prediction.
-    auto extrapolateEntry = [&](Vector3& pos, const Vector3& vel, float lastUpdateMs) {
+    auto extrapolateEntry = [&](Vector3& pos, const Vector3& vel, uint64_t lastUpdateMs) {
         if (lastUpdateMs <= 0.f)
             return;
         const float dtSec =
@@ -853,17 +1307,21 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
     }
 
     for (EspFrameWorld& frameRobot : out.robots) {
-        if (IsPlausibleWorldPos(frameRobot.entry.WorldPos))
-            continue;
-        if (IsPlausibleWorldPos(frameRobot.entry.CenterWorldPos))
-            frameRobot.entry.WorldPos = frameRobot.entry.CenterWorldPos;
+        Vector3 selected{};
+        if (BotEspPosition::Select(
+                frameRobot.entry.WorldPos,
+                frameRobot.entry.CenterWorldPos,
+                IsPlausibleWorldPos,
+                selected))
+            frameRobot.entry.WorldPos = selected;
     }
 
+    // Keep bot frame entries at their raw DMA sample. Prediction is applied
+    // once in RenderRobotEspFromFrame, immediately before projection, using
+    // the actual paint-time gap rather than the worker's earlier timestamp.
+    // This prevents variable frame-builder delay from becoming visible stepping.
     for (EspFrameWorld& frameRobot : out.robots) {
-        Engine::WorldCacheEntry& e = frameRobot.entry;
-        if (!IsPlausibleWorldPos(e.WorldPos))
-            continue;
-        extrapolateEntry(e.WorldPos, e.cachedVelocity, e.lastVelocityUpdate);
+        (void)frameRobot;
     }
 
     {
@@ -890,6 +1348,29 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             e.Distance = static_cast<float>(
                 std::sqrt(dx * dx + dy * dy + dz * dz) / 100.0);
         }
+    }
+
+    // Apply range only after current-camera distance is known. The old
+    // pre-collection check used the scanner's stale Distance and could reject
+    // a target that had just flown into range.
+    const float playerMaxM = PlayerCollectMaxM();
+    if (playerMaxM > 0.f) {
+        out.players.erase(
+            std::remove_if(
+                out.players.begin(), out.players.end(),
+                [playerMaxM](const EspFramePlayer& item) {
+                    const bool culled =
+                        item.entry.Distance > playerMaxM * 1.05f;
+                    if (culled) {
+                        // Selected earlier, then dropped by the fresh-camera
+                        // range gate — the most confusing miss, so name it.
+                        PlayerEspMiss::Global().Note(item.actorKey,
+                            item.entry.ActorName, item.entry.Distance,
+                            PlayerEspMiss::Reason::FrameRangeCull);
+                    }
+                    return culled;
+                }),
+            out.players.end());
     }
 
     out.robots.erase(
@@ -938,10 +1419,9 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         }
     }
 
-    out.collectStampMs = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
+    out.collectStampMs = SteadyNowMs();
     out.valid = true;
+    RecordEspFramePublished(out);
 
     // #region agent log
     // Flush only — world Drawing transitions are owned by FinalizeWorldCacheMap
@@ -989,7 +1469,11 @@ static void DrawPlayerEspList(
     for (const Engine::PlayerCacheEntry* actor : actors) {
         if (!actor->APawn || !engine.IsValidPointer(actor->APawn))
             continue;
-        if (!actor->Drawing) {
+        // A validated first position completes admission even when the
+        // slower EntityList ring has not set Drawing yet. Keep the original
+        // Drawing check for never-initialized entries; otherwise a live player
+        // can be collected into the frame and then immediately discarded here.
+        if (!actor->Drawing && !actor->positionInitialized) {
             // #region agent log
             WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintPlayer,
                 actor->APawn, false, WorldScan::FlickerCause::VisMiss);
@@ -1127,8 +1611,8 @@ static void DrawPlayerEspList(
                     drawList->AddCircle(pS, 5.5f, IM_COL32(70, 255, 70, 220));
 
                     const uint64_t ageMs = nowMsDbg - live.boneData.readStampMs;
-                    const float extAgeMs = (live.lastVelocityUpdate > 0.f)
-                        ? static_cast<float>(nowMsDbg) - live.lastVelocityUpdate
+                    const float extAgeMs = live.lastVelocityUpdate != 0
+                        ? static_cast<float>(nowMsDbg - live.lastVelocityUpdate)
                         : -1.f;
                     const float speed = static_cast<float>(std::sqrt(
                         live.cachedVelocity.x * live.cachedVelocity.x
@@ -1211,8 +1695,11 @@ static void DrawPlayerEspList(
                 drawList);
         }
 
-        if (var::names || var::show_weapon || var::show_distance)
-            StackPlayerLabels(drawList, live, head.x, labelStackY, scale);
+        if (var::names || var::show_weapon || var::show_distance || var::show_squad_idx
+            || var::show_armor_line || var::show_dbno_badge
+            || var::show_steam_ids || var::show_look_arrows)
+            StackPlayerLabels(
+                drawList, live, head.x, labelStackY, frameCam.Rotation.y, scale);
 
         if (var::snaplines && EspDraw::IsEspPointOnScreen(feet))
             EspDraw::DrawSnaplineEsp(drawList, feet, color, live.Distance);
@@ -1318,7 +1805,7 @@ static void RenderRobotEspFromFrame(
     const Engine::CameraCache& frameCam,
     uint64_t collectStampMs)
 {
-    if (!var::showRobots)
+    if (!FeaturePolicy::ShouldRenderRobotEsp(var::showRobots))
         return;
 
     ImDrawList* drawList = ImGui::GetForegroundDrawList();
@@ -1328,6 +1815,42 @@ static void RenderRobotEspFromFrame(
     const Engine::EngineStateSnapshot stateSnap = engine.GetStateSnapshot();
     const Vector3 distRef = engine.ResolveDistanceReference(
         frameCam, stateSnap.acknowledgedPawn);
+
+    struct BotPaintFunnel {
+        int input = 0;
+        int invalid = 0;
+        int playerVeto = 0;
+        int dead = 0;
+        int position = 0;
+        int distance = 0;
+        int projection = 0;
+        int label = 0;
+        int offscreen = 0;
+        int painted = 0;
+        const char* closestReason = "none";
+        uintptr_t closestKey = 0;
+        float closestDistance = -1.f;
+        bool closestDrawing = false;
+        bool closestProven = false;
+        uint64_t closestSampleAgeMs = 0;
+    } funnel;
+    const auto noteSkip = [&](const char* reason, uintptr_t key,
+                              const Engine::WorldCacheEntry& robot, float distance) {
+        LogGhostBotDecision(key, robot, reason, distance);
+        if (distance >= 0.f && (funnel.closestDistance < 0.f
+            || distance < funnel.closestDistance)) {
+            funnel.closestReason = reason;
+            funnel.closestKey = key;
+            funnel.closestDistance = distance;
+            funnel.closestDrawing = robot.Drawing;
+            funnel.closestProven = robot.botIdentityProven;
+            const uint64_t now = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            funnel.closestSampleAgeMs = robot.positionSampleMs != 0
+                && now >= robot.positionSampleMs ? now - robot.positionSampleMs : 0;
+        }
+    };
 
     // #region agent log
     // Bots that vanish from the render frame entirely (collect drop) blink
@@ -1348,15 +1871,27 @@ static void RenderRobotEspFromFrame(
     // #endregion
 
     for (const Engine::EspFrameWorld& item : robots) {
+        ++funnel.input;
         const uintptr_t key = item.actorKey;
         const Engine::WorldCacheEntry& robot = item.entry;
-        if (!key || !engine.IsValidPointer(key))
+        if (!key || !engine.IsValidPointer(key)) {
+            ++funnel.invalid;
+            noteSkip("invalid", key, robot, -1.f);
             continue;
-        if (engine.IsCachedPlayerTry(key))
+        }
+        if (engine.IsCachedPlayerTry(key)) {
+            ++funnel.playerVeto;
+            noteSkip("playerVeto", key, robot, -1.f);
             continue;
-        if (robot.IsBreaked && !var::show_dead_bots)
+        }
+        if (robot.IsBreaked && !var::show_dead_bots) {
+            ++funnel.dead;
+            noteSkip("dead", key, robot, -1.f);
             continue;
+        }
         if (!IsPlausibleWorldPos(robot.WorldPos)) {
+            ++funnel.position;
+            noteSkip("position", key, robot, -1.f);
             // #region agent log
             WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
                 key, false, WorldScan::FlickerCause::PosFail);
@@ -1378,6 +1913,8 @@ static void RenderRobotEspFromFrame(
         // otherwise the paint path hard-cuts a bot the worker is still holding.
         constexpr float kDistOffFactor = 1.15f;
         if (distM > botMaxM * kDistOffFactor) {
+            ++funnel.distance;
+            noteSkip("distance", key, robot, distM);
             // #region agent log
             WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
                 key, false, WorldScan::FlickerCause::DistEdge);
@@ -1387,32 +1924,72 @@ static void RenderRobotEspFromFrame(
 
         Engine::WorldCacheEntry drawEntry = robot;
 
-        // Paint-gap velocity continuation (same as player path): the frame was
-        // collected ~40-90ms ago; extrapolate the robot's cached velocity over
-        // the collect->present delta so boxes don't lag strafing targets.
-        // Pure math, no DMA on the paint thread.
-        if (collectStampMs != 0) {
-            const uint64_t paintNowMs = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count());
-            const float gapSec = static_cast<float>(paintNowMs - collectStampMs) * 0.001f;
-            if (gapSec > 0.f && gapSec <= 0.25f) {
-                const Vector3& v = drawEntry.cachedVelocity;
-                if (v.x != 0.f || v.y != 0.f || v.z != 0.f) {
-                    drawEntry.WorldPos.x += v.x * gapSec;
-                    drawEntry.WorldPos.y += v.y * gapSec;
-                    drawEntry.WorldPos.z += v.z * gapSec;
-                    if (IsPlausibleWorldPos(drawEntry.CenterWorldPos)) {
-                        drawEntry.CenterWorldPos.x += v.x * gapSec;
-                        drawEntry.CenterWorldPos.y += v.y * gapSec;
-                        drawEntry.CenterWorldPos.z += v.z * gapSec;
-                    }
-                    if (drawEntry.hasBotHeadWorldPos
-                        && IsPlausibleWorldPos(drawEntry.BotHeadWorldPos)) {
-                        drawEntry.BotHeadWorldPos.x += v.x * gapSec;
-                        drawEntry.BotHeadWorldPos.y += v.y * gapSec;
-                        drawEntry.BotHeadWorldPos.z += v.z * gapSec;
-                    }
+        // Render the track at a fixed delay behind the newest sample and
+        // interpolate between the two newest samples (Core/BotMotion.hpp).
+        // Snapping to the newest sample is what made the box step once per
+        // sample and jump backward on a late one; extrapolation with a noisy
+        // velocity then moved it around inside the interval. This replaces both.
+        const uint64_t paintNowMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        const BotMotion::RenderState renderState = BotMotion::ResolveRenderPos(
+            BotMotion::Sample{drawEntry.prevSampleWorldPos, drawEntry.prevSampleMs},
+            BotMotion::Sample{drawEntry.WorldPos, drawEntry.positionSampleMs},
+            drawEntry.cachedVelocity,
+            paintNowMs);
+        if (renderState.valid) {
+            Vector3 target = renderState.pos;
+            // Correction smoothing: a late sample corrects the extrapolated
+            // target by a jump-sized prediction error, and snapping to it is the
+            // visible teleport. Carry the last rendered anchor and glide to the
+            // new target at the bot's own speed plus a bounded correction budget,
+            // which absorbs the error below perception instead of in one frame.
+            {
+                struct BotWorldSmooth {
+                    Vector3 pos{};
+                    uint64_t ms = 0;
+                    bool valid = false;
+                };
+                static std::unordered_map<uintptr_t, BotWorldSmooth> s_botWorldSmooth;
+                BotWorldSmooth& smooth = s_botWorldSmooth[key];
+                const uint64_t dtMs = (smooth.valid && paintNowMs > smooth.ms)
+                    ? paintNowMs - smooth.ms : 0;
+                if (smooth.valid && dtMs > 0) {
+                    target = BotMotion::SmoothCorrection(
+                        smooth.pos, target, dtMs,
+                        BotMotion::SpeedOf(drawEntry.cachedVelocity));
+                }
+                smooth.pos = target;
+                smooth.ms = paintNowMs;
+                smooth.valid = true;
+                if (s_botWorldSmooth.size() > 4096)
+                    s_botWorldSmooth.clear();
+            }
+            const Vector3 delta{
+                target.x - drawEntry.WorldPos.x,
+                target.y - drawEntry.WorldPos.y,
+                target.z - drawEntry.WorldPos.z};
+            if (delta.x != 0.0 || delta.y != 0.0 || delta.z != 0.0) {
+                drawEntry.WorldPos.x += delta.x;
+                drawEntry.WorldPos.y += delta.y;
+                drawEntry.WorldPos.z += delta.z;
+                if (drawEntry.hasBotHeadWorldPos
+                    && IsPlausibleWorldPos(drawEntry.BotHeadWorldPos)) {
+                    drawEntry.BotHeadWorldPos.x += delta.x;
+                    drawEntry.BotHeadWorldPos.y += delta.y;
+                    drawEntry.BotHeadWorldPos.z += delta.z;
+                }
+                if (IsPlausibleWorldPos(drawEntry.CenterWorldPos)) {
+                    drawEntry.CenterWorldPos.x += delta.x;
+                    drawEntry.CenterWorldPos.y += delta.y;
+                    drawEntry.CenterWorldPos.z += delta.z;
+                }
+                for (int i = 0; i < drawEntry.BotPartCount; ++i) {
+                    if (!IsPlausibleWorldPos(drawEntry.BotPartPos[i]))
+                        continue;
+                    drawEntry.BotPartPos[i].x += delta.x;
+                    drawEntry.BotPartPos[i].y += delta.y;
+                    drawEntry.BotPartPos[i].z += delta.z;
                 }
             }
         }
@@ -1420,6 +1997,8 @@ static void RenderRobotEspFromFrame(
         Vector3 headWorld{};
         Vector3 feetWorld{};
         if (!EspDraw::ResolveBotHeadFeetWorld(drawEntry, headWorld, feetWorld)) {
+            ++funnel.position;
+            noteSkip("headFeet", key, robot, distM);
             // #region agent log
             WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
                 key, false, WorldScan::FlickerCause::PosFail);
@@ -1434,24 +2013,46 @@ static void RenderRobotEspFromFrame(
         // the last screen coords here stamped a ghost copy of the box at a
         // stale pixel position for up to 1.5s.
         if (!EspDraw::WorldToScreenBox(engine, frameCam, headWorld, feetWorld, head, feet)) {
-            if (WorldPointRoughlyInView(frameCam, headWorld)) {
-                // #region agent log
-                WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
-                    key, false, WorldScan::FlickerCause::ProjFail);
-                // #endregion
+            // Flying constructables can keep a plausible scene-root position
+            // while their rendered mesh center/head is the useful projection
+            // anchor. Retry those already-cached anchors before dropping the
+            // bot. This is paint-thread only: no DMA and no new identity gate.
+            bool recovered = false;
+            const Vector3* fallbackAnchors[] = {
+                &drawEntry.CenterWorldPos,
+                &drawEntry.BotHeadWorldPos,
+            };
+            for (const Vector3* anchor : fallbackAnchors) {
+                if (!anchor || !IsPlausibleWorldPos(*anchor))
+                    continue;
+                Vector3 fallbackHead = *anchor;
+                Vector3 fallbackFeet = *anchor;
+                fallbackHead.z += 90.0;
+                fallbackFeet.z -= 90.0;
+                if (EspDraw::WorldToScreenBox(
+                        engine, frameCam, fallbackHead, fallbackFeet, head, feet)) {
+                    recovered = true;
+                    break;
+                }
             }
-            continue;
+            if (!recovered) {
+                ++funnel.projection;
+                noteSkip("projection", key, robot, distM);
+                if (WorldPointRoughlyInView(frameCam, headWorld)) {
+                    // #region agent log
+                    WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
+                        key, false, WorldScan::FlickerCause::ProjFail);
+                    // #endregion
+                }
+                continue;
+            }
         }
 
-        // ── EMA smoothing (same as player path) ───────────────────────
+        // ── Bot skeleton/position lag probe + light smoothing ──────────
         {
             struct BotSmooth { ImVec2 head{}; ImVec2 feet{}; bool valid = false; };
             static std::unordered_map<uintptr_t, BotSmooth> s_botSmooth;
-            // Raised from 0.35 so the bot box doesn't lag off the actual model.
-            // Raised to 0.85 so the bot box tracks the target instead of trailing:
-            // with paint-gap continuation the position is already predicted ~30-90ms
-            // ahead, and a heavy screen-space EMA was re-introducing the lag.
-            static constexpr float kBotSmoothAlpha = 0.85f;
+            static constexpr float kBotSmoothAlpha = 1.0f;
             auto bs = s_botSmooth.find(key);
             if (bs != s_botSmooth.end() && bs->second.valid) {
                 head.x = bs->second.head.x + (head.x - bs->second.head.x) * kBotSmoothAlpha;
@@ -1460,13 +2061,143 @@ static void RenderRobotEspFromFrame(
                 feet.y = bs->second.feet.y + (feet.y - bs->second.feet.y) * kBotSmoothAlpha;
             }
             s_botSmooth[key] = { head, feet, true };
-            // Prune stale entries
             if (s_botSmooth.size() > 1024)
                 s_botSmooth.clear();
+
+            if (var::debug_skeleton_lag) {
+                const uint64_t nowDbg = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+                // The rendered (interpolated) anchor, not the raw sample: the
+                // probe has to measure what is actually painted.
+                const Vector3 anchorW = drawEntry.WorldPos;
+                const Vector3 markerW = robot.hasBotHeadWorldPos
+                    && IsPlausibleWorldPos(robot.BotHeadWorldPos)
+                    ? robot.BotHeadWorldPos
+                    : headWorld;
+                Vector3 anchorS{};
+                Vector3 markerS{};
+                const bool anchorOk = engine.ProjectWorldLocationToScreen(
+                    anchorW, anchorS, frameCam);
+                const bool markerOk = engine.ProjectWorldLocationToScreen(
+                    markerW, markerS, frameCam);
+                if (anchorOk && markerOk) {
+                    const double dx = markerW.x - anchorW.x;
+                    const double dy = markerW.y - anchorW.y;
+                    const double dz = markerW.z - anchorW.z;
+                    const double dWorld = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    const float dScreen = static_cast<float>(std::sqrt(
+                        (markerS.x - anchorS.x) * (markerS.x - anchorS.x)
+                        + (markerS.y - anchorS.y) * (markerS.y - anchorS.y)));
+                    const float speed = static_cast<float>(std::sqrt(
+                        robot.cachedVelocity.x * robot.cachedVelocity.x
+                        + robot.cachedVelocity.y * robot.cachedVelocity.y
+                        + robot.cachedVelocity.z * robot.cachedVelocity.z));
+                    const uint64_t sampleAge = robot.positionSampleMs != 0
+                        ? nowDbg - robot.positionSampleMs : 0;
+                    const uint64_t velocityAge = robot.lastVelocityUpdate != 0
+                        ? nowDbg - robot.lastVelocityUpdate : 0;
+                    // Per-frame rendered displacement for this bot. On a smooth
+                    // track stepCm stays proportional to stepDtMs; a choppy one
+                    // alternates near-zero and large steps.
+                    static std::unordered_map<uintptr_t,
+                        std::pair<Vector3, uint64_t>> s_botRenderStep;
+                    double stepCm = 0.0;
+                    uint64_t stepDtMs = 0;
+                    {
+                        const auto sit = s_botRenderStep.find(key);
+                        if (sit != s_botRenderStep.end()) {
+                            const double sx = anchorW.x - sit->second.first.x;
+                            const double sy = anchorW.y - sit->second.first.y;
+                            const double sz = anchorW.z - sit->second.first.z;
+                            stepCm = std::sqrt(sx * sx + sy * sy + sz * sz);
+                            stepDtMs = nowDbg > sit->second.second
+                                ? nowDbg - sit->second.second : 0;
+                        }
+                        s_botRenderStep[key] = { anchorW, nowDbg };
+                        if (s_botRenderStep.size() > 1024)
+                            s_botRenderStep.clear();
+                    }
+
+                    drawList->AddLine(
+                        ImVec2(static_cast<float>(anchorS.x), static_cast<float>(anchorS.y)),
+                        ImVec2(static_cast<float>(markerS.x), static_cast<float>(markerS.y)),
+                        IM_COL32(255, 170, 40, 210), 1.0f);
+                    drawList->AddCircleFilled(
+                        ImVec2(static_cast<float>(anchorS.x), static_cast<float>(anchorS.y)),
+                        3.5f, IM_COL32(255, 70, 70, 255));
+                    drawList->AddCircleFilled(
+                        ImVec2(static_cast<float>(markerS.x), static_cast<float>(markerS.y)),
+                        3.5f, IM_COL32(70, 170, 255, 255));
+
+                    char botDbg[256]{};
+                    snprintf(botDbg, sizeof(botDbg),
+                        "bot age %llums velAge %llums dW %.0fcm dS %.0fpx v %.0f "
+                        "int %llums delay %llums lead %llums step %.0fcm/%llums",
+                        static_cast<unsigned long long>(sampleAge),
+                        static_cast<unsigned long long>(velocityAge),
+                        dWorld, dScreen, speed,
+                        static_cast<unsigned long long>(renderState.intervalMs),
+                        static_cast<unsigned long long>(renderState.delayMs),
+                        static_cast<unsigned long long>(renderState.leadMs),
+                        stepCm,
+                        static_cast<unsigned long long>(stepDtMs));
+                    drawList->AddText(
+                        ImVec2(static_cast<float>(markerS.x) + 10.f,
+                               static_cast<float>(markerS.y) - 8.f),
+                        IM_COL32(255, 210, 100, 255), botDbg);
+
+                    static uint64_t s_lastBotProbeLog = 0;
+                    static float s_bestBotDist = -1.f;
+                    static struct {
+                        uint64_t key = 0;
+                        uint64_t sampleAge = 0;
+                        uint64_t velocityAge = 0;
+                        double dWorld = 0.0;
+                        float dScreen = 0.f;
+                        float speed = 0.f;
+                        float dist = 0.f;
+                        uint64_t intervalMs = 0;
+                        uint64_t delayMs = 0;
+                        uint64_t leadMs = 0;
+                        double stepCm = 0.0;
+                        uint64_t stepDtMs = 0;
+                    } best{};
+                    if (s_bestBotDist < 0.f || distM < s_bestBotDist) {
+                        s_bestBotDist = distM;
+                        best = { static_cast<uint64_t>(key), sampleAge, velocityAge,
+                            dWorld, dScreen, speed, distM,
+                            renderState.intervalMs, renderState.delayMs,
+                            renderState.leadMs, stepCm, stepDtMs };
+                    }
+                    if (nowDbg - s_lastBotProbeLog >= 500) {
+                        std::ofstream lf(kArcVerifyPath, std::ios::app);
+                        if (lf) {
+                            lf << "{\"location\":\"Esp.cpp\",\"message\":\"bot_skel_lag\","
+                               << "\"data\":{\"key\":" << best.key
+                               << ",\"sampleAgeMs\":" << best.sampleAge
+                               << ",\"velocityAgeMs\":" << best.velocityAge
+                               << ",\"dWorldCm\":" << best.dWorld
+                               << ",\"dScreenPx\":" << best.dScreen
+                               << ",\"speed\":" << best.speed
+                               << ",\"dist\":" << best.dist
+                               << ",\"intervalMs\":" << best.intervalMs
+                               << ",\"delayMs\":" << best.delayMs
+                               << ",\"leadMs\":" << best.leadMs
+                               << ",\"stepCm\":" << best.stepCm
+                               << ",\"stepDtMs\":" << best.stepDtMs
+                               << "},\"ts\":" << nowDbg << "}\n";
+                        }
+                        s_lastBotProbeLog = nowDbg;
+                        s_bestBotDist = -1.f;
+                    }
+                }
+            }
         }
         // ───────────────────────────────────────────────────────────────
 
         const ImU32 color_base = BotEspColor(robot.isVisible, robot.IsBreaked);
+        const ImU32 color = color_base;
         const float boxH = feet.y - head.y;
         const Visuals::EspDrawScale scale =
             Visuals::ComputeEspScaleFromBox(boxH > 1.f ? boxH : 24.f, distM);
@@ -1480,28 +2211,83 @@ static void RenderRobotEspFromFrame(
         std::string botLabel = ResolveBotDrawLabel(key, robot.ActorName, fname, /*allowDma=*/false);
         if (botLabel.empty() && !robot.ItemDisplayName.empty())
             botLabel = ResolveBotDrawLabel(key, robot.ItemDisplayName, fname, /*allowDma=*/false);
-        // No real name → no ESP (heart/dist alone = ghost bots; log GC Electrified).
-        // Never use ARC/Bot/Oil placeholders. IsAnyBotActor alone is not enough.
-
-        // Hatches are containers now (Loot tab) — never arrive in the robot path.
-        const ImU32 color = color_base;
+        // Constructable is an internal admission token, not a displayable bot.
+        // A cache entry must have a real accepted bot identity before paint;
+        // otherwise props/effects with a transient enemy-data pointer become
+        // ghost ESP. The worker retries label resolution on its next pass.
         if (botLabel.empty() || !IsAcceptedBotEspLabel(engine, botLabel, fname)) {
-            RecordBotDrawLabelMiss();
-            // #region agent log
-            WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
-                key, false, WorldScan::FlickerCause::LabelMiss);
-            // #endregion
-            continue;
+            ++funnel.label;
+            noteSkip("label", key, robot, distM);
+            if (!robot.botIdentityProven) {
+                RecordBotDrawLabelMiss();
+                // #region agent log
+                WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
+                    key, false, WorldScan::FlickerCause::LabelMiss);
+                // #endregion
+                continue;
+            }
+            botLabel = "Bot";
         }
         if (!EspDraw::IsEspBoxOnScreen(head, feet)) {
+            ++funnel.offscreen;
+            noteSkip("offscreen", key, robot, distM);
             // Looking away is not flicker — leave the track as-is so return
             // to screen does not count as an on->off->on blink.
             continue;
         }
 
+        ++funnel.painted;
+
         // #region agent log
         WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
             key, true, WorldScan::FlickerCause::Other);
+        // #endregion
+
+        // #region agent log
+        // bot_appear (verify log): the end-to-end discovery funnel — first
+        // seen (pending-lane insert) -> admitted (cache) -> FIRST PAINTED
+        // (past every draw gate, on screen). appearMs = seen->painted,
+        // admitMs = seen->cached, paintMs = cached->painted. Keyed by
+        // firstSeenMs so a reused address spawning a new bot logs again.
+        {
+            static std::unordered_map<uintptr_t, uint64_t> s_botAppearLogged;
+            if (robot.firstSeenMs != 0
+                && s_botAppearLogged[key] != robot.firstSeenMs) {
+                if (s_botAppearLogged.size() > 4096)
+                    s_botAppearLogged.clear();
+                s_botAppearLogged[key] = robot.firstSeenMs;
+                const uint64_t nowMs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+                const long long appearMs =
+                    static_cast<long long>(nowMs - robot.firstSeenMs);
+                const long long admitMs =
+                    (robot.admittedMs && robot.admittedMs >= robot.firstSeenMs)
+                        ? static_cast<long long>(robot.admittedMs - robot.firstSeenMs)
+                        : -1;
+                const long long paintMs =
+                    (robot.admittedMs && nowMs >= robot.admittedMs)
+                        ? static_cast<long long>(nowMs - robot.admittedMs)
+                        : -1;
+                std::ofstream f(kArcVerifyPath, std::ios::app);
+                if (f) {
+                    char labelEsc[48]{};
+                    snprintf(labelEsc, sizeof(labelEsc), "%.40s", botLabel.c_str());
+                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"appear\","
+                      << "\"location\":\"Esp.cpp:paintBot\",\"message\":\"bot_appear\","
+                      << "\"data\":{\"key\":" << key
+                      << ",\"name\":\"" << labelEsc
+                      << "\",\"appearMs\":" << appearMs
+                      << ",\"admitMs\":" << admitMs
+                      << ",\"paintMs\":" << paintMs
+                      << ",\"dist\":" << distM
+                      << ",\"fallback\":" << (botLabel == "Bot" ? 1 : 0)
+                      << "},\"timestamp\":" << ts << "}\n";
+                }
+            }
+        }
         // #endregion
 
         // Bot health bar + heart
@@ -1530,6 +2316,35 @@ static void RenderRobotEspFromFrame(
                 ImColor(255, 255, 255, 255));
         }
 
+        // Best-effort loadout line (weapon + armor tier) for bots that carry an
+        // inventory. Everything is self-filtered at read time, so an empty
+        // line is the normal case for plain ARC constructables.
+        if (var::show_bot_loadout) {
+            std::string loadoutLine = robot.weaponName;
+            const std::string clip = LoadoutFormat::ClipText(robot.weaponClip);
+            if (!clip.empty())
+                loadoutLine += loadoutLine.empty() ? clip : " " + clip;
+            const std::string armorLine = LoadoutFormat::ArmorText(robot.armorTier, 0.f);
+            if (!armorLine.empty()) {
+                if (!loadoutLine.empty())
+                    loadoutLine += " | ";
+                loadoutLine += armorLine;
+            }
+            if (!loadoutLine.empty()) {
+                float loadoutY = botLabelY;
+                if (var::bot_names && !botLabel.empty() && ImGui::GetFont()) {
+                    loadoutY -= ImGui::GetFont()->CalcTextSizeA(
+                        Visuals::LabelTextPx(distM), FLT_MAX, 0.f, botLabel.c_str()).y + 2.f;
+                }
+                EspDraw::DrawLabelEsp(
+                    drawList,
+                    ImVec2(head.x, loadoutY),
+                    loadoutLine.c_str(),
+                    IM_COL32(200, 200, 200, 200),
+                    distM);
+            }
+        }
+
         if (var::bot_show_distance) {
             char distBuf[32]{};
             snprintf(distBuf, sizeof(distBuf), "%.0fm", distM);
@@ -1549,8 +2364,138 @@ static void RenderRobotEspFromFrame(
                 distM);
         }
 
+        // Bot vision cone + alertness tag (feature #7): the fan shows what the
+        // bot can see, red = Combat (it is hunting something).
+        if (var::show_bot_vision && robot.visionValid && distM <= 150.f) {
+            VisionCone::Vec2 fan[10];
+            const int fanCount = VisionCone::FanPoints(
+                static_cast<float>(robot.WorldPos.x),
+                static_cast<float>(robot.WorldPos.y),
+                robot.facingYawDeg, robot.sightHalfAngleDeg,
+                robot.sightRadiusCm, fan, 10);
+            if (fanCount >= 3) {
+                ImVec2 poly[12];
+                int polyN = 0;
+                bool allOk = true;
+                for (int i = 0; i < fanCount && polyN < 12; ++i) {
+                    Vector3 scr{};
+                    if (!engine.ProjectWorldLocationToScreen(
+                            Vector3{ fan[i].x, fan[i].y, robot.WorldPos.z },
+                            scr, frameCam)) {
+                        allOk = false;
+                        break;
+                    }
+                    poly[polyN++] = ImVec2(
+                        static_cast<float>(scr.x), static_cast<float>(scr.y));
+                }
+                if (allOk && polyN >= 3) {
+                    const bool hunting = robot.alertness >= 3;
+                    const ImU32 fill = hunting
+                        ? IM_COL32(255, 60, 40, 46)
+                        : IM_COL32(255, 200, 60, 34);
+                    const ImU32 edge = hunting
+                        ? IM_COL32(255, 60, 40, 150)
+                        : IM_COL32(255, 200, 60, 110);
+                    drawList->AddConvexPolyFilled(poly, polyN, fill);
+                    drawList->AddPolyline(
+                        poly, polyN, edge, ImDrawFlags_Closed, 1.2f);
+                }
+            }
+            if (var::show_bot_alertness) {
+                const char* tag = VisionCone::AlertnessTag(robot.alertness);
+                if (tag && tag[0]) {
+                    EspDraw::DrawLabelEsp(
+                        drawList,
+                        ImVec2(head.x, feet.y + 12.f),
+                        tag,
+                        robot.alertness >= 3
+                            ? IM_COL32(255, 80, 60, 235)
+                            : IM_COL32(240, 220, 120, 220),
+                        distM);
+                }
+            }
+        }
+
+        // Per-part damage pips (feature #8): hp fraction per bot part at its
+        // part position (index alignment is best-effort) - a blown-off leg is
+        // a red pip on the leg.
+        if (var::show_bot_parts && robot.partHpCount > 0 && robot.BotPartCount > 0) {
+            int pipN = robot.partHpCount < robot.BotPartCount
+                ? robot.partHpCount : robot.BotPartCount;
+            if (pipN > 10)
+                pipN = 10;
+            for (int i = 0; i < pipN; ++i) {
+                const PartDamage::Pip cls = PartDamage::Classify(robot.partHp[i]);
+                if (cls == PartDamage::Pip::Unread)
+                    continue;
+                if (!IsPlausibleWorldPos(robot.BotPartPos[i]))
+                    continue;
+                Vector3 scr{};
+                if (!engine.ProjectWorldLocationToScreen(
+                        robot.BotPartPos[i], scr, frameCam))
+                    continue;
+                ImU32 pipCol = IM_COL32(120, 220, 120, 220);
+                if (cls == PartDamage::Pip::Hurt)
+                    pipCol = IM_COL32(240, 200, 70, 230);
+                else if (cls == PartDamage::Pip::Critical)
+                    pipCol = IM_COL32(240, 120, 50, 235);
+                else if (cls == PartDamage::Pip::Dead)
+                    pipCol = IM_COL32(200, 40, 40, 240);
+                drawList->AddCircleFilled(
+                    ImVec2(static_cast<float>(scr.x), static_cast<float>(scr.y)),
+                    3.2f, pipCol, 8);
+            }
+            const int damaged =
+                PartDamage::CountBelow(robot.partHp, robot.partHpCount, 0.95f);
+            if (damaged > 0 || robot.destroyedParts > 0) {
+                std::string summary =
+                    PartDamage::SummaryText(damaged, robot.partHpCount);
+                if (robot.destroyedParts > 0)
+                    summary += " (" + std::to_string(robot.destroyedParts) + " destroyed)";
+                EspDraw::DrawLabelEsp(
+                    drawList,
+                    ImVec2(head.x, feet.y + 26.f),
+                    summary.c_str(),
+                    IM_COL32(240, 140, 90, 225),
+                    distM);
+            }
+        }
+
         if (var::bot_snaplines && EspDraw::IsEspPointOnScreen(feet))
             EspDraw::DrawSnaplineEsp(drawList, feet, color, distM);
+    }
+
+    // One compact funnel sample per second keeps the expensive paint path
+    // observable without making Present do file I/O every frame.
+    {
+        static uint64_t s_lastFunnelLogMs = 0;
+        const uint64_t nowMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        if (nowMs - s_lastFunnelLogMs >= 1000) {
+            s_lastFunnelLogMs = nowMs;
+            std::ofstream f(kArcVerifyPath, std::ios::app);
+            if (f) {
+                f << "{\"location\":\"Esp.cpp:paintBot\",\"message\":\"bot_paint_funnel\","
+                  << "\"data\":{\"input\":" << funnel.input
+                  << ",\"invalid\":" << funnel.invalid
+                  << ",\"playerVeto\":" << funnel.playerVeto
+                  << ",\"dead\":" << funnel.dead
+                  << ",\"position\":" << funnel.position
+                  << ",\"distance\":" << funnel.distance
+                  << ",\"projection\":" << funnel.projection
+                  << ",\"label\":" << funnel.label
+                  << ",\"offscreen\":" << funnel.offscreen
+                  << ",\"painted\":" << funnel.painted
+                  << ",\"closestReason\":\"" << funnel.closestReason
+                  << "\",\"closestKey\":" << funnel.closestKey
+                  << ",\"closestDist\":" << funnel.closestDistance
+                  << ",\"closestDrawing\":" << (funnel.closestDrawing ? 1 : 0)
+                  << ",\"closestProven\":" << (funnel.closestProven ? 1 : 0)
+                  << ",\"closestAgeMs\":" << funnel.closestSampleAgeMs
+                  << "},\"ts\":" << nowMs << "}\n";
+            }
+        }
     }
 }
 
@@ -1794,7 +2739,7 @@ static void GhostTracePaint(
     const float panelW = 620.f;
     const float px = disp.x > panelW + 40.f ? disp.x - panelW - 20.f : 20.f;
     const float py = 60.f;
-    const float panelH = 34.f + (kGhostEventSlots + 3) * 16.f;
+    const float panelH = 34.f + (kGhostEventSlots + 6) * 16.f;
     dl->AddRectFilled(ImVec2(px, py), ImVec2(px + panelW, py + panelH),
         IM_COL32(0, 0, 0, 225));
     dl->AddText(font, 16.f, ImVec2(px + 8.f, py + 5.f),
@@ -1834,6 +2779,51 @@ static void GhostTracePaint(
         dpitchNow,
         dlocNow);
     dl->AddText(font, fs, ImVec2(px + 8.f, ry), IM_COL32(200, 220, 255, 255), line);
+    ry += 16.f;
+
+    const auto& diag = engine.m_espFrameDiagnostics;
+    const uint64_t currentGeneration =
+        engine.m_worldGeneration.load(std::memory_order_acquire);
+    const uint64_t collectStart = diag.lastCollectStartMs.load(std::memory_order_acquire);
+    const uint64_t publishMs = diag.lastPublishMs.load(std::memory_order_acquire);
+    const uint64_t failureMs = diag.lastFailureMs.load(std::memory_order_acquire);
+    const int collectAge = collectStart != 0 && nowMs >= collectStart
+        ? static_cast<int>(nowMs - collectStart) : -1;
+    const int publishAge = publishMs != 0 && nowMs >= publishMs
+        ? static_cast<int>(nowMs - publishMs) : -1;
+    const int failureAge = failureMs != 0 && nowMs >= failureMs
+        ? static_cast<int>(nowMs - failureMs) : -1;
+    std::snprintf(line, sizeof(line),
+        "health %s | collect %dms | publish %dms | fail %dms x%d",
+        EspFrameResultName(diag.lastResult.load(std::memory_order_acquire)),
+        collectAge,
+        publishAge,
+        failureAge,
+        diag.consecutiveFailures.load(std::memory_order_acquire));
+    dl->AddText(font, fs, ImVec2(px + 8.f, ry), IM_COL32(160, 220, 255, 255), line);
+    ry += 16.f;
+
+    std::snprintf(line, sizeof(line),
+        "gen pub %llu cur %llu | published p%d b%d w%d | cam %s",
+        static_cast<unsigned long long>(frame.worldGeneration),
+        static_cast<unsigned long long>(currentGeneration),
+        diag.lastPlayerCount.load(std::memory_order_relaxed),
+        diag.lastRobotCount.load(std::memory_order_relaxed),
+        diag.lastWorldCount.load(std::memory_order_relaxed),
+        camDbg.src);
+    dl->AddText(font, fs, ImVec2(px + 8.f, ry), IM_COL32(160, 220, 255, 255), line);
+    ry += 16.f;
+
+    std::snprintf(line, sizeof(line),
+        "world n%d draw%d | skip pos%d dist%d proj%d allow%d picked%d",
+        g_worldEspDbg.frameEntries,
+        g_worldEspDbg.rendered,
+        g_worldEspDbg.skipPos,
+        g_worldEspDbg.skipDist,
+        g_worldEspDbg.skipProj,
+        g_worldEspDbg.skipAllow,
+        g_worldEspDbg.skipPickedUp);
+    dl->AddText(font, fs, ImVec2(px + 8.f, ry), IM_COL32(160, 220, 255, 255), line);
     ry += 18.f;
 
     for (int i = 0; i < s_eventCount; ++i) {
@@ -1966,7 +2956,7 @@ void DrawCollisionDebug(
 void Engine::RenderEsp()
 {
     const bool drawPlayers = var::enableesp;
-    const bool drawBots = var::showRobots || var::robotAimEnabled;
+    const bool drawBots = FeaturePolicy::ShouldRenderRobotEsp(var::showRobots);
     const bool drawWorld = AnyWorldEspEnabled();
     const bool drawCollDbg = var::collision_debug_draw || var::collision_debug_rays;
     if (!drawPlayers && !drawBots && !drawWorld && !var::show_radar && !drawCollDbg)
@@ -1976,18 +2966,25 @@ void Engine::RenderEsp()
         ImGui::GetIO().DisplaySize.x,
         ImGui::GetIO().DisplaySize.y);
 
-    // Never block paint on m_espFrameMutex — keep last good frame if busy.
-    static std::shared_ptr<const EspRenderFrame> s_paintFrame;
+    // Never block paint on m_espFrameMutex. Keep only a current, fresh frame;
+    // the atomic retained pointer is reset by ClearEspCaches on world changes.
+    std::shared_ptr<const EspRenderFrame> paintFrame;
     {
         std::shared_lock<std::shared_mutex> lock(m_espFrameMutex, std::try_to_lock);
-        if (lock.owns_lock() && m_espFrameShared && m_espFrameShared->valid)
-            s_paintFrame = m_espFrameShared;
+        if (lock.owns_lock()) {
+            if (m_espFrameShared && IsCurrentFreshEspFrame(*m_espFrameShared))
+                m_espPaintFrame.store(m_espFrameShared);
+            // Do not clear the retained snapshot merely because the newest
+            // worker snapshot is briefly stale. The next successful publish
+            // replaces it; ClearEspCaches still clears it on world changes.
+        }
+        paintFrame = m_espPaintFrame.load();
     }
-    if (!s_paintFrame)
+    if (!paintFrame || !IsCurrentFreshEspFrame(*paintFrame)) {
+        RenderEspFrameHealthFallback(paintFrame.get(), nullptr);
         return;
-    const EspRenderFrame& frame = *s_paintFrame;
-    if (!frame.valid)
-        return;
+    }
+    const EspRenderFrame& frame = *paintFrame;
 
     // #region agent log
     // Sub-phase probe: measure where the [Rend] stall time goes. Memory-only,
@@ -2002,8 +2999,10 @@ void Engine::RenderEsp()
 
     Engine::CameraCache renderCam{};
     RenderCamDebug camDbg{};
-    if (!ResolveLiveRenderCamera(frame, renderCam, &camDbg))
+    if (!ResolveLiveRenderCamera(frame, renderCam, &camDbg)) {
+        RenderEspFrameHealthFallback(&frame, &camDbg);
         return;
+    }
     // #region agent log
     PaintSubPhaseNote(0, msT(tR0, nowT()));  // cam
     // #endregion
@@ -2028,9 +3027,8 @@ void Engine::RenderEsp()
         // #region agent log
         PaintSubPhaseNote(2, msT(tP0, nowT()));  // player
         // #endregion
-    }
-    if (var::showRobots) {
-        const auto tB0 = nowT();
+    }        if (drawBots) {
+            const auto tB0 = nowT();
         RenderRobotEspFromFrame(frame.robots, renderCam, frame.collectStampMs);
         // #region agent log
         PaintSubPhaseNote(3, msT(tB0, nowT()));  // bot
@@ -2117,8 +3115,8 @@ static void RenderWorldEspFromFrame(
 ;
     dbg.frameEntries = static_cast<int>(world.size());
 
-    if (!AnyWorldEspEnabled())
-        return;
+    if (!AnyWorldEspEnabled() && !var::enableesp)
+        return; // near-field reveal: still paint near entries per-entry below
 
     ImDrawList* drawList = ImGui::GetForegroundDrawList();
     if (!drawList)
@@ -2313,8 +3311,37 @@ static void RenderWorldEspFromFrame(
             color = (color & 0x00FFFFFFu) | (fadedA << IM_COL32_A_SHIFT);
         }
 
+        // Looted crates: grey + "(Looted)" tag instead of a whole trip to an
+        // empty box. RGB replaced, the distance-fade alpha is kept.
+        const bool lootedGrey =
+            var::grey_looted_containers && 0 < entry.cachedOpened;
+        if (lootedGrey)
+            color = (color & 0xFF000000u) | (IM_COL32(140, 140, 140, 255) & 0x00FFFFFFu);
+
         // Extraction hatches: append the replicated SDK state to the label.
         std::string drawLabel = label;
+        if (lootedGrey)
+            drawLabel += " (Looted)";
+        // Crate contents preview: "Crate [Bandage x2, Med Kit]" answers "is
+        // that crate worth running to" from across the room.
+        if (var::show_crate_contents && 0 < entry.crateStackCount
+            && (isContainerEsp || looksLikeContainer)) {
+            drawLabel += " [";
+            drawLabel += CrateContents::JoinSummary(
+                entry.crateStacks, entry.crateStackCount, 56);
+            drawLabel += "]";
+        }
+        // Dispenser ports (phase 2): " (2 ports)" when the container ejects
+        // loot from dispenser drop points and its socket-loot mesh resolved.
+        if (var::show_crate_contents && entry.socketLootMesh
+            && (isContainerEsp || looksLikeContainer))
+            drawLabel += CrateContents::PortsTag(entry.dispenserPorts);
+        if (var::show_stack_counts && 1 < entry.stackAmount
+            && !isContainerEsp && !looksLikeContainer) {
+            char amtBuf[16]{};
+            snprintf(amtBuf, sizeof(amtBuf), " x%d", entry.stackAmount);
+            drawLabel += amtBuf;
+        }
         if (cat == WorldItemCategory::Hatch && entry.extractState >= 0) {
             const char* state = "Unknown";
             switch (entry.extractState) {
@@ -2331,6 +3358,23 @@ static void RenderWorldEspFromFrame(
             drawLabel += " (";
             drawLabel += state;
             drawLabel += ")";
+        }
+        // Extraction countdown (FExtractionInfo): "Hatch (Arriving) [0:23]".
+        if (cat == WorldItemCategory::Hatch && entry.extractRemainS >= 0.0) {
+            double r = entry.extractRemainS;
+            if (entry.extractRemainStampMs != 0) {
+                const uint64_t nowMs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+                if (nowMs > entry.extractRemainStampMs)
+                    r -= static_cast<double>(nowMs - entry.extractRemainStampMs) / 1000.0;
+            }
+            if (r < 0.0)
+                r = 0.0;
+            const int secs = static_cast<int>(r + 0.999);
+            char tbuf[16]{};
+            snprintf(tbuf, sizeof(tbuf), " [%d:%02d]", secs / 60, secs % 60);
+            drawLabel += tbuf;
         }
 
         char buf[160]{};
@@ -2376,7 +3420,12 @@ static void RenderWorldEspFromFrame(
 
 void Engine::RenderFovCircle()
 {
-    if (!var::show_fov || var::aimbot_fov <= 0.f)
+    const FeaturePolicy::AimFeatures features{
+        var::enable_aimbot,
+        var::robotAimEnabled,
+        var::enable_triggerbot};
+    if (!FeaturePolicy::ShouldRenderFov(var::show_fov, features)
+        || var::aimbot_fov <= 0.f)
         return;
 
     float gameFov = 90.f;
@@ -2544,6 +3593,81 @@ void Engine::RenderOverlayCrosshair()
     }
 }
 
+void Engine::RenderRaidHud()
+{
+    if (!var::show_raid_hud)
+        return;
+    const RaidHudState st = GetRaidHud();
+    if (!st.valid)
+        return;
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    // Extrapolate the clock between worker refreshes (feature #9).
+    double remain = st.timeLeftS;
+    if (remain >= 0.0 && nowMs > st.stampMs)
+        remain -= static_cast<double>(nowMs - st.stampMs) / 1000.0;
+    if (remain < 0.0)
+        remain = 0.0;
+
+    const ImVec2 ds = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowBgAlpha(0.35f);
+    ImGui::SetNextWindowPos(
+        ImVec2(ds.x * 0.5f, 6.f), ImGuiCond_Always, ImVec2(0.5f, 0.f));
+    ImGui::Begin("##raid_hud", nullptr,
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav
+            | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings
+            | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoInputs);
+    if (st.timeLeftS >= 0.0)
+        ImGui::Text("Raid %s", RaidClock::FormatClock(remain).c_str());
+    if (st.graceS >= 0.0) {
+        ImGui::SameLine();
+        ImGui::TextColored(
+            ImVec4(1.f, 0.8f, 0.3f, 1.f),
+            "| Grace %s", RaidClock::FormatClock(st.graceS).c_str());
+    }
+    if (st.gamePhase >= 0) {
+        ImGui::SameLine();
+        ImGui::Text("| %s", RaidClock::PhaseText(st.gamePhase).c_str());
+    }
+    if (st.enemyCount >= 0) {
+        ImGui::SameLine();
+        ImGui::Text("| Enemies %d", st.enemyCount);
+    }
+    if (st.pickupCount >= 0) {
+        ImGui::SameLine();
+        ImGui::Text("| Loot %d", st.pickupCount);
+    }
+    ImGui::End();
+}
+
+void Engine::RenderActivityFeed()
+{
+    if (!var::show_activity_feed)
+        return;
+    const ActivityFeed::Feed feed = GetActivityFeed();
+    if (feed.Count() <= 0)
+        return;
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+
+    const ImVec2 ds = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowBgAlpha(0.35f);
+    ImGui::SetNextWindowPos(
+        ImVec2(8.f, ds.y - 8.f), ImGuiCond_Always, ImVec2(0.f, 1.f));
+    ImGui::Begin("##activity_feed", nullptr,
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav
+            | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings
+            | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoInputs);
+    for (int i = 0; i < feed.Count(); ++i) {
+        const ActivityFeed::Entry& e = feed.At(i);
+        ImGui::Text("[%s] %s",
+            ActivityFeed::AgeText(nowMs, e.stampMs).c_str(), e.text);
+    }
+    ImGui::End();
+}
+
 void Engine::RenderRadar(bool interactive)
 {
     if (!var::show_radar)
@@ -2560,7 +3684,7 @@ void Engine::RenderRadar(bool interactive)
         if (lock.owns_lock())
             frameShared = m_espFrameShared;
     }
-    if (!frameShared || !frameShared->valid)
+    if (!frameShared || !IsCurrentFreshEspFrame(*frameShared))
         return;
     const EspRenderFrame& frame = *frameShared;
 
@@ -2635,9 +3759,34 @@ void Engine::RenderRadar(bool interactive)
     }
     drawList->AddCircleFilled(ImVec2(cx, cy), 3.f, IM_COL32(255, 255, 255, 220), 12);
 
+    // Map mode (feature #11): whole-map fit when the minimap bounds resolved.
+    bool mapBoundsOk = false;
+    const RadarProjection::Bounds mapBounds = GetRadarBounds(mapBoundsOk);
+
     auto projectBlip = [&](const Vector3& worldPos, float& outX, float& outY) -> bool {
         if (!IsPlausibleWorldPos(worldPos))
             return false;
+
+        if (var::radar_map_mode) {
+            float mx = 0.f, my = 0.f;
+            if (mapBoundsOk && RadarProjection::MapFitted(
+                    worldPos.x, worldPos.y, mapBounds, radarPx, mx, my)) {
+                outX = cx + mx;
+                outY = cy + my;
+                return true;
+            }
+            // Bounds not resolved yet: north-up player-centered fallback,
+            // still geographically oriented.
+            if (RadarProjection::NorthUp(
+                    worldPos.x, worldPos.y,
+                    frameCam.Location.x, frameCam.Location.y,
+                    static_cast<double>(rangeM) * 100.0, radarPx, mx, my)) {
+                outX = cx + mx;
+                outY = cy + my;
+                return true;
+            }
+            return false;
+        }
 
         Vector3 delta = worldPos - frameCam.Location;
         delta.z = 0.f;
@@ -2671,7 +3820,8 @@ void Engine::RenderRadar(bool interactive)
         return true;
     };
 
-    auto drawBlip = [&](float x, float y, ImU32 color, float distanceM, float baseRadius = 3.5f) {
+    auto drawBlip = [&](float x, float y, ImU32 color, float distanceM,
+                        float baseRadius = 3.5f, bool hollow = false) {
         const float dx = x - cx;
         const float dy = y - cy;
         const float clipR = (std::max)(radarPx - 1.f, 1.f);
@@ -2682,7 +3832,11 @@ void Engine::RenderRadar(bool interactive)
             baseRadius * Visuals::EspDistanceScale(distanceM),
             1.8f,
             baseRadius * 1.12f);
-        drawList->AddCircleFilled(ImVec2(x, y), radius, color, 12);
+        // Underground-floor blips draw hollow + thinner (feature #11).
+        if (hollow)
+            drawList->AddCircle(ImVec2(x, y), radius, color, 12, 1.5f);
+        else
+            drawList->AddCircleFilled(ImVec2(x, y), radius, color, 12);
     };
 
     auto pickerColor = [](const float rgba[4]) -> ImU32 {
@@ -2732,7 +3886,10 @@ void Engine::RenderRadar(bool interactive)
                 drawList->AddTriangleFilled(
                     ImVec2(tipX, tipY), ImVec2(lx, ly), ImVec2(rx2, ry2), color);
             } else {
-                drawBlip(rx, ry, color, actor.Distance);
+                drawBlip(rx, ry, color, actor.Distance, 3.5f,
+                    var::radar_underground_dim
+                        && RadarProjection::IsUnderground(
+                            actor.WorldPos.z - frameCam.Location.z));
             }
         }
     }
@@ -2760,7 +3917,10 @@ void Engine::RenderRadar(bool interactive)
             : (robot.isVisible
                 ? pickerColor(var::bot_color_visible)
                 : pickerColor(var::bot_color_invisible));
-        drawBlip(rx, ry, color, robot.Distance);
+        drawBlip(rx, ry, color, robot.Distance, 3.5f,
+            var::radar_underground_dim
+                && RadarProjection::IsUnderground(
+                    robot.WorldPos.z - frameCam.Location.z));
     }
 
     // Quest items: always shown as a gold star (never filtered by loot
@@ -2811,6 +3971,9 @@ void Engine::RenderRadar(bool interactive)
         const ImU32 color = isPickup
             ? WorldLootLabelColor(cat, entry.lootRarityTier, true)
             : WorldCategoryLabelColor(cat);
-        drawBlip(rx, ry, color, entry.Distance, isPickup ? 3.f : 2.5f);
+        drawBlip(rx, ry, color, entry.Distance, isPickup ? 3.f : 2.5f,
+            var::radar_underground_dim
+                && RadarProjection::IsUnderground(
+                    entry.WorldPos.z - frameCam.Location.z));
     }
 }

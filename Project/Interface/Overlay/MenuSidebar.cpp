@@ -4,6 +4,7 @@
 #include "MenuTheme.h"
 
 #include <cfloat>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -28,7 +29,12 @@
 
 namespace {
 
-static void RequestArcSlowCache() {}
+// Row tooltip on whichever sub-widget of a composite row is hovered.
+static void RowTip(const char* txt)
+{
+    if (txt && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", txt);
+}
 
 static bool ArcIsSaneLocation(const Vector3& loc)
 {
@@ -81,8 +87,10 @@ static void WrappedBulletText(const char* text)
 
 static void CheckboxWithColor(const char* label, bool* value, float color[4], const char* colorId, bool requestSlowCache = false)
 {
-    if (ArcMenuLayout::CheckboxWithColorRow(label, value, color, colorId) && requestSlowCache)
-        RequestArcSlowCache();
+    if (ArcMenuLayout::CheckboxWithColorRow(label, value, color, colorId)) {
+        (void)requestSlowCache;
+        AutoConfig_MarkDirty();
+    }
 }
 
 using ArcMenuLayout::kColorColumnX;
@@ -104,7 +112,8 @@ static void ContainerTypeRow(
     bool* enabled,
     float color[4],
     const char* colorId,
-    WorldItemCategory cat)
+    WorldItemCategory cat,
+    const char* rowTooltip)
 {
     const float startX = ImGui::GetCursorStartPos().x;
     ImGui::PushID(colorId);
@@ -112,17 +121,21 @@ static void ContainerTypeRow(
 
     if (ImGui::Checkbox("##cb", enabled))
         changed = true;
+    RowTip(rowTooltip);
     ImGui::SameLine(0.f, ImGui::GetStyle().ItemInnerSpacing.x);
     ImGui::SetCursorPosX(startX + ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x);
     ImGui::PushTextWrapPos(startX + kColorColumnX - 2.f);
     ImGui::TextUnformatted(label);
     ImGui::PopTextWrapPos();
-    if (ImGui::IsItemHovered())
+    if (ImGui::IsItemHovered()) {
         ImGui::GetWindowDrawList()->AddRectFilled(
             ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), IM_COL32(255, 255, 255, 22));
+        ImGui::SetTooltip("%s", rowTooltip);
+    }
 
     if (ArcMenuLayout::ColorEditAtColumn(colorId, color))
         changed = true;
+    RowTip(rowTooltip);
 
     ImGui::SameLine();
     ImGui::SetCursorPosX(startX + kContainerSpColumnX);
@@ -138,7 +151,7 @@ static void ContainerTypeRow(
 
     ImGui::PopID();
     if (changed)
-        RequestArcSlowCache();
+        AutoConfig_MarkDirty();
 }
 
 static bool LootFilterSliderWithSp(
@@ -149,7 +162,8 @@ static bool LootFilterSliderWithSp(
     float vMax,
     const char* fmt,
     bool* spFlag,
-    const char* spTooltip)
+    const char* spTooltip,
+    const char* rowTooltip)
 {
     const float startX = ImGui::GetCursorStartPos().x;
     ImGui::PushID(sliderId);
@@ -161,6 +175,7 @@ static bool LootFilterSliderWithSp(
         changed = true;
         AutoConfig_MarkDirty();
     }
+    RowTip(rowTooltip);
 
     ImGui::SameLine();
     ImGui::SetCursorPosX(startX + kContainerSpColumnX);
@@ -182,7 +197,8 @@ static bool LootFilterComboWithSp(
     const char* const* items,
     int count,
     bool* spFlag,
-    const char* spTooltip)
+    const char* spTooltip,
+    const char* rowTooltip)
 {
     const float startX = ImGui::GetCursorStartPos().x;
     ImGui::PushID(comboId);
@@ -194,6 +210,7 @@ static bool LootFilterComboWithSp(
         changed = true;
         AutoConfig_MarkDirty();
     }
+    RowTip(rowTooltip);
 
     ImGui::SameLine();
     ImGui::SetCursorPosX(startX + kContainerSpColumnX);
@@ -304,6 +321,117 @@ int ArcGetMonitorCount()
     return OverlayDisplay_GetMonitorCount();
 }
 
+static void DrawPlayerEspDiagnostics(Engine& eng)
+{
+    const std::vector<Engine::PlayerEspDiagnostic> rows =
+        eng.GetPlayerEspDiagnostics();
+    ImGui::Separator();
+    ArcMenuLayout::HoverableText("Player ESP diagnostics");
+    ArcMenuHoverTooltip(
+        "Read-only snapshot of the player worker's latest resolved values. "
+        "Opening this panel does not perform DMA reads.");
+    if (rows.empty()) {
+        ImGui::TextDisabled("No player cache entries yet.");
+        return;
+    }
+
+    static uintptr_t selectedActor = 0;
+    uintptr_t selectedKey = selectedActor;
+    const auto selected = std::find_if(rows.begin(), rows.end(),
+        [selectedKey](const Engine::PlayerEspDiagnostic& row) {
+            return row.actorKey == selectedKey;
+        });
+    if (selected == rows.end()) {
+        selectedActor = rows.front().actorKey;
+        selectedKey = selectedActor;
+    }
+
+    const auto initialSelectedIt = std::find_if(rows.begin(), rows.end(),
+        [selectedKey](const Engine::PlayerEspDiagnostic& row) {
+            return row.actorKey == selectedKey;
+        });
+    const std::string selectedName =
+        (initialSelectedIt->name.empty() ? std::string("Raider") : initialSelectedIt->name)
+        + "  [" + std::to_string(static_cast<int>(initialSelectedIt->distance)) + "m]";
+    if (ImGui::BeginCombo("Target", selectedName.c_str())) {
+        for (const auto& row : rows) {
+            const std::string label =
+                (row.name.empty() ? std::string("Raider") : row.name)
+                + "  [" + std::to_string(static_cast<int>(row.distance)) + "m]";
+            if (ImGui::Selectable(label.c_str(), row.actorKey == selectedActor))
+                selectedActor = row.actorKey;
+        }
+        ImGui::EndCombo();
+    }
+    selectedKey = selectedActor;
+    const auto selectedIt = std::find_if(rows.begin(), rows.end(),
+        [selectedKey](const Engine::PlayerEspDiagnostic& row) {
+            return row.actorKey == selectedKey;
+        });
+    ImGui::TextDisabled("Nearest cached player is selected automatically.");
+    ImGui::Separator();
+
+    const Engine::PlayerEspDiagnostic& row = *selectedIt;
+    const char* healthState = row.healthResolved ? "resolved" : "unresolved";
+    const char* armorState = (var::health || var::show_armor_line)
+        ? (row.armorResolved ? "resolved" : "unresolved")
+        : "not read (toggle off)";
+    const char* steamState = !var::show_steam_ids
+        ? "not read (Steam IDs off)"
+        : (row.steamIdResolved
+            ? (row.steamId64 ? "resolved" : "component resolved; ID unavailable")
+            : "unresolved");
+    const char* squadState = !var::show_squad_idx
+        ? "not read (Squad tags off)"
+        : (row.squadResolved ? "resolved" : "unresolved");
+    const bool inventoryRequested = var::show_weapon || var::show_armor_line
+        || var::show_player_kit || var::enable_aimbot;
+    const char* inventoryState = !inventoryRequested
+        ? "not read (features off)"
+        : (row.inventoryResolved ? "resolved" : "unresolved");
+    const char* dbnoState = !(var::show_dbno_badge || var::show_activity_feed)
+        ? "not read (DBNO toggle off)"
+        : (row.dbnoResolved ? "resolved" : "unresolved");
+
+    ImGui::BeginChild("##player_esp_diagnostics", ImVec2(0.0f, 300.0f), true);
+    ArcMenuLayout::HoverableTextF("Actor: 0x%llx  PS: 0x%llx  %.1fm  %s",
+        static_cast<unsigned long long>(row.actorKey),
+        static_cast<unsigned long long>(row.actorState),
+        row.distance, row.drawing ? "drawing" : "not drawing");
+    ArcMenuLayout::HoverableTextF("Health raw: %.2f / %.2f  [%s]",
+        row.health, row.maxHealth, healthState);
+    ArcMenuLayout::HoverableTextF("Armor raw: %.2f / %.2f  [%s]",
+        row.armor, row.maxArmor, armorState);
+    if (row.steamId64) {
+        ArcMenuLayout::HoverableTextF("SteamID64: %llu  [%s]",
+            static_cast<unsigned long long>(row.steamId64), steamState);
+    } else {
+        ArcMenuLayout::HoverableTextF("SteamID64: unavailable  [%s]", steamState);
+    }
+    ArcMenuLayout::HoverableTextF("Squad: ptr 0x%llx  index %u  [%s]",
+        static_cast<unsigned long long>(row.squadPtr),
+        static_cast<unsigned>(row.squadIdx), squadState);
+    ArcMenuLayout::HoverableTextF("Inventory: %s  weapon: %s  tier %d  clip %d",
+        inventoryState,
+        row.weaponName.empty() ? "<none>" : row.weaponName.c_str(),
+        row.weaponQuality, row.weaponClip);
+    ArcMenuLayout::HoverableTextF("Armor item: %s  plates %.2f  stowed: %s / %s",
+        row.armorName.empty() ? "<none>" : row.armorName.c_str(),
+        row.armorPlates,
+        row.stowedWeapon0.empty() ? "<none>" : row.stowedWeapon0.c_str(),
+        row.stowedWeapon1.empty() ? "<none>" : row.stowedWeapon1.c_str());
+    ArcMenuLayout::HoverableTextF("DBNO: %s  broken armor: %s  [%s]",
+        row.isDbno ? "yes" : "no",
+        row.hasBrokenArmor ? "yes" : "no", dbnoState);
+    ArcMenuLayout::HoverableTextF("Revive timer: %.1f / %.1f seconds",
+        row.reviveRemainS, row.reviveTotalS);
+    ArcMenuLayout::HoverableTextF("Kit: tool %s  pouch %s  belt %d  pack %d",
+        row.kitTool.empty() ? "<none>" : row.kitTool.c_str(),
+        row.kitPouch.empty() ? "<none>" : row.kitPouch.c_str(),
+        row.kitBeltSlots, row.kitPackSlots);
+    ImGui::EndChild();
+}
+
 namespace arc_ui {
 
 void DrawArcEspTab()
@@ -323,7 +451,8 @@ void DrawArcEspTab()
                         var::esp_color_visible,
                         "##esp_vis",
                         var::esp_color_invisible,
-                        "##esp_invis");
+                        "##esp_invis",
+                        "Master switch for player ESP. Colors: visible (left), invisible (right).");
                     ArcMenuHoverTooltip("Master switch for player ESP. Colors: visible (left), invisible (right).");
                     ArcMenuLayout::SliderFloat("ESP distance", "##esp_distance", &var::esp_distance, 50.f, var::kMaxDistanceSliderM, "%.0f m");
                     ArcMenuHoverTooltip("Maximum distance for player ESP rendering.");
@@ -338,6 +467,30 @@ void DrawArcEspTab()
                     ArcMenuHoverTooltip(
                         "Held item in hand — gun, bandage, shield recharger, grenade, defibrillator, etc. "
                         "Guns tint by tier; other items use a neutral color.");
+                    ArcMenuLayout::Checkbox("Armor + plates", &var::show_armor_line);
+                    ArcMenuHoverTooltip(
+                        "Loadout readout: armor tier (I-IV) and plate count under the weapon line.");
+                    ArcMenuLayout::Checkbox("Full kit line", &var::show_player_kit);
+                    ArcMenuHoverTooltip(
+                        "Full kit readout under the loadout: stowed guns (when the weapon line is off), "
+                        "stowed tool, safe pouch item with rarity, and belt/backpack slot capacity.");
+                    ArcMenuLayout::Checkbox("Downed + revive", &var::show_dbno_badge);
+                    ArcMenuHoverTooltip(
+                        "DOWNED badge plus a revive/defib countdown ring on downed players.");
+                    ArcMenuLayout::Checkbox("Steam IDs", &var::show_steam_ids);
+                    ArcMenuHoverTooltip(
+                        "Permanent SteamID64 under each player label (stable across raids), with "
+                        "[Bot]/[Spec]/[Done] status tags when the player state resolves them.");
+                    ArcMenuLayout::CheckboxWithColorRow(
+                        "Look arrows",
+                        &var::show_look_arrows,
+                        var::color_look_arrow,
+                        "##col_look_arrow",
+                        "Arrow above each player pointing where they are actually aiming "
+                        "(ControlRotation, clamped-validated).");
+                    ArcMenuHoverTooltip(
+                        "Arrow above each player pointing where they are actually aiming "
+                        "(ControlRotation, clamped-validated).");
                     ArcMenuLayout::Checkbox("Snaplines", &var::snaplines);
                     ArcMenuHoverTooltip("Draw lines from screen bottom to players.");
                     ArcMenuLayout::Checkbox("Skeleton", &var::skeleton);
@@ -363,11 +516,13 @@ void DrawArcEspTab()
                     ArcMenuLayout::Checkbox("Distance", &var::show_distance);
                     ArcMenuHoverTooltip("Show distance in meters below each player.");
                     if (ArcMenuLayout::Checkbox("Hide allies", &var::hide_allies))
-                        RequestArcSlowCache();
                     ArcMenuHoverTooltip("No ESP or radar on teammates (box, skeleton, silhouette, names, etc.).");
                     ArcMenuLayout::Checkbox("Squad tags", &var::show_squad_idx);
-                    ArcMenuHoverTooltip("Show @1 / @2 / @3 on enemies to identify which squad they belong to.");
+                    ArcMenuHoverTooltip(
+                        "Show [S1] / [S2] ... on enemies: real squad membership when it "
+                        "resolves, TeamID grouping as the fallback.");
                     ImGui::EndDisabled();
+                    DrawPlayerEspDiagnostics(engine);
                     ImGui::EndTabItem();
                 }
                 if (ImGui::BeginTabItem("Bot"))
@@ -378,7 +533,8 @@ void DrawArcEspTab()
                         var::bot_color_visible,
                         "##bot_vis",
                         var::bot_color_invisible,
-                        "##bot_invis");
+                        "##bot_invis",
+                        "Draw ARC robots. Colors: visible (left), invisible (right).");
                     ArcMenuHoverTooltip("Draw ARC robots. Colors: visible (left), invisible (right).");
                     ArcMenuLayout::SliderFloat(
                         "Bot ESP distance", "##bot_esp_distance", &var::bot_esp_distance, 50.f, var::kMaxDistanceSliderM, "%.0f m");
@@ -394,12 +550,28 @@ void DrawArcEspTab()
                     ArcMenuHoverTooltip("Show distance in meters below each robot.");
                     ArcMenuLayout::Checkbox("Heart", &var::bot_heart);
                     ArcMenuHoverTooltip("Pulsating heart at box center; robot aim targets the same point.");
+                    ArcMenuLayout::Checkbox("Loadout line", &var::show_bot_loadout);
+                    ArcMenuHoverTooltip(
+                        "Best-effort weapon/armor readout for bots that carry an inventory.");
+                    ArcMenuLayout::Checkbox("Vision cones", &var::show_bot_vision);
+                    ArcMenuHoverTooltip(
+                        "Draw each bot's sight cone on the ground (red = Combat). ");
+                    ImGui::Indent(16.f);
+                    ImGui::BeginDisabled(!var::show_bot_vision);
+                    ArcMenuLayout::Checkbox("Alertness tag", &var::show_bot_alertness);
+                    ArcMenuHoverTooltip(
+                        "Idle / Alert / Searching / Combat under the bot - Combat means it is hunting.");
+                    ImGui::EndDisabled();
+                    ImGui::Unindent(16.f);
+                    ArcMenuLayout::Checkbox("Part damage pips", &var::show_bot_parts);
+                    ArcMenuHoverTooltip(
+                        "Per-part hp pips over each bot limb (red = blown off) plus a summary line.");
                     if (ArcMenuLayout::CheckboxWithColorRow(
                             "Dead bot bodies",
                             &var::show_dead_bots,
                             var::color_dead_bots,
-                            "##col_dead_bots"))
-                        RequestArcSlowCache();
+                            "##col_dead_bots",
+                            "Show destroyed/broken robot wrecks; color applies to dead bot ESP and radar."))
                     ArcMenuHoverTooltip("Show destroyed/broken robot wrecks; color applies to dead bot ESP and radar.");
                     ImGui::EndDisabled();
                     ImGui::EndTabItem();
@@ -425,59 +597,79 @@ void DrawArcEspTab()
                         std::lock_guard<std::mutex> lk(LrtsVis::g_session.mu);
                         ImGui::Separator();
                         ArcMenuLayout::HoverableText("Collision tree");
+                        ArcMenuHoverTooltip("Mirrored collision-geometry KD-tree behind the collision visibility vote.");
                         ImGui::Text("Ready: %s  tris: %zu  meshes: %d",
                             CollisionMirror::IsReady() ? "yes" : "no",
                             CollisionMirror::TriangleCount(),
                             CollisionMirror::MeshCount());
+                        ArcMenuHoverTooltip("Whether the collision mirror is built, plus its triangle and mesh counts.");
                         ImGui::Text("rebuilds: %d  lastMs: %d",
                             CollisionMirror::RebuildCount(),
                             CollisionMirror::LastRebuildMs());
+                        ArcMenuHoverTooltip("How many mirror rebuilds have run and how long the last one took.");
                     }
                     ImGui::BeginDisabled(!var::vis_enabled);
                     ImGui::Separator();
                     ArcMenuLayout::HoverableText("Status");
+                    ArcMenuHoverTooltip("Live LRTS session diagnostics: key state, read rates, and verdict counters.");
                     {
                         std::lock_guard<std::mutex> lk(LrtsVis::g_session.mu);
                         const char* state = LrtsVis::g_session.verified ? "LOCKED" : "scanning...";
                         ImGui::Text("Key: %s", state);
+                        ArcMenuHoverTooltip("XOR key state for the encrypted render stamps. LOCKED = discovered and verified.");
                         ImGui::Separator();
                         ImGui::Text("[Tuned] Hide: 2 checks | Reveal: instant");
+                        ArcMenuHoverTooltip("Verdict hysteresis: two occluded checks to hide, instant reveal.");
                         ImGui::Text("[Tuned] Freshness: 0.15s | BRR fast-hide: on");
+                        ArcMenuHoverTooltip("Render-stamp freshness window and the bulk-read fast-hide path.");
                         ImGui::Text("[Tuned] BRR+Occluded=fast | BRR+Vis=counts toward hide");
+                        ArcMenuHoverTooltip("How bulk-read verdicts feed the hysteresis counters.");
                         ImGui::Separator();
                         ImGui::Text("WorldTime: %.1f", LrtsVis::g_session.lastWorldTime);
+                        ArcMenuHoverTooltip("Game world clock as last observed.");
                         ImGui::Text("Raw Submit: %.3f  OnScreen: %.3f",
                             LrtsVis::g_session.lastRawSubmit,
                             LrtsVis::g_session.lastRawOnScreen);
+                        ArcMenuHoverTooltip("Raw Submit/OnScreen render-stamp values as last read (the vis check's 0x480/0x484 floats).");
                         ImGui::Text("Scan passes: %d  candidates: %d",
                             LrtsVis::g_session.scanAttempts,
                             LrtsVis::g_session.pendingCollected);
+                        ArcMenuHoverTooltip("Key-scan passes run and candidates still queued.");
                         ImGui::Text("Visible: %d  Occluded: %d  Unknown: %d  ReadFail: %d",
                             LrtsVis::g_session.visibleCount,
                             LrtsVis::g_session.occludedCount,
                             LrtsVis::g_session.unknownCount,
                             LrtsVis::g_session.readFailures);
+                        ArcMenuHoverTooltip("Verdict totals across tracked meshes.");
                         ImGui::Text("noMesh: %d  noKey: %d",
                             LrtsVis::g_session.unkNoMesh,
                             LrtsVis::g_session.unkNoKey);
+                        ArcMenuHoverTooltip("Unknowns split: missing mesh pointer vs missing XOR key.");
                         ImGui::Text("readZero: %d  keyMiss: %d",
                             LrtsVis::g_session.unkReadZero,
                             LrtsVis::g_session.unkKeyMiss);
+                        ArcMenuHoverTooltip("Unknowns split: stamp read as zero vs failed key check.");
                         ImGui::Text("brr0: %d  brrNoBit: %d",
                             LrtsVis::g_session.scanBrrZero,
                             LrtsVis::g_session.scanBrrNoBit);
+                        ArcMenuHoverTooltip("Bulk-read scan counters: zero block vs missing flag bit.");
                         ImGui::Text("brrPass: %d  bulkFail: %d  dropFull: %d",
                             LrtsVis::g_session.scanBrrPass,
                             LrtsVis::g_session.scanBulkFail,
                             LrtsVis::g_session.scanDropFull);
+                        ArcMenuHoverTooltip("Bulk-read passes, bulk-read failures, and dropped batches.");
                         ImGui::Text("directZero: %d  directInsane: %d",
                             LrtsVis::g_session.directReadZero,
                             LrtsVis::g_session.directInsane);
+                        ArcMenuHoverTooltip("Direct decrypt reads that returned zero or implausible values.");
                         ImGui::Text("brrByte: 0x%02X", LrtsVis::g_session.lastBrrByte);
+                        ArcMenuHoverTooltip("Last raw flag byte seen by the bulk scan.");
                         ImGui::Text("decrypted: %.2f", LrtsVis::g_session.lastDirectValue);
+                        ArcMenuHoverTooltip("Last decrypted render-stamp value.");
                         ImGui::Text("TimeSec: %.2f  RealTimeSec: %.2f",
                             LrtsVis::g_session.lastWorldTime,
                             LrtsVis::g_session.lastRealTime);
+                        ArcMenuHoverTooltip("Game clock vs real seconds for read-rate sanity.");
                         // Hysteresis diagnostics: flips should stay near 0
                         // during steady aim; unknownHolds counts how often a
                         // read failure kept the previous verdict instead of
@@ -487,9 +679,11 @@ void DrawArcEspTab()
                                 LrtsVis::g_flipsToVisible.load(std::memory_order_relaxed)),
                             static_cast<unsigned long long>(
                                 LrtsVis::g_flipsToOccluded.load(std::memory_order_relaxed)));
+                        ArcMenuHoverTooltip("Hysteresis flips between verdicts; should stay near zero while steadily aiming.");
                         ImGui::Text("Unknown keeps verdict: %llu",
                             static_cast<unsigned long long>(
                                 LrtsVis::g_unknownHolds.load(std::memory_order_relaxed)));
+                        ArcMenuHoverTooltip("Times a read failure kept the previous verdict instead of popping the box through a wall.");
                     }
                     ImGui::EndDisabled();
                     ImGui::EndTabItem();
@@ -511,7 +705,6 @@ void DrawArcEspTab()
 void DrawArcLootContent()
 {
     if (ArcMenuLayout::Checkbox("Enable world ESP", &var::enable_world))
-        RequestArcSlowCache();
     ArcMenuHoverTooltip(
         "Master switch for item/container scanners and world radar blips. Off = no world cache updates.");
 
@@ -519,7 +712,6 @@ void DrawArcLootContent()
     ArcMenuLayout::HoverableText("Loot");
     ArcMenuHoverTooltip("Loot container ESP settings.");
     if (ArcMenuLayout::Checkbox("Show loot", &var::showLoot))
-        RequestArcSlowCache();
     ArcMenuHoverTooltip(
         "Master switch for loot/container ESP draw. Off = hide all world loot labels. "
         "On = each Container types row below filters what is shown.");
@@ -531,6 +723,19 @@ void DrawArcLootContent()
     ArcMenuHoverTooltip("Pickup/loot label color when rarity coloring is off.");
     ArcMenuLayout::Checkbox("Show loot value on label", &var::show_loot_value);
     ArcMenuHoverTooltip("Append coin value to resolved pickup names.");
+    ArcMenuLayout::Checkbox("Show crate contents", &var::show_crate_contents);
+    ArcMenuHoverTooltip(
+        "List what is inside each container on its label: 'Crate [Bandage x2 (Rare), Med Kit]'. "
+        "Best-effort from the container's spawn list - a crate that does not expose "
+        "one just shows the plain label. Resolved stacks carry a rarity tag, and "
+        "socket-loot containers show their dispenser ports: ' (2 ports)'.");
+    ArcMenuLayout::Checkbox("Show stack counts", &var::show_stack_counts);
+    ArcMenuHoverTooltip("Append xN to ground-loot labels when the stack holds more than one item.");
+    if (ArcMenuLayout::Checkbox("Grey looted crates", &var::grey_looted_containers))
+    ArcMenuHoverTooltip(
+        "Crates someone already emptied draw grey with a (Looted) tag so you never "
+        "waste a trip. Off = old behavior (opened containers hide unless "
+        "'Open container' is on).");
     ImGui::SetCursorPosX(ImGui::GetCursorStartPos().x + kContainerSpColumnX);
     ImGui::TextUnformatted("SP");
     ArcMenuHoverTooltip(
@@ -547,8 +752,9 @@ void DrawArcLootContent()
             5000.f,
             "%.0f c",
             &var::loot_min_val_sp,
-            "Never hides. SP checked = far distance for pickups at/above min value."))
-        RequestArcSlowCache();
+            "Never hides. SP checked = far distance for pickups at/above min value.",
+            "Does not hide loot. At/above threshold: SP distance when checked, "
+            "loot/category distance when unchecked. Below threshold: loot/category distance. 0 = off."))
     ArcMenuHoverTooltip(
         "Does not hide loot. At/above threshold: SP distance when checked, "
         "loot/category distance when unchecked. Below threshold: loot/category distance. 0 = off.");
@@ -559,8 +765,9 @@ void DrawArcLootContent()
             kMinRarityLabels,
             IM_ARRAYSIZE(kMinRarityLabels),
             &var::loot_min_rar_sp,
-            "Never hides. SP checked = far distance for pickups at/above min rarity."))
-        RequestArcSlowCache();
+            "Never hides. SP checked = far distance for pickups at/above min rarity.",
+            "Does not hide loot. At/above threshold: SP distance when checked, "
+            "loot/category distance when unchecked. Below threshold: loot/category distance. Any = off."))
     ArcMenuHoverTooltip(
         "Does not hide loot. At/above threshold: SP distance when checked, "
         "loot/category distance when unchecked. Below threshold: loot/category distance. Any = off.");
@@ -577,42 +784,62 @@ void DrawArcLootContent()
         "Each row: SP unchecked = Loot distance. SP checked = SP distance. Requires Show loot on.");
     DrawContainerTypeHeaderRow();
     ContainerTypeRow("Dropped items", &var::droppedItems, var::color_dropped_items, "##col_dropped",
-        WorldItemCategory::DroppedPickup);
-    ArcMenuHoverTooltip("Show dropped loot items.");
+        WorldItemCategory::DroppedPickup, "Show dropped loot items.");
     ContainerTypeRow("Raider stock", &var::raiderStock, var::color_raider_stock, "##col_raider",
-        WorldItemCategory::RaiderCache);
-    ArcMenuHoverTooltip("Show raider stock/world pickups list.");
+        WorldItemCategory::RaiderCache, "Show raider stock/world pickups list.");
     ContainerTypeRow("ARC entities", &var::showArc, var::color_arc_entities, "##col_arc",
-        WorldItemCategory::ArcCargoship);
-    ArcMenuHoverTooltip("Show ARC-specific world entities.");
+        WorldItemCategory::ArcCargoship, "Show ARC-specific world entities.");
     ContainerTypeRow("Corpses", &var::showDeadPlayers, var::color_world_corpses, "##col_corpse",
-        WorldItemCategory::Corpse);
-    ArcMenuHoverTooltip("World ESP corpse markers (not the same as downed players in player ESP).");
-    ContainerTypeRow("Items", &var::show_world_items, var::color_world_items, "##col_w_items", WorldItemCategory::Items);
-    ContainerTypeRow("Ammo", &var::show_world_ammo, var::color_world_ammo, "##col_w_ammo", WorldItemCategory::Ammo);
-    ContainerTypeRow("Arc loot", &var::show_world_arc_loot, var::color_world_arc_loot, "##col_w_arc_loot", WorldItemCategory::ArcLoot);
-    ContainerTypeRow("Backpack", &var::show_world_backpack, var::color_world_backpack, "##col_w_backpack", WorldItemCategory::Backpack);
-    ContainerTypeRow("Crate", &var::show_world_crate, var::color_world_crate, "##col_w_crate", WorldItemCategory::Crate);
-    ContainerTypeRow("Furniture", &var::show_world_furniture, var::color_world_furniture, "##col_w_furniture", WorldItemCategory::Furniture);
-    ContainerTypeRow("Grenade", &var::show_world_grenade, var::color_world_grenade, "##col_w_grenade", WorldItemCategory::Grenade);
-    ContainerTypeRow("Harvestable", &var::show_world_harvestable, var::color_world_harvestable, "##col_w_harvestable", WorldItemCategory::Harvestable);
-    ContainerTypeRow("Industrial", &var::show_world_industrial, var::color_world_industrial, "##col_w_industrial", WorldItemCategory::Industrial);
-    ContainerTypeRow("Medical", &var::show_world_medical, var::color_world_medical, "##col_w_medical", WorldItemCategory::Medical);
-    ContainerTypeRow("Other", &var::show_world_other, var::color_world_other, "##col_w_other", WorldItemCategory::Other);
-    ContainerTypeRow("Probe", &var::show_world_probe, var::color_world_probe, "##col_w_probe", WorldItemCategory::Probe);
-    ContainerTypeRow("Vehicles", &var::show_world_vehicles, var::color_world_vehicles, "##col_w_vehicles", WorldItemCategory::Vehicles);
-    ContainerTypeRow("Weapon case", &var::show_world_weapon_case, var::color_world_weapon_case, "##col_w_weapon_case", WorldItemCategory::WeaponCase);
-    ContainerTypeRow("Field crate", &var::show_world_field_crate, var::color_world_field_crate, "##col_w_field_crate", WorldItemCategory::FieldCrate);
-    ContainerTypeRow("Supply station", &var::show_world_supply_station, var::color_world_supply_station, "##col_w_supply", WorldItemCategory::SupplyCallStation);
-    ContainerTypeRow("Keys", &var::show_world_keys, var::color_world_keys, "##col_w_keys", WorldItemCategory::Keys);
-    ContainerTypeRow("Locker", &var::show_world_locker, var::color_world_locker, "##col_w_locker", WorldItemCategory::Locker);
-    ContainerTypeRow("Trash", &var::show_world_trash, var::color_world_trash, "##col_w_trash", WorldItemCategory::Trash);
-    ContainerTypeRow("Open container", &var::show_world_open_container, var::color_world_open_container, "##col_w_open", WorldItemCategory::OpenedContainer);
-    ContainerTypeRow("Hatches", &var::showHatches, var::color_hatches, "##col_hatches", WorldItemCategory::Hatch);
-    ArcMenuHoverTooltip("Already searched/opened containers. Uses its own color so you can tell at a glance.");
-    ContainerTypeRow("Safe", &var::show_world_safe, var::color_world_safe, "##col_w_safe", WorldItemCategory::Safe);
-    ContainerTypeRow("Buried", &var::show_world_buried, var::color_world_buried, "##col_w_buried", WorldItemCategory::Buried);
-    ContainerTypeRow("Dead drop", &var::show_world_deaddrop, var::color_world_deaddrop, "##col_w_deaddrop", WorldItemCategory::DeadDrop);
+        WorldItemCategory::Corpse, "World ESP corpse markers (not the same as downed players in player ESP).");
+    ContainerTypeRow("Items", &var::show_world_items, var::color_world_items, "##col_w_items",
+        WorldItemCategory::Items, "Show generic world item pickups.");
+    ContainerTypeRow("Ammo", &var::show_world_ammo, var::color_world_ammo, "##col_w_ammo",
+        WorldItemCategory::Ammo, "Show ammo pickups.");
+    ContainerTypeRow("Arc loot", &var::show_world_arc_loot, var::color_world_arc_loot, "##col_w_arc_loot",
+        WorldItemCategory::ArcLoot, "Show ARC loot drops.");
+    ContainerTypeRow("Backpack", &var::show_world_backpack, var::color_world_backpack, "##col_w_backpack",
+        WorldItemCategory::Backpack, "Show backpacks.");
+    ContainerTypeRow("Crate", &var::show_world_crate, var::color_world_crate, "##col_w_crate",
+        WorldItemCategory::Crate, "Show crates. With 'Show crate contents' on, the label lists what is inside.");
+    ContainerTypeRow("Furniture", &var::show_world_furniture, var::color_world_furniture, "##col_w_furniture",
+        WorldItemCategory::Furniture, "Show furniture containers.");
+    ContainerTypeRow("Grenade", &var::show_world_grenade, var::color_world_grenade, "##col_w_grenade",
+        WorldItemCategory::Grenade, "Show grenades.");
+    ContainerTypeRow("Harvestable", &var::show_world_harvestable, var::color_world_harvestable, "##col_w_harvestable",
+        WorldItemCategory::Harvestable, "Show harvestable resource nodes.");
+    ContainerTypeRow("Industrial", &var::show_world_industrial, var::color_world_industrial, "##col_w_industrial",
+        WorldItemCategory::Industrial, "Show industrial containers.");
+    ContainerTypeRow("Medical", &var::show_world_medical, var::color_world_medical, "##col_w_medical",
+        WorldItemCategory::Medical, "Show medical containers and supplies.");
+    ContainerTypeRow("Other", &var::show_world_other, var::color_world_other, "##col_w_other",
+        WorldItemCategory::Other, "Show uncategorized world items.");
+    ContainerTypeRow("Probe", &var::show_world_probe, var::color_world_probe, "##col_w_probe",
+        WorldItemCategory::Probe, "Show probes.");
+    ContainerTypeRow("Vehicles", &var::show_world_vehicles, var::color_world_vehicles, "##col_w_vehicles",
+        WorldItemCategory::Vehicles, "Show vehicles.");
+    ContainerTypeRow("Weapon case", &var::show_world_weapon_case, var::color_world_weapon_case, "##col_w_weapon_case",
+        WorldItemCategory::WeaponCase, "Show weapon cases.");
+    ContainerTypeRow("Field crate", &var::show_world_field_crate, var::color_world_field_crate, "##col_w_field_crate",
+        WorldItemCategory::FieldCrate, "Show field crates.");
+    ContainerTypeRow("Supply station", &var::show_world_supply_station, var::color_world_supply_station, "##col_w_supply",
+        WorldItemCategory::SupplyCallStation, "Show supply call stations.");
+    ContainerTypeRow("Keys", &var::show_world_keys, var::color_world_keys, "##col_w_keys",
+        WorldItemCategory::Keys, "Show keys.");
+    ContainerTypeRow("Locker", &var::show_world_locker, var::color_world_locker, "##col_w_locker",
+        WorldItemCategory::Locker, "Show lockers.");
+    ContainerTypeRow("Trash", &var::show_world_trash, var::color_world_trash, "##col_w_trash",
+        WorldItemCategory::Trash, "Show trash containers.");
+    ContainerTypeRow("Open container", &var::show_world_open_container, var::color_world_open_container, "##col_w_open",
+        WorldItemCategory::OpenedContainer,
+        "Already searched/opened containers. Uses its own color so you can tell at a glance.");
+    ContainerTypeRow("Hatches", &var::showHatches, var::color_hatches, "##col_hatches",
+        WorldItemCategory::Hatch, "Show extraction hatches (extract state tracked per hatch).");
+    ContainerTypeRow("Safe", &var::show_world_safe, var::color_world_safe, "##col_w_safe",
+        WorldItemCategory::Safe, "Show safes.");
+    ContainerTypeRow("Buried", &var::show_world_buried, var::color_world_buried, "##col_w_buried",
+        WorldItemCategory::Buried, "Show buried stashes.");
+    ContainerTypeRow("Dead drop", &var::show_world_deaddrop, var::color_world_deaddrop, "##col_w_deaddrop",
+        WorldItemCategory::DeadDrop, "Show dead drop containers.");
     ImGui::EndDisabled();
 }
 
@@ -630,6 +857,26 @@ void DrawArcRadarTab()
     ArcMenuHoverTooltip("Circle clips blips to range; square uses a box outline.");
     ArcMenuLayout::SliderFloat("World range", "##radar_range", &var::radar_range, 20.f, var::kMaxDistanceSliderM, "%.0f m");
     ArcMenuHoverTooltip("Radar radius for players, bots, and rare loot blips.");
+    ArcMenuLayout::Checkbox("Map mode (north-up)", &var::radar_map_mode);
+    ArcMenuHoverTooltip(
+        "Geographically correct radar: north-up whole-map fit from the minimap bounds "
+        "(north-up range view until the bounds resolve).");
+    ArcMenuLayout::Checkbox("Dim underground", &var::radar_underground_dim);
+    ArcMenuHoverTooltip(
+        "Blips on a lower floor draw hollow (detected by Z below you). ");
+    ImGui::EndDisabled();
+
+    // HUD and feed are independent dashboard features; they must remain
+    // configurable when the radar itself is off.
+    ImGui::Separator();
+    ArcMenuLayout::Checkbox("Raid HUD", &var::show_raid_hud);
+    ArcMenuHoverTooltip(
+        "Top-center panel: raid clock, grace timer, phase, live server-side enemy + loot counts.");
+    ArcMenuLayout::Checkbox("Activity feed", &var::show_activity_feed);
+    ArcMenuHoverTooltip(
+        "Bottom-left raid timeline: downs, revives, containers being opened (45s window).");
+
+    ImGui::BeginDisabled(!var::show_radar);
     static const char* kRadarMinRarityLabels[] = { "Rare+", "Epic+", "Legendary only" };
     ArcMenuLayout::Combo(
         "Min rarity",
@@ -643,10 +890,11 @@ void DrawArcRadarTab()
         "Show container types with SP checked under Visuals on the radar (within world range).");
     ArcMenuLayout::Checkbox("Ally arrows", &var::radar_ally_arrows);
     ArcMenuHoverTooltip("Show teammates as arrows pointing their facing direction instead of dots.");
-    ImGui::Separator();
-    ArcMenuLayout::HoverableTextF("While this menu is open, click and drag the radar to move it. Position saves automatically when you close the menu.");
-    ArcMenuLayout::HoverableTextF("Players/bots use Visuals ESP colors; rare loot uses rarity colors; SP containers use their type colors.");
     ImGui::EndDisabled();
+
+    ImGui::Separator();
+    ArcMenuLayout::HoverableTextF("While the radar is enabled and this menu is open, click and drag it to move it. Position saves automatically when you close the menu.");
+    ArcMenuLayout::HoverableTextF("Players/bots use Visuals ESP colors; rare loot uses rarity colors; SP containers use their type colors.");
 }
 
 void DrawArcTriggerbotContent()
@@ -695,6 +943,7 @@ void DrawArcAimbotTab()
             kCrosshairStyleLabels,
             IM_ARRAYSIZE(kCrosshairStyleLabels)))
         var::crosshair_style = crosshairStyle;
+    ArcMenuHoverTooltip("Reticle shape. The spin styles rotate at 'Crosshair spin RPM'.");
     ArcMenuLayout::Label("Crosshair color");
     ArcMenuLayout::ColorEditAtColumn("##crosshair_color", var::crosshair_color);
     ArcMenuHoverTooltip("Screen-center reticle color.");
@@ -715,7 +964,6 @@ void DrawArcAimbotTab()
     ArcMenuLayout::Checkbox("Enable Aimbot", &var::enable_aimbot);
     ArcMenuHoverTooltip("KmBox hardware aim — requires MAKCU or Net device connected.");
     if (ArcMenuLayout::Checkbox("Robot aim", &var::robotAimEnabled))
-        RequestArcSlowCache();
     ArcMenuHoverTooltip("Aim at robots (works without Show robots on Visuals).");
 
     static const char* kAimVisLabels[] = { "Always", "Visible only" };
@@ -958,9 +1206,13 @@ void DrawArcDebugContent()
     ArcMenuLayout::HoverableText("Engine caches");
     ArcMenuHoverTooltip("Entity lists populated by the DMA scanner.");
     ArcMenuLayout::HoverableTextF("playerCache: %zu", engine.PlayerCacheCount());
+    ArcMenuHoverTooltip("Players currently cached by the DMA scanner.");
     ArcMenuLayout::HoverableTextF("worldCache: %zu", engine.WorldCacheCount());
+    ArcMenuHoverTooltip("World loot/container entries cached.");
     ArcMenuLayout::HoverableTextF("robotCache: %zu", engine.RobotCacheCount());
+    ArcMenuHoverTooltip("ARC robots currently cached.");
     ArcMenuLayout::HoverableTextF("esp drawable players: %zu", engine.CountEspDrawablePlayers());
+    ArcMenuHoverTooltip("Players that would draw right now (passes distance and visibility gates).");
     ImGui::Separator();
     ArcMenuLayout::HoverableText("AggGeom probe");
     ArcMenuHoverTooltip("Read-only simple-collision probe. Reads FKAggregateGeom TArray headers inline at UBodySetup+0xB8. Nothing here feeds ESP.");
@@ -974,24 +1226,30 @@ void DrawArcDebugContent()
 
         if (probe.running) {
             ArcMenuLayout::HoverableText("running...");
+            ArcMenuHoverTooltip("Probe is running - results appear when it finishes.");
         } else if (!probe.ran) {
             ArcMenuLayout::HoverableText("not run yet");
+            ArcMenuHoverTooltip("Nothing collected yet - run the probe above.");
         } else if (!probe.note.empty()) {
             ArcMenuLayout::HoverableTextColoredF(ImVec4(1.f, 0.4f, 0.4f, 1.f), "%s", probe.note.c_str());
         } else {
             ArcMenuLayout::HoverableTextF("actors %d  roots %d  mesh %d/%d(legacy)",
                 probe.actorsWalked, probe.rootsValid,
                 probe.meshFromPrimary, probe.meshFromLegacy);
+            ArcMenuHoverTooltip("Level actors walked, valid roots, and meshes resolved from primary vs legacy paths.");
             ArcMenuLayout::HoverableTextF("bodySetups %d  unique %d  nonEmpty %d",
                 probe.bodySetupsValid, probe.bodySetupsUnique, probe.bodySetupsNonEmpty);
+            ArcMenuHoverTooltip("Body setups found, unique among them, and ones holding actual collision geometry.");
             ArcMenuLayout::HoverableTextColoredF(
                 probe.headersRejected ? ImVec4(1.f, 0.6f, 0.2f, 1.f) : ImVec4(0.6f, 0.6f, 0.6f, 1.f),
                 "bodySetups rejected: %d", probe.headersRejected);
             ArcMenuHoverTooltip("Whole BodySetups thrown out because a header in the 0x70 block was garbage. Non-zero means the struct was misread, not that collision is absent.");
             ArcMenuLayout::HoverableTextF("sph %d  box %d  sphyl %d  convex %d",
                 probe.sphereElems, probe.boxElems, probe.sphylElems, probe.convexElems);
+            ArcMenuHoverTooltip("Aggregate geometry element counts by primitive type.");
             ArcMenuLayout::HoverableTextF("tapered %d  levelSet %d  skinnedLevelSet %d",
                 probe.taperedCapsuleElems, probe.levelSetElems, probe.skinnedLevelSetElems);
+            ArcMenuHoverTooltip("Element counts for the rarer geometry types.");
         }
     }
 
@@ -1008,16 +1266,20 @@ void DrawArcDebugContent()
 
         if (clk.running) {
             ArcMenuLayout::HoverableText("sampling...");
+            ArcMenuHoverTooltip("Sampling now - results appear when the probe finishes.");
         } else if (!clk.ran) {
             ArcMenuLayout::HoverableText("not run yet");
+            ArcMenuHoverTooltip("Nothing collected yet - run the probe above.");
         } else if (!clk.note.empty()) {
             ArcMenuLayout::HoverableTextColoredF(ImVec4(1.f, 0.4f, 0.4f, 1.f), "%s", clk.note.c_str());
         } else {
             ArcMenuLayout::HoverableTextF("candidates %d  over %.2fs  bytesChanged %d",
                 clk.hits, clk.elapsed, clk.bytesChanged);
+            ArcMenuHoverTooltip("Samples gathered and how many bytes changed between the two passes.");
             ArcMenuLayout::HoverableTextColoredF(ImVec4(0.45f, 1.0f, 0.55f, 1.0f),
                 "first: UWorld+0x%X (%s) = %.2f",
                 clk.firstOffset, clk.firstIsFloat ? "float" : "double", clk.firstValue);
+            ArcMenuHoverTooltip("Winning clock candidate: UWorld offset, value type, and first sampled value.");
         }
     }
 
@@ -1034,17 +1296,21 @@ void DrawArcDebugContent()
 
         if (tk.running) {
             ArcMenuLayout::HoverableText("sampling...");
+            ArcMenuHoverTooltip("Sampling now - results appear when the probe finishes.");
         } else if (!tk.ran) {
             ArcMenuLayout::HoverableText("not run yet");
+            ArcMenuHoverTooltip("Nothing collected yet - run the probe above.");
         } else if (!tk.note.empty()) {
             ArcMenuLayout::HoverableTextColoredF(ImVec4(1.f, 0.4f, 0.4f, 1.f), "%s", tk.note.c_str());
         } else {
             ArcMenuLayout::HoverableTextF("samples %d  slots moved %d", tk.samples, tk.slotsChanged);
+            ArcMenuHoverTooltip("Tick probe samples and how many candidate slots changed during them.");
             for (int k = 0; k < WorldScan::TickProbeResult::kTop; ++k) {
                 if (tk.topCount[k] <= 0)
                     continue;
                 ArcMenuLayout::HoverableTextColoredF(ImVec4(0.45f, 1.0f, 0.55f, 1.0f),
                     "+0x%X changed %d/%d", tk.topOffset[k], tk.topCount[k], tk.samples);
+                ArcMenuHoverTooltip("Candidate render-stamp slot and how often it changed across samples.");
             }
         }
     }
@@ -1059,8 +1325,8 @@ void DrawArcDebugContent()
     } else {
         ArcMenuLayout::HoverableTextColoredF(ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
             "Raid: lobby / menu (ESP paused)");
-    ArcMenuHoverTooltip("ESP scanning state. Scanning only runs while in a raid.");
     }
+    ArcMenuHoverTooltip("ESP scanning state. Scanning only runs while in a raid.");
     ArcMenuLayout::HoverableTextF("In raid raw: %s", engine.IsInRaidRaw() ? "yes" : "no");
     ArcMenuHoverTooltip("Raw in-raid flag read from the game.");
     ArcMenuLayout::HoverableTextF("Aimbot enabled: %s", var::enable_aimbot ? "yes" : "no");
@@ -1084,7 +1350,7 @@ void DrawArcDebugContent()
         const bool fovOk = cam.FOV > 1.0f && cam.FOV <= 179.0f && ArcIsSaneLocation(cam.Location);
         ImGui::Separator();
         ArcMenuLayout::HoverableText("Camera (engine cache)");
-    ArcMenuHoverTooltip("Last camera frame read from the game.");
+        ArcMenuHoverTooltip("Last camera frame read from the game.");
         if (!fovOk) {
             ArcMenuLayout::HoverableTextColoredF(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "Status: bad or missing");
     ArcMenuHoverTooltip("Camera transform is bad or missing — check DMA attach.");
@@ -1092,19 +1358,24 @@ void DrawArcDebugContent()
             ArcMenuLayout::HoverableTextColoredF(ImVec4(0.45f, 1.0f, 0.55f, 1.0f), "Status: OK");
     ArcMenuHoverTooltip("Camera transform is sane and usable by aim/ESP.");
             ArcMenuLayout::HoverableTextF("Location: %.1f, %.1f, %.1f", cam.Location.x, cam.Location.y, cam.Location.z);
+            ArcMenuHoverTooltip("Camera world position from the engine cache.");
             ArcMenuLayout::HoverableTextF("Rotation: %.2f, %.2f, %.2f", cam.Rotation.x, cam.Rotation.y, cam.Rotation.z);
+            ArcMenuHoverTooltip("Camera rotation (pitch, yaw, roll) from the engine cache.");
             ArcMenuLayout::HoverableTextF("FOV: %.2f", cam.FOV);
+            ArcMenuHoverTooltip("Camera field of view in degrees.");
         }
     }
 
-    if (const char* attached = Memory::GetAttachedGameExe())
+    if (const char* attached = Memory::GetAttachedGameExe()) {
         ArcMenuLayout::HoverableTextF("Attached: %s", attached);
-    ArcMenuHoverTooltip("Game executable the DMA reader is attached to.");
+        ArcMenuHoverTooltip("Game executable the DMA reader is attached to.");
+    }
     ArcMenuLayout::HoverableTextF("GWorld: 0x%llX", static_cast<unsigned long long>(engine.GWorld));
     ArcMenuHoverTooltip("Current GWorld pointer read from the game.");
 
     ImGui::Separator();
     ArcMenuLayout::HoverableText("Debug overlay");
+    ArcMenuHoverTooltip("On-screen and console diagnostics. Close the menu to see the overlay panel.");
     ArcMenuLayout::Checkbox("Show offset validation", &var::show_debug_overlay);
     ArcMenuHoverTooltip(
         "On-screen CORE/PLAYER/COMPONENT offset panel + console [debug*] tags. Close menu to see overlay.");
@@ -1116,6 +1387,10 @@ void DrawArcDebugContent()
     ArcMenuHoverTooltip(
         "Prints [debugShake] per error sign-flip (overshoot oscillation) plus "
         "extended [debugAim] fields: command, px/mouse, tick time, switches.");
+    ArcMenuLayout::Checkbox("Log ghost bot decisions", &var::debug_ghost_bots);
+    ArcMenuHoverTooltip(
+        "Write every bot draw rejection and ghost-expiry decision to help/entity_diagnostics.ndjson. "
+        "Includes actor address, name, reason, position age, distance, identity, and broken state.");
     ArcMenuLayout::Checkbox("Hatch detect probe", &var::debug_hatch_detect);
     ArcMenuHoverTooltip(
         "Prints [debugHatch] per hatch-candidate actor: fname, class fname, "
@@ -1161,6 +1436,15 @@ void DrawArcHelpGuideTab()
         "Min value/rarity + SP only pick close vs far distance — they never hide loot.");
     WrappedBulletText(
         "Per-container toggles/colors; SP unchecked = Loot distance, checked = SP distance.");
+    WrappedBulletText(
+        "Player intel: loadout/armor line, DOWNED + revive ring, look arrows, Steam IDs.");
+    WrappedBulletText(
+        "Bot intel (Bot sub-tab): vision cones with alertness tags, per-part damage pips.");
+    WrappedBulletText(
+        "Radar tab: raid HUD (clock/counts), activity feed, north-up map mode, underground dim.");
+    WrappedBulletText(
+        "Server event objects (EmbarkServerEvents) are transient dispatches and are not "
+        "readable over DMA - the activity feed reflects persistent interaction state instead.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Radar tab:");

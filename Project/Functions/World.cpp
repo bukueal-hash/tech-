@@ -116,10 +116,45 @@ void Engine::FinalizeWorldCacheMap(
                 entry.cachedOpened = ContainerLootLooksOpened(
                     it->first, entry.ActorName) ? 1 : 0;
                 entry.openedProbeMs = nowMs;
-                if (entry.cachedOpened != prevOpened)
+                if (entry.cachedOpened != prevOpened) {
                     entry.openedStateMs = nowMs;
+                    // Activity feed (feature #10): a closed -> opened flip is
+                    // the readable "someone is here" signal (the
+                    // EmbarkServerEvents dispatch objects themselves are not
+                    // readable over DMA - see Core/ActivityFeed.hpp).
+                    if (prevOpened == 0 && entry.cachedOpened == 1) {
+                        char who[32] = "someone";
+                        const uintptr_t inter = Memory::read_nocache<uintptr_t>(
+                            it->first + Offsets::LootInteractionComponent);
+                        if (IsUsableObjectPtr(inter)) {
+                            const uintptr_t instigator =
+                                Memory::read_nocache<uintptr_t>(
+                                    inter + Offsets::Interact_ActiveInstigator);
+                            if (IsUsableObjectPtr(instigator)) {
+                                const uintptr_t ps =
+                                    Memory::read_nocache<uintptr_t>(
+                                        instigator + Offsets::APlayerState);
+                                const std::string name =
+                                    GetPlayerName(ps, instigator);
+                                if (!name.empty())
+                                    snprintf(who, sizeof(who), "%.28s", name.c_str());
+                            }
+                        }
+                        char feedText[80];
+                        snprintf(feedText, sizeof(feedText), "%.32s opened %.32s",
+                            who,
+                            entry.ItemDisplayName.empty()
+                                ? "a container"
+                                : entry.ItemDisplayName.c_str());
+                        PushActivity(it->first, feedText);
+                    }
+                }
             }
-            if (entry.cachedOpened > 0) {
+            // Looted containers: grey-loot mode keeps them in their own
+            // category and greys the label (Esp.cpp) so an emptied crate is
+            // visible but obviously not worth the trip. Otherwise the old
+            // behavior: hide them, or re-home them as OpenedContainer.
+            if (0 < entry.cachedOpened && !var::grey_looted_containers) {
                 if (!var::show_world_open_container) {
                     entry.Drawing = false;
                     ++it;

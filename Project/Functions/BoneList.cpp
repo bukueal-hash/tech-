@@ -7,6 +7,7 @@
 #include "../Core/Memory.h"
 #include "../Core/Offsets.h"
 #include "../Core/SteamDecrypt.hpp"
+#include "../Core/BoneRoster.hpp"
 #include "../Core/AgentLog.h"
 #include <chrono>
 #include <cstdint>
@@ -92,7 +93,7 @@ static int ScoreBoneArrayForMesh(
     bool hasHead = false;
     bool hasPelvis = false;
 
-    for (const auto& [gameIndex, uniBone] : eng.GameBoneMapArcRaiders) {
+    for (const auto& [gameIndex, uniBone] : BoneRoster::GameBoneMap()) {
         const Vector3 world = eng.GetBone(gameIndex, boneArray, ctw);
         if (!IsPlausibleWorldPos(world) || IsNearZero(world))
             continue;
@@ -122,9 +123,10 @@ static int ScoreBoneArrayAccumulated(
     const FTransform ctw = Engine::ReadComponentToWorld(mesh);
     const D3DMATRIX ctwMat = ctw.ToMatrixWithScale();
 
-    // Read all bone transforms.
-    FTransform boneTransforms[97] = {};
-    D3DMATRIX csMats[97] = {};
+    // Read all bone transforms. Sized to the parent table — the calibrated
+    // roster spans the full skeleton, not just the 97 legacy slots.
+    std::vector<FTransform> boneTransforms((maxBone > 0) ? maxBone : 1);
+    std::vector<D3DMATRIX> csMats((maxBone > 0) ? maxBone : 1);
     for (int i = 0; i < maxBone; ++i) {
         boneTransforms[i] = Memory::read<FTransform>(
             boneArray + static_cast<uintptr_t>(i) * Bones::BoneStride);
@@ -140,7 +142,7 @@ static int ScoreBoneArrayAccumulated(
     bool hasHead = false;
     bool hasPelvis = false;
 
-    for (const auto& [gameIndex, uniBone] : eng.GameBoneMapArcRaiders) {
+    for (const auto& [gameIndex, uniBone] : BoneRoster::GameBoneMap()) {
         if (gameIndex < 0 || gameIndex >= maxBone)
             continue;
         const D3DMATRIX w = engine.MatrixMultiplication(csMats[gameIndex], ctwMat);
@@ -246,10 +248,15 @@ static BoneArrayCandidate FindBestBoneArray(uintptr_t actor, uintptr_t primaryMe
                     best = { arr, mesh, score, false };
                 }
 
-                // If direct scoring fails, try accumulated (bone-space).
+                // If direct scoring fails, try accumulated (bone-space) —
+                // with the calibrated parent chain when one is proven.
                 if (score < 2) {
+                    const std::vector<int32_t>* calParents =
+                        BoneRoster::GameBoneParents();
                     score = ScoreBoneArrayAccumulated(
-                        eng, mesh, arr, kParentIndices, 97);
+                        eng, mesh, arr,
+                        calParents ? calParents->data() : kParentIndices,
+                        calParents ? static_cast<int>(calParents->size()) : 97);
                     if (score > best.score) {
                         best = { arr, mesh, score, true };
                     }
@@ -264,15 +271,71 @@ static BoneArrayCandidate FindBestBoneArray(uintptr_t actor, uintptr_t primaryMe
 uintptr_t Engine::ResolveBoneArray(
     uintptr_t actor, uintptr_t primaryMesh,
     uintptr_t* outBoneMesh, std::ptrdiff_t* outCtwOffset,
-    std::ptrdiff_t* outTransOff)
+    std::ptrdiff_t* outTransOff, bool* outBoneSpace)
 {
     const BoneArrayCandidate best = FindBestBoneArray(actor, primaryMesh);
     if (outBoneMesh)
         *outBoneMesh = best.mesh;
+    if (outBoneSpace)
+        *outBoneSpace = best.accumulated;
+    // Report the same block the readers use: the probe picks between the
+    // live-pinned ComponentToWorld and its derived fallback per mesh.
     if (outCtwOffset)
-        *outCtwOffset = Offsets::ComponentToWorld;
+        *outCtwOffset = Engine::ProbeComponentToWorldOffset(best.mesh);
     if (outTransOff)
-        *outTransOff = 0x20;
+        *outTransOff = Offsets::Transform_Translation;
+
+    // Bind gameIndex -> body part by bone NAME (patch-proof). Before a roster
+    // is proven the static CL-1233465 table stays in effect.
+    if (best.score >= 2 && best.mesh)
+        BoneRoster::TryCalibrate(best.mesh, Memory::getBaseAddress());
+
+    // One-time roster tap: which name won each body part.
+    if (BoneRoster::IsCalibrated()) {
+        static std::atomic<bool> s_rosterLogged{ false };
+        if (!s_rosterLogged.exchange(true)) {
+            const auto rMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            std::ofstream rf(kArcVerifyPath, std::ios::app);
+            if (rf) {
+                rf << "{\"sessionId\":\"c190fb\",\"runId\":\"verify\","
+                   << "\"location\":\"BoneList.cpp\",\"message\":\"bone_roster\","
+                   << "\"data\":{\"map\":\"";
+                const auto& rm = BoneRoster::GameBoneMap();
+                for (size_t ri = 0; ri < rm.size(); ++ri) {
+                    if (ri) rf << ',';
+                    rf << rm[ri].first << ':' << BoneRoster::UniBoneAbbr(rm[ri].second);
+                }
+                rf << "\"},\"timestamp\":" << rMs << "}\n";
+            }
+        }
+    }
+
+    // bone_roster_fail tap (throttled 15 s, only while uncalibrated): names
+    // the exact stage that keeps rejecting the live skeleton — 136 probe
+    // attempts with 0 installs were previously silent.
+    if (!BoneRoster::IsCalibrated()) {
+        static std::chrono::steady_clock::time_point s_lastFailTrace{};
+        const auto fNow = std::chrono::steady_clock::now();
+        if (fNow - s_lastFailTrace >= std::chrono::seconds(15)) {
+            s_lastFailTrace = fNow;
+            const auto& d = BoneRoster::Diag();
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            std::ofstream f(kArcVerifyPath, std::ios::app);
+            if (f) {
+                f << "{\"sessionId\":\"c190fb\",\"runId\":\"verify\","
+                  << "\"location\":\"BoneList.cpp\",\"message\":\"bone_roster_fail\","
+                  << "\"data\":{\"stage\":" << d.stage.load()
+                  << ",\"skelTried\":" << d.skelTried.load()
+                  << ",\"hdrOff\":" << d.hdrOff.load()
+                  << ",\"count\":" << d.count.load()
+                  << ",\"resolved\":" << d.resolved.load()
+                  << ",\"roles\":\"0x" << std::hex << d.roles.load() << std::dec << "\""
+                  << "},\"timestamp\":" << ms << "}\n";
+            }
+        }
+    }
 
     // Verify tap (throttled 15 s): which array won and how it was scored.
     if (best.score >= 2) {
@@ -288,6 +351,7 @@ uintptr_t Engine::ResolveBoneArray(
                    << "\"location\":\"BoneList.cpp\",\"message\":\"bone_resolve\"," 
                    << "\"data\":{\"score\":" << best.score
                    << ",\"accum\":" << (best.accumulated ? 1 : 0)
+                   << ",\"roster\":" << (BoneRoster::IsCalibrated() ? 1 : 0)
                    << ",\"array\":0x" << std::hex << best.array
                    << ",\"mesh\":0x" << best.mesh << std::dec
                    << "},\"timestamp\":" << ms << "}\n";
@@ -337,18 +401,35 @@ void Engine::GetBones(PlayerCacheEntry& actor)
     uintptr_t resolvedMesh = 0;
     std::ptrdiff_t ctwOffset = Offsets::ComponentToWorld;
     std::ptrdiff_t transOff = 0x20;
+    bool boneSpaceArray = false;
     actor.boneArray = ResolveBoneArray(
-        actor.APawn, meshForBones, &resolvedMesh, &ctwOffset, &transOff);
+        actor.APawn, meshForBones, &resolvedMesh, &ctwOffset, &transOff,
+        &boneSpaceArray);
     if (!actor.boneArray || !IsValidPointer(actor.boneArray))
         return;
 
     actor.boneMesh = resolvedMesh ? resolvedMesh : meshForBones;
     actor.actorMesh = actor.boneMesh;
 
-    const size_t boneCount = GameBoneMapArcRaiders.size();
+    // Active roster: name-calibrated when proven (Core/BoneRoster.hpp), the
+    // static CL-1233465 table otherwise. Bound once so the whole read uses one
+    // consistent view.
+    const auto& boneMap = BoneRoster::GameBoneMap();
+    const std::vector<int32_t>* calParents = BoneRoster::GameBoneParents();
+    const size_t boneCount = boneMap.size();
 
-    // Check if the winning array was scored via accumulation (bone-space).
-    // If so, use the DP accumulation path. Otherwise use the fast direct path.
+    // Slots are addressed by GAME bone index; the calibrated roster spans the
+    // full skeleton, not just the 97 legacy slots.
+    int nSlots = 97;
+    for (const auto& entry : boneMap)
+        if (entry.first + 1 > nSlots)
+            nSlots = entry.first + 1;
+    if (calParents && static_cast<int>(calParents->size()) > nSlots)
+        nSlots = static_cast<int>(calParents->size());
+
+    // The winning array was scored either way: component-space transforms
+    // read directly, or bone-space transforms accumulated up the parent
+    // chain. Honor that choice below - they are not interchangeable.
     FTransform componentToWorld = Engine::ReadComponentToWorld(actor.boneMesh);
 
     // Parent indices for accumulation (only used for drawn bones).
@@ -363,6 +444,11 @@ void Engine::GetBones(PlayerCacheEntry& actor)
         -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
         -1
     };
+    auto parentOf = [&](int gi) -> int {
+        if (calParents && gi >= 0 && gi < static_cast<int>(calParents->size()))
+            return (*calParents)[gi];
+        return (gi >= 0 && gi < 97) ? kParentIdx[gi] : -1;
+    };
 
     // Batched bone read — only the 22 drawn bones (old approach).
     constexpr size_t kMaxDrawn = 32;
@@ -373,60 +459,68 @@ void Engine::GetBones(PlayerCacheEntry& actor)
         if (scatter.isValid()) {
             bool ok = true;
             for (size_t i = 0; i < boneCount && ok; ++i) {
-                const int gameIndex = GameBoneMapArcRaiders[i].first;
+                const int gameIndex = boneMap[i].first;
                 ok = scatter.prepare(
                     actor.boneArray + (gameIndex * 0x60),
                     &boneTransforms[i], sizeof(FTransform));
             }
             if (!ok || !scatter.execute()) {
                 for (size_t i = 0; i < boneCount; ++i) {
-                    const int gameIndex = GameBoneMapArcRaiders[i].first;
+                    const int gameIndex = boneMap[i].first;
                     boneTransforms[i] = Memory::read<FTransform>(
                         actor.boneArray + (gameIndex * 0x60));
                 }
             }
         } else {
             for (size_t i = 0; i < boneCount; ++i) {
-                const int gameIndex = GameBoneMapArcRaiders[i].first;
+                const int gameIndex = boneMap[i].first;
                 boneTransforms[i] = Memory::read<FTransform>(
                     actor.boneArray + (gameIndex * 0x60));
             }
         }
     }
 
-    // Accumulate bone-space → component-space via parent chain.
-    // Only accumulate bones we actually draw.
-    D3DMATRIX csMats[97] = {};
-    {
+    std::vector<D3DMATRIX> csMats(static_cast<size_t>(nSlots));
+    if (!boneSpaceArray) {
+        // Fast direct path: the array is component-space, so every transform
+        // is already relative to the mesh and is used as read. Walking the
+        // parent chain over component-space transforms folds the pose into a
+        // crumple - each chain step re-applies rotations it already contains.
+        for (size_t i = 0; i < boneCount; ++i) {
+            const int gi = boneMap[i].first;
+            if (gi >= 0 && gi < nSlots)
+                csMats[gi] = boneTransforms[i].ToMatrixWithScale();
+        }
+    } else {
+        // Accumulate bone-space → component-space via parent chain.
+        // Only accumulate bones we actually draw.
         // Build a map from gameIndex → boneTransforms position.
-        int idxMap[97] = {};
-        for (int i = 0; i < 97; ++i) idxMap[i] = -1;
+        std::vector<int> idxMap(static_cast<size_t>(nSlots), -1);
         for (size_t i = 0; i < boneCount; ++i)
-            idxMap[GameBoneMapArcRaiders[i].first] = static_cast<int>(i);
+            idxMap[boneMap[i].first] = static_cast<int>(i);
         // Accumulate: walk the parent chain for each drawn bone, reading
         // only the bones we have (scattered reads).
         for (size_t i = 0; i < boneCount; ++i) {
-            const int gi = GameBoneMapArcRaiders[i].first;
-            if (gi < 0 || gi >= 97 || csMats[gi]._44 != 0.0f) continue; // already done
+            const int gi = boneMap[i].first;
+            if (gi < 0 || gi >= nSlots || csMats[gi]._44 != 0.0f) continue; // already done
             // Walk chain rootward, collecting unbuilt bones.
-            int chain[32];
-            int depth = 0;
+            std::vector<int> chain;
             int cur = gi;
-            while (cur >= 0 && cur < 97 && depth < 32 && csMats[cur]._44 == 0.0f) {
-                chain[depth++] = cur;
-                cur = kParentIdx[cur];
+            while (cur >= 0 && cur < nSlots && chain.size() < 64 && csMats[cur]._44 == 0.0f) {
+                chain.push_back(cur);
+                cur = parentOf(cur);
             }
             // Build from root to leaf.
-            for (int d = depth - 1; d >= 0; --d) {
-                const int bi = chain[d];
+            for (int d = static_cast<int>(chain.size()) - 1; d >= 0; --d) {
+                const int bi = chain[static_cast<size_t>(d)];
                 const int mi = idxMap[bi];
                 const D3DMATRIX local = (mi >= 0)
                     ? boneTransforms[mi].ToMatrixWithScale()
                     : Memory::read<FTransform>(
                         actor.boneArray + static_cast<uintptr_t>(bi) * Bones::BoneStride
                       ).ToMatrixWithScale();
-                const int parent = kParentIdx[bi];
-                if (parent >= 0 && parent < 97 && csMats[parent]._44 != 0.0f)
+                const int parent = parentOf(bi);
+                if (parent >= 0 && parent < nSlots && csMats[parent]._44 != 0.0f)
                     csMats[bi] = engine.MatrixMultiplication(local, csMats[parent]);
                 else
                     csMats[bi] = local;
@@ -434,39 +528,19 @@ void Engine::GetBones(PlayerCacheEntry& actor)
         }
     }
 
-    // Check if accumulated result is upside-down by comparing head vs pelvis
-    // in component space (before CTW). Head Z should be > pelvis Z.
+    // Component-space → world with the full CTW. (An old "upside-down" check
+    // swapped in a rotation-less CTW whenever head Z fell below pelvis Z;
+    // with the array semantics honored above that only misfires on prone or
+    // crawling players and wrecks their pose, so the transform is now
+    // unconditional.)
     const D3DMATRIX ctwMatrix = componentToWorld.ToMatrixWithScale();
-    {
-        const D3DMATRIX headW = engine.MatrixMultiplication(csMats[7], ctwMatrix);
-        const D3DMATRIX pelW = engine.MatrixMultiplication(csMats[1], ctwMatrix);
-        if (headW._43 < pelW._43) {
-            // Upside down — use CTW-translation-only.
-            D3DMATRIX ctwT = {};
-            ctwT._11 = ctwT._22 = ctwT._33 = ctwT._44 = 1.0f;
-            ctwT._41 = ctwMatrix._41;
-            ctwT._42 = ctwMatrix._42;
-            ctwT._43 = ctwMatrix._43;
-            for (const auto& [gameIndex, uniBone] : GameBoneMapArcRaiders) {
-                if (gameIndex < 0 || gameIndex >= 97) continue;
-                const D3DMATRIX w = engine.MatrixMultiplication(csMats[gameIndex], ctwT);
-                const Vector3 wp(w._41, w._42, w._43);
-                if (!IsNearZero(wp) && IsPlausibleWorldPos(wp)) {
-                    actor.boneData.bonesWorldDouble[static_cast<size_t>(uniBone)] = wp;
-                    actor.boneData.valid.set(static_cast<size_t>(uniBone));
-                }
-            }
-        } else {
-            // Normal — use full CTW.
-            for (const auto& [gameIndex, uniBone] : GameBoneMapArcRaiders) {
-                if (gameIndex < 0 || gameIndex >= 97) continue;
-                const D3DMATRIX w = engine.MatrixMultiplication(csMats[gameIndex], ctwMatrix);
-                const Vector3 wp(w._41, w._42, w._43);
-                if (!IsNearZero(wp) && IsPlausibleWorldPos(wp)) {
-                    actor.boneData.bonesWorldDouble[static_cast<size_t>(uniBone)] = wp;
-                    actor.boneData.valid.set(static_cast<size_t>(uniBone));
-                }
-            }
+    for (const auto& [gameIndex, uniBone] : boneMap) {
+        if (gameIndex < 0 || gameIndex >= nSlots) continue;
+        const D3DMATRIX w = engine.MatrixMultiplication(csMats[gameIndex], ctwMatrix);
+        const Vector3 wp(w._41, w._42, w._43);
+        if (!IsNearZero(wp) && IsPlausibleWorldPos(wp)) {
+            actor.boneData.bonesWorldDouble[static_cast<size_t>(uniBone)] = wp;
+            actor.boneData.valid.set(static_cast<size_t>(uniBone));
         }
     }
 
@@ -516,7 +590,8 @@ void Engine::GetBones(PlayerCacheEntry& actor)
                    << ",\"pelv\":[" << pelvis.x << "," << pelvis.y << "," << pelvis.z << "]"
                    << ",\"headB\":[" << headB.x << "," << headB.y << "," << headB.z << "]"
                    << ",\"dPz\":" << (pelvis.z - actor.WorldPos.z)
-                   << ",\"dHz\":" << (headB.z - actor.head.z)
+                   << ",\"dHz\":" << (headB.z - actor.WorldPos.z)
+                   << ",\"hpz\":" << (headB.z - pelvis.z)
                    << "},\"timestamp\":" << ms << "}\n";
             }
         }

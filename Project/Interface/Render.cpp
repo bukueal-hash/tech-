@@ -15,6 +15,7 @@
 #include "Utils/Variables/index.h"
 #include "../Core/Engine.h"
 #include "../Core/AgentLog.h"
+#include "../Core/PlayerEspMissLog.hpp"
 #include "../Core/Memory.h"
 #include "Overlay/Menu.h"
 #include "OverlayHost.h"
@@ -66,6 +67,12 @@ void Render(HWND hwnd)
             engine.SetProjectionViewport(ds.x, ds.y);
     }
 
+    if (raidActive && !showmenu && var::show_raid_hud)
+        engine.RenderRaidHud();
+
+    if (raidActive && !showmenu && var::show_activity_feed)
+        engine.RenderActivityFeed();
+
     if (raidActive && !showmenu && var::show_radar)
         engine.RenderRadar(showmenu);
 
@@ -97,9 +104,11 @@ static void DrawDebugOffsetValidation(Engine& eng)
         size_t worldCacheSz = 0;
         size_t worldDrawSz = 0;
         size_t robotDrawSz = 0;
+        Engine::PlayerPipelineStats playerDiag{};
         int actorCount = 0;
         float camFov = 0.f;
         uintptr_t playerState = 0;
+        std::string playerMissSummary;
     };
     static OverlaySnap s_snap{};
     static auto s_lastHeavy = std::chrono::steady_clock::time_point{};
@@ -119,8 +128,9 @@ static void DrawDebugOffsetValidation(Engine& eng)
             if (lock.owns_lock()) {
                 gotState = 1;
                 next.state.gWorld = eng.GWorld;
-                next.state.gWorldRaw = eng.m_gWorldRaw.load(std::memory_order_relaxed);
-                next.state.gWorldFailStep = eng.m_gWorldFailStep.load(std::memory_order_relaxed);
+                next.state.chain = eng.m_chain;   // same lock: the ladder's state
+                next.state.gWorldRaw = eng.m_chain.worldRaw;
+                next.state.gWorldFailStep = eng.m_chain.worldFailStep;
                 next.state.persistentLevel = eng.PersistentLevel;
                 next.state.actors = eng.Actors;
                 next.actorCount = eng.ActorsCount;
@@ -131,6 +141,14 @@ static void DrawDebugOffsetValidation(Engine& eng)
                 next.state.owningGameInstance = eng.OwningGameInstance;
                 next.state.localPlayer = eng.localplayer;
                 next.playerState = eng.PlayerState;
+                // SDK reflection walker + FString self-check (Core/Reflection.hpp).
+                next.state.reflectOk = eng.m_reflectOk;
+                next.state.reflectDepth = eng.m_reflectDepth;
+                next.state.reflectProps = eng.m_reflectProps;
+                next.state.reflectSample = eng.m_reflectSample;
+                next.state.fstrOk = eng.m_fstrOk;
+                next.state.fstrKey = eng.m_fstrKey;
+                next.state.fstrText = eng.m_fstrText;
             }
             msState = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tA).count();
@@ -140,7 +158,9 @@ static void DrawDebugOffsetValidation(Engine& eng)
             std::shared_lock<std::shared_mutex> lock(eng.m_espFrameMutex, std::try_to_lock);
             if (lock.owns_lock() && eng.m_espFrameShared && eng.m_espFrameShared->valid) {
                 gotFrame = 1;
-                next.drawTargets = eng.m_espFrameShared->players.size();
+                next.drawTargets = eng.m_espFrameShared->players.size()
+                    + eng.m_espFrameShared->world.size()
+                    + eng.m_espFrameShared->robots.size();
                 next.robotDrawSz = eng.m_espFrameShared->robots.size();
                 next.worldDrawSz = eng.m_espFrameShared->world.size();
             }
@@ -163,6 +183,12 @@ static void DrawDebugOffsetValidation(Engine& eng)
                 }
                 if (!gotFrame)
                     next.drawTargets = drawN;
+                {
+                    std::shared_lock<std::shared_mutex> dl(eng.m_playerDiagMutex,
+                        std::try_to_lock);
+                    if (dl.owns_lock())
+                        next.playerDiag = eng.m_playerDiag;
+                }
             }
             msPlayer = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tA).count();
@@ -203,8 +229,10 @@ static void DrawDebugOffsetValidation(Engine& eng)
                     next.worldCacheSz = contN;
                 else
                     next.worldCacheSz = itemN;
-                if (!gotFrame)
+                if (!gotFrame) {
                     next.worldDrawSz = contDraw + itemDraw;
+                    next.drawTargets += next.worldDrawSz;
+                }
             }
             msWorld = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tA).count();
@@ -221,11 +249,22 @@ static void DrawDebugOffsetValidation(Engine& eng)
                         continue;
                     ++drawN;
                 }
-                if (!gotFrame)
+                if (!gotFrame) {
                     next.robotDrawSz = drawN;
+                    next.drawTargets += next.robotDrawSz;
+                }
             }
             msRobot = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tA).count();
+        }
+        {
+            // PlayerEspMissLog: who is missing and which gate dropped them.
+            // try_lock only — the ledger is written by workers; a contended
+            // paint frame keeps the previous summary (same policy as above).
+            std::string missSummary;
+            if (PlayerEspMiss::Global().SummaryTryLock(
+                    missSummary, PlayerEspMiss::NowMs(), 4))
+                next.playerMissSummary = std::move(missSummary);
         }
         {
             const auto tA = std::chrono::steady_clock::now();
@@ -319,14 +358,46 @@ static void DrawDebugOffsetValidation(Engine& eng)
         ok = (fs == 0 || fs == 4);
         drawRow(xPos, row++, "GWorldStep", ok, "%s", failName);
 
+        // Which rung won the world hop (Core/PlayerChain.hpp): slotDirect is the
+        // dump-backed read, slotInner a GWorld** slot, gameStateGlobal the
+        // GameState-owning-world fallback.
+        const PlayerChain::Rung worldRung =
+            state.chain.RungOf(PlayerChain::Hop::World);
+        drawRow(xPos, row++, "WorldSrc", state.chain.Ok(PlayerChain::Hop::World),
+            "%s", PlayerChain::RungName(worldRung));
+
         ok = state.gWorld != 0;
         drawRow(xPos, row++, "UWorld", ok, "0x%llX", (unsigned long long)state.gWorld);
 
         ok = state.owningGameInstance != 0;
         drawRow(xPos, row++, "OwningGI", ok, "0x%llX", (unsigned long long)state.owningGameInstance);
 
+        // GameInstance rung: owning slot / its world back-ref / the LP outer hop /
+        // the retired SIMD decrypt / legacy slot / world scan.
+        drawRow(xPos, row++, "GISrc", state.chain.Ok(PlayerChain::Hop::GameInstance),
+            "%s", PlayerChain::RungName(
+                state.chain.RungOf(PlayerChain::Hop::GameInstance)));
+
         ok = eng.IsValidPointer(state.localPlayer);
         drawRow(xPos, row++, "LocalPlayer", ok, "0x%llX", (unsigned long long)state.localPlayer);
+
+        // LocalPlayer rung: GI array with the PC back-ref, the PC+0x4B0 decrypt,
+        // the retirement slot scan, GI array slot 0, or the cached value.
+        drawRow(xPos, row++, "LPSrc", state.chain.Ok(PlayerChain::Hop::LocalPlayer),
+            "%s", PlayerChain::RungName(
+                state.chain.RungOf(PlayerChain::Hop::LocalPlayer)));
+
+        // The controller rung (flag / pair cache / camera manager / actor scan /
+        // GI array) and the pawn rung, then the whole chain as one line: hop=rung
+        // and how many rungs each hop tried. This is the single source of truth.
+        drawRow(xPos, row++, "PCSrc", state.chain.Ok(PlayerChain::Hop::Controller),
+            "%s", PlayerChain::RungName(
+                state.chain.RungOf(PlayerChain::Hop::Controller)));
+        drawRow(xPos, row++, "PawnSrc", state.chain.Ok(PlayerChain::Hop::Pawn),
+            "%s", PlayerChain::RungName(
+                state.chain.RungOf(PlayerChain::Hop::Pawn)));
+        drawRow(xPos, row++, "Chain", state.chain.Ok(PlayerChain::Hop::Controller),
+            "%s", PlayerChain::Trace(state.chain).c_str());
 
         ok = eng.IsValidPointer(state.playerController);
         drawRow(xPos, row++, "PlayerCtrl", ok, "0x%llX", (unsigned long long)state.playerController);
@@ -359,7 +430,25 @@ static void DrawDebugOffsetValidation(Engine& eng)
         drawRow(xPos, row++, "PlayerCache", ok, "%zu", snap.playerCacheSz);
 
         ok = snap.drawTargets > 0;
+        // Total published frame entries. The old row only counted players,
+        // so a frame drawing world/bot entries reported EspDraw: 0.
         drawRow(xPos, row++, "EspDraw", ok, "%zu", snap.drawTargets);
+        drawRow(xPos, row++, "PInit", snap.playerDiag.initialized > 0,
+            "%d/%d", snap.playerDiag.initialized, snap.playerDiag.uninitialized);
+        drawRow(xPos, row++, "PDraw", snap.playerDiag.drawing > 0,
+            "%d", snap.playerDiag.drawing);
+        drawRow(xPos, row++, "PFrame", snap.playerDiag.frameSelected > 0,
+            "%d", snap.playerDiag.frameSelected);
+        drawRow(xPos, row++, "PDrop", true,
+            "nd=%d ni=%d ally=%d dist=%d pos=%d",
+            snap.playerDiag.frameNotDrawing,
+            snap.playerDiag.frameNotInitialized,
+            snap.playerDiag.frameAlly,
+            snap.playerDiag.frameDistance,
+            snap.playerDiag.framePosition);
+        drawRow(xPos, row++, "PMiss", snap.playerMissSummary.empty(),
+            "%s", snap.playerMissSummary.empty()
+                ? "none" : snap.playerMissSummary.c_str());
 
         ok = snap.worldCacheSz > 0;
         drawRow(xPos, row++, "WorldCache", ok, "%zu", snap.worldCacheSz);
@@ -372,6 +461,25 @@ static void DrawDebugOffsetValidation(Engine& eng)
 
         ok = snap.actorCount > 0 && snap.actorCount < 10000;
         drawRow(xPos, row++, "ActorCount", ok, "%d", snap.actorCount);
+
+        // SDK reflection walker (Core/Reflection.hpp): UStruct chain depth,
+        // decoded FProperty count and the first property names/offsets.
+        ok = state.reflectOk;
+        drawRow(xPos, row++, "ReflClass", ok, "depth=%d", state.reflectDepth);
+
+        ok = state.reflectProps > 0;
+        drawRow(xPos, row++, "ReflProps", ok, "n=%d", state.reflectProps);
+
+        drawRow(xPos, row++, "ReflSample", state.reflectSample.size() > 0, "%s",
+            state.reflectSample.empty() ? "-" : state.reflectSample.c_str());
+
+        // SDK FString self-check (Offsets::FStringVerificationRva).
+        ok = state.fstrOk;
+        drawRow(xPos, row++, "FStrCheck", ok, "%s",
+            state.fstrText.empty() ? "-" : state.fstrText.c_str());
+
+        ok = state.fstrKey >= 0;
+        drawRow(xPos, row++, "FStrKey", ok, "%d", state.fstrKey);
 
         ok = IsUsableCameraFov(snap.camFov);
         drawRow(xPos, row++, "CameraRead", ok, "FOV:%.1f", snap.camFov);
@@ -399,6 +507,9 @@ static void DrawDebugOffsetValidation(Engine& eng)
         drawRow(xPos, row++, "RepMovement", true, "0x%llX", (unsigned long long)Offsets::ReplicatedMovement);
         drawRow(xPos, row++, "Velocity", true, "0x%llX", (unsigned long long)Offsets::Velocity);
         drawRow(xPos, row++, "CompToWorld", true, "0x%llX", (unsigned long long)Offsets::ComponentToWorld);
+        drawRow(xPos, row++, "C2WAlt", true, "0x%llX", (unsigned long long)Offsets::ComponentToWorld_Alt);
+        drawRow(xPos, row++, "C2WUsed", true, "0x%llX", (unsigned long long)(
+            Engine::ProbeComponentToWorldOffset(state.rootComponent)));
         drawRow(xPos, row++, "RelLocation", true, "0x%llX", (unsigned long long)Offsets::RelativeLocation);
     }
 
@@ -423,6 +534,16 @@ static void DrawDebugOffsetValidation(Engine& eng)
         drawRow(xPos, row++, "UIHoverData", ok, "0x%llX", (unsigned long long)Offsets::UIHoverData);
         drawRow(xPos, row++, "IsBreaked", ok, "0x%llX", (unsigned long long)Offsets::bIsBreaked);
         drawRow(xPos, row++, "Inventory", ok, "0x%llX", (unsigned long long)Offsets::InventoryComponent);
+
+        const Engine::HumanizerDebugState humanizer = eng.GetHumanizerDebug();
+        const char* phase = !humanizer.valid ? "off"
+            : humanizer.phase == 1 ? "react"
+            : humanizer.phase == 2 ? "settle"
+            : humanizer.phase == 3 ? "held" : "off";
+        drawRow(xPos, row++, "Humanizer", humanizer.valid,
+            "phase=%s offset=(%.2f,%.2f) limiter=%s",
+            phase, humanizer.injectedX, humanizer.injectedY,
+            humanizer.limiterActive ? "ACTIVE" : "off");
     }
 }
 

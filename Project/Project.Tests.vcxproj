@@ -101,10 +101,84 @@
     <ClCompile Include="Tests\aim_math_tests.cpp"/>
     <ClCompile Include="Tests\json_parser_tests.cpp"/>
     <ClCompile Include="Tests\memory_interface_tests.cpp"/>
+    <ClCompile Include="Tests\bot_esp_expiry_tests.cpp"/>
     <ClCompile Include="Tests\collision_mirror_tests.cpp"/>
+    <ClCompile Include="Tests\name_crypto_tests.cpp"/>
+    <ClCompile Include="Tests\reflection_tests.cpp"/>
+    <ClCompile Include="Tests\player_chain_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\bot_motion_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\bone_roster_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\bot_admit_queue_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\scan_gate_policy_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\crate_contents_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\loadout_format_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\revive_badge_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\look_arrow_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\squad_roster_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\vision_cone_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\part_damage_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\raid_clock_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\activity_feed_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\radar_projection_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\worker_lifecycle_tests.cpp" />
+    <ClCompile Include="Tests\esp_frame_policy_tests.cpp" />    <ClCompile Include="Tests\feature_policy_tests.cpp"/>
+    <ClCompile Include="Tests\entity_diagnostics_tests.cpp"/>
+    <ClCompile Include="Tests\player_esp_miss_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
     <ClCompile Include="Tests\dma_stubs.cpp"/>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Core\SDK.hpp"/>
+    <ClInclude Include="Core\BotMotion.hpp"/>
+    <ClInclude Include="Core\BoneRoster.hpp"/>
+    <ClInclude Include="Core\BotAdmitQueue.hpp"/>
+    <ClInclude Include="Core\ScanGatePolicy.hpp"/>
+    <ClInclude Include="Core\CrateContents.hpp"/>
+    <ClInclude Include="Core\LoadoutFormat.hpp"/>
+    <ClInclude Include="Core\ReviveBadge.hpp"/>
+    <ClInclude Include="Core\LookArrow.hpp"/>
+    <ClInclude Include="Core\SquadRoster.hpp"/>
+    <ClInclude Include="Core\VisionCone.hpp"/>
+    <ClInclude Include="Core\PartDamage.hpp"/>
+    <ClInclude Include="Core\RaidClock.hpp"/>
+    <ClInclude Include="Core\ActivityFeed.hpp"/>
+    <ClInclude Include="Core\RadarProjection.hpp"/>
+    <ClInclude Include="Core\EspFramePolicy.hpp"/>
+    <ClInclude Include="Core\FeaturePolicy.hpp"/>
+    <ClInclude Include="Core\EntityDiagnostics.hpp"/>
+    <ClInclude Include="Core\PlayerEspMissLog.hpp"/>
+    <ClInclude Include="Core\BotEspPosition.hpp"/>
     <ClInclude Include="Tests\tests_main.hpp"/>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets"/>

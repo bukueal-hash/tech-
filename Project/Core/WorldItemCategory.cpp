@@ -1768,10 +1768,13 @@ bool LootInteractionOwnedByActor(uintptr_t component, uintptr_t actor)
 {
     if (!component || !actor || !Memory::IsValidPtrFast2(component))
         return false;
-    // UObject::OuterPrivate @ 0x20 — component must belong to this actor.
-    // Strict: never treat a foreign LootInteraction pointer as owned (inflated admits).
-    const uintptr_t outer = Memory::read<uintptr_t>(component + 0x20);
-    return outer == actor;
+    // UObject::Outer — the component must belong to this actor. This build keeps
+    // the outer in one of the four encrypted slots at +0x20, so the old plain
+    // read there compared ClassPrivate against the actor and could never pass;
+    // OuterLink tries every rung and reports success only when one lands on the
+    // actor itself.
+    return OuterLink::GetOuterChecked(
+        component, [actor](uintptr_t p) { return p == actor; }) != 0;
 }
 
 bool FnameExcludedFromContainerEsp(const std::string& fnameLower)
@@ -2248,11 +2251,19 @@ bool IsFurniturePropLabel(const std::string& label)
 
 namespace {
 
-void AppendUniqueLootPointer(std::vector<uintptr_t>& out, uintptr_t candidate)
+void AppendUniqueLootPointer(std::vector<uintptr_t>& out, uintptr_t candidate,
+    uintptr_t owner)
 {
     if (!candidate || !Memory::IsValidPtrFast2(candidate))
         return;
-    if (!PointerIsLootInteractionComponent(candidate))
+    // The class FName decrypt flakes here (a missed name silently dropped locker
+    // banks), so an unreadable class is not a rejection: `candidate` was read out
+    // of `owner`'s own field, and the outer chain proves it belongs to that actor.
+    // The FName test stays the fast path; the walk is the structural one.
+    // (3 hops is deliberately tight: an actor's own component is one or two out,
+    // and a garbage pointer would otherwise pay the full walk.)
+    if (!PointerIsLootInteractionComponent(candidate)
+        && engine.ResolveOwningActor(candidate, 3) != owner)
         return;
     for (const uintptr_t existing : out) {
         if (existing == candidate)
@@ -2289,14 +2300,15 @@ void CollectLootInteractionPointers(uintptr_t actor, const std::string& fnameLow
     out.clear();
 
     AppendUniqueLootPointer(out,
-        Memory::read<uintptr_t>(actor + Offsets::LootInteractionComponent));
+        Memory::read<uintptr_t>(actor + Offsets::LootInteractionComponent), actor);
     AppendUniqueLootPointer(out,
-        Memory::read<uintptr_t>(actor + Offsets::LootInteraction_Container));
+        Memory::read<uintptr_t>(actor + Offsets::LootInteraction_Container), actor);
 
     if (ActorClassLooksLikeSimpleLootActivity(actor)
         || FnameLooksLikeSimpleLootActivityContainer(fnameLower)) {
         AppendUniqueLootPointer(out,
-            Memory::read<uintptr_t>(actor + Offsets::SimpleLootActivity_LootInteraction));
+            Memory::read<uintptr_t>(actor + Offsets::SimpleLootActivity_LootInteraction),
+            actor);
     }
 }
 
@@ -2334,9 +2346,14 @@ bool PointerIsItemContainerComponent(uintptr_t obj)
     return lower.find("itemcontainercomponent") != std::string::npos;
 }
 
-void AppendUniqueItemContainerPointer(std::vector<uintptr_t>& out, uintptr_t candidate)
+void AppendUniqueItemContainerPointer(std::vector<uintptr_t>& out, uintptr_t candidate,
+    uintptr_t owner)
 {
-    if (!PointerIsItemContainerComponent(candidate))
+    // Same shape as AppendUniqueLootPointer: the FName test is the fast path, and
+    // a component the actor's own outer chain reaches is accepted when the name
+    // did not decrypt. Only ever adds candidates, never drops one.
+    if (!PointerIsItemContainerComponent(candidate)
+        && engine.ResolveOwningActor(candidate, 3) != owner)
         return;
     for (const uintptr_t existing : out) {
         if (existing == candidate)
@@ -2358,9 +2375,9 @@ void CollectActorItemContainerPointers(uintptr_t actor, std::vector<uintptr_t>& 
     out.clear();
 
     AppendUniqueItemContainerPointer(out,
-        Memory::read<uintptr_t>(actor + Offsets::LootContainer_ItemContainer));
+        Memory::read<uintptr_t>(actor + Offsets::LootContainer_ItemContainer), actor);
     AppendUniqueItemContainerPointer(out,
-        Memory::read<uintptr_t>(actor + Offsets::SimpleLootActivity_ItemContainer));
+        Memory::read<uintptr_t>(actor + Offsets::SimpleLootActivity_ItemContainer), actor);
 
     const TArrayIntLocal instance =
         Memory::read<TArrayIntLocal>(actor + Offsets::Actor_InstanceComponents);
@@ -2370,7 +2387,8 @@ void CollectActorItemContainerPointers(uintptr_t actor, std::vector<uintptr_t>& 
         for (int32_t i = 0; i < instance.Num; ++i) {
             AppendUniqueItemContainerPointer(out,
                 Memory::read<uintptr_t>(
-                    instance.Data + static_cast<uintptr_t>(i) * sizeof(uintptr_t)));
+                    instance.Data + static_cast<uintptr_t>(i) * sizeof(uintptr_t)),
+                actor);
         }
     }
 }
@@ -2386,15 +2404,30 @@ bool ActorItemContainerLooksOpened(uintptr_t actor)
     return false;
 }
 
+// bHasBeenOpened probe (phase 2 refinement): the dump-reflected byte leads -
+// the drop's BYTE_HAS_BEEN_OPENED 0x8D8 is the pre-shift slot and the
+// 2026-09-22 dump reflects bHasBeenOpened at 0x858 (same pattern as
+// ExtractionPoint_State). The working runtime profile at
+// LootInteraction_Searched stays as a second source so a layout we misread
+// can never hide a looted crate; either source seeing the opened bit counts.
+bool LootInteractByteLooksOpened(uintptr_t li)
+{
+    if (!li || !Memory::IsValidPtrFast2(li))
+        return false;
+    const uint8_t refined = Memory::read<uint8_t>(
+        li + static_cast<uint64_t>(Offsets::LootInteract_OpenedByte));
+    if ((refined & Offsets::LootInteract_OpenedMask) != 0)
+        return true;
+    const uint8_t legacy = Memory::read<uint8_t>(
+        li + static_cast<uint64_t>(Offsets::LootInteraction_Searched));
+    return (legacy & Offsets::LootInteract_OpenedMask) != 0;
+}
+
 bool LootComponentLooksSearched(uintptr_t lootComp)
 {
     if (!PointerIsLootInteractionComponent(lootComp))
         return false;
-
-    // Offsets::LootInteraction_Searched == bHasBeenOpened @0x8A0 (mask 0x1).
-    const uint8_t opened = Memory::read<uint8_t>(
-        lootComp + static_cast<uint64_t>(Offsets::LootInteraction_Searched));
-    return (opened & 0x1) != 0;
+    return LootInteractByteLooksOpened(lootComp);
 }
 
 bool ActorLooksHiddenOrDestroyed(uintptr_t actor)
@@ -2436,11 +2469,7 @@ ContainerOpenSignal ProbeContainerOpenSignals(uintptr_t actor, const std::string
     // require OuterPrivate@0x20 (that gate silently blocked opens for minutes
     // while the shell stayed labeled as a closed crate).
     auto fieldLiOpened = [](uintptr_t li) -> bool {
-        if (!li || !Memory::IsValidPtrFast2(li))
-            return false;
-        const uint8_t openedByte = Memory::read<uint8_t>(
-            li + static_cast<uint64_t>(Offsets::LootInteraction_Searched));
-        return (openedByte & 0x1) != 0;
+        return LootInteractByteLooksOpened(li);
     };
     if (fieldLiOpened(Memory::read<uintptr_t>(
             actor + static_cast<uint64_t>(Offsets::LootInteractionComponent)))

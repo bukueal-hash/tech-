@@ -34,14 +34,20 @@ bool Combo(
     int count);
 bool Checkbox(const char* label, bool* value);
 bool ColorEditAtColumn(const char* colorId, float color[4]);
-bool CheckboxWithColorRow(const char* label, bool* enabled, float color[4], const char* colorId);
+bool CheckboxWithColorRow(
+    const char* label,
+    bool* enabled,
+    float color[4],
+    const char* colorId,
+    const char* rowTooltip = nullptr);
 bool CheckboxWithDualColorRow(
     const char* label,
     bool* enabled,
     float colorA[4],
     const char* idA,
     float colorB[4],
-    const char* idB);
+    const char* idB,
+    const char* rowTooltip = nullptr);
 bool BeginCombo(const char* label, const char* id, const char* previewValue);
 bool InputText(const char* label, const char* id, char* buf, int bufSize, ImGuiInputTextFlags flags = 0);
 

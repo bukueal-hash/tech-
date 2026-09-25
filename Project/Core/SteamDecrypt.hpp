@@ -1,6 +1,10 @@
 #pragma once
 // FName / player-name / bone decrypt — PlayerName/Bones/GNames namespaces.
-// FName: CL-1341255 v20260818 PCLMULQDQ pipeline (GNamePool 0xE35AB00, keystream 0xE2997F4).
+// FName: the dumped SDK (sdk/CppSDK/SDK/Basic.hpp) defines this build's pool as
+// the vanilla FNamePool — Blocks[0x2000] @ pool+0x40, 2-byte stride, block =
+// index >> 16, u16 header (bit 0 wide, bits 6..15 len). That plain walk is the
+// primary pipeline; the PCLMULQDQ slot / keystream schemes from the earlier drop
+// remain compiled as fallbacks and are gated on the entry-text plausibility check.
 // Player-name scramble: CL-1341255 key 0xD351FEEC rol 28, legacy 0xA7A3FF6B rol 19 fallback.
 
 #include "Memory.h"
@@ -8,6 +12,7 @@
 #include "Cache.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -78,8 +83,13 @@ inline T MemReadVal(uint64_t addr)
 
 namespace PlayerName {
 
+// sdk/sdk.txt PRNG patch history:
+//   2026-08-18 → ADD=0xD351FEEC, ROL=28  (CL-1341255, RVA 0x3731030)
+//   2026-09-22 → ADD=0xD351FEEC, ROL=14   <-- current build
+// The key did not move with today's patch, the rotation did; rol 28 is the
+// previous build's scramble and decodes this build's names to ciphertext.
 constexpr uint32_t kKeyCurrent = 0xD351FEECu;
-constexpr int      kRotCurrent = 28;
+constexpr int      kRotCurrent = 14;
 constexpr uint32_t kKeyLegacy  = 0xA7A3FF6Bu;
 constexpr int      kRotLegacy  = 19;
 
@@ -141,6 +151,38 @@ inline void DecryptWithKey(std::vector<uint16_t>& buffer, int maxLength,
 // via DecryptWithKey(kKeyLegacy, kRotLegacy) when the result isn't plausible.
 inline void Decrypt(std::vector<uint16_t>& buffer, int maxLength) {
 	DecryptWithKey(buffer, maxLength, kKeyCurrent, kRotCurrent);
+}
+
+// ── SDK drop (sdk/sdk.txt, "v922") FString pipeline ─────────────────────────
+// The hand-rolled rol-28 variants above are CL-1341255 era. The drop documents
+// the current scramble as
+//
+//   state = (rol32(state * 0x01000193 + 0xD351FEEC, 14) + state) * 0x01000193
+//   byte ^= state & 31            (low byte of the wchar only)
+//
+// followed by a printable-range correction chain, all of which already lives in
+// Core/SDK.hpp as game::gasm::decode_fstring_byte. The state advance happens
+// BEFORE the XOR there, and the high byte of each wchar is preserved. Every
+// in-repo variant rotates by 28 and substitutes instead, which is why names
+// came back as ciphertext ("NbIe)xj[,U" in debug-c190fb.log).
+inline void DecryptPlayerNameSdk(std::vector<uint16_t>& buffer, int maxLength)
+{
+	if (buffer.empty() || maxLength <= 0)
+		return;
+	const int length = (std::min)(maxLength, static_cast<int>(buffer.size()));
+	if (length < 1 || buffer[0] == 0)
+		return;
+
+	uint32_t state = 0;
+	int i = 0;
+	for (; i < length && buffer[i] != 0; ++i) {
+		const uint8_t decoded = game::gasm::decode_fstring_byte(
+			static_cast<uint8_t>(buffer[static_cast<size_t>(i)] & 0xFF), state);
+		buffer[static_cast<size_t>(i)] = static_cast<uint16_t>(
+			(buffer[static_cast<size_t>(i)] & 0xFF00) | decoded);
+	}
+	if (i < static_cast<int>(buffer.size()))
+		buffer[static_cast<size_t>(i)] = 0;
 }
 
 // ── CL-1341255 SIMD name decrypt ────────────────────────────────────────────
@@ -207,11 +249,172 @@ inline void DecryptSimd(std::vector<uint16_t>& buffer, int maxLength) {
 
 } // namespace PlayerName
 
+// ── PlayerLink: APlayerController → ULocalPlayer (2026-09-22 drop) ──────────
+// RE source: APlayerController::GetLocalPlayer (sub_3680940). This build keeps
+// the local player at controller+0x4B0 *encrypted*, which is exactly why the
+// back-pointer scan (look for a slot whose +0xA0 points at the PC) has never
+// resolved a LocalPlayer on it — the slot is not a plain ULocalPlayer*.
+//
+// Static SIMD path (no TLS, works on any controller pointer):
+//   enc     = read64(controller + 0x4B0)
+//   rot     = ROL32 each 32-bit lane by 13
+//   blended = rot ^ 0x9A492C85DDF6F193   (the xmm AND / ANDNOT pair is a
+//                                         bit-complement blend, so one XOR)
+//   ULocalPlayer* = ROL64(blended, 39)
+//
+// The drop also carries a TEB variant (XOR with TEB+0x1F8, ROR16 x1, PSHUFB
+// {6,3,1,7,0,2,4,5}, ROR64 x3) used whenever a TEB key is available. An
+// external DMA reader usually does not have one, so the static path is primary
+// here and the TEB key is honoured only when something calls SetTebKey.
+namespace PlayerLink {
+
+inline std::atomic<uint64_t> g_tebKey{0};
+
+inline void SetTebKey(uint64_t key) { g_tebKey.store(key, std::memory_order_relaxed); }
+inline uint64_t TebKey() { return g_tebKey.load(std::memory_order_relaxed); }
+inline void ClearTebKey() { SetTebKey(0); }
+
+inline uint64_t DecryptTeb(uint64_t enc, uint64_t tebKey) {
+	if (enc == 0 || tebKey == 0)
+		return 0;
+
+	uint64_t x = enc ^ tebKey;
+	uint16_t words[4];
+	std::memcpy(words, &x, 8);
+	for (int i = 0; i < 4; ++i)
+		words[i] = static_cast<uint16_t>(
+			(words[i] >> Offsets::TebWordRor) |
+			(words[i] << (16 - Offsets::TebWordRor)));
+
+	const uint8_t mask[8] = { 6, 3, 1, 7, 0, 2, 4, 5 };
+	uint8_t bytes[8];
+	std::memcpy(bytes, words, 8);
+	uint8_t shuffled[8];
+	for (int i = 0; i < 8; ++i)
+		shuffled[i] = bytes[mask[i]];
+
+	uint64_t s;
+	std::memcpy(&s, shuffled, 8);
+	const uint64_t result =
+		(s >> Offsets::TebQwordRor) | (s << (64 - Offsets::TebQwordRor));
+	return steam_decrypt::ValidPtr(result) ? result : 0;
+}
+
+/**
+ * Decrypt controller+0x4B0 into the controller's ULocalPlayer.
+ * Returns 0 when the slot is empty or the decrypt lands outside a usable range.
+ * Callers still validate identity (LocalPlayer::PlayerController @ 0xA0 back-ref).
+ */
+/**
+ * Pure maths half of the drop's static pipeline: encrypted qword -> pointer.
+ * Split out from the memory read so the transform is unit-testable on synthetic
+ * values (the read itself goes through the uncached DMA path, which the test
+ * harness deliberately does not intercept).
+ */
+inline uint64_t DecryptStatic(uint64_t enc) {
+	if (enc == 0)
+		return 0;
+
+	const uint32_t lo = static_cast<uint32_t>(enc);
+	const uint32_t hi = static_cast<uint32_t>(enc >> 32);
+	const uint64_t rot =
+		static_cast<uint64_t>(steam_decrypt::rotl32(lo, Offsets::PlayerDecrypt_LaneRot)) |
+		(static_cast<uint64_t>(steam_decrypt::rotl32(hi, Offsets::PlayerDecrypt_LaneRot)) << 32);
+	const uint64_t blended = rot ^ Offsets::PlayerDecrypt_BlendXorMask;
+	if (blended == 0)
+		return 0;
+
+	const uint64_t result = steam_decrypt::rotl64(blended, Offsets::PlayerDecrypt_FinalRot);
+	return steam_decrypt::ValidPtr(result) ? result : 0;
+}
+
+inline uint64_t FromController(uint64_t controller) {
+	if (!steam_decrypt::ValidPtr(controller))
+		return 0;
+
+	// Uncached on purpose: a cached read froze stale pointers elsewhere in the
+	// chain, and this slot changes on every controller swap.
+	const uint64_t enc = Memory::read_nocache<uint64_t>(
+		controller + Offsets::PlayerDecrypt_LocalPlayerOffset);
+	if (enc == 0)
+		return 0;
+
+	if (const uint64_t tebKey = TebKey(); tebKey != 0)
+		return DecryptTeb(enc, tebKey);
+	return DecryptStatic(enc);
+}
+
+} // namespace PlayerLink
+
+// ── GameInstanceStaticDecrypt: exact SDK drop path ───────────────────────────
+// sdk/sdk.txt: decrypt_game_instance_static (sub_145046B00). This is distinct
+// from the retired world+slot XOR path: it derives two stage blocks from the
+// module-wide stage array and dereferences result+0x18 for UGameInstance.
+namespace GameInstanceLink {
+
+inline uint64_t PshufbLo8(uint64_t lo, uint64_t hi, uint64_t mask)
+{
+	uint8_t src[16]{};
+	uint8_t m[8]{};
+	uint8_t out[8]{};
+	std::memcpy(src, &lo, 8);
+	std::memcpy(src + 8, &hi, 8);
+	std::memcpy(m, &mask, 8);
+	for (int i = 0; i < 8; ++i)
+		out[i] = (m[i] & 0x80u) ? 0 : src[m[i] & 0x0Fu];
+	uint64_t result = 0;
+	std::memcpy(&result, out, sizeof(result));
+	return result;
+}
+
+inline uint64_t DecryptStatic(uint64_t moduleBase)
+{
+	if (!moduleBase)
+		return 0;
+	const uint64_t stage = moduleBase + Offsets::GameInstanceStaticStageArrayRva;
+	const uint64_t maskAddr = moduleBase + Offsets::GameInstanceStaticPshufbMaskRva;
+	const uint64_t seedLo = steam_decrypt::MemReadVal<uint64_t>(stage);
+	const uint64_t mask = steam_decrypt::MemReadVal<uint64_t>(maskAddr);
+	if (!seedLo || !mask)
+		return 0;
+
+	constexpr uint32_t P = 0x01000193u;
+	constexpr uint32_t K1 = 0x742217C8u;
+	constexpr uint32_t K2 = 0x0005E838u;
+	constexpr uint32_t NEG109 = 0xFFFFFF93u;
+	uint32_t h1 = P * steam_decrypt::rotl32(static_cast<uint32_t>(seedLo), 21) - K1;
+	uint32_t h2 = P * steam_decrypt::rotl32(h1, 17) +
+		static_cast<uint32_t>(seedLo >> 32) - K1;
+	uint32_t h3 = P * steam_decrypt::rotl32(h2, 21) - K1;
+	const uint32_t v0 = steam_decrypt::rotl32(h3, 17);
+	const uint32_t v1 = (NEG109 * v0) ^ ((P * v0 + K2) >> 16);
+	const uint32_t slotA = v1 & 7u;
+	const uint32_t slotB = (v1 + 1u) & 7u;
+	const uint64_t blockA = stage + (2ull * slotA + 1ull) * 16ull;
+	const uint64_t blockB = stage + (2ull * slotB + 1ull) * 16ull;
+	const uint64_t aLo = steam_decrypt::MemReadVal<uint64_t>(blockA);
+	const uint64_t aHi = steam_decrypt::MemReadVal<uint64_t>(blockA + 8);
+	const uint64_t bLo = steam_decrypt::MemReadVal<uint64_t>(blockB);
+	const uint64_t bHi = steam_decrypt::MemReadVal<uint64_t>(blockB + 8);
+	const uint64_t v3 = PshufbLo8(aLo, aHi, mask) ^ Offsets::GameInstanceStaticXorMask;
+	const uint64_t vb = PshufbLo8(bLo, bHi, mask) ^ Offsets::GameInstanceStaticXorMask;
+	constexpr uint64_t FNV64 = 0x100000001B3ull;
+	uint64_t inner = FNV64 * steam_decrypt::rotl64(v3, 56) + Offsets::GameInstanceStaticAdd;
+	const uint64_t outer = FNV64 * steam_decrypt::rotl64(inner, 33) + Offsets::GameInstanceStaticAdd;
+	const uint64_t seedPtr = (outer ^ vb) + v3;
+	const uint64_t result = steam_decrypt::MemReadVal<uint64_t>(
+		seedPtr + Offsets::GameInstanceStaticResultDeref);
+	return steam_decrypt::ValidPtr(result) ? result : 0;
+}
+
+} // namespace GameInstanceLink
+
 // ── Bones namespace (CL-1341255 v818 pipeline) ─────────────────────────────
 // Theia-style SIMD pointer decrypt, bones are plaintext component-space transforms.
 // CL-1341255 v818: seed @ mesh+0x7B0, LOD @ mesh+0x7F8, descriptor @ bone+0x48,
 // stride 0x60, ROL64=50, ROL32=22, XOR key removed (0), PSHUFB mask below.
-// Same pipeline on all maps — CTW @ 0x370 is what makes it work off-Stella.
+// Same pipeline on all maps — the CTW block (Offsets::ComponentToWorld) is what
+// makes it work off-Stella.
 
 namespace Bones {
 
@@ -254,32 +457,58 @@ inline BoneArrayResult DecryptBoneArray(
 	if (!steam_decrypt::ValidPtr(mesh))
 		return result;
 
-	alignas(16) uint8_t seed[16]{};
+	// SDK drop: decode_bonearray_table_address reads the dword pair at
+	// mesh+0x7B0/+0x7B4. The v818 PSHUFB pipeline stays as the fallback.
+	alignas(16) uint8_t seed[0x20]{};
 	if (!steam_decrypt::MemRead(mesh + SeedOffset, seed, sizeof(seed)))
 		return result;
 
-	const uint64_t base = DecryptBoneArrayPointer(seed);
+	uint64_t base = game::gasm::decode_bonearray_table_address_slot(seed);
+	if (!steam_decrypt::ValidPtr(base))
+		base = DecryptBoneArrayPointer(seed);   // legacy PSHUFB pipeline
 	if (!steam_decrypt::ValidPtr(base))
 		return result;
 
+	// The {array,count} descriptor has moved between CL revisions while the seed
+	// slot stayed at mesh+0x7B0:
+	//   * CL-1341255: index = (lod32 @ mesh+0x7D0 >> 27) & 0xFFFFFFF0,
+	//     descriptor = base + index + 0x48;
+	//   * 2026-09-22 drop (sdk/sdk.txt, CL-1389382 "v922"): selector =
+	//     (dword @ mesh+0x848 >> 15) & 1, descriptor = base + 0x18 + 0x10 * sel.
+	// Try both and keep whichever yields a plausible array + count, so a bone
+	// layout change can't silently zero the skeleton.
 	const uint32_t lodDword =
 		steam_decrypt::MemReadVal<uint32_t>(mesh + LodOffset);
 	const uint32_t lodIndex =
 		(lodDword >> LodShiftRight) & LodBitMask;
-	const uint64_t descriptor =
-		base + lodIndex + DescriptorOffset;
-	if (!steam_decrypt::ValidPtr(descriptor))
-		return result;
+	const uint32_t selDword =
+		steam_decrypt::MemReadVal<uint32_t>(mesh + Offsets::BoneV922SelectorOffset);
+	const uint32_t selector =
+		(selDword >> Offsets::BoneV922SelectorShift) & Offsets::BoneV922SelectorMask;
 
-	const uint64_t boneArray =
-		steam_decrypt::MemReadVal<uint64_t>(descriptor);
-	if (!steam_decrypt::ValidPtr(boneArray))
-		return result;
+	const uint64_t descriptors[] = {
+		base + lodIndex + DescriptorOffset,
+		base + Offsets::BoneV922DescriptorBase +
+			Offsets::BoneV922DescriptorStride * selector,
+	};
+	for (const uint64_t descriptor : descriptors) {
+		if (!steam_decrypt::ValidPtr(descriptor))
+			continue;
 
-	result.Array = boneArray;
-	result.Count = steam_decrypt::MemReadVal<int32_t>(descriptor + 8);
-	if (result.Count <= 0 || result.Count > MaxBoneCount)
-		result.Count = 0;
+		const uint64_t boneArray =
+			steam_decrypt::MemReadVal<uint64_t>(descriptor);
+		if (!steam_decrypt::ValidPtr(boneArray))
+			continue;
+
+		const int32_t count =
+			steam_decrypt::MemReadVal<int32_t>(descriptor + 8);
+		if (count <= 0 || count > MaxBoneCount)
+			continue;
+
+		result.Array = boneArray;
+		result.Count = count;
+		return result;
+	}
 
 	return result;
 }
@@ -337,14 +566,22 @@ inline uint64_t DecryptBoneArrayForum(
 
 } // namespace Bones
 
-// ── GNames namespace (CL-1341255 / v20260818 PCLMULQDQ pipeline) ─────────────
-// Replaces the old SSE-mask pipeline (SeedXor1Rva 0xB42D320 & friends) which
-// died on the 2026-08-18 build. Constants from the UC "v20260818" post:
+// ── GNames namespace ─────────────────────────────────────────────────────────
+// PRIMARY: the plain SDK pool of THIS build (sdk/CppSDK/SDK/Basic.hpp) — see
+// ResolveNamePointerPlain / DecodeStringPlain below; no key material involved.
+// FALLBACKS (earlier drops), tried only when the plain walk yields nothing:
+// The retired SDK drop (Core/SDK.hpp):
+//   pool @ game::offsets::GNAMES, u16[64] key table @ game::offsets::KEYTABLE
+//   chunk window: selector seed @ +0x40, eight 0x20-byte blocks @ +0x50
+//   chunk base   -> game::gasm::decode_fname_pool_address
+//   entry string -> game::gasm::decode_fname
+//   header: len = ((hdr >> 3) & 0x3F8) + (hdr >> 13), bIsWide = hdr & 1
+// The v20260818 PCLMULQDQ/keystream/shard scheme is retained as the fallback
+// (*Legacy functions below) so builds that never picked up the SDK change keep
+// resolving names:
 //   Slot hash:   ROL32(0x19/0x0E/0x19/0x0E)*P + ADD 0xD4C2DB3A, Hi folded step 2
-//   Slot idx:    name=(h&3)^2, class=(h&3)^0, outer=(h&3)^1
 //   Slot decrypt: 16B (Lo,Hi); T=Hi^clmul(K1,Lo); V=clmul(K2,T)^Lo; ROL64(V,32)
-//   Shard hash (hashes ADDRESS): ROL32(0x17/0x15/0x17)*P+ADD 0x30091BB7,
-//                last step SHR(0x0B)*P+A, (H^H>>16)
+//   Shard hash (hashes ADDRESS): ROL32(0x17/0x15/0x17)*P+ADD 0x30091BB7
 //   Block decode: ROL64(4)^0xF31D220392B6800B, per-dword ROL32(2)
 //   FNV:         FNV64_PRIME*ROL64(V,48/46)+ADD 0x6463CD794F959557; ptr chain NOP
 //   Header:      len=hdr&0x03FF, wide=hdr&0x8000
@@ -352,8 +589,24 @@ inline uint64_t DecryptBoneArrayForum(
 
 namespace GNames {
 
-constexpr uint64_t NamesOffset = 0xE35AB00;   // RVA_GNAMEPOOL (v20260818; was 0xE38FA00)
-constexpr uint64_t KeystreamRva = 0xE2997F4;  // RVA_KEYSTREAM  (v20260818; was 0xE2CE894)
+// ── SDK pipeline constants ───────────────────────────────────────────────────
+constexpr uint64_t NamesOffset = Offsets::GNamePoolRva;      // FName pool (SDK GNAMES)
+
+// SDK container layout (sdk/CppSDK/SDK/Basic.hpp). THIS build ships the vanilla
+// FNamePool: Blocks[0x2000] at +0x40 (CurrentBlock 0x38, CurrentByteCursor
+// 0x3C), a 2-byte entry stride, and block = index >> 16. The dump's own header
+// defines no key table, no keystream and no shard slots, so the plain walk
+// below decodes names with no key material at all.
+constexpr uint64_t PoolBlocksOff = static_cast<uint64_t>(Offsets::FNamePool_Blocks);
+constexpr uint64_t EntryStride   = static_cast<uint64_t>(Offsets::FNamePool_EntryStride);
+constexpr int      PoolBlockBits = static_cast<int>(Offsets::FNamePool_BlockOffsetBits);
+constexpr uint64_t EntryTextOff  = static_cast<uint64_t>(Offsets::FNameEntry_TextOffset);
+constexpr uint64_t KeyTableRva = Offsets::FNameKeyTableRva;  // u16[64] key table (SDK KEYTABLE)
+constexpr uint64_t KeyTableWindow = 0x18 + 64 * 2;         // decode_fname reads u16[64] at +0x18
+constexpr uint64_t ChunkWindowSize = 0x50 + 8 * 0x20;      // seed @ +0x40, slots @ +0x50 (stride 0x20)
+
+// ── Legacy (v20260818) fallback constants ───────────────────────────────────
+constexpr uint64_t KeystreamRvaLegacy = Offsets::FNameKeystreamLegacyRva;
 constexpr int      KeystreamBase = 80;
 constexpr int      KeystreamCount = 144;
 
@@ -395,8 +648,13 @@ constexpr uint32_t KeyAdvance = 1u;
 constexpr uint32_t KeyIndexMask = 0x3Fu;
 constexpr int      NarrowKeyShift = 3;
 
+// SDK key table window — raw bytes handed straight to game::gasm::decode_fname.
+inline uint8_t keyTableRaw[KeyTableWindow]{};
+// Legacy keystream table.
 inline uint16_t keyTable[256]{};
-inline bool ready = false;
+inline bool ready = false;        // FName pool reachable (SDK plain layout)
+inline bool keyTableReady = false; // SDK-drop key table loaded (slot path only)
+inline bool legacyReady = false;  // legacy keystream loaded
 // Runtime pool override; defaults to the compile-time name-pool RVA.
 inline uint64_t gRuntimePoolRva = NamesOffset;
 
@@ -408,63 +666,78 @@ inline uint64_t RotateLeft64(uint64_t value, int count) {
 	return (value << count) | (value >> (64 - count));
 }
 
-// Portable GF(2) carry-less multiply (low 64 bits) — PCLMULQDQ emulation.
+// Carry-less multiply (low 64 bits) — delegates to the SDK's primitive.
 inline uint64_t ClmulLo(uint64_t X, uint64_t Y) {
-	uint64_t R = 0;
-	while (Y) {
-#if defined(_MSC_VER)
-		unsigned long B = 0;
-		_BitScanForward64(&B, Y);
-#else
-		unsigned B = static_cast<unsigned>(__builtin_ctzll(Y));
-#endif
-		R ^= (X << B);
-		Y &= Y - 1;
-	}
-	return R;
+	return game::detail::clmul64_low(X, Y);
+}
+
+// Key table view decode_fname expects: u16[64] starting at +0x18.
+inline const u16* KeyTableBase() {
+	return reinterpret_cast<const u16*>(keyTableRaw);
 }
 
 inline void Reset() {
+	std::memset(keyTableRaw, 0, sizeof(keyTableRaw));
 	std::memset(keyTable, 0, sizeof(keyTable));
 	gRuntimePoolRva = NamesOffset;
 	ready = false;
+	keyTableReady = false;
+	legacyReady = false;
 }
 
+// SDK init: load the FName key table (game::offsets::KEYTABLE). The legacy
+// keystream is loaded best-effort — it only feeds the fallback path.
 inline bool Init(uint64_t moduleBase)
 {
 	if (ready)
 		return true;
 
-	uint8_t KsBuf[KeystreamCount * 2]{};
-	const bool readOk = steam_decrypt::MemRead(moduleBase + KeystreamRva, KsBuf, sizeof(KsBuf));
-	if (!readOk) {
-		std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-		if (f) f << "{\"sessionId\":\"c190fb\",\"runId\":\"diag\",\"hypothesisId\":\"FNAME\","
-		           << "\"location\":\"SteamDecrypt.hpp:Init\",\"message\":\"keystream_read_failed\","
-		           << "\"data\":{\"rva\":\"0x" << std::hex << KeystreamRva << std::dec << "\"}}\n";
+	if (!moduleBase)
 		return false;
-	}
+
+	// Primary gate: the FName pool itself. This build ships the vanilla pool
+	// (sdk/CppSDK/SDK/Basic.hpp), so names decode with no key material; the key
+	// table below only feeds the retired slot / keystream paths.
+	const uint64_t PoolBlock0 = steam_decrypt::MemReadVal<uint64_t>(
+		moduleBase + gRuntimePoolRva + PoolBlocksOff);
+	ready = steam_decrypt::ValidPtr(PoolBlock0);
+
+	keyTableReady = steam_decrypt::MemRead(moduleBase + KeyTableRva, keyTableRaw, sizeof(keyTableRaw));
 
 	int nz = 0;
-	for (int I = 0; I < KeystreamCount; ++I) {
-		std::memcpy(&keyTable[I], KsBuf + I * 2, 2);
-		nz += (keyTable[I] != 0);
+	for (int I = 0; I < 64; ++I) {
+		u16 Entry = 0;
+		std::memcpy(&Entry, keyTableRaw + 0x18 + I * 2, 2);
+		nz += (Entry != 0);
 	}
-	if (nz < 8) {
-		std::ofstream f("F:/Test/ARCs/debug-c190fb.log", std::ios::app);
-		if (f) f << "{\"sessionId\":\"c190fb\",\"runId\":\"diag\",\"hypothesisId\":\"FNAME\","
-		           << "\"location\":\"SteamDecrypt.hpp:Init\",\"message\":\"keystream_low_nz\","
-		           << "\"data\":{\"rva\":\"0x" << std::hex << KeystreamRva << std::dec
-		           << "\",\"nz\":" << nz << "}}\n";
-		return false;
+	keyTableReady = keyTableReady && nz >= 8;
+	if (!keyTableReady)
+		std::memset(keyTableRaw, 0, sizeof(keyTableRaw));
+
+	uint8_t KsBuf[KeystreamCount * 2]{};
+	if (steam_decrypt::MemRead(moduleBase + KeystreamRvaLegacy, KsBuf, sizeof(KsBuf))) {
+		int KsNz = 0;
+		for (int I = 0; I < KeystreamCount; ++I) {
+			std::memcpy(&keyTable[I], KsBuf + I * 2, 2);
+			KsNz += (keyTable[I] != 0);
+		}
+		legacyReady = KsNz >= 8;
 	}
 
-	ready = true;
 	return true;
 }
 
 // ── UObject slot hash + slot selection ───────────────────────────────────────
 inline uint32_t SlotHash(uint64_t ObjPtr) {
+	return game::detail::uobject_selector(ObjPtr);
+}
+
+inline uint32_t NameSlot(uint64_t ObjPtr)  { return (SlotHash(ObjPtr) & 3u) ^ NameSlotXor; }
+inline uint32_t ClassSlot(uint64_t ObjPtr) { return (SlotHash(ObjPtr) & 3u) ^ ClassSlotAdj; }
+inline uint32_t OuterSlot(uint64_t ObjPtr) { return (SlotHash(ObjPtr) & 3u) ^ OuterSlotAdj; }
+
+// Legacy selector — used only by the *Legacy fallback paths.
+inline uint32_t SlotHashLegacy(uint64_t ObjPtr) {
 	const uint64_t Seed = ObjPtr + 0x10;
 	const uint32_t Lo = static_cast<uint32_t>(Seed);
 	const uint32_t Hi = static_cast<uint32_t>(Seed >> 32);
@@ -475,20 +748,54 @@ inline uint32_t SlotHash(uint64_t ObjPtr) {
 	return H ^ (H >> 16);
 }
 
-inline uint32_t NameSlot(uint64_t ObjPtr)  { return (SlotHash(ObjPtr) & 3u) ^ NameSlotXor; }
-inline uint32_t ClassSlot(uint64_t ObjPtr) { return (SlotHash(ObjPtr) & 3u) ^ ClassSlotAdj; }
-inline uint32_t OuterSlot(uint64_t ObjPtr) { return (SlotHash(ObjPtr) & 3u) ^ OuterSlotAdj; }
+inline uint32_t NameSlotLegacy(uint64_t ObjPtr)  { return (SlotHashLegacy(ObjPtr) & 3u) ^ NameSlotXor; }
+inline uint32_t ClassSlotLegacy(uint64_t ObjPtr) { return (SlotHashLegacy(ObjPtr) & 3u) ^ ClassSlotAdj; }
 
-// Slot decrypt (16-byte PCLMULQDQ):
-//   T = Hi ^ clmul_lo(K1, Lo); V = clmul_lo(K2, T) ^ Lo; ROL64(V, 32)
-// Low 32 bits of the decoded value are the FName comparison index for the
-// name slot; the full u64 is a pointer for the class/outer slots.
+// SDK slot decrypt (game::detail::decode_uobject_slot). The name slot
+// (nameprivate) applies ROL64(32) afterwards; the class slot does not.
 inline uint64_t DecodeSlot16(uint64_t Lo, uint64_t Hi) {
+	uint8_t Buf[16]{};
+	std::memcpy(Buf, &Lo, sizeof(Lo));
+	std::memcpy(Buf + 8, &Hi, sizeof(Hi));
+	return game::detail::rol64(game::detail::decode_uobject_slot(Buf), 32);
+}
+
+inline uint64_t DecodeClassSlot16(uint64_t Lo, uint64_t Hi) {
+	uint8_t Buf[16]{};
+	std::memcpy(Buf, &Lo, sizeof(Lo));
+	std::memcpy(Buf + 8, &Hi, sizeof(Hi));
+	return game::detail::decode_uobject_slot(Buf);
+}
+
+// Legacy v20260818 slot decrypt: T=Hi^clmul(K1,Lo); V=clmul(K2,T)^Lo; ROL64(V,32).
+inline uint64_t DecodeSlot16Legacy(uint64_t Lo, uint64_t Hi) {
 	const uint64_t T = Hi ^ ClmulLo(SlotClmulK1, Lo);
 	const uint64_t V = ClmulLo(SlotClmulK2, T) ^ Lo;
 	return RotateLeft64(V, SlotRol64Final);
 }
 
+// SDK slot reads: one window covers the four 0x20-byte blocks at ObjBase+0x20.
+constexpr uint64_t SlotWindowSize = 0x20 + 4 * 0x20;
+
+inline bool ReadSlotWindow(uint64_t ObjBase, uint8_t (&Buf)[SlotWindowSize]) {
+	return steam_decrypt::MemRead(ObjBase, Buf, sizeof(Buf));
+}
+
+inline uint64_t ReadNameSlot16(uint64_t ObjBase) {
+	uint8_t Buf[SlotWindowSize]{};
+	if (!ReadSlotWindow(ObjBase, Buf))
+		return 0;
+	return game::gasm::decode_uobject_nameprivate(ObjBase, Buf);
+}
+
+inline uint64_t ReadClassSlot16(uint64_t ObjBase) {
+	uint8_t Buf[SlotWindowSize]{};
+	if (!ReadSlotWindow(ObjBase, Buf))
+		return 0;
+	return game::gasm::decode_uobject_classprivate(ObjBase, Buf);
+}
+
+// Legacy v20260818 slot read.
 inline uint64_t ReadSlot16Decoded(uint64_t ObjBase, uint32_t Slot) {
 	const uint64_t Addr = ObjBase + 0x20 + static_cast<uint64_t>(Slot) * 0x20;
 	uint8_t Raw[16]{};
@@ -499,8 +806,261 @@ inline uint64_t ReadSlot16Decoded(uint64_t ObjBase, uint32_t Slot) {
 	std::memcpy(&Hi, Raw + 8, 8);
 	if (!Lo && !Hi)
 		return 0;
-	return DecodeSlot16(Lo, Hi);
+	return DecodeSlot16Legacy(Lo, Hi);
 }
+
+} // namespace GNames (resumes after OuterLink: the outer chain is not FName machinery)
+
+// ── UObject outer chain ──────────────────────────────────────────────────────
+// Two schemes put an object's Outer behind the four 0x20-byte slots at
+// obj+0x20, and this build keeps both:
+//
+//   1. the v20260922 slot scheme the SDK's own decoders use for ClassPrivate /
+//      NamePrivate (game::gasm): slot = (uobject_selector(obj) ^ adj) & 3, then
+//      detail::decode_uobject_slot over the slot's 16 bytes. The SDK drop has no
+//      outer decoder, so the name slot's extra ROL64(32) is tried as well.
+//   2. the CL-1299607 cipher (drop OuterDecrypt, sub_1439B00C0): hash (obj+0x10)
+//      -> slot ((h ^ (h >> 16)) & 3) ^ 2, read the qword there, ROL32 the lanes by
+//      13, XOR 0x9A492C85DDF6F193, ROL64 by 39 - the same shape as the
+//      PlayerController->ULocalPlayer decrypt, with its own constants.
+//
+// No static file can say which one is live, so every rung is tried in order and
+// the first candidate that passes the caller's predicate wins. A bare range
+// check is never enough: `ok` is what turns a candidate into a pointer, and the
+// callers pass their own test (== the actor, ValidateGameInstance,
+// ResolvePersistentLevelHelp), which is also what makes a wrong rung harmless.
+namespace OuterLink {
+
+enum class Rung : uint8_t {
+	None = 0,
+	SdkSlot,      // v20260922 slot, detail::decode_uobject_slot
+	SdkSlotRol,   // the same, with the name slot's ROL64(32)
+	DropCipher,   // CL-1299607 OuterDecrypt
+	PlainOuter,   // UObject::OuterPrivate (0xA0) read straight
+	PlainSlot,    // obj+0x20 read straight (pre-encryption layout)
+};
+
+inline const char* RungName(Rung rung)
+{
+	switch (rung) {
+	case Rung::SdkSlot:    return "sdkSlot";
+	case Rung::SdkSlotRol: return "sdkSlotRol";
+	case Rung::DropCipher: return "drop";
+	case Rung::PlainOuter: return "plainA0";
+	case Rung::PlainSlot:  return "plain20";
+	default:               return "none";
+	}
+}
+
+struct Hop {
+	uint64_t ptr = 0;
+	Rung rung = Rung::None;
+};
+
+/** What every rung's candidate has to pass before it is called a pointer. */
+inline bool Plausible(uint64_t p)
+{
+	return steam_decrypt::ValidPtr(p) && (p & 0x3u) == 0;
+}
+
+/** Live slot read: uncached, because these slots change with every outer walk. */
+inline uint64_t NoCacheReader(uint64_t addr)
+{
+	return Memory::read_nocache<uint64_t>(addr);
+}
+
+inline uint32_t Ror32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+inline uint64_t Ror64(uint64_t x, int n) { return (x >> n) | (x << (64 - n)); }
+
+// ── pure maths (no memory reads; the suite drives these on synthetic values) ─
+
+/** The drop's outer_hash(obj + 0x10). */
+inline uint32_t Hash(uint64_t obj)
+{
+	const uint64_t seed =
+		obj + static_cast<uint64_t>(Offsets::OuterDecrypt_HashSeedOff);
+	const uint32_t lo = static_cast<uint32_t>(seed);
+	const uint32_t hi = static_cast<uint32_t>(seed >> 32);
+	const uint32_t prime = Offsets::OuterDecrypt_HashPrime;
+	const uint32_t add = Offsets::OuterDecrypt_HashAdd;
+	const int rot1 = static_cast<int>(Offsets::OuterDecrypt_HashRot1);
+	const int rot2 = static_cast<int>(Offsets::OuterDecrypt_HashRot2);
+
+	uint32_t h = prime * steam_decrypt::rotl32(lo, rot1) + add;
+	h = prime * steam_decrypt::rotl32(h, rot2) + hi + add;
+	h = prime * steam_decrypt::rotl32(h, rot1) + add;
+	h = prime * steam_decrypt::rotl32(h, rot2) + add;
+	return h;
+}
+
+/** Which of the four slots the drop's cipher puts the outer in. */
+inline uint32_t DropSlot(uint64_t obj)
+{
+	const uint32_t h = Hash(obj);
+	const uint32_t shifted = h >> Offsets::OuterDecrypt_HashShr;
+	return ((h ^ shifted) & Offsets::OuterDecrypt_SlotMask) ^ Offsets::OuterDecrypt_SlotXor;
+}
+
+/** Encrypted qword -> outer pointer. Split from the read so it is testable. */
+inline uint64_t DecryptSlot(uint64_t enc)
+{
+	if (enc == 0)
+		return 0;
+
+	const int laneRot = static_cast<int>(Offsets::OuterDecrypt_LaneRot);
+	const uint64_t rot =
+		static_cast<uint64_t>(steam_decrypt::rotl32(static_cast<uint32_t>(enc), laneRot)) |
+		(static_cast<uint64_t>(steam_decrypt::rotl32(
+			static_cast<uint32_t>(enc >> 32), laneRot)) << 32);
+	const uint64_t blended = rot ^ Offsets::OuterDecrypt_XorMask;
+	if (blended == 0)
+		return 0;
+
+	const uint64_t result = steam_decrypt::rotl64(
+		blended, static_cast<int>(Offsets::OuterDecrypt_FinalRot));
+	return Plausible(result) ? result : 0;
+}
+
+/** Inverse of DecryptSlot — the ciphertext a slot holds for a pointer. */
+inline uint64_t EncryptSlot(uint64_t ptr)
+{
+	const int laneRot = static_cast<int>(Offsets::OuterDecrypt_LaneRot);
+	const uint64_t r = Ror64(ptr, static_cast<int>(Offsets::OuterDecrypt_FinalRot))
+		^ Offsets::OuterDecrypt_XorMask;
+	const uint32_t lo = Ror32(static_cast<uint32_t>(r), laneRot);
+	const uint32_t hi = Ror32(static_cast<uint32_t>(r >> 32), laneRot);
+	return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+}
+
+// ── the ladder ──────────────────────────────────────────────────────────────
+
+template <typename ReadFn>
+inline bool ReadSlot16(ReadFn read, uint64_t addr, uint8_t (&out)[16])
+{
+	const uint64_t lo = read(addr);
+	const uint64_t hi = read(addr + 8);
+	if (!lo && !hi)
+		return false;
+	std::memcpy(out, &lo, sizeof(lo));
+	std::memcpy(out + 8, &hi, sizeof(hi));
+	return true;
+}
+
+/**
+ * One hop up the outer chain. `read(addr) -> uint64_t` is the only memory
+ * access, so the live path passes NoCacheReader and the suite passes its fake.
+ */
+template <typename ReadFn, typename OkFn>
+inline Hop FromObject(uint64_t obj, ReadFn read, OkFn ok)
+{
+	Hop hop{};
+	if (!steam_decrypt::ValidPtr(obj))
+		return hop;
+
+	const uint64_t slotBase =
+		obj + static_cast<uint64_t>(Offsets::OuterDecrypt_SlotBaseOff);
+	const uint64_t stride =
+		static_cast<uint64_t>(Offsets::OuterDecrypt_SlotStride);
+
+	// 1. the slot the SDK's own name/class decoders would use for the outer
+	alignas(16) uint8_t slot[16]{};
+	if (ReadSlot16(read, slotBase + GNames::OuterSlot(obj) * stride, slot)) {
+		const uint64_t decoded = game::detail::decode_uobject_slot(slot);
+		if (ok(decoded))
+			return Hop{ decoded, Rung::SdkSlot };
+		const uint64_t roled = steam_decrypt::rotl64(decoded, 32);
+		if (ok(roled))
+			return Hop{ roled, Rung::SdkSlotRol };
+	}
+
+	// 2. the CL-1299607 cipher
+	const uint64_t decrypted = DecryptSlot(read(slotBase + DropSlot(obj) * stride));
+	if (ok(decrypted))
+		return Hop{ decrypted, Rung::DropCipher };
+
+	// 3. the plain fields last: the dump reflects UObject::OuterPrivate at 0xA0,
+	//    and the pre-encryption layout had the outer at +0x20
+	const uint64_t outer =
+		read(obj + static_cast<uint64_t>(Offsets::UObject_OuterPrivate));
+	if (ok(outer))
+		return Hop{ outer, Rung::PlainOuter };
+	const uint64_t first = read(slotBase);
+	if (ok(first))
+		return Hop{ first, Rung::PlainSlot };
+	return hop;
+}
+
+/** Live hop: uncached reads, any plausible object accepted. */
+inline Hop FromObject(uint64_t obj)
+{
+	return FromObject(obj, &NoCacheReader, &Plausible);
+}
+
+/**
+ * UObject::GetOuter with the caller's own validation — a rung only counts when
+ * its candidate passes `ok`, so `== actor` turns this into "is that object this
+ * object's owner" instead of "did some mix produce a number".
+ */
+template <typename ReadFn, typename OkFn>
+inline uint64_t GetOuterFrom(uint64_t obj, ReadFn read, OkFn ok,
+	Rung* outRung = nullptr)
+{
+	const Hop hop = FromObject(obj, read, ok);
+	if (outRung)
+		*outRung = hop.rung;
+	return hop.ptr;
+}
+
+template <typename OkFn>
+inline uint64_t GetOuterChecked(uint64_t obj, OkFn ok, Rung* outRung = nullptr)
+{
+	return GetOuterFrom(obj, &NoCacheReader, ok, outRung);
+}
+
+/**
+ * The structural "this object is an AActor" rule: it has a live RootComponent,
+ * and that component's own Outer is the object itself. Nothing else in the
+ * object graph is shaped that way, so no class name has to be consulted — and
+ * the rule is templated on the reader so the suite can drive it.
+ */
+template <typename ReadFn>
+inline bool OwnerIsActor(ReadFn read, uint64_t obj, uint64_t rootComponentOffset)
+{
+	const uint64_t root = read(obj + rootComponentOffset);
+	if (!Plausible(root))
+		return false;
+	return GetOuterFrom(root, read, [obj](uint64_t p) { return p == obj; }) != 0;
+}
+
+/**
+ * Walk UObject::Outer until `isOwner` accepts a hop's target (the standard
+ * GetTypedOuter walk; the object itself is never considered). Stops on a cycle,
+ * on a broken hop, or after maxHops.
+ *
+ * `hopOk` decides what a hop may land on, and it matters: `Plausible` alone
+ * would let the first rung shadow every other one, because a wrong rung's mix is
+ * still a 64-bit number in range. The live caller passes "the class pointer
+ * resolves", which also rejects an unmapped address.
+ */
+template <typename ReadFn, typename HopOkFn, typename IsOwnerFn>
+inline uint64_t ResolveOwner(uint64_t obj, ReadFn read, HopOkFn hopOk,
+	IsOwnerFn isOwner, int maxHops = 8)
+{
+	uint64_t cur = obj;
+	for (int hop = 0; hop < maxHops; ++hop) {
+		const Hop up = FromObject(cur, read, hopOk);
+		if (!up.ptr || up.ptr == cur)
+			return 0;
+		cur = up.ptr;
+		if (isOwner(cur))
+			return cur;
+	}
+	return 0;
+}
+
+} // namespace OuterLink
+
+namespace GNames {
 
 // ── Shard hash — hashes the ADDRESS of (ChunkAddr + ShardSeedOff) ────────────
 inline void ShardHash(uint64_t SeedAddr, uint32_t& Bidx1, uint32_t& Bidx2) {
@@ -524,7 +1084,56 @@ inline uint64_t DecodeBlock(uint64_t Raw) {
 }
 
 // ── CI → FNameEntry* (v818: PTR chain is NOP after Entry) ────────────────────
-inline uint64_t ResolveNamePointer(uint64_t moduleBase, int32_t CompIndex) {
+// SDK scheme (game::gasm::decode_fname_pool_address): the chunk window holds the
+// selector seed at +0x40 and eight 0x20-byte blocks at +0x50; the decoded mix is
+// the chunk's entry base, and the entry sits 2 bytes per name offset after it.
+// ── SDK plain pipeline (sdk/CppSDK/SDK/Basic.hpp) ────────────────────────────
+// FNamePool::GetEntryByIndex: block = index >> FNameBlockOffsetBits,
+// entry = Blocks[block] + (index & 0xFFFF) * FNameEntryStride. This is the walk
+// the dump's own SDK performs on this build, so it is tried first.
+inline uint64_t ResolveNamePointerPlain(uint64_t moduleBase, int32_t CompIndex) {
+	if (CompIndex <= 0 || !ready || !moduleBase)
+		return 0;
+
+	const uint32_t Ci = static_cast<uint32_t>(CompIndex);
+	const uint32_t ChunkIndex = Ci >> PoolBlockBits;
+	const uint32_t InChunk = Ci & ((1u << PoolBlockBits) - 1u);
+
+	const uint64_t BlockPtr = steam_decrypt::MemReadVal<uint64_t>(
+		moduleBase + gRuntimePoolRva + PoolBlocksOff +
+		static_cast<uint64_t>(ChunkIndex) * sizeof(uint64_t));
+	if (!steam_decrypt::ValidPtr(BlockPtr))
+		return 0;
+
+	const uint64_t EntryPtr = BlockPtr + static_cast<uint64_t>(InChunk) * EntryStride;
+	return steam_decrypt::ValidPtr(EntryPtr) ? EntryPtr : 0;
+}
+
+inline uint64_t ResolveNamePointerSdk(uint64_t moduleBase, int32_t CompIndex) {
+	if (CompIndex <= 0 || !keyTableReady)
+		return 0;
+
+	const uint32_t Ci = static_cast<uint32_t>(CompIndex);
+	const uint32_t NameOff = Ci & 0xFFFFu;
+	const uint32_t ChunkOff = (Ci >> 8) & 0xFFFF00u;
+	const uint64_t ChunkAddr = moduleBase + gRuntimePoolRva + ChunkOff;
+
+	uint8_t Chunk[ChunkWindowSize]{};
+	if (!steam_decrypt::MemRead(ChunkAddr, Chunk, sizeof(Chunk)))
+		return 0;
+
+	const uint64_t Base = game::gasm::decode_fname_pool_address(ChunkAddr, Chunk, 0);
+	if (!Base)
+		return 0;
+
+	const uint64_t EntryPtr = Base + 2ULL * NameOff;
+	if (!steam_decrypt::ValidPtr(EntryPtr))
+		return 0;
+	return EntryPtr;
+}
+
+// Legacy v818: shard hash picks two 0x20 blocks, DecodeBlock + FNV mix + 2*NameOff.
+inline uint64_t ResolveNamePointerLegacy(uint64_t moduleBase, int32_t CompIndex) {
 	if (CompIndex <= 0)
 		return 0;
 
@@ -554,9 +1163,152 @@ inline uint64_t ResolveNamePointer(uint64_t moduleBase, int32_t CompIndex) {
 	return EntryPtr;
 }
 
+inline uint64_t ResolveNamePointer(uint64_t moduleBase, int32_t CompIndex) {
+	if (const uint64_t Entry = ResolveNamePointerPlain(moduleBase, CompIndex))
+		return Entry;
+	if (const uint64_t Entry = ResolveNamePointerSdk(moduleBase, CompIndex))
+		return Entry;
+	return ResolveNamePointerLegacy(moduleBase, CompIndex);
+}
+
 // ── FNameEntry → string (v818 header + keystream) ────────────────────────────
-inline std::string DecodeString(uint64_t NameEntryPtr) {
-	if (!NameEntryPtr || !ready)
+// Cheap plausibility gate so the SDK and legacy pipelines can be ranked.
+inline bool LooksLikeFName(const std::string& S) {
+	if (S.empty() || S.size() > 128)
+		return false;
+	int Printable = 0;
+	for (unsigned char C : S)
+		if (C >= 32 && C <= 126)
+			++Printable;
+	return Printable * 5 >= static_cast<int>(S.size()) * 4;
+}
+
+// Gate for the plain (SDK) entry text. Real FName text is identifiers, digits
+// and a small punctuation set, so a wrong pool layout can never publish garbage
+// (the looser LooksLikeFName lets e.g. "2#52?/2#+" through).
+inline bool LooksLikeNameEntry(const std::string& S) {
+	if (S.empty() || S.size() > 128)
+		return false;
+	bool HasAlpha = false;
+	for (unsigned char C : S) {
+		const bool Alpha = (C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z');
+		const bool Digit = (C >= '0' && C <= '9');
+		const bool Punct = (C == '_' || C == '.' || C == '-' || C == ':' ||
+		                    C == '/' || C == ' ' || C == '+');
+		if (Alpha)
+			HasAlpha = true;
+		if (!Alpha && !Digit && !Punct)
+			return false;
+	}
+	return HasAlpha;
+}
+
+// SDK string decode: len = ((hdr >> 3) & 0x3F8) + (hdr >> 13); bit 0 is bIsWide
+// and is never touched by that formula. Narrow entries XOR against the key table
+// through decode_fname; wide ones go through the SDK UTF-16 decoder.
+// SDK plain string decode — FNameEntryHeader from sdk/CppSDK/SDK/Basic.hpp:
+// bit 0 = bIsWide, bits 6..15 = Len, text at entry + 2 (FNameEntry::Name).
+inline std::string DecodeStringPlain(uint64_t NameEntryPtr) {
+	if (!NameEntryPtr)
+		return {};
+
+	const uint16_t Header = steam_decrypt::MemReadVal<uint16_t>(NameEntryPtr);
+	const bool IsWide = (Header & Offsets::FNameEntry_WideBit) != 0;
+	const uint32_t Length =
+		(static_cast<uint32_t>(Header) >> static_cast<int>(Offsets::FNameEntry_LenShift)) &
+		static_cast<uint32_t>(Offsets::FNameEntry_LenMask);
+	if (!Length || Length > 1023)
+		return {};
+
+	std::string Out;
+	Out.reserve(Length);
+
+	if (!IsWide) {
+		std::vector<uint8_t> Buf(Length);
+		if (!steam_decrypt::MemRead(NameEntryPtr + EntryTextOff, Buf.data(), Buf.size()))
+			return {};
+		for (uint8_t Ch : Buf) {
+			if (!Ch)
+				break;
+			Out.push_back((Ch >= 32 && Ch <= 126) ? static_cast<char>(Ch) : '?');
+		}
+		return Out;
+	}
+
+	std::vector<uint16_t> WBuf(Length);
+	if (!steam_decrypt::MemRead(NameEntryPtr + EntryTextOff, WBuf.data(),
+		WBuf.size() * sizeof(uint16_t)))
+		return {};
+	for (uint16_t W : WBuf) {
+		if (!W)
+			break;
+		Out.push_back(W < 0x80 ? static_cast<char>(W) : '?');
+	}
+	return Out;
+}
+
+inline std::string DecodeStringSdk(uint64_t NameEntryPtr) {
+	if (!NameEntryPtr || !keyTableReady)
+		return {};
+
+	const uint16_t Header = steam_decrypt::MemReadVal<uint16_t>(NameEntryPtr);
+	const uint32_t Length = game::gasm::decode_fname_header_len(Header);
+	if (!Length || Length > 1023)
+		return {};
+
+	std::string Out;
+	Out.reserve(Length);
+
+	// A decoded name never contains '?' unless the bytes were wrong
+	// (non-printables are mapped to it), which is how the wide variant below
+	// decides whether the FString fallback is needed.
+	auto sane = [](const std::string& s) {
+		return !s.empty() && s.find('?') == std::string::npos;
+	};
+	auto render = [](const auto& buf) {
+		std::string s;
+		for (auto ch : buf) {
+			if (!ch)
+				break;
+			using T = typename std::decay<decltype(ch)>::type;
+			s.push_back(static_cast<T>(ch) >= 32 && static_cast<T>(ch) <= 126
+				? static_cast<char>(ch) : '?');
+		}
+		return s;
+	};
+	if ((Header & 0x1u) == 0) {
+		std::vector<uint8_t> Buf(Length);
+		if (!steam_decrypt::MemRead(NameEntryPtr + 2, Buf.data(), Buf.size()))
+			return {};
+		game::gasm::decode_fname(Header, Buf.data(), KeyTableBase());
+		return render(Buf);
+	}
+
+	std::vector<uint16_t> WBuf(static_cast<size_t>(Length) + 1, 0);
+	if (!steam_decrypt::MemRead(NameEntryPtr + 2, WBuf.data(),
+		static_cast<size_t>(Length) * sizeof(uint16_t)))
+		return {};
+	// Wide entries: the current drop XORs the full u16 keystream word; the older
+	// one ran the FString pipeline over them.
+	{
+		std::vector<uint16_t> V922 = WBuf;
+		game::gasm::decode_fname_wide_v922(Header, V922.data(), KeyTableBase());
+		std::string wide = render(V922);
+		if (sane(wide))
+			return wide;
+	}
+	game::gasm::decode_fstring(WBuf.data());
+	for (uint16_t W : WBuf) {
+		if (!W)
+			break;
+		Out.push_back(W < 0x80 ? static_cast<char>(W) : '?');
+	}
+	return Out;
+}
+
+// Legacy v818 string decode: len=hdr&0x03FF, wide=hdr&0x8000, keystream base 80.
+inline std::string DecodeStringLegacy(uint64_t NameEntryPtr) {
+	if (!NameEntryPtr || !legacyReady)
 		return {};
 
 	const uint16_t Header = steam_decrypt::MemReadVal<uint16_t>(NameEntryPtr);
@@ -610,6 +1362,20 @@ inline std::string DecodeString(uint64_t NameEntryPtr) {
 	return Out;
 }
 
+// Entry-pointer decode, in order: the SDK's plain pool (this build's real
+// layout, sdk/CppSDK/SDK/Basic.hpp), then the retired SDK-drop slot pipeline,
+// then the v20260818 keystream. Every candidate must pass the entry-text gate,
+// so a candidate produced by the wrong layout is rejected rather than published.
+inline std::string DecodeString(uint64_t NameEntryPtr) {
+	if (const std::string Plain = DecodeStringPlain(NameEntryPtr); LooksLikeNameEntry(Plain))
+		return Plain;
+	if (const std::string Sdk = DecodeStringSdk(NameEntryPtr); LooksLikeNameEntry(Sdk))
+		return Sdk;
+	if (const std::string Legacy = DecodeStringLegacy(NameEntryPtr); LooksLikeNameEntry(Legacy))
+		return Legacy;
+	return {};
+}
+
 } // namespace GNames
 
 // ── Steam decrypt (internal pipeline) ────────────────────────────────────────
@@ -619,10 +1385,11 @@ namespace steam_decrypt {
 // CL-1341255 / v20260818 — all pipeline constants live in GNames; the mirrors
 // below keep the FNameState snapshot API stable.
 inline constexpr uint64_t RVA_GNAMEPOOL = GNames::NamesOffset;
-inline constexpr uint64_t RVA_KEYSTREAM = GNames::KeystreamRva;
+inline constexpr uint64_t RVA_KEYTABLE = GNames::KeyTableRva;          // SDK pipeline
+inline constexpr uint64_t RVA_KEYSTREAM_LEGACY = GNames::KeystreamRvaLegacy;  // v818 fallback
 
-inline constexpr uint64_t RVA_GUOBJECTARRAY_CHUNKS = 0xE80BA10ULL;
-inline constexpr uint64_t RVA_GOBJ_PSHUFB_MASK = 0xAD97CC0ULL;
+inline constexpr uint64_t RVA_GUOBJECTARRAY_CHUNKS = Offsets::GUObjectArrayChunksRva;
+inline constexpr uint64_t RVA_GOBJ_PSHUFB_MASK = Offsets::GObjPshufbMaskRva;
 
 struct FNameState {
 	uint64_t gnamePoolRva = 0;
@@ -660,11 +1427,11 @@ inline bool InitFNameState(uint64_t game_base)
 	s.gnamePoolRva = GNames::NamesOffset;
 	s.keystreamBase = GNames::KeystreamBase;
 
-	// v20260818: the keystream (144 u16 from RVA_KEYSTREAM) is the only
-	// runtime state — no SIMD masks to load.
-	s.ksLoaded = GNames::Init(game_base);
-	if (!s.ksLoaded)
+	// SDK drop: the FName key table (game::offsets::KEYTABLE) is the gate; the
+	// legacy v818 keystream is loaded best-effort for the fallback path.
+	if (!GNames::Init(game_base))
 		return false;
+	s.ksLoaded = GNames::legacyReady;
 
 	s.initialised = true;
 	return true;
@@ -726,10 +1493,18 @@ inline uint32_t obj_class_slot(uint64_t ObjPtr)
 	return GNames::ClassSlot(ObjPtr);
 }
 
-// v20260818: 16-byte PCLMULQDQ slot decode; low 32 bits = comparison index.
+// SDK nameprivate slot decode; low 32 bits = comparison index. Falls back to
+// the v818 slot decode (with its own selector) when the SDK path reads nothing.
 inline uint64_t FindFNameSlot(uint64_t ObjBase)
 {
-	return GNames::ReadSlot16Decoded(ObjBase, obj_name_slot(ObjBase));
+	// SDK layout (sdk/CppSDK/SDK/CoreUObject_classes.hpp) first: UObject::Name is
+	// a plain FName at +0x98 and its low dword is the comparison index.
+	const uint64_t Plain = MemReadVal<uint64_t>(ObjBase + Offsets::UObject_NamePrivate);
+	if ((Plain & 0xFFFFFFFFULL) > 1 && (Plain & 0xFFFFFFFFULL) < 0x2000000ULL)
+		return Plain;
+	if (const uint64_t Sdk = GNames::ReadNameSlot16(ObjBase); Sdk)
+		return Sdk;
+	return GNames::ReadSlot16Decoded(ObjBase, GNames::NameSlotLegacy(ObjBase));
 }
 
 inline uint64_t ResolveNamePtr(int32_t CompIndex, uint64_t game_base)
@@ -816,8 +1591,18 @@ inline uintptr_t GetActorClassPtr(uintptr_t ObjBase)
 {
 	if (!ObjBase || !ValidPtr(ObjBase))
 		return 0;
-	// v20260818: class slot decodes to a full u64 UClass* (no CI split).
-	const uint64_t Decoded = GNames::ReadSlot16Decoded(ObjBase, obj_class_slot(ObjBase));
+	// SDK layout first (CoreUObject_classes.hpp): UObject::Class @ +0x20.
+	const uint64_t PlainClass = MemReadVal<uint64_t>(ObjBase + Offsets::UObject_ClassPrivate);
+	if (PlainClass >= 0x10000ULL && PlainClass < 0x800000000000ULL)
+		return static_cast<uintptr_t>(PlainClass);
+
+	// SDK classprivate slot decodes straight to a full u64 UClass*.
+	if (const uint64_t Sdk = GNames::ReadClassSlot16(ObjBase);
+		Sdk >= 0x10000ULL && Sdk < 0x800000000000ULL)
+		return static_cast<uintptr_t>(Sdk);
+
+	// Fallback: v818 class slot (same u64-shape contract).
+	const uint64_t Decoded = GNames::ReadSlot16Decoded(ObjBase, GNames::ClassSlotLegacy(ObjBase));
 	if (Decoded < 0x10000ULL || Decoded >= 0x800000000000ULL)
 		return 0;
 	return static_cast<uintptr_t>(Decoded);
@@ -861,9 +1646,43 @@ inline void DecryptPlayerNameForum(std::vector<uint16_t>& NameBuffer, int MaxLen
 		0x20003155u, 29);
 }
 
+// SDK drop (sdk/sdk.txt, "v922") FString pipeline — state advance
+// (rol 14) before the 5-bit XOR, printable-range correction chain.
+inline void DecryptPlayerNameSdk(std::vector<uint16_t>& NameBuffer, int MaxLength)
+{
+	PlayerName::DecryptPlayerNameSdk(NameBuffer, MaxLength);
+}
+
 inline void DecryptName(std::vector<uint16_t>& nameBuffer, int maxLength)
 {
 	DecryptPlayerName(nameBuffer, maxLength);
+}
+
+// Verified player-name scramble index — set by the SDK FString self-check
+// (Reflection::CheckFStringPipeline, driven from Engine::Update).
+// 0=current, 1=simd, 2=legacy, 3=forum, -1=not verified yet.
+inline std::atomic<int>& preferred_name_key()
+{
+	static std::atomic<int> key{ -1 };
+	return key;
+}
+
+inline void SetPreferredNameKey(int key) { preferred_name_key().store(key, std::memory_order_relaxed); }
+inline int PreferredNameKey() { return preferred_name_key().load(std::memory_order_relaxed); }
+
+// Runs the verified scramble (if any). Returns false when nothing is verified.
+inline bool TryPreferredPlayerNameKey(std::vector<uint16_t>& buffer, int maxLength)
+{
+	if (maxLength <= 0)
+		return false;
+	switch (PreferredNameKey()) {
+	case 0: DecryptPlayerName(buffer, maxLength); return true;
+	case 1: DecryptPlayerNameSimd(buffer, maxLength); return true;
+	case 2: DecryptPlayerNameLegacy(buffer, maxLength); return true;
+	case 3: DecryptPlayerNameForum(buffer, maxLength); return true;
+	case 4: DecryptPlayerNameSdk(buffer, maxLength); return true;
+	default: return false;
+	}
 }
 
 inline bool IsPlausibleArcPlayerName(const std::string& name)
@@ -998,6 +1817,25 @@ inline std::string ReadPlayerNameFromFString(uintptr_t fstringAddr)
 			std::string result;
 			const std::vector<uint16_t> original = chars;
 
+			// Scramble proven on the game's verification FString first (SDK drop
+			// Offsets::FStringVerificationRva), then the default order.
+			if (TryPreferredPlayerNameKey(chars, rawLen)) {
+				result = WideCharsToPlayerName(chars, rawLen);
+				if (IsPlausibleArcPlayerName(result))
+					return result;
+				chars = original;
+			}
+
+			// The drop's own pipeline next: it is the only variant whose rotate
+			// amount (14) and state advance match sdk/sdk.txt. Without it every
+			// decrypt failed and the raw ciphertext was displayed as a name.
+			chars = original;
+			DecryptPlayerNameSdk(chars, rawLen);
+			result = WideCharsToPlayerName(chars, rawLen);
+			if (IsPlausibleArcPlayerName(result))
+				return result;
+
+			chars = original;
 			PlayerName::Decrypt(chars, rawLen);
 			result = WideCharsToPlayerName(chars, rawLen);
 			if (IsPlausibleArcPlayerName(result))
@@ -1020,10 +1858,16 @@ inline std::string ReadPlayerNameFromFString(uintptr_t fstringAddr)
 			if (IsPlausibleArcPlayerName(result))
 				return result;
 
-			chars = original;
-			result = WideCharsToPlayerName(chars, rawLen);
-			if (IsPlausibleArcPlayerName(result))
-				return result;
+			// Raw text is only a name when the verification FString proved that
+			// names on this build are NOT scrambled. When a candidate did decode
+			// it, the raw bytes here are ciphertext, and returning them painted
+			// strings like "NbIe)xj[,U" as player names (debug-c190fb.log).
+			if (PreferredNameKey() < 0) {
+				chars = original;
+				result = WideCharsToPlayerName(chars, rawLen);
+				if (IsPlausibleArcPlayerName(result))
+					return result;
+			}
 		} else {
 			const std::string result = WideCharsToPlayerName(chars, rawLen);
 			if (IsPlausibleArcPlayerName(result))
@@ -1039,10 +1883,13 @@ inline std::string ReadPlayerNameFromPlayerState(uintptr_t playerStateAddr)
 	if (!playerStateAddr || !ValidPtr(playerStateAddr))
 		return {};
 
+	// 20260922 dump: APlayerState.PlayerNamePrivate 0x458, PawnPrivate 0x438.
+	// The trailing pair are previous-build slots, kept as last-resort probes.
 	static const std::ptrdiff_t kNameOffsets[] = {
 		Offsets::PlayerNamePrivate,
+		Offsets::PS_PlayerNamePrivate2, // drop's second name slot (fallback)
+		Offsets::PlayerState_PawnPrivate,
 		0x448,
-		0x438,
 		0x430,
 	};
 
