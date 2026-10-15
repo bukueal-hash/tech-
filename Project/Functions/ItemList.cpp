@@ -2,6 +2,7 @@
 #include "../Core/AgentLog.h"
 #include "../Core/ActorType.h"
 #include "../Core/AssetNames.h"
+#include "../Core/StringUtils.hpp"
 #include "../Core/EntityDiagnostics.hpp"
 #include "../Core/Offsets.h"
 #include "../Core/WorldItemCategory.h"
@@ -38,7 +39,7 @@ bool FnameLooksLikeNonWorldEspActor(const std::string& fname)
         return false;
     if (FnameLooksLikeDroppedPickup(fname))
         return false;
-    const std::string lower = ToLowerCopy(fname);
+    const std::string lower = StringUtils::ToLowerCopy(fname);
     if (IsInventoryWorldFnameExcluded(lower))
         return true;
     if (FnameExcludedFromContainerEsp(lower))
@@ -176,8 +177,8 @@ WorldItemCategory ClassifyItem(
         return WorldItemCategory::DroppedPickup;
 
     // Item scanner feeds item/dropped rows only. Medical/Ammo/Grenade/Backpack/
-    // ArcLoot/WeaponCase are container-type menu rows — never classify pickups
-    // as those (e.g. a syringe must not inherit Medical SP distance).
+    // ArcLoot/WeaponCase/WeaponRack are container-type menu rows — never classify
+    // pickups as those (e.g. a syringe must not inherit Medical SP distance).
     const auto remapContainerTyped = [&](WorldItemCategory c) -> WorldItemCategory {
         switch (c) {
         case WorldItemCategory::Medical:
@@ -186,6 +187,7 @@ WorldItemCategory ClassifyItem(
         case WorldItemCategory::Backpack:
         case WorldItemCategory::ArcLoot:
         case WorldItemCategory::WeaponCase:
+        case WorldItemCategory::WeaponRack:
             return (classGroundLoot || fnameIsPickup)
                 ? WorldItemCategory::DroppedPickup
                 : WorldItemCategory::Items;
@@ -246,15 +248,14 @@ static bool IsGroundPickupCategory(WorldItemCategory cat)
 // #region agent log
 static void AgentItemLog(const char* message, const char* hypothesisId, const std::string& dataJson)
 {
-    std::ofstream f(kArcDebugLogPath, std::ios::app);
-    if (!f)
-        return;
+    std::ostringstream f;
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     f << "{\"sessionId\":\"c190fb\",\"runId\":\"baseline\",\"hypothesisId\":\""
         << hypothesisId << "\",\"location\":\"ItemList.cpp\",\"message\":\""
         << message << "\",\"data\":" << dataJson
         << ",\"timestamp\":" << ms << "}\n";
+    EntityDiagnostics::LogRaw(f.str());
 }
 // #endregion
 
@@ -281,7 +282,11 @@ void Engine::ItemList()
     }
 
     // LAG1: cap this pass's DMA so camera/position/frame-builder keeps cadence.
-    WorldScan::ScanBudget scanBudget(std::chrono::milliseconds(90));
+    // Raid-start mode: an empty item cache means nothing to retain yet, so
+    // spend more bus time walking; tapers to 90ms once items are cached.
+    const bool itemRaidStart = localCache.size() < 4;
+    WorldScan::ScanBudget scanBudget(
+        std::chrono::milliseconds(itemRaidStart ? 150 : 90));
 
     const std::unordered_set<uint64_t> currentSet(
         ctx.currentActors.begin(),
@@ -325,8 +330,43 @@ void Engine::ItemList()
     static IntervalTimer metadataTimer(250);
     const bool doMetadata = metadataTimer.fire();
 
-    for (uint64_t actorU64 : ctx.currentActors) {
-        const uintptr_t key = static_cast<uintptr_t>(actorU64);
+    // Resume cursor + non-item memo (was: full 16K-array walk every pass,
+    // unbudgeted — multi-second gate holds that starved every other scanner
+    // while re-reading the same rejected actors over and over). The walk now
+    // stops on budget and continues next pass; decisive non-item rejects are
+    // memoized (60s TTL, cleared on world-gen change) so they cost zero DMA
+    // on later sweeps.
+    static size_t s_itemScanCursor = 0;
+    static uint64_t s_itemScanGen = 0;
+    static std::unordered_map<uintptr_t, int64_t> s_itemNonWorldMemo;
+    if (s_itemScanGen != genAtStart) {
+        s_itemScanGen = genAtStart;
+        s_itemScanCursor = 0;
+        s_itemNonWorldMemo.clear();
+    }
+    const int64_t itemNowMs = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    auto memoNonItem = [&](uintptr_t k2) {
+        if (s_itemNonWorldMemo.size() > 32768)
+            s_itemNonWorldMemo.clear();
+        s_itemNonWorldMemo[k2] = itemNowMs;
+    };
+    bool itemWalkBroke = false;
+    // Own budget: the pre-walk DMA above must not consume the walk's time.
+    WorldScan::ScanBudget walkBudget(
+        std::chrono::milliseconds(itemRaidStart ? 150 : 90));
+    const size_t itemCount = ctx.currentActors.size();
+    const size_t itemStart =
+        s_itemScanCursor < itemCount ? s_itemScanCursor : itemCount;
+    for (size_t itemAi = itemStart; itemAi < itemCount; ++itemAi) {
+        if (walkBudget.expired()) {
+            s_itemScanCursor = itemAi;
+            itemWalkBroke = true;
+            break;
+        }
+        const uintptr_t key =
+            static_cast<uintptr_t>(ctx.currentActors[itemAi]);
         if (!key)
             continue;
         if (localPawn && key == localPawn)
@@ -344,14 +384,28 @@ void Engine::ItemList()
         if (IsGroundPickupGoneSticky(key))
             continue;
 
+        if (const auto memoIt = s_itemNonWorldMemo.find(key);
+            memoIt != s_itemNonWorldMemo.end()) {
+            if (itemNowMs - memoIt->second < 60000)
+                continue;
+            s_itemNonWorldMemo.erase(memoIt); // stale — recheck
+        }
+
         ++dbgScanned;
+
+        // Ledger: class/FName identity work dominates the per-key block here.
+        ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Name);
 
         const uint32_t maskedType =
             ArcActorType::MaskActorTypeId(ArcActorType::ReadActorTypeId(key));
-        if (ArcActorType::IsPlayerClassId(maskedType))
+        if (ArcActorType::IsPlayerClassId(maskedType)) {
+            memoNonItem(key);
             continue;
-        if (ArcActorType::IsBotClassId(maskedType))
+        }
+        if (ArcActorType::IsBotClassId(maskedType)) {
+            memoNonItem(key);
             continue;
+        }
 
         const uint32_t classAt70 =
             Memory::read<uint32_t>(key + Offsets::ClassDefaultObject);
@@ -368,21 +422,29 @@ void Engine::ItemList()
             fname = GetActorFNameString(key);
 
         const std::string classFname = GetActorClassFName(key);
-        if (!classFname.empty() && FnameLooksLikeEngineSubobjectClass(classFname))
+        if (!classFname.empty() && FnameLooksLikeEngineSubobjectClass(classFname)) {
+            memoNonItem(key);
             continue;
+        }
 
         const bool classFnameIsPickup =
             !classFname.empty() && FnameLooksLikeDroppedPickup(classFname);
         const bool scanPickupLike = classGroundLoot || classFnameIsPickup
             || FnameLooksLikeDroppedPickup(fname);
 
-        if (!scanPickupLike && FnameLooksLikeNonWorldEspActor(fname))
+        if (!scanPickupLike && FnameLooksLikeNonWorldEspActor(fname)) {
+            memoNonItem(key);
             continue;
-        if (!scanPickupLike && FnameLooksLikeNonWorldEspActor(classFname))
+        }
+        if (!scanPickupLike && FnameLooksLikeNonWorldEspActor(classFname)) {
+            memoNonItem(key);
             continue;
+        }
 
-        if (!scanPickupLike && WorldScan::LooksLikeBotPawn(key, localPawn))
+        if (!scanPickupLike && WorldScan::LooksLikeBotPawn(key, localPawn)) {
+            memoNonItem(key);
             continue;
+        }
 
         std::string dataAssetFName;
         bool fnameIsContainer = false;
@@ -451,7 +513,7 @@ void Engine::ItemList()
         if (fname.empty() && !dataAssetFName.empty())
             fname = dataAssetFName;
 
-        const std::string fnameLower = ToLowerCopy(fname);
+        const std::string fnameLower = StringUtils::ToLowerCopy(fname);
         // Classify before label resolve so harvestable/category fallbacks fire (#10).
         WorldItemCategory cat = ClassifyItem(
             fnameLower, std::string{}, hasLootInteraction,
@@ -496,17 +558,16 @@ void Engine::ItemList()
                 if (s_slugSeen.size() < 64
                     && s_slugSeen.insert(displayName).second) {
                     // Bounded (≤64 distinct) verification tap → real log.
-                    std::ofstream f(kArcVerifyPath, std::ios::app);
-                    if (f) {
-                        char lbl[96]{};
-                        snprintf(lbl, sizeof(lbl), "%.80s", displayName.c_str());
-                        const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
-                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"post-fix\","
-                          << "\"hypothesisId\":\"N1\",\"location\":\"ItemList.cpp:ItemList\","
-                          << "\"message\":\"item_slug_label\",\"data\":{\"label\":\"" << lbl
-                          << "\"},\"timestamp\":" << ts << "}\n";
-                    }
+                    char lbl[96]{};
+                    snprintf(lbl, sizeof(lbl), "%.80s", displayName.c_str());
+                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    std::ostringstream oss;
+                    oss << "{\"sessionId\":\"c190fb\",\"runId\":\"post-fix\","
+                      << "\"hypothesisId\":\"N1\",\"location\":\"ItemList.cpp:ItemList\","
+                      << "\"message\":\"item_slug_label\",\"data\":{\"label\":\"" << lbl
+                      << "\"},\"timestamp\":" << ts << "}\n";
+                    EntityDiagnostics::LogRaw(oss.str());
                 }
             }
             // Final fallback: try the class FName — it is a different memory read
@@ -532,7 +593,7 @@ void Engine::ItemList()
         if (displayName.empty())
             continue;
 
-        const std::string displayLower = ToLowerCopy(displayName);
+        const std::string displayLower = StringUtils::ToLowerCopy(displayName);
         cat = ClassifyItem(
             fnameLower, displayLower, hasLootInteraction,
             classGroundLoot, classChest, fnameIsPickup, fnameIsContainer);
@@ -576,19 +637,18 @@ void Engine::ItemList()
                 if (s_posGateSeen.insert(displayName).second
                     && s_posGateSeen.size() <= 60) {
                     // Bounded (≤60 distinct) verification tap → real log.
-                    std::ofstream f(kArcVerifyPath, std::ios::app);
-                    if (f) {
-                        char lbl[96]{};
-                        snprintf(lbl, sizeof(lbl), "%.80s", displayName.c_str());
-                        const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
-                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"post-fix\",\"hypothesisId\":\"P5\","
-                          << "\"location\":\"ItemList.cpp:ItemList\",\"message\":\"item_posgate_drop\","
-                          << "\"data\":{\"label\":\"" << lbl
-                          << "\",\"cat\":" << static_cast<int>(cat)
-                          << ",\"droppedTotal\":" << s_posGateDropped << "}"
-                          << ",\"timestamp\":" << ts << "}\n";
-                    }
+                    char lbl[96]{};
+                    snprintf(lbl, sizeof(lbl), "%.80s", displayName.c_str());
+                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    std::ostringstream oss;
+                    oss << "{\"sessionId\":\"c190fb\",\"runId\":\"post-fix\",\"hypothesisId\":\"P5\","
+                      << "\"location\":\"ItemList.cpp:ItemList\",\"message\":\"item_posgate_drop\","
+                      << "\"data\":{\"label\":\"" << lbl
+                      << "\",\"cat\":" << static_cast<int>(cat)
+                      << ",\"droppedTotal\":" << s_posGateDropped << "}"
+                      << ",\"timestamp\":" << ts << "}\n";
+                    EntityDiagnostics::LogRaw(oss.str());
                 }
             }
             // #endregion
@@ -609,6 +669,7 @@ void Engine::ItemList()
         // while its toggle is off. Prefers the hover AMOUNT, then falls back to
         // the drop-estimated Pickup::VISIBLE_AMOUNT.
         if (var::show_stack_counts) {
+            ReadBudget::PurposeScope purposeKit(ReadBudget::Purpose::Kit);
             int32_t amount = Memory::read<int32_t>(
                 key + static_cast<uint64_t>(Offsets::UIHoverData)
                 + static_cast<uint64_t>(Offsets::ItemUIHoverData_Amount));
@@ -620,6 +681,8 @@ void Engine::ItemList()
         }
         ++dbgAdmitted;
     }
+    if (!itemWalkBroke)
+        s_itemScanCursor = 0; // full sweep done — start over next pass
 
     WorldScan::DedupeWorldCacheByRoot(localCache);
 
@@ -711,6 +774,7 @@ void Engine::ItemList()
             const auto refreshedCat = static_cast<WorldItemCategory>(
                 it->second.worldCategory);
             if (IsGroundPickupCategory(refreshedCat)) {
+                ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Kit);
                 it->second.stackAmount = 0;
                 for (const std::ptrdiff_t hoverOff : {
                          Offsets::UIHoverData,
@@ -741,8 +805,8 @@ void Engine::ItemList()
             const bool fnameIsPickup = FnameLooksLikeDroppedPickup(retainFname)
                 || FnameLooksLikeDroppedPickup(retainClass);
             const WorldItemCategory fixed = ClassifyItem(
-                ToLowerCopy(retainFname),
-                ToLowerCopy(it->second.ItemDisplayName),
+                StringUtils::ToLowerCopy(retainFname),
+                StringUtils::ToLowerCopy(it->second.ItemDisplayName),
                 false,
                 ArcActorType::IsGroundLootClassId(
                     ArcActorType::MaskActorTypeId(ArcActorType::ReadActorTypeId(key))),
@@ -874,6 +938,12 @@ void Engine::ItemList()
             shellRows.push_back(row);
         }
 
+        // Bound the batch so a pickup-dense area cannot balloon one pass. Rows
+        // beyond the cap keep their previous shell bits (not updated below).
+        constexpr size_t kMaxShellRowsPerPass = 128;
+        if (shellRows.size() > kMaxShellRowsPerPass)
+            shellRows.resize(kMaxShellRowsPerPass);
+
         int scatterExecs = 0;
         if (!shellRows.empty()) {
             {
@@ -946,17 +1016,16 @@ void Engine::ItemList()
                 int pickedHidden = 0;
                 for (const auto& row : shellRows)
                     pickedHidden += row.hid;
-                std::ofstream f(kArcDebugLogPath, std::ios::app);
-                if (f) {
-                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"batch\",\"hypothesisId\":\"P3\","
-                      << "\"location\":\"ItemList.cpp:ItemList\",\"message\":\"item_shell_batch\","
-                      << "\"data\":{\"n\":" << shellRows.size()
-                      << ",\"scatterExecs\":" << scatterExecs
-                      << ",\"pickedHidden\":" << pickedHidden << "}"
-                      << ",\"timestamp\":" << ts << "}\n";
-                }
+                std::ostringstream f;
+                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"sessionId\":\"c190fb\",\"runId\":\"batch\",\"hypothesisId\":\"P3\","
+                  << "\"location\":\"ItemList.cpp:ItemList\",\"message\":\"item_shell_batch\","
+                  << "\"data\":{\"n\":" << shellRows.size()
+                  << ",\"scatterExecs\":" << scatterExecs
+                  << ",\"pickedHidden\":" << pickedHidden << "}"
+                  << ",\"timestamp\":" << ts << "}\n";
+                EntityDiagnostics::LogRaw(f.str());
             }
         }
         // #endregion

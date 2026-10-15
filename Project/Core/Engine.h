@@ -13,6 +13,8 @@
 #include "VisionCone.hpp"
 #include "PartDamage.hpp"
 #include "RaidClock.hpp"
+#include "ReadBudget.hpp"
+#include "ObjectiveBrief.hpp"
 #include "ActivityFeed.hpp"
 #include "RadarProjection.hpp"
 #include "EspFramePolicy.hpp"
@@ -33,6 +35,11 @@
 #include "../ThirdParty/ImGui/imgui.h"
 #include "../Interface/Utils/Threads/SyncedThread.h"
 #include "../Interface/Utils/Variables/index.h"
+
+// Single player range used by BOTH admission (EntityList) and the frame cull
+// (Esp.cpp). Defined in Esp.cpp. Keeping one definition stops a player from
+// being admitted at one radius and culled at a smaller one every frame.
+float PlayerCollectMaxM();
 #include <memory>
 
 #define M_PI	3.14159265358979323846
@@ -64,6 +71,33 @@ inline bool IsPlausibleWorldPos(const Vector3& p)
 }
 
 namespace EngineProjection {
+
+// Which screen axis CameraCache::FOV describes (T4.5). The projection has always
+// derived its scale from half the overlay HEIGHT -- it has always read the FOV as
+// vertical -- while the aim cone (Visuals::AimbotFovRadiusPx) has always derived
+// its radius from half the WIDTH, i.e. as horizontal. Both readings agree only on
+// a square overlay, so the axis is now a setting rather than an accident:
+// Vertical leaves every screen position exactly as it was, Horizontal makes the
+// projection agree with the cone.
+enum class FovAxis : uint8_t {
+    Vertical = 0,    // today's behaviour: scale from half the height
+    Horizontal = 1   // the FOV spans the width; the vertical half-tangent follows
+};
+
+// Pixels per unit tangent -- the ONE angle-to-screen-distance conversion, so the
+// world projection and anything drawn against it cannot silently disagree.
+// Horizontal: the vertical half-tangent is the horizontal one divided by the
+// aspect ratio, which is what makes (W/2)/tan(fov/2) come back out of it.
+inline double AxisScalePx(double halfFovTan, FovAxis axis, double overlayW, double overlayH)
+{
+    if (!(halfFovTan > 0.0) || !(overlayH > 0.0))
+        return 0.0;
+    const double aspect = (overlayW > 0.0) ? (overlayW / overlayH) : 1.0;
+    const double halfTanVertical =
+        (axis == FovAxis::Horizontal && aspect > 0.0) ? (halfFovTan / aspect) : halfFovTan;
+    return (overlayH * 0.5) / halfTanVertical;
+}
+
 inline void RotationGetAxes(const Vector3& rot, Vector3& axisX, Vector3& axisY, Vector3& axisZ)
 {
     constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
@@ -86,7 +120,10 @@ inline bool ProjectWorldLocationToScreen(
     const Vector3& cameraRotation,
     float cameraFov,
     double overlayW,
-    double overlayH)
+    double overlayH,
+    // Defaulted: every existing caller keeps today's vertical reading, so this
+    // parameter cannot change a screen position unless a caller asks it to.
+    FovAxis axis = FovAxis::Vertical)
 {
     if (worldLocation.x == 0.0 &&
         worldLocation.y == 0.0 &&
@@ -120,7 +157,9 @@ inline bool ProjectWorldLocationToScreen(
     if (tanHalfFov < 0.001)
         return false;
 
-    const double scale = centerY / tanHalfFov;
+    const double scale = AxisScalePx(tanHalfFov, axis, overlayW, overlayH);
+    if (!(scale > 0.0) || !std::isfinite(scale))
+        return false;
     screen.x = centerX + (transformedX * scale) / transformedZ;
     screen.y = centerY - (transformedY * scale) / transformedZ;
 
@@ -222,7 +261,11 @@ public:
         int32_t gamePhase = -1;
         int32_t enemyCount = -1;
         int32_t pickupCount = -1;
+        int64_t mapConditionId = 0;
+        bool mapConditionKnown = false;
+        int32_t serverHealthStatus = -1; // cached client enum, not host CPU/server telemetry
         uint64_t stampMs = 0;
+        uint64_t worldGeneration = 0;
         bool valid = false;
     };
     /** 1 Hz worker-side refresh of the raid clock/counts + minimap bounds.
@@ -236,13 +279,26 @@ public:
     void RenderRaidHud();
     void RenderActivityFeed();
 
+    // ---- Part 6: mission objectives (cached, worker-side read) ---------------
+    /** Reads PioneerGameState::MainObjectiveComponent -> MainObjectives[0] and
+     *  caches a validated ObjectiveBrief. FText titles are not read: without a
+     *  resolved text table they cannot be decoded, so the panel shows no title
+     *  instead of raw bytes. Called from RefreshRaidDashboard (same 500ms tick). */
+    void RefreshObjectives(uintptr_t gameState, uint64_t generation, uint64_t nowMs);
+    ObjectiveBrief::Brief GetObjectives() const;
+    mutable std::shared_mutex m_objectiveMutex;
+    ObjectiveBrief::Brief m_objectives{};
+
     mutable std::shared_mutex m_raidHudMutex;
     RaidHudState m_raidHud{};
     mutable std::shared_mutex m_feedMutex;
     ActivityFeed::Feed m_activityFeed;
+    uint64_t m_feedGeneration = 0;
     mutable std::shared_mutex m_radarBoundsMutex;
     RadarProjection::Bounds m_radarBounds{};
     bool m_radarBoundsValid = false;
+    uint64_t m_radarBoundsGeneration = 0;
+    uint64_t m_radarBoundsStampMs = 0;
     uintptr_t m_miniMapActor = 0;
     void RefreshRadarBounds();
 
@@ -284,18 +340,24 @@ private:
     std::atomic<bool> m_espRaidActive{ false };
     /** Scanners may run; ESP/aim only draw after caches prove healthy. */
     std::atomic<bool> m_espDrawReady{ false };
+    /** Set by RequestForceRescan() (R hotkey); consumed in TickRaidGate. */
+    std::atomic<bool> m_forceRescanRequested{ false };
+    /** Cooldown — ClearEspCaches() wipes live data and flickers the overlay. */
+    std::chrono::steady_clock::time_point m_lastForceRescan{};
     bool m_raidEnterPending{ false };
     bool m_partyEnterPending{ false };
     std::chrono::steady_clock::time_point m_raidDebSince{};
     std::chrono::steady_clock::time_point m_partyDebSince{};
     std::chrono::steady_clock::time_point m_raidArmedSince{};
+    
 
     /** Party settle then raid settle before arming scanners.
      *  Was 5s+5s — log proof (raid-gate TheDam_02_P): raw/ok_enter already true
      *  at party_wait, so ESP sat idle ~10s after the map was ready. */
     static constexpr std::chrono::milliseconds kPartyEnterDelayMs{ 500 };
-    /** User spec: map found -> wait 10s before ESP scanning starts. */
-    static constexpr std::chrono::milliseconds kRaidEnterDelayMs{ 10000 };
+    /** Was a 10s user spec (map found -> wait before ESP scanning). Cut to 3s
+     *  on user request to speed up the time to first green diagnostics. */
+    static constexpr std::chrono::milliseconds kRaidEnterDelayMs{ 3000 };
     /** Live-verified (debug-c190fb.log TheDam burst): VMM read stalls of ~8.5s
      *  where GWorld resolvers return 0 for every attempt. With a 5s grace the
      *  gate dropped, ClearEspCaches() wiped everything, and re-arm+rescan made
@@ -303,7 +365,7 @@ private:
      *  out the observed stalls on last-known data instead of wiping. */
     static constexpr std::chrono::milliseconds kRaidRawFalseGraceMs{ 12000 };
     /** Soft draw-ready if not all three caches fill (solo / empty pocket). */
-    static constexpr std::chrono::milliseconds kEspCacheReadySoftMs{ 12000 };
+    static constexpr std::chrono::milliseconds kEspCacheReadySoftMs{ 4000 };
     static constexpr int kPartyMinPlayers{ 3 };
 
     std::chrono::steady_clock::time_point m_raidFalseSince{};
@@ -320,6 +382,11 @@ private:
     void ResetRaidTransitionState();
 
 public:
+    /** Hotkey R: flush the VMM read cache and drop the ESP caches so the
+     *  scanners repopulate from a fresh read. TickRaidGate owns the actual
+     *  work (and the cooldown) so this stays a lock-free flag set. */
+    void RequestForceRescan() { m_forceRescanRequested.store(true, std::memory_order_release); }
+
     struct CameraCache
     {
         Vector3 Location;
@@ -334,16 +401,15 @@ public:
         double z = 0.0;
     };
 
-    // POV layout: Location at +0x00, Rotation at +0x28, FOV at +0x48
-    // (internal FMinimalViewInfo offsets; PCM base offsets in Offsets.h).
+    // 2026-10-09 live FMinimalViewInfo layout relative to PCM+0xE20.
     struct FMinimalViewInfo
     {
-        FVector3d Location;         // 0x00
-        char pad_to_rotation[0x10]; // 0x18–0x27
-        FVector3d Rotation;         // 0x28
-        char pad_to_fov[0x08];      // 0x40–0x47
-        float FOV;                  // 0x48
-        // DesiredFOV / AspectRatio / PostProcessSettings omitted (not read)
+        char pad_to_location[0x08]; // 0x00–0x07
+        FVector3d Location;         // 0x08
+        char pad_to_rotation[0x10]; // 0x20–0x2F
+        FVector3d Rotation;         // 0x30
+        char pad_to_fov[0x08];      // 0x48–0x4F
+        float FOV;                  // 0x50
     };
 
     struct CameraProbeSnapshot;
@@ -384,8 +450,12 @@ public:
 
     void RenderEsp();
     void RenderFovCircle();
+    // T4.4: draws the named practice/calibration reference objects and returns
+    // immediately when the mode is off, so normal ESP output is untouched.
+    void RenderPracticeReference();
     void RenderOverlayCrosshair();
     void RenderRadar(bool interactive = false);
+    void RenderSearch();
 
     struct EspFramePlayer;
     struct EspFrameWorld;
@@ -537,6 +607,8 @@ public:
 
     bool IsValidPointer(uintptr_t ptr) const;
     bool IsUsermodePtr(uintptr_t ptr);
+    
+    
     std::string getEntityType(const std::string& actorName);
     bool getAllowType(const std::string& actorName, int category = 0) const;
     bool getAllowWorldEntry(const WorldCacheEntry& entry) const;
@@ -583,7 +655,15 @@ public:
         int fstrKey = -1;          // verified scramble index, -1 = none
         std::string fstrText;
     };
-    EngineStateSnapshot GetStateSnapshot() const;
+    /**
+     * allowStale=false: blocks on m_stateMutex (the default, used by workers).
+     * allowStale=true: never waits on a writer. If the state lock is busy it
+     * returns the last snapshot taken, at most one publish behind. Paint uses this.
+     */
+    EngineStateSnapshot GetStateSnapshot(bool allowStale = false) const;
+    mutable std::mutex m_snapCacheMutex;
+    mutable EngineStateSnapshot m_snapCache{};
+    mutable bool m_snapCacheValid = false;
 
     /** The chain the last Update tick resolved (read under m_stateMutex). */
     PlayerChain::State m_chain;   // worldRaw / worldFailStep live on the World hop
@@ -598,11 +678,13 @@ public:
     // SDK reflection walker + FString verification (written by Update, published
     // through EngineStateSnapshot).
     uintptr_t m_reflectPawn = 0;   // pawn whose class was last walked
+    uint64_t m_reflectTryMs = 0;   // last walk attempt (throttles retries)
     bool m_reflectOk = false;
     int m_reflectDepth = 0;
     int m_reflectProps = 0;
     std::string m_reflectSample;
-    bool m_fstrChecked = false;    // one-shot per session (build constant)
+    bool m_fstrChecked = false;    // settled (ok or not-applicable)
+    int m_fstrAttempts = 0;        // retries before the n/a verdict
     bool m_fstrOk = false;
     int m_fstrKey = -1;
     std::string m_fstrText;
@@ -653,6 +735,7 @@ public: // PlayerCache
         bool isAlly = false;
         uint8_t enemyTeamId = 0;
         uint8_t squadIdx = 0;
+        uint8_t squadSlotIdx = 0; // EmbarkPlayerState.SquadSlotIndex (B5) - slot within the squad
         float facingYaw = 0.f;
 
         float health = 0.0f;
@@ -705,9 +788,15 @@ public: // PlayerCache
         float reviveRemainS = -1.f;
         float reviveTotalS = -1.f;
         // Look direction (feature #5): where they AIM (ControlRotation yaw),
-        // falling back to body facing when no controller resolves.
+        // falling back to body facing when no controller resolves. aimPitchDeg
+        // is populated from the controller when available, else from Pawn's
+        // replicated RemoteViewPitch (B3). The current 2D arrow is yaw-only;
+        // pitch is a validated aim signal for rendering/tuning once a pitch
+        // surface exists.
         float aimYawDeg = 0.f;
         bool hasAimYaw = false;
+        float aimPitchDeg = 0.f;
+        bool hasAimPitch = false;
         // Identity (feature #6): permanent SteamID64 + real UEmbarkSquad*.
         uint64_t steamId64 = 0;
         uintptr_t squadPtr = 0;
@@ -956,6 +1045,18 @@ public:
         // positionSampleMs, this is never advanced by the slow scanner fallback.
         // It is the proof that a scanner-disabled entry still has a live actor.
         uint64_t livePositionSampleMs = 0;
+        // Retain worker's ~2Hz bIsDestroyed probe, published here so latency-
+        // critical consumers (aim tick, paint) never DMA per candidate per tick.
+        bool broken = false;
+        // Stamps for the fields above, so a consumer can ask how old the value
+        // it is about to use actually is (FeaturePolicy::FieldAgeMs) instead of
+        // assuming it came from the newest frame. 0 = never sampled.
+        uint64_t brokenSampleMs = 0;
+        uint64_t healthSampleMs = 0;
+        uint64_t partHpSampleMs = 0;
+        Vector3 boundsCorners[8]{};
+        uint64_t boundsSampleMs = 0;
+        bool boundsValid = false;
         // Last RobotList pass that saw this actor in the current actor array.
         // Prevents an old cache entry from being promoted by a stale plausible
         // root after the actor has left the current world list.
@@ -965,6 +1066,11 @@ public:
         // is what removes the per-sample step in box motion.
         Vector3 prevSampleWorldPos{};
         uint64_t prevSampleMs = 0;
+        // Consecutive samples refused by Core/BotPosSanity.hpp because they
+        // disagreed with this entry's own history. Reset by the first sample the
+        // policy accepts; at its cap the policy re-anchors rather than freezing
+        // the entry, so a genuine jump cannot outlive the sample-age kill.
+        uint8_t posJumpRejects = 0;
 
         // Discovery funnel (bot_admit / bot_appear telemetry): steady-ms when
         // the pending lane first saw this actor and when it was admitted to
@@ -1085,6 +1191,15 @@ public:
         // velocity lead from here so skeletons/boxes do not swim behind
         // during the collect→present gap.
         uint64_t collectStampMs = 0;
+        // Steady ms when the player and robot copies below were taken (the frame
+        // completes later, so collectStampMs - playersCopyStampMs is the rest of
+        // the collect). A consumer holding a copy needs these to ask how old a
+        // sample was WHEN IT WAS CAPTURED, instead of charging the copy the whole
+        // collect→read latency: the sampler stamps the cache, the collect copies
+        // it, the frame is published, and only then does the reader run.
+        // See FeaturePolicy::SnapshotSampleAgeMs.
+        uint64_t playersCopyStampMs = 0;
+        uint64_t robotsCopyStampMs = 0;
         bool valid = false;
     };
 
@@ -1121,9 +1236,12 @@ public:
             nowMs, std::memory_order_release);
         m_espFrameDiagnostics.consecutiveFailures.fetch_add(
             1, std::memory_order_relaxed);
-    }
-
-    void RecordEspFramePublished(const EspRenderFrame& frame) {
+    }    void RecordEspFramePublished(const EspRenderFrame& frame)
+    {
+        // A published frame is the one pass boundary every consumer shares, so
+        // the read ledger closes its measurement window here: the panel then
+        // reports DMA reads PER PASS instead of a lifetime total.
+        ReadBudget::MarkPassBoundary();
         m_espFrameDiagnostics.lastResult.store(
             static_cast<int>(EspFrameResult::Published), std::memory_order_release);
         m_espFrameDiagnostics.lastPublishMs.store(
@@ -1189,6 +1307,7 @@ public:
     /** ComponentToWorld translation is FVector3d @ +0x20 on this build (not float Vector3). */
     static Vector3 ReadSceneWorldPos(uintptr_t sceneComponent)
     {
+        ReadBudget::DefaultPurposeScope purpose(ReadBudget::Purpose::Position);
         if (!sceneComponent || !Memory::IsValidPtrFast2(sceneComponent))
             return {};
         const FVector3d world = Memory::read<FVector3d>(
@@ -1211,13 +1330,13 @@ public:
      */
     static Vector3 ReadWorldLocationNocache(uintptr_t sceneComponent, bool allowRelativeFallback)
     {
+        ReadBudget::DefaultPurposeScope purpose(ReadBudget::Purpose::Position);
         if (!sceneComponent || !Memory::IsValidPtrFast2(sceneComponent))
             return {};
-        // Offsets::WorldLocation is pinned to the ComponentToWorld (0x2D0) slot.
-        // Bot roots do not use that slot on this build: the pos_refresh probe
-        // reported bFail == bots, 39/39, for every pass while every other reader
-        // went through the probe. Try the alternate slot before giving up, the
-        // way ProbeComponentToWorldOffset does for the local pawn.
+        // Offsets::WorldLocation is ComponentToWorld + 0x20 (0x340 on CL-1426848,
+        // measured against the camera eye). The alternate candidate targets 0x2F0,
+        // which reads as zeros on this build, so it is an inert second chance
+        // rather than a second working slot.
         const FVector3d world =
             Memory::read_nocache<FVector3d>(sceneComponent + Offsets::WorldLocation);
         const Vector3 w = ToVector3(world);
@@ -1237,9 +1356,11 @@ public:
     }
 
     /**
-     * ComponentToWorld is not a UPROPERTY on this build, so no dump carries the slot.     * The working runtime profile uses 0x2D0; 0x310 stays as the alternate
-     * candidate. Both use the dump's CoreUObject.Transform layout: Rotation
-     * +0x00 (Quat), Translation +0x20, Scale3D +0x40, size 0x60. The same
+     * ComponentToWorld is not a UPROPERTY on this build, so no dump carries the slot.
+     * The live slot is 0x320 (measured: translation lands 1.6 m from the camera eye
+     * on the local pawn root, see Offsets.h); 0x2D0 stays as the alternate, which
+     * reads zeros on CL-1426848. Both use the dump's CoreUObject.Transform layout:
+     * Rotation +0x00 (Quat), Translation +0x20, Scale3D +0x40, size 0x60. The same
      * world-position gate decides which candidate is usable at runtime.
      */
     static std::ptrdiff_t ProbeComponentToWorldOffset(uintptr_t sceneComponent)
@@ -1247,19 +1368,45 @@ public:
         if (!sceneComponent || !Memory::IsValidPtrFast2(sceneComponent))
             return Offsets::ComponentToWorld;
 
+        // A component's slot is fixed for its lifetime and every probe is a full
+        // uncached round trip (~0.5 ms measured), so the answer for the component
+        // just probed is remembered. The pair that matters is
+        // ResolveBoneArray's probe followed by the ReadComponentToWorld of the
+        // same mesh, which happens for every player and bot every frame; with a
+        // single entry that pair is a hit even when other actors sit between
+        // frames. Only a successful primary-slot probe is remembered: a
+        // component caught mid-initialization (zeros at 0x320) must be re-probed
+        // rather than pinned to the fallback for the rest of its life.
+        static std::atomic<uintptr_t> s_lastProbed{ 0 };
+        static std::atomic<std::ptrdiff_t> s_lastOffset{ Offsets::ComponentToWorld };
+        if (s_lastProbed.load(std::memory_order_relaxed) == sceneComponent)
+            return s_lastOffset.load(std::memory_order_relaxed);
+
         auto plausible = [&](std::ptrdiff_t off) -> bool {
             const FVector3d t = Memory::read_nocache<FVector3d>(
                 sceneComponent + off + Offsets::Transform_Translation);
             return IsPlausibleWorldPos(ToVector3(t));
         };
-        if (plausible(Offsets::ComponentToWorld))
+        if (plausible(Offsets::ComponentToWorld)) {
+            s_lastOffset.store(Offsets::ComponentToWorld, std::memory_order_relaxed);
+            s_lastProbed.store(sceneComponent, std::memory_order_relaxed);
             return Offsets::ComponentToWorld;
+        }
         if (plausible(Offsets::ComponentToWorld_Alt))
             return Offsets::ComponentToWorld_Alt;
         return Offsets::ComponentToWorld;
     }
 
-    /** FTransform.Translation is float; live world translation is FVector3d @ C2W+0x20. */
+    /**
+     * One uncached read covers the whole transform. FTransform is the 0x60-byte
+     * CoreUObject.Transform layout (FQuat @ +0x00, LWC translation @ +0x20,
+     * Scale3D @ +0x40) and its Translation member is the same Vector3 of doubles
+     * sitting at +0x20, so the block read already carries the live translation.
+     * Reading it a second time and copying it over the block — which this used to
+     * do — cost another ~0.5 ms uncached round trip per call for identical bytes:
+     * the ComponentToWorld stage measured 1.5 ms per actor, with six actors per
+     * ESP frame.
+     */
     static FTransform ReadComponentToWorld(uintptr_t sceneComponent)
     {
         FTransform ctw{};
@@ -1267,11 +1414,6 @@ public:
             return ctw;
         const std::ptrdiff_t ctwOff = ProbeComponentToWorldOffset(sceneComponent);
         ctw = Memory::read_nocache<FTransform>(sceneComponent + ctwOff);
-        const FVector3d t = Memory::read_nocache<FVector3d>(
-            sceneComponent + ctwOff + Offsets::Transform_Translation);
-        ctw.Translation.x = static_cast<float>(t.x);
-        ctw.Translation.y = static_cast<float>(t.y);
-        ctw.Translation.z = static_cast<float>(t.z);
         return ctw;
     }
 
@@ -1333,7 +1475,8 @@ public:
 
     static bool IsUsableObjectPtr(uintptr_t p)
     {
-        return p != 0 && p != UINTPTR_MAX && Memory::IsValidPtrFast2(p);
+        return p != 0 && p != UINTPTR_MAX && (p & 0x7u) == 0
+            && p >= 0x10000ULL && p < 0x800000000000ULL;
     }
 
     /** Reject pointers that look like packed ASCII UTF-16 (common GWorld/GI garbage). */
@@ -1360,6 +1503,7 @@ public:
  	/** RootComponent is often TObjectPtr — 0xFF..FF is invalid; try alt offsets + mesh. */
     static uintptr_t ResolveActorRoot(uintptr_t actor)
     {
+        ReadBudget::DefaultPurposeScope purpose(ReadBudget::Purpose::Link);
         if (!IsUsableObjectPtr(actor))
             return 0;
 
@@ -1422,10 +1566,14 @@ public:
     }
 
     /**
-     * Read the possessed pawn pointer off a controller, trying every known slot:
-     * 0x3F0 (SDK-verified AController.Pawn), 0x3D8 (StateName per SDK — heuristic),
-     * 0x408 (PC::Character — heuristic). A wrong primary slot can no longer zero
-     * PC resolution — callers still apply their own world-position/root gates.
+     * Read the possessed pawn pointer off a controller. The dump (sdk/sdk.txt,
+     * CL-1426848, build 25879518) puts AController::Pawn at 0x418 and
+     * AController::Character at 0x400; both are tried first, in that order.
+     * The older heuristics stay last because this build moved them: 0x3D8 is
+     * AController::OnPossessedPawnChanged (a multicast delegate, not a pawn) and
+     * 0x408 sits between Character and TransformComponent. A wrong slot can no
+     * longer zero PC resolution — callers still apply their own root/world-position
+     * gates, and every candidate here keeps its ResolveActorRoot gate.
      */
     static uintptr_t ReadAcknowledgedPawn(uintptr_t controller)
     {
@@ -1433,13 +1581,15 @@ public:
             return 0;
 
         static const std::ptrdiff_t kPawnOffs[] = {
-            Offsets::AcknowledgedPawn,
-            Offsets::AcknowledgedPawn_Fallback,
-            Offsets::Controller_Character,
+            Offsets::AcknowledgedPawn,          // AController::Pawn (0x418)
+            Offsets::Controller_Character,      // AController::Character (0x400)
+            Offsets::AcknowledgedPawn_Fallback, // retired heuristic, gated, last
         };
         for (std::ptrdiff_t off : kPawnOffs) {
+            if (off <= 0)
+                continue; // Disabled slots must not read the UObject vtable.
             const uintptr_t pawn = Memory::read_nocache<uintptr_t>(controller + off);
-            if (IsUsableObjectPtr(pawn))
+            if (IsUsableObjectPtr(pawn) && ResolveActorRoot(pawn))
                 return pawn;
         }
         return 0;
@@ -1542,6 +1692,7 @@ public:
      *  bug as frozen remote positions before nocache). */
     static double ReadHealthComponentStat(uintptr_t actor, std::ptrdiff_t compOff)
     {
+        ReadBudget::DefaultPurposeScope purpose(ReadBudget::Purpose::Health);
         if (!actor)
             return std::numeric_limits<double>::quiet_NaN();
         const uintptr_t health_comp =
@@ -1554,45 +1705,43 @@ public:
         return value;
     }
 
-    static double ReadPlayerStatWithHealthFallback(
-        uintptr_t actor,
-        std::ptrdiff_t psOff,
-        std::ptrdiff_t compOff)
+    static double ReadHealthComponentSane(uintptr_t actor, std::ptrdiff_t compOff)
     {
-        (void)psOff;
-        if (!actor)
-            return std::numeric_limits<double>::quiet_NaN();
-        const double hcValue = ReadHealthComponentStat(actor, compOff);
-        if (std::isfinite(hcValue) && hcValue >= 0.0 && hcValue < 100000.0)
-            return hcValue;
-        return std::numeric_limits<double>::quiet_NaN();
+        const double v = ReadHealthComponentStat(actor, compOff);
+        return (std::isfinite(v) && v >= 0.0 && v < 100000.0)
+            ? v
+            : std::numeric_limits<double>::quiet_NaN();
+    }
+
+    /** Probe-pick (dump-first): try the reflected slot, fall back to the legacy
+     *  live pin on garbage/failed reads. */
+    double ReadHealthSlot(uintptr_t actor, std::ptrdiff_t dumpOff, std::ptrdiff_t legacyOff)
+    {
+        const double dump = ReadHealthComponentSane(actor, dumpOff);
+        if (std::isfinite(dump))
+            return dump;
+        return ReadHealthComponentSane(actor, legacyOff);
     }
 
     double get_health(uintptr_t actor)
     {
-        return ReadPlayerStatWithHealthFallback(
-            actor, Offsets::PlayerState_Health, Offsets::Health);
+        return ReadHealthComponentSane(actor, Offsets::Health);
     }
 
     double get_maxhealth(uintptr_t actor)
     {
-        return ReadPlayerStatWithHealthFallback(
-            actor, Offsets::PlayerState_MaxHealth, Offsets::MaxHealth);
+        return ReadHealthSlot(actor, Offsets::HC_MaxHealth, Offsets::MaxHealth);
     }
 
     double get_armor(uintptr_t actor)
     {
-        if (!actor)
-            return 0.0;
-        const double v = ReadHealthComponentStat(actor, Offsets::Shield);
+        const double v = ReadHealthSlot(actor, Offsets::HC_ArmorSlot, Offsets::Shield);
         return std::isfinite(v) ? v : 0.0;
     }
 
     double get_maxarmor(uintptr_t actor)
     {
-        if (!actor)
-            return 0.0;
-        const double v = ReadHealthComponentStat(actor, Offsets::ShieldMax);
+        const double v = ReadHealthSlot(actor, Offsets::HC_ArmorSlotMax, Offsets::ShieldMax);
         return std::isfinite(v) ? v : 0.0;
     }
 public:
@@ -1614,11 +1763,32 @@ public:
         float score = -FLT_MAX;
         float distanceM = 0.f;
         float health = 100.f;
+        float healthMax = 100.f;
+        // ── Lead provenance ────────────────────────────────────────────────
+        // The monitor used to print Position/Velocity/Predicted/Prediction
+        // Error as 0.000/[0,0,0] because nothing ever published them: the aim
+        // tick had no way to say what the solver started from or extrapolated
+        // with. Carrying the inputs on the target keeps the measurement honest
+        // (a real lead, not a recomputed guess at display time).
+        Vector3 worldPosNoLead{};   // the sample the solver extrapolated FROM
+        Vector3 velocityUsed{};     // the velocity it extrapolated WITH
+        bool leadApplied = false;
         bool isRobot = false;
         int32_t partID = -1;
         int32_t resistGroup = 0;
         uint8_t aimPosSrc = 0;
+        // Age of the geometry the aim point was derived from (a bone sample for a
+        // player, the resolved bot entry for a robot), in milliseconds.
         float aimWorldAgeMs = 0.f;
+        // T4.2/T4.3 -- provenance travels WITH the point, so no consumer has to
+        // guess. `aimDataValidated` is what the strict gate tests: the point is
+        // this tick's own sample, not blended between samples. `aimConfidence`
+        // (FeaturePolicy::AimPointConfidence) is what gets DISPLAYED: a plotted
+        // bone position is confirmed, an inferred bot point or a blended one is
+        // estimated. A bot point is validated but estimated -- two different
+        // questions, so two fields.
+        bool aimDataValidated = false;
+        uint8_t aimConfidence = 0;
     };
 
     Vector3 PredictPosition(
@@ -1639,6 +1809,7 @@ public:
         int32_t& outResistGroup);
 
     void AimAssistRobot(
+        float bulletSpeed,
         const Vector3& screenCenter,
         float fovRadius,
         float currentTime,

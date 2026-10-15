@@ -1,3 +1,4 @@
+#define NOMINMAX
 #include "ThirdParty/ImGui/imgui.h"
 #include "ThirdParty/ImGui/imgui_impl_win32.h"
 #include "ThirdParty/ImGui/imgui_impl_dx11.h"
@@ -7,10 +8,14 @@
 #include <dwmapi.h>
 #include <iostream>
 #include <chrono>
+#include <sstream>
+#include <string>
 
 #include "Core/Memory.h"
 #include "Core/SessionLog.h"
 #include "Core/EntityDiagnostics.hpp"
+#include "Core/FeaturePolicy.hpp"
+#include "Core/RunReport.hpp"
 #include "DMA/Memory.h"
 #include "DMA/DmaKeyboard.h"
 #include "Hardware/KmBox.h"
@@ -19,11 +24,18 @@
 #include "Interface/Overlay/Menu.h"
 #include "Interface/OverlayHost.h"
 #include "Interface/Utils/AutoConfig.h"
+#include "Interface/Utils/UpgradeOptions.hpp"
+#include "Functions/CollisionRead.h"
+#include "Functions/CollisionDebug.h"
+#include "Functions/WorldScanCommon.h"
 #include "Interface/Render.h"
 #include "Core/AgentLog.h"
 #include "Core/AssetNames.h"
 #include "Core/CrashHandler.h"
 #include "resource.h"
+
+#define DOCTEST_CONFIG_IMPLEMENT
+#include "ThirdParty/doctest/doctest.h"
 
 static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
@@ -33,7 +45,7 @@ static UINT                     g_ResizeWidth = 0, g_ResizeHeight = 0;
 static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
-void CreateRenderTarget();
+bool CreateRenderTarget();
 void CleanupRenderTarget();
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 void Render(HWND hwnd);
@@ -42,12 +54,25 @@ static DWORD g_pid = 0;
 
 int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 {
+    // Explicit pure diagnostics exit before attach, settings/log writes, graphics
+    // and device initialization. Read the process command line directly so this
+    // remains reliable for the Windows-subsystem entry point and shell launchers.
+    const wchar_t* commandLine = GetCommandLineW();
+    if (commandLine && std::wstring(commandLine).find(L"--audit-diagnostics") != std::wstring::npos) {
+        doctest::Context context;
+        context.setOption("out", "audit-diagnostics.txt");
+        context.setOption("no-breaks", true);
+        return context.run();
+    }
     ImGui_ImplWin32_EnableDpiAwareness();
     float main_scale = ImGui_ImplWin32_GetDpiScaleForMonitor(::MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY));
 
     InstallCrashHandler();  // VEH — log crash context before dying
     SessionLog::Init();
     EntityDiagnostics::Init();
+    RunReport::Init();
+    std::cout << "[diag] run report: "
+              << RunReport::GetPath().string() << std::endl;
     std::cout << "[diag] entity log: "
               << EntityDiagnostics::GetPath().string() << std::endl;
     timeBeginPeriod(1);
@@ -55,7 +80,17 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     // No AllocConsole — Release is Windows subsystem; keep overlay-only (no black console).
 
     while (!Memory::InitializeGame()) {
-        Sleep(2000);
+        // Local END cancels attach without waiting for a target process forever.
+        for (int wait = 0; wait < 20; ++wait) {
+            if (GetAsyncKeyState(VK_END) & 0x8000) {
+                RunReport::Shutdown();
+        EntityDiagnostics::Shutdown();
+                SessionLog::Shutdown();
+                timeEndPeriod(1);
+                return 0;
+            }
+            Sleep(100);
+        }
     }
     g_pid = static_cast<DWORD>(Memory::getProcessID());
 
@@ -74,8 +109,6 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     g_controller.InitController();
     std::cout << "[+] Controller: " << (g_controller.IsReady() ? "ready" : "not found — plug pad on target PC") << std::endl;
 
-    engine.StartWorkerThreads();
-
     std::cout << "=========================" << std::endl;
     std::cout << "[*] Starting overlay..." << std::endl;
 
@@ -88,7 +121,13 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     wc.hIconSm = LoadIconW(hInst, MAKEINTRESOURCE(IDI_ICON1));
     wc.lpszClassName = L"UnrealWindow";
 
-    RegisterClassExW(&wc);
+    if (!RegisterClassExW(&wc)) {
+        RunReport::Shutdown();
+        EntityDiagnostics::Shutdown();
+                SessionLog::Shutdown();
+        timeEndPeriod(1);
+        return 1;
+    }
 
     // Full screen including taskbar
     int x = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -116,6 +155,15 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         nullptr
     );
 
+    if (!hwnd) {
+        ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        RunReport::Shutdown();
+        EntityDiagnostics::Shutdown();
+                SessionLog::Shutdown();
+        timeEndPeriod(1);
+        return 1;
+    }
+
     // Push the icon onto the window explicitly: the taskbar/Alt-Tab does not
     // always pick up the window-class icon for WS_POPUP | WS_EX_NOACTIVATE
     // overlay windows, and falls back to a blank white glyph.
@@ -129,8 +177,15 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     if (!CreateDeviceD3D(hwnd))
     {
         CleanupDeviceD3D();
+        engine.StopWorkerThreads();
+        RunReport::Shutdown();
+        EntityDiagnostics::Shutdown();
+                SessionLog::Shutdown();
+        if (hwnd)
+            ::DestroyWindow(hwnd);
         ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
-        return 0;
+        timeEndPeriod(1);
+        return 1;
     }
 
     ::ShowWindow(hwnd, SW_SHOWDEFAULT);
@@ -173,11 +228,43 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     colors[ImGuiCol_Text] = ImVec4(0.95f, 0.95f, 0.98f, 1.00f);
 
 
-    ImGui_ImplWin32_Init(hwnd);
-    ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+    const bool win32Ready = ImGui_ImplWin32_Init(hwnd);
+    const bool dx11Ready = win32Ready
+        && ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+    if (!dx11Ready) {
+        if (win32Ready)
+            ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        CleanupDeviceD3D();
+        ::DestroyWindow(hwnd);
+        ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        RunReport::Shutdown();
+        EntityDiagnostics::Shutdown();
+                SessionLog::Shutdown();
+        timeEndPeriod(1);
+        return 1;
+    }
     InitArcMenuAssets(g_pd3dDevice);
     OverlayDisplay_Bind(hwnd, &g_ResizeWidth, &g_ResizeHeight);
     OverlayDisplay_ApplySelectedMonitor();
+
+    try {
+        engine.StartWorkerThreads(); // graphics/UI dependencies are now ready
+    } catch (...) {
+        // A later thread constructor can fail after earlier workers started.
+        engine.StopWorkerThreads();
+        ImGui_ImplDX11_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        CleanupDeviceD3D();
+        ::DestroyWindow(hwnd);
+        ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        RunReport::Shutdown();
+        EntityDiagnostics::Shutdown();
+                SessionLog::Shutdown();
+        timeEndPeriod(1);
+        return 1;
+    }
 
     bool done = false;
     while (!done)
@@ -193,20 +280,30 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         if (done)
             break;
 
-        if (g_SwapChainOccluded && g_pSwapChain->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED)
-        {
-            AutoConfig_Tick();
-            ::Sleep(10);
-            continue;
+        if (g_SwapChainOccluded) {
+            const HRESULT testResult = g_pSwapChain->Present(0, DXGI_PRESENT_TEST);
+            if (FAILED(testResult)) {
+                std::cerr << "[graphics] Present test failed; shutting down overlay.\n";
+                break;
+            }
+            if (testResult == DXGI_STATUS_OCCLUDED) {
+                AutoConfig_Tick();
+                ::Sleep(10);
+                continue;
+            }
         }
         g_SwapChainOccluded = false;
 
         if (g_ResizeWidth != 0 && g_ResizeHeight != 0)
         {
             CleanupRenderTarget();
-            g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
+            const HRESULT resizeResult = g_pSwapChain->ResizeBuffers(
+                0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
             g_ResizeWidth = g_ResizeHeight = 0;
-            CreateRenderTarget();
+            if (FAILED(resizeResult) || !CreateRenderTarget()) {
+                std::cerr << "[graphics] Resize/render target failed; shutting down overlay.\n";
+                break;
+            }
         }
 
         // Paint-stall diagnostic: time the whole frame iteration (NewFrame →
@@ -223,6 +320,62 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
         Render(hwnd);
         AutoConfig_Tick();
+        // Armed diagnostics run themselves once the world cache has actors; see
+        // CollisionRead.h. No-op unless UpgradeOptions::collisionProbe is on.
+        CollisionRead::TickAutoArm();
+        // One-shot visibility self-tests that need no target (the collision-debug
+        // ray verdict split, which otherwise only runs when a camera resolves).
+        CollisionDebug::EnsureSelfTestsRan();
+        // Same idea for the admission lane's first-probe ordering: it is the one
+        // check in this build that the tests project cannot run for you.
+        WorldScan::EnsureFirstProbeSelfTestRan();
+        // And the same for the aim profile. "Players and ARC share one collected
+        // target set" is the invariant this build just changed; the tests project
+        // pins it but cannot run here, so the shipping exe checks it once and
+        // records the verdict with the other self-tests.
+        {
+            static bool s_aimProfileChecked = false;
+            if (!s_aimProfileChecked)
+            {
+                s_aimProfileChecked = true;
+                const FeaturePolicy::AimProfileSelfTest aim = FeaturePolicy::RunAimProfileSelfTest();
+                std::ostringstream f;
+                f << "{\"location\":\"FeaturePolicy.hpp\",\"message\":\"aim_profile_selftest\","
+                  << "\"timestamp\":" << EntityDiagnostics::NowMs()
+                  << ",\"passed\":" << (aim.passed ? "true" : "false")
+                  << ",\"cases\":" << aim.cases << ",\"failed\":" << aim.failed
+                  << ",\"detail\":\"" << EntityDiagnostics::Sanitize(aim.detail, 200) << "\"}\n";
+                EntityDiagnostics::LogRaw(f.str());
+            }
+        }
+        // Same treatment for the two invariants this build changed and that the
+        // tests project cannot run: the read ledger's per-field split (what
+        // scan_turn reports) and the legacy auto_config.ini round trip.
+        {
+            static bool s_ledgerChecked = false;
+            if (!s_ledgerChecked)
+            {
+                s_ledgerChecked = true;
+                const ReadBudget::BreakdownSelfTest rb = ReadBudget::RunBreakdownSelfTest();
+                const UpgradeOptions::LegacyKeySelfTest legacy =
+                    UpgradeOptions::RunLegacyKeySelfTest();
+                std::ostringstream f;
+                f << "{\"location\":\"ReadBudget.hpp\",\"message\":\"ledger_purpose_selftest\","
+                  << "\"timestamp\":" << EntityDiagnostics::NowMs()
+                  << ",\"passed\":" << (rb.passed ? "true" : "false")
+                  << ",\"cases\":" << rb.cases << ",\"failed\":" << rb.failed
+                  << ",\"detail\":\"" << EntityDiagnostics::Sanitize(rb.detail, 200) << "\"}\n";
+                EntityDiagnostics::LogRaw(f.str());
+
+                std::ostringstream c;
+                c << "{\"location\":\"UpgradeOptions.hpp\",\"message\":\"config_legacy_keys_selftest\","
+                  << "\"timestamp\":" << EntityDiagnostics::NowMs()
+                  << ",\"passed\":" << (legacy.passed ? "true" : "false")
+                  << ",\"cases\":" << legacy.cases << ",\"failed\":" << legacy.failed
+                  << ",\"detail\":\"" << EntityDiagnostics::Sanitize(legacy.detail, 200) << "\"}\n";
+                EntityDiagnostics::LogRaw(c.str());
+            }
+        }
         if (GetAsyncKeyState(VK_END) & 0x1)
             SendMessage(hwnd, WM_CLOSE, 0, 0);
         const auto tAfterRender = std::chrono::steady_clock::now();
@@ -245,6 +398,10 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
         HRESULT hr = g_pSwapChain->Present(1, 0);
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
+        if (FAILED(hr)) {
+            std::cerr << "[graphics] Present failed; shutting down overlay.\n";
+            break;
+        }
 
         const auto tEnd = std::chrono::steady_clock::now();
         const float frameMs = std::chrono::duration<float, std::milli>(tEnd - frameStart).count();
@@ -264,12 +421,14 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
     }
 
+    engine.StopWorkerThreads();
     AutoConfig_SaveNow();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
-    engine.StopWorkerThreads();
-    EntityDiagnostics::Shutdown();
+    RunReport::Shutdown();
+        EntityDiagnostics::Shutdown();
+                SessionLog::Shutdown();
     ImGui::DestroyContext();
 
     CleanupDeviceD3D();
@@ -309,8 +468,7 @@ bool CreateDeviceD3D(HWND hWnd)
     if (res != S_OK)
         return false;
 
-    CreateRenderTarget();
-    return true;
+    return CreateRenderTarget();
 }
 
 void CleanupDeviceD3D()
@@ -321,12 +479,28 @@ void CleanupDeviceD3D()
     if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
 }
 
-void CreateRenderTarget()
+bool CreateRenderTarget()
 {
-    ID3D11Texture2D* pBackBuffer;
-    g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
-    g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+    if (!g_pSwapChain || !g_pd3dDevice)
+        return false;
+    ID3D11Texture2D* pBackBuffer = nullptr;
+    const HRESULT bufferResult =
+        g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+    if (FAILED(bufferResult) || !pBackBuffer) {
+        if (pBackBuffer)
+            pBackBuffer->Release();
+        std::cerr << "[graphics] Failed to acquire swap-chain backbuffer.\n";
+        return false;
+    }
+    const HRESULT viewResult = g_pd3dDevice->CreateRenderTargetView(
+        pBackBuffer, nullptr, &g_mainRenderTargetView);
     pBackBuffer->Release();
+    if (FAILED(viewResult) || !g_mainRenderTargetView) {
+        CleanupRenderTarget();
+        std::cerr << "[graphics] Failed to create render target view.\n";
+        return false;
+    }
+    return true;
 }
 
 void CleanupRenderTarget()

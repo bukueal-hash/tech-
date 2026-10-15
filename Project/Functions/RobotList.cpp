@@ -1,18 +1,20 @@
 #include "../Core/Engine.h"
+#include "../Interface/Utils/UpgradeOptions.hpp"
 #include "../Core/AgentLog.h"
 #include "../Core/ActorType.h"
 #include "../Core/EntityDiagnostics.hpp"
+#include "../Core/FeaturePolicy.hpp"
 #include "../Core/AssetNames.h"
 #include "../Core/BoneRoster.hpp"
 #include "../Core/BotAdmitQueue.hpp"
 #include "../Core/BotEspExpiry.hpp"
+#include "../Core/BotPosSanity.hpp"
 #include "../Core/BotTypes.h"
 #include "../Core/IntervalTimer.h"
+#include "../Core/ReadBudget.hpp"
 #include "../Core/WorldItemCategory.h"
 #include "RobotList.h"
 #include "WorldScanCommon.h"
-#include "LrtsVisibility.h"
-#include "CollisionMirror.h"
 
 #include <algorithm>
 #include <cctype>
@@ -31,52 +33,10 @@ std::string ResolveBotTypeLabel(uintptr_t actor, const std::string& fname);
 
 namespace {
 
-// LRTS per-mesh visibility state for bots (persisted across frames)
-static std::unordered_map<uintptr_t, LrtsVis::MeshState> s_lrtsBotMeshStates;
-// Per-actor verdict smoothing: keyed on cache key (NOT mesh) so MeshState
-// Resets during scan retries cannot wipe verdict history and flicker the box.
-static std::unordered_map<uintptr_t, LrtsVis::VerdictSmoother> s_botVisSmooth;
-// One Scan feed per pass while the session key is unverified (see EntityList).
-static bool s_botScanFedThisPass = false;
-
-// Per-candidate observation history for the toggle-aware mesh resolver.
-// A render flag is proven live only by watching the 0x20 bit change (set AND
-// clear seen) across resolves; a static non-zero byte (trace: 0x3f/0x40/0x64
-// floats, or const 0x9/0xa/0xb) is garbage and must not win over a toggler.
-struct BotVisChildObs {
-    uintptr_t comp = 0;
-    uint8_t firstByte = 0;   // byte at first observation (baseline)
-    uint8_t changed = 0;     // byte has differed from firstByte at some point
-    uint8_t setSeen = 0;     // non-zero byte with the 0x20 bit observed
-    uint8_t clearSeen = 0;   // non-zero byte without the 0x20 bit observed
-};
-struct BotVisMeshResolve {
-    uintptr_t mesh = 0;      // currently selected probe component
-    std::chrono::steady_clock::time_point at;
-    std::unordered_map<uintptr_t, BotVisChildObs> obs; // comp -> history
-    size_t pickIdx = 0;      // round-robin index when nothing has toggled yet
-};
-static std::unordered_map<uintptr_t, BotVisMeshResolve> s_botVisMeshResolve;
-
-// Burst capture: full-frame-rate NDJSON rows for ONE bot, to measure the true
-// delay between a line-of-sight change and the flag verdict. The 1 Hz trace
-// (8 rows/s shared across bots) could not distinguish real latency from
-// sampling spacing.
-static std::chrono::steady_clock::time_point s_burstCaptureUntil{};
-static uintptr_t s_burstPawn = 0;
-static int s_burstRows = 0;
-static constexpr int kBotBurstMaxRows = 900;     // ~10-15 s at 60-90 fps
-static constexpr int kBotBurstMaxSecs = 15;
-
 bool IsWorldEspLabel(const std::string& name)
 {
     return name == "Loot Item" || name == "World Item" || name == "Corpse"
         || name == "Raider stock" || name == "Arc Cargoship";
-}
-
-bool IsZeroWorldPos(const Vector3& pos)
-{
-    return pos.x == 0.0 && pos.y == 0.0 && pos.z == 0.0;
 }
 
 // Mid-raid pollution leaked into bot ESP (log: ActorName "GC Electrified",
@@ -499,19 +459,18 @@ std::string DiscoverNewBotType(uintptr_t actor, const std::string& fname)
         {
             static std::unordered_set<std::string> s_discoveredSeen;
             if (s_discoveredSeen.insert(label).second) {
-                std::ofstream f(kArcDebugLogPath, std::ios::app);
-                if (f) {
-                    char labelEsc[64]{}, fnameEsc[64]{};
-                    snprintf(labelEsc, sizeof(labelEsc), "%.48s", label.c_str());
-                    snprintf(fnameEsc, sizeof(fnameEsc), "%.48s", fname.c_str());
-                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"post-fix\",\"hypothesisId\":\"B3\","
-                      << "\"location\":\"RobotList.cpp:DiscoverNewBotType\",\"message\":\"bot_type_discovered\","
-                      << "\"data\":{\"label\":\"" << labelEsc
-                      << "\",\"fname\":\"" << fnameEsc << "\"}"
-                      << ",\"timestamp\":" << ts << "}\n";
-                }
+                std::ostringstream f;
+                char labelEsc[64]{}, fnameEsc[64]{};
+                snprintf(labelEsc, sizeof(labelEsc), "%.48s", label.c_str());
+                snprintf(fnameEsc, sizeof(fnameEsc), "%.48s", fname.c_str());
+                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"sessionId\":\"c190fb\",\"runId\":\"post-fix\",\"hypothesisId\":\"B3\","
+                  << "\"location\":\"RobotList.cpp:DiscoverNewBotType\",\"message\":\"bot_type_discovered\","
+                  << "\"data\":{\"label\":\"" << labelEsc
+                  << "\",\"fname\":\"" << fnameEsc << "\"}"
+                  << ",\"timestamp\":" << ts << "}\n";
+                EntityDiagnostics::LogRaw(f.str());
             }
         }
         // #endregion
@@ -612,6 +571,13 @@ static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point>
 // hot via PositionRefreshPass @16ms. 8 slices (was 4) halves reads/pass so
 // the shared DMA link lets the 8ms camera thread keep cadence.
 static constexpr size_t kAdmitSlices = 8;
+// Streaming window: a transient-failing spawn (no root/mesh/name yet) keeps
+// being retried every pass for this long before it is released. The old
+// 8-try budget (~8 passes ≈ 8-16s) settled slow-streaming spawns, hid them
+// behind the 8-slice band ring, and produced "no bot esp till a minute later"
+// on large maps. After the window the band ring still re-checks the actor, so
+// a late-finishing spawn is admitted on its next band pass.
+static constexpr uint64_t kBotTransientWindowMs = 45000;
 // C10: persistent pending lane (Core/BotAdmitQueue.hpp). Newly-seen actors
 // stay queued until a definitive outcome instead of being "new" for one pass —
 // the missed-window actors used to wait an up-to-19s ring sweep ("bot ESP takes
@@ -624,6 +590,10 @@ static size_t s_admitSliceCursor = 0;
 // makes forward progress instead of restarting at row 0 forever (the
 // "stuck slice, scanned:0, cache:0" deadlock).
 static size_t s_admitResumeRow = 0;
+// Priority-lane rows probed per pass. Uncapped, a 1000+ pending backlog filled
+// the 90ms probe budget every pass from the same first rows, so the band slice
+// was never scattered and the ring sat on slice 0 forever (admitted=0).
+static constexpr size_t kAdmitPrioPerPass = 96;
 // B5 (Stage 2): serial-verify backlog — candidates queued when the 60ms
 // verify budget overruns are drained FIRST on later passes. Verify never
 // gates ring advance, so a saturated bus defers the tail by one pass instead
@@ -657,6 +627,78 @@ static bool HasFreshBotVerifyNeg(uintptr_t actor)
         return false;
     return std::chrono::steady_clock::now() - it->second
         < std::chrono::seconds(10 + static_cast<int>((actor >> 5) & 7));
+}
+
+// ---------------------------------------------------------------------------
+// Per-actor admission rejection trace.
+//
+// "The bot two metres away had no ESP" was unanswerable from the log: the
+// funnel carried counters (verifyFail / failRoot / failMesh / failId) but never
+// a NAME, and every stage-1 settle -- prop structure, cached player, undecrypted
+// spawn -- settled the actor silently. This writes one NDJSON line per (actor,
+// reason) per second, with the fname and the bot-positive evidence that was or
+// was not present, so a drop can be judged instead of guessed at. Bounded by a
+// per-pass budget so a 1,000-row band scan cannot flood the log, and gated on
+// debug_ghost_bots like the other bot traces.
+void LogBotAdmitReject(uintptr_t actor, const char* reason, const std::string& fnameRaw,
+    int& budget, bool anyBot = false, bool strongDa = false, bool hasRoot = false,
+    bool hasMesh = false, bool hasId = false, bool memoized = false,
+    bool enemyDaPresent = false, bool aiTemplatePresent = false,
+    double distM = -1.0)
+{
+    if (budget <= 0 || !var::debug_ghost_bots)
+        return;
+
+    // Throttle per (actor, reason): one line a second. A single slot per actor
+    // would let two alternating reasons log every pass (the defect the position
+    // logger already fixed).
+    uint64_t reasonHash = 1469598103934665603ull;
+    for (const char* p = reason; p && *p; ++p)
+        reasonHash = (reasonHash ^ static_cast<uint64_t>(
+            static_cast<unsigned char>(*p))) * 1099511628211ull;
+    static std::unordered_map<uint64_t, uint64_t> last;
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    const uint64_t key =
+        (static_cast<uint64_t>(actor) * 0x9E3779B97F4A7C15ull) ^ reasonHash;
+    const auto it = last.find(key);
+    if (it != last.end() && nowMs >= it->second && nowMs - it->second < 1000)
+        return;
+    last[key] = nowMs;
+    if (last.size() > 8192)
+        last.clear();
+    --budget;
+
+    // An actor's fname is untrusted bytes from the target: quote and control
+    // characters would otherwise break the NDJSON line.
+    std::string fname;
+    fname.reserve(fnameRaw.size());
+    for (char c : fnameRaw) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (c == '"' || c == '\\')
+            fname += '_';
+        else if (uc < 0x20)
+            fname += '?';
+        else
+            fname += c;
+    }
+
+    std::ostringstream f;
+    f << "{\"message\":\"bot_admit_reject\",\"data\":{\"actor\":\"0x"
+      << std::hex << actor << std::dec
+      << "\",\"reason\":\"" << reason << "\",\"fname\":\"" << fname << "\""
+      << ",\"anyBot\":" << (anyBot ? 1 : 0)
+      << ",\"strongDa\":" << (strongDa ? 1 : 0)
+      << ",\"hasRoot\":" << (hasRoot ? 1 : 0)
+      << ",\"hasMesh\":" << (hasMesh ? 1 : 0)
+      << ",\"hasId\":" << (hasId ? 1 : 0)
+      << ",\"enemyDa\":" << (enemyDaPresent ? 1 : 0)
+      << ",\"aiTemplate\":" << (aiTemplatePresent ? 1 : 0)
+      << ",\"memoized\":" << (memoized ? 1 : 0)
+      << ",\"distM\":" << static_cast<long long>(distM)
+      << "},\"ts\":" << nowMs << "}\n";
+    EntityDiagnostics::LogRaw(f.str());
 }
 
 static bool QuickBotFnameCandidateMemo(
@@ -915,6 +957,7 @@ void UpdateBotVelocity(Engine::WorldCacheEntry& actor, const Vector3& worldPosRe
 
 Vector3 ReadComponentWorldPos(uintptr_t component)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Position);
     if (!component || !engine.IsValidPointer(component))
         return {};
     return Engine::ReadSceneWorldPos(component);
@@ -923,11 +966,13 @@ Vector3 ReadComponentWorldPos(uintptr_t component)
 // Live bot tracking — mirror EntityList (NOCACHE WorldLocation, no RelativeLocation).
 Vector3 ReadBotSceneWorldPosLive(uintptr_t component)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Position);
     return Engine::ReadWorldLocationNocache(component, /*allowRelativeFallback=*/false);
 }
 
 Vector3 ResolveBotWorldPos(uintptr_t actor, uintptr_t root, uintptr_t mesh)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Position);
     if (root) {
         const Vector3 fromRoot = ReadBotSceneWorldPosLive(root);
         if (IsPlausibleWorldPos(fromRoot))
@@ -964,18 +1009,17 @@ Vector3 ResolveBotWorldPos(uintptr_t actor, uintptr_t root, uintptr_t mesh)
                 if (s_lastRelLog.time_since_epoch().count() == 0
                     || nowRel - s_lastRelLog >= std::chrono::seconds(3)) {
                     s_lastRelLog = nowRel;
-                    std::ofstream f(kArcDebugLogPath, std::ios::app);
-                    if (f) {
-                        const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
-                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"roller\",\"hypothesisId\":\"R3\","
-                          << "\"location\":\"RobotList.cpp:ResolveBotWorldPos\",\"message\":\"bot_pos_fallback\","
-                          << "\"data\":{\"source\":\"root_relative\",\"key\":" << actor
-                          << ",\"posX\":" << static_cast<long long>(fromRel.x)
-                          << ",\"posY\":" << static_cast<long long>(fromRel.y)
-                          << ",\"posZ\":" << static_cast<long long>(fromRel.z) << "}"
-                          << ",\"timestamp\":" << ts << "}\n";
-                    }
+                    std::ostringstream f;
+                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"roller\",\"hypothesisId\":\"R3\","
+                      << "\"location\":\"RobotList.cpp:ResolveBotWorldPos\",\"message\":\"bot_pos_fallback\","
+                      << "\"data\":{\"source\":\"root_relative\",\"key\":" << actor
+                      << ",\"posX\":" << static_cast<long long>(fromRel.x)
+                      << ",\"posY\":" << static_cast<long long>(fromRel.y)
+                      << ",\"posZ\":" << static_cast<long long>(fromRel.z) << "}"
+                      << ",\"timestamp\":" << ts << "}\n";
+                    EntityDiagnostics::LogRaw(f.str());
                 }
             }
             // #endregion
@@ -1018,6 +1062,9 @@ void ReadChildComponentsLocal(
 
 void PopulateBotPartCache(Engine::WorldCacheEntry& actor, uintptr_t key)
 {
+    // Ledger: mesh/child-component discovery is a pointer chase, and its position
+    // reads re-tag themselves below.
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Link);
     actor.BotPartCount = 0;
     actor.CenterWorldPos = {};
 
@@ -1070,10 +1117,21 @@ void PopulateBotPartCache(Engine::WorldCacheEntry& actor, uintptr_t key)
         if (!IsPlausibleWorldPos(actor.WorldPos))
             actor.WorldPos = actor.CenterWorldPos;
     } else {
-        actor.WorldPos = ResolveBotWorldPos(key, actor.rootComponent, actor.Mesh);
-        actor.CenterWorldPos = actor.WorldPos;
-        if (!IsZeroWorldPos(actor.WorldPos) && actor.BotPartCount < Engine::WorldCacheEntry::kMaxBotParts) {
-            actor.BotPartPos[actor.BotPartCount++] = actor.WorldPos;
+        // A failed resolve returns zeros, and writing those over the last good
+        // sample is what makes a bot permanently undrawable: ShouldDrawRobotEsp
+        // needs a plausible WorldPos or CenterWorldPos before it will put the
+        // entry in the render frame, so ONE bad read hid the bot until eviction
+        // no matter how close it stood. Measured live: Tick and Surveyor sat in
+        // the bot cache with [0,0,0] positions while still in the actor array,
+        // and DrawBotEsp logged collect_gate / no_live_position / Tick's
+        // position_implausible behind every one of those misses. Keep the last
+        // good sample instead; the live sampler owns advancing it.
+        const Vector3 resolved = ResolveBotWorldPos(key, actor.rootComponent, actor.Mesh);
+        if (IsPlausibleWorldPos(resolved)) {
+            actor.WorldPos = resolved;
+            actor.CenterWorldPos = resolved;
+            if (actor.BotPartCount < Engine::WorldCacheEntry::kMaxBotParts)
+                actor.BotPartPos[actor.BotPartCount++] = resolved;
         }
     }
 
@@ -1102,6 +1160,7 @@ void PopulateBotPartCache(Engine::WorldCacheEntry& actor, uintptr_t key)
 
 uintptr_t ResolveBotSceneRoot(uintptr_t actor)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Link);
     if (!actor)
         return 0;
 
@@ -1123,6 +1182,7 @@ uintptr_t ResolveBotSceneRoot(uintptr_t actor)
 // PioneerConstructablePawn: no PlayerState, enemy asset or resolvable bot mesh/class.
 bool IsArcBotActor(uintptr_t actor, uintptr_t localPawn, const std::string& fnameHint)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Name);
     if (!actor || actor == localPawn)
         return false;
 
@@ -1174,6 +1234,7 @@ bool StillLooksLikeBot(
     int category,
     const Vector3& localPos)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Name);
     if (ShouldSkipBotActor(actor, localPawn, localPos))
         return false;
 
@@ -1308,13 +1369,6 @@ static void ClearRobotListStaticMaps()
     s_quickFnameNeg.clear();
     s_botVerifyNeg.clear();
     s_admitQueue.Clear();
-    // LRTS per-actor state is keyed by bot APawn/visMesh pointers that churn
-    // every raid — without clearing, s_botVisSmooth / s_lrtsBotMeshStates grew
-    // unbounded across a session (slow leak). s_botVisMeshResolve is capped
-    // at 8192 with an age guard, but clearing here is cheaper than the cap.
-    s_botVisSmooth.clear();
-    s_lrtsBotMeshStates.clear();
-    s_botVisMeshResolve.clear();
     s_botDeadSince.clear();
     s_botAllZeroHealthSince.clear();
     s_lastBotHealthProbe.clear();
@@ -1410,6 +1464,10 @@ bool HasLiveBotVisual(uintptr_t actor, uintptr_t mesh)
 
 uint8_t ReadBotBrokenFlag(uintptr_t actor)
 {
+    // Ledger tag: this is a death-state probe, not a position read. Without it
+    // the whole retain pass reports as "untagged" and can never be told apart
+    // from the scan it competes with.
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Broken);
     // Soft-deprecate bIsBreaked@0x1220 (not in SDK). Prefer only
     // Constructable_bIsDestroyed (help/esp.txt + SDK). Do not treat
     // Health==0 as dead — spawn frames often read 0 HP and blocked admits.
@@ -1422,6 +1480,14 @@ uint8_t ReadBotBrokenFlag(uintptr_t actor)
         Memory::read<uint8_t>(actor + Offsets::Constructable_bIsDestroyed);
     constexpr uint8_t kDestroyedMask = 0x1;
     return (byte & kDestroyedMask) != 0 ? 1 : 0;
+}
+
+/** Steady-ms of a retain-pass time point, for the entry's field stamps. */
+static uint64_t SteadyMsFrom(const std::chrono::steady_clock::time_point& tp)
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            tp.time_since_epoch()).count());
 }
 
 static std::atomic<int> g_botDrawLabelMiss{ 0 };
@@ -1607,173 +1673,6 @@ std::string ResolveBotDrawLabel(
     return {};
 }
 
-// Update the persistent observation of one candidate component from a fresh
-// flag-byte read. A render flag is only proven by the 0x20 bit existing in
-// both states across time; a static non-zero byte (0x3f/0x40/0x64 floats, or
-// const 0x9/0xa/0xb) is garbage and must never outrank a toggler.
-static void ObserveBotVisChild(
-    BotVisMeshResolve& st, uintptr_t comp, uint8_t byte)
-{
-    if (!comp)
-        return;
-    BotVisChildObs& o = st.obs[comp];
-    o.comp = comp;
-    if (!o.firstByte)
-        o.firstByte = byte;
-    if (byte != o.firstByte)
-        o.changed = 1;
-    if (byte & LrtsVis::BrrMask)
-        o.setSeen = 1;
-    if (byte && !(byte & LrtsVis::BrrMask))
-        o.clearSeen = 1;
-}
-
-// Priorities: proven toggler > dynamic byte that ever showed the render bit
-// > static set-only > dynamic clear-only > static clear-only > dead (zero).
-// Zero = unbound slot, never a render signal. A constant byte with 0x20 set
-// (float garbage 0x3f) must never outrank a real flag that merely reads clear
-// while occluded.
-static int ScoreBotVisChild(const BotVisChildObs& o)
-{
-    if (!o.comp)
-        return -1000000;
-    if (o.setSeen && o.clearSeen)
-        return 100;                              // proven: 0x20 toggled both ways
-    if (o.changed && o.setSeen)
-        return 80;                               // dynamic byte that showed the flag
-    if (o.changed)
-        return 60;                               // byte moves, may be a live flag
-    if (o.setSeen)
-        return 55;                               // flag bit seen set, byte static
-    if (o.clearSeen)
-        return 20;                               // flag seen clear (occluded?)
-    if (o.firstByte)
-        return 10;
-    return 0;
-}
-
-// LRTS mesh resolution for bots: the render flag lives in different slots per
-// bot class — some follow the 0x438 USkeletalMeshComponent slot, some the
-// EmbarkMesh 0x7E8 slot, and constructive-pawns may defer to child components.
-// Rather than trusting a single non-zero byte, persist which candidate the
-// 0x20 bit has actually toggled on and prefer it. Candidates no child has ever
-// proven get sampled round-robin so a valid but quiet mesh is not missed.
-static uintptr_t ResolveBotVisMesh(
-    uintptr_t actor, uintptr_t primaryMesh, uintptr_t root,
-    BotVisMeshResolve& st)
-{
-    const uintptr_t embark = Memory::read<uintptr_t>(actor + Offsets::EmbarkMesh);
-
-    // Ordered candidate set: primary, embark, root, then root children.
-    std::vector<uintptr_t> cand;
-    auto pushCand = [&](uintptr_t c) {
-        if (!c || !engine.IsValidPointer(c))
-            return;
-        for (uintptr_t x : cand)
-            if (x == c)
-                return;
-        cand.push_back(c);
-    };
-    pushCand(primaryMesh);
-    pushCand(embark);
-    pushCand(root);
-    if (root && engine.IsValidPointer(root))
-        ReadChildComponentsLocal(root, cand, 2);
-
-    // Refresh observations for every candidate.
-    for (uintptr_t c : cand)
-        ObserveBotVisChild(st, c,
-            Memory::read_nocache<uint8_t>(c + LrtsVis::BrrOffset));
-
-    // Drop observations whose component is no longer in the candidate set
-    // (despawned / re-allocated memory must not keep an old winner alive).
-    for (auto it = st.obs.begin(); it != st.obs.end();) {
-        bool alive = false;
-        for (uintptr_t c : cand)
-            if (c == it->first)
-                { alive = true; break; }
-        if (!alive)
-            it = st.obs.erase(it);
-        else
-            ++it;
-    }
-
-    if (cand.empty())
-        return st.mesh ? st.mesh : primaryMesh;
-
-    // Pick the best-scoring candidate; a proven toggler is sticky (never
-    // bounced away to a sibling that happens to be first in child order).
-    uintptr_t best = st.mesh;
-    int bestScore = -1000000;
-    if (best && st.obs.count(best))
-        bestScore = ScoreBotVisChild(st.obs[best]);
-    for (size_t i = 0; i < cand.size(); ++i) {
-        const uintptr_t c = cand[i];
-        const auto it = st.obs.find(c);
-        const int s = (it != st.obs.end()) ? ScoreBotVisChild(it->second) : 0;
-        if (s > bestScore) {
-            best = c;
-            bestScore = s;
-            st.pickIdx = i;
-        }
-    }
-
-    // Nothing proven (score < 60: only static bytes seen) and the current pick
-    // is not known-live — walk forward (wrapping) so a valid mesh that sits
-    // later in the child list gets a chance to show its 0x20 bit, and a static
-    // float-garbage byte can never pin the selection. A dynamic or proven
-    // candidate (score >= 60) sticks.
-    if (bestScore < 60 && cand.size() > 1)
-        best = cand[(st.pickIdx + 1) % cand.size()];
-
-    return best;
-}
-
-// Diagnostic tree walk: collect the mesh slots plus their child components
-// (depth 2) so a single raid reveals which component actually carries the
-// recently-rendered flag for each bot class.
-struct BotVisNode {
-    uintptr_t comp;
-    uint8_t flag[7];  // window around the flag byte: brrOffset-3 .. brrOffset+3
-};
-
-static void CollectBotVisTree(
-    uintptr_t actorKey,
-    uintptr_t primaryMesh,
-    uintptr_t root,
-    std::vector<BotVisNode>& out,
-    bool wantChildren)
-{
-    std::vector<uintptr_t> roots;
-    if (primaryMesh && engine.IsValidPointer(primaryMesh))
-        roots.push_back(primaryMesh);
-    uintptr_t embark = Memory::read<uintptr_t>(actorKey + Offsets::EmbarkMesh);
-    if (embark && engine.IsValidPointer(embark) && embark != primaryMesh)
-        roots.push_back(embark);
-    if (root && engine.IsValidPointer(root)
-        && root != primaryMesh && root != embark)
-        roots.push_back(root);
-
-    std::vector<uintptr_t> all;
-    for (uintptr_t r : roots)
-        all.push_back(r);
-    if (wantChildren) {
-        for (uintptr_t r : roots)
-            ReadChildComponentsLocal(r, all, 1);
-    }
-    std::unordered_set<uintptr_t> seen;
-    for (uintptr_t c : all) {
-        if (!c || !engine.IsValidPointer(c) || !seen.insert(c).second)
-            continue;
-        BotVisNode n{};
-        n.comp = c;
-        for (int i = 0; i < 7; ++i)
-            n.flag[i] = Memory::read_nocache<uint8_t>(
-                c + LrtsVis::BrrOffset - 3 + i);
-        out.push_back(n);
-    }
-}
-
 void Engine::RobotList()
 {
     // Pre-size so runtime bot-type discovery inserts never rehash while the
@@ -1800,11 +1699,6 @@ void Engine::RobotList()
     const uintptr_t sAcknowledgedPawn = ctx.acknowledgedPawn;
     if (!sGWorld || !ctx.persistentLevel)
         return;
-
-    // Read UWorld::TimeSeconds (double in UE5) for LRTS visibility check
-    const float worldTime = var::LrtsVisActive()
-        ? static_cast<float>(Memory::read_nocache<double>(sGWorld + Offsets::UWorld_TimeSeconds))
-        : 0.f;
 
     const uint64_t genAtStart =
         m_worldGeneration.load(std::memory_order_acquire);
@@ -1836,8 +1730,25 @@ void Engine::RobotList()
     }
     // LOS mesh rebuild is owned by Update � calling it every RobotList tick
 
-    const float maxDistM = var::bot_esp_distance > 0.f ? var::bot_esp_distance : var::kMaxDistanceSliderM;
+    const float visualMaxM = var::bot_esp_distance > 0.f ? var::bot_esp_distance : var::kMaxDistanceSliderM;
+    // One profile: the pool is collected out to whichever is further — what the
+    // ESP draws, or what aim is allowed to shoot at (Core/FeaturePolicy.hpp,
+    // aimbot_distance). It used to follow the separate ARC distance, so an aim
+    // range of 257m over a 180m pool left every bot between them locked out of
+    // the cache and therefore out of aim.
+    const FeaturePolicy::AimFeatures botPoolFeatures{
+        var::enable_aimbot, var::robotAimEnabled, var::enable_triggerbot };
+    const float maxDistM =
+        FeaturePolicy::ShouldCollectRobotTargets(botPoolFeatures)
+        ? (std::max)(visualMaxM, var::aimbot_distance)
+        : visualMaxM;
     const float maxDistSq = maxDistM * maxDistM * 10000.0f;
+    // Distance anchor: localPos (pawn-root preferred, camera fallback) instead
+    // of g_Location directly. A transiently reset/unreadable camera made every
+    // bot measure its distance from the origin — the WHOLE cache failed the
+    // range gate in one pass ("all filtered"), then all came back the next:
+    // the bot ESP blink. Bad anchor this pass = hold previous draw state.
+    const bool distRefOk = IsPlausibleWorldPos(localPos);
     // Dist-edge hysteresis (Schmitt trigger): a bot already drawing stays on up
     // to 15% past the slider cutoff, so a bot hovering on the boundary can't
     // blink on/off. New bots still only admit at the true cutoff.
@@ -1848,7 +1759,7 @@ void Engine::RobotList()
     {
         std::shared_lock<std::shared_mutex> lock(m_robotCacheMutex);
         localCache = robotCache;
-    }    s_botScanFedThisPass = false;
+    }
     for (auto it = localCache.begin(); it != localCache.end(); )
     {
         if (!currentActorSet.contains(it->first)) {
@@ -1901,6 +1812,23 @@ void Engine::RobotList()
     int dbgFailNoId = 0;
     int dbgFailOther = 0;
 
+    // Why an actor left the admission lane without entering the cache. The
+    // funnel previously reported only verifyFail plus the fail* sub-gates, so
+    // every stage-1 settle (props, cached players, undecrypted spawns) was
+    // invisible in the totals and entirely invisible per actor -- which is why
+    // "75 enemies, 22 cached" could not be attributed to anything.
+    int dbgRejPlayerClass = 0;
+    int dbgRejLocalPs = 0;
+    int dbgRejCachedPlayer = 0;
+    int dbgRejWorldItem = 0;
+    int dbgRejFnameNeg = 0;
+    int dbgRejUndecrypted = 0;
+    int dbgRejVerifyMemo = 0;
+    int dbgRejVerifyTransient = 0;
+    int dbgRejVerifyExpired = 0;
+    // Per-pass per-actor trace budget. Counters above are unaffected by it.
+    int rejectLogBudget = 24;
+
     // P6/P6b (Bukupex admission batching + 4-slice ring): batch the struct
     // fields both gates need, but only for one rotating band of the actor
     // array per pass (~1/4 DMA) plus a bounded newly-seen priority set.
@@ -1926,6 +1854,12 @@ void Engine::RobotList()
     int dbgAdmitFnameChecked = 0;
     int dbgAdmitFnameMemoSkip = 0;
     int dbgAdmitPrioNew = 0;
+    // The priority lane by class (Core/BotAdmitQueue.hpp): prioSight is
+    // never-probed work, prioOverdue is never-probed work past the bound (it
+    // preempts every retry), prioRetry is actors that already had a probe.
+    int dbgAdmitPrioOverdue = 0;
+    int dbgAdmitPrioFirstSight = 0;
+    int dbgAdmitPrioRetry = 0;
     int dbgAdmitSliceActors = 0;
     size_t dbgAdmitSlice = 0;
     size_t dbgAdmitSliceBase = 0;
@@ -2033,6 +1967,12 @@ void Engine::RobotList()
         if (s_admitCycleStart.time_since_epoch().count() == 0)
             s_admitCycleStart = std::chrono::steady_clock::now();
 
+        // Everything in this pass is stamped from one clock so the lane can age
+        // its rows against the same instant the probes are measured against.
+        const uint64_t admitNowMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+
         // C10 pending lane: every newly-seen actor joins the queue and STAYS
         // until a definitive outcome (admitted / proven non-bot / try budget
         // spent / left the world). The one-shot diff lost actors that missed
@@ -2047,9 +1987,10 @@ void Engine::RobotList()
             if (HasFreshQuickFnameNeg(actor) || HasFreshBotVerifyNeg(actor))
                 continue;
             // True first sight — the discovery funnel clock starts here
-            // (bot_admit / bot_appear telemetry).
+            // (bot_admit / bot_appear telemetry), and the lane's own first-probe
+            // clock with it.
             s_botCandFirstSeen.try_emplace(actor, std::chrono::steady_clock::now());
-            s_admitQueue.NoteNew(actor);
+            s_admitQueue.NoteNew(actor, admitNowMs);
         }
 
         const size_t slice = s_admitSliceCursor % kAdmitSlices;
@@ -2059,9 +2000,61 @@ void Engine::RobotList()
         dbgAdmitSliceBase = sliceBase;
         dbgAdmitSliceEnd = sliceEnd;
 
+        // C10: priority rows come from the PENDING QUEUE (not a one-shot
+        // diff), and they are collected FIRST so the band below can tell which
+        // of its own rows the lane already took this pass. The lane orders them
+        // by AGE (Core/BotAdmitQueue.hpp): a never-probed actor past
+        // kFirstProbeBoundMs leads, never-probed work keeps a reserved share of
+        // the pass, and retries take the rest. The old retry-first collection
+        // let a retry storm (a spawn that fails transiently for the whole 45s
+        // streaming window) consume the pass, so a brand-new actor could not be
+        // probed until the retries settled.
+        std::vector<AdmitProbeRow> prioRows;
+        std::unordered_set<uintptr_t> laneSet;
+        {
+            AdmitQueue::PendingQueue::PassPlan plan;
+            plan.maxRows = (std::min)(s_admitQueue.Cap(), kAdmitPrioPerPass);
+            std::vector<uint64_t> prioActors;
+            prioActors.reserve(plan.maxRows);
+            s_admitQueue.CollectPrio(
+                admitIndex.begin(), admitIndex.end(), admitNowMs, plan, prioActors);
+            prioRows.reserve(prioActors.size());
+            laneSet.reserve(prioActors.size());
+            for (uint64_t actorU64 : prioActors) {
+                const uintptr_t actor = static_cast<uintptr_t>(actorU64);
+                switch (s_admitQueue.Classify(actor, admitNowMs)) {
+                case AdmitQueue::PendingQueue::Lane::OverdueFirst:
+                    ++dbgAdmitPrioOverdue;
+                    break;
+                case AdmitQueue::PendingQueue::Lane::FirstSight:
+                    ++dbgAdmitPrioFirstSight;
+                    break;
+                case AdmitQueue::PendingQueue::Lane::Retry:
+                    ++dbgAdmitPrioRetry;
+                    break;
+                }
+                laneSet.insert(actor);
+                AdmitProbeRow row{};
+                row.actor = actor;
+                prioRows.push_back(row);
+            }
+        }
+        dbgAdmitPrioNew = static_cast<int>(prioRows.size());
+
         // B4 (RIVENTIDES resume-band): stable deterministic row order
         // (admitIndex order) so the cross-pass resume frontier points at the
         // same rows — unordered_set iteration reorders each pass.
+        //
+        // The pending lane owns unclassified actors (probed first, every pass,
+        // until they settle) — never let the band double-probe them. Letting the
+        // band also carry queued actors the lane did not take was tried on a cold
+        // load and measured at 178 first probes/s against 193/s without it —
+        // inside this lane's run-to-run spread, so the measurement alone does not
+        // condemn it. The MECHANISM does: band rows are scattered after the
+        // lane's, and the 40ms process budget is already spent by the time it
+        // reaches them, so a queued actor carried by the band costs scatter time
+        // and is then dropped unscreened. That is DMA taken from the lane to no
+        // end, so the band keeps its old rule.
         std::unordered_set<uintptr_t> bandSet;
         bandSet.reserve(sliceEnd - sliceBase);
         std::vector<AdmitProbeRow> bandRows;
@@ -2071,8 +2064,10 @@ void Engine::RobotList()
             // Cached bots are owned by retain + PositionRefreshPass.
             if (localCache.contains(actor))
                 continue;
-            // The pending lane owns unclassified actors (probed first, every
-            // pass, until they settle) — never let the band double-probe them.
+            // The lane took this one this pass (see the measurement above: the
+            // band must not spend rows on queued actors).
+            if (laneSet.count(actor) != 0)
+                continue;
             if (s_admitQueue.Contains(actor))
                 continue;
             if (!bandSet.insert(actor).second)
@@ -2082,25 +2077,6 @@ void Engine::RobotList()
             bandRows.push_back(row);
         }
         dbgAdmitSliceActors = static_cast<int>(bandRows.size());
-
-        // C10: priority rows come from the PENDING QUEUE (not a one-shot
-        // diff). Deterministic admitIndex order; the cap rises with the
-        // backlog so a streaming burst drains in a pass or two.
-        std::vector<AdmitProbeRow> prioRows;
-        {
-            const size_t prioCap = s_admitQueue.Cap();
-            prioRows.reserve(prioCap);
-            for (uintptr_t actor : admitIndex) {
-                if (prioRows.size() >= prioCap)
-                    break;
-                if (!s_admitQueue.Contains(actor))
-                    continue;
-                AdmitProbeRow row{};
-                row.actor = actor;
-                prioRows.push_back(row);
-            }
-        }
-        dbgAdmitPrioNew = static_cast<int>(prioRows.size());
 
         // Frontier: continue the band where the last pass stopped instead of
         // restarting at row 0 every pass (stuck slice / cache:0 deadlock on
@@ -2124,9 +2100,12 @@ void Engine::RobotList()
         // forever -> cache:0, zero bots. Small chunks keep every execute
         // short even on a loaded bus.
         constexpr size_t kAdmitChunk = 48;
+        // Own probe budget: the prep above (index build, actor-type reads) must
+        // not consume the probe scatter's time. Same fix as the items walk.
+        WorldScan::ScanBudget probeBudget(std::chrono::milliseconds(90));
         size_t base = 0;
         for (; base < probeRows.size(); base += kAdmitChunk) {
-            if (scanBudget.expired()) { slicePartial = true; break; }
+            if (probeBudget.expired()) { slicePartial = true; break; }
             const size_t end = (std::min)(base + kAdmitChunk, probeRows.size());
             ScatterSession scatter;
             if (!scatter.isValid())
@@ -2244,17 +2223,28 @@ void Engine::RobotList()
             const AdmitProbeRow& r = probeRows[ri];
             if (procBudget.expired()) { slicePartial = true; break; }
             processEnd = ri + 1;
+            // First-probe stopwatch: a row that reached screening has been
+            // probed. Only queued actors can be in the lane (band rows skip
+            // them), and NoteProbed records the wait once per actor — this is
+            // the measurement the first-probe bound is judged by.
+            if (s_admitQueue.Contains(r.actor))
+                s_admitQueue.NoteProbed(r.actor, admitNowMs);
             const uint32_t masked = ArcActorType::MaskActorTypeId(r.typeId);
+            // Counted, not logged: a player is never the actor this funnel is
+            // asked about, and the band scans thousands of them per pass.
             if (ArcActorType::IsPlayerClassId(masked)) {
+                ++dbgRejPlayerClass;
                 s_admitQueue.Settle(r.actor);
                 continue;
             }
             if (r.playerState != 0 && Memory::IsValidPtrFast2(r.playerState)
                 && r.playerState == localPs) {
+                ++dbgRejLocalPs;
                 s_admitQueue.Settle(r.actor);
                 continue;
             }
             if (engine.IsCachedPlayer(r.actor)) {
+                ++dbgRejCachedPlayer;
                 s_admitQueue.Settle(r.actor);
                 continue;
             }
@@ -2273,6 +2263,16 @@ void Engine::RobotList()
                     || (r.hover != 0 && Memory::IsValidPtrFast2(r.hover))
                     || (r.containerLoot != 0
                         && engine.IsValidPointer(static_cast<uintptr_t>(r.containerLoot)))) {
+                    ++dbgRejWorldItem;
+                    // Prop-shaped, but the same row carries an enemy data asset
+                    // or an AI template pointer: that is the one shape where this
+                    // screen can drop a real bot, so it gets a named line.
+                    if (r.enemyDa != 0 || r.aiTemplate != 0)
+                        LogBotAdmitReject(r.actor, "stage1_world_item_structure",
+                            engine.GetActorFNameStringCached(r.actor), rejectLogBudget,
+                            false, false, r.root != 0, false, false, false,
+                            r.enemyDa != 0, r.aiTemplate != 0,
+                            r.hasDist ? std::sqrt(r.distSq) / 100.0 : -1.0);
                     s_admitQueue.Settle(r.actor);
                     continue;
                 }
@@ -2280,8 +2280,35 @@ void Engine::RobotList()
                         r.actor, dbgAdmitFnameChecked, dbgAdmitFnameMemoSkip)) {
                     // Settled negatives leave the lane; undecrypted spawns
                     // (no memo written) stay queued and retry next pass.
-                    if (HasFreshQuickFnameNeg(r.actor))
+                    if (HasFreshQuickFnameNeg(r.actor)) {
+                        ++dbgRejFnameNeg;
+                        // The name is why it was dropped, so print it: this is
+                        // the screen that decides "not a bot" from a string, and
+                        // a wrong verdict here looks exactly like a missing bot.
+                        LogBotAdmitReject(r.actor, "stage1_fname_not_botlike",
+                            engine.GetActorFNameStringCached(r.actor), rejectLogBudget,
+                            false, false, r.root != 0, false, false, false,
+                            r.enemyDa != 0, r.aiTemplate != 0,
+                            r.hasDist ? std::sqrt(r.distSq) / 100.0 : -1.0);
                         s_admitQueue.Settle(r.actor);
+                        continue;
+                    }
+                    // Undecrypted name with no memo: the lane has no try budget
+                    // here, so a never-decrypting actor sat in the priority lane
+                    // forever and displaced new bots (the band ring skips queued
+                    // actors). Release it once the streaming window has passed.
+                    if (const auto fsIt = s_botCandFirstSeen.find(r.actor);
+                        fsIt != s_botCandFirstSeen.end()
+                        && std::chrono::steady_clock::now() - fsIt->second
+                            >= std::chrono::milliseconds(kBotTransientWindowMs)) {
+                        ++dbgRejUndecrypted;
+                        LogBotAdmitReject(r.actor, "stage1_name_never_decrypted",
+                            engine.GetActorFNameStringCached(r.actor), rejectLogBudget,
+                            false, false, r.root != 0, false, false, false,
+                            r.enemyDa != 0, r.aiTemplate != 0,
+                            r.hasDist ? std::sqrt(r.distSq) / 100.0 : -1.0);
+                        s_admitQueue.Settle(r.actor);
+                    }
                     continue;
                 }
             }
@@ -2331,14 +2358,22 @@ void Engine::RobotList()
     // scatters above already consume the whole 90ms, so checking
     // scanBudget.expired() here broke on the first candidate every pass
     // (quickPass:0, cache drained to 0, zero bot ESP).
-    WorldScan::ScanBudget admitBudget(std::chrono::milliseconds(60));
+    // Raid-start mode: deep backlog + near-empty cache means there is nothing
+    // to retain yet, so spend more bus time admitting — 60ms paced only
+    // ~35-50 verifies/pass and took 62-78s to drain a 1000-actor backlog.
+    // Tapers to 60ms as soon as the cache fills (LAG1 guard: retain must
+    // keep Drawing flags fresh once bots are cached).
+    const bool raidStartMode =
+        s_admitQueue.Size() > 256 && localCache.size() < 8;
+    WorldScan::ScanBudget admitBudget(
+        std::chrono::milliseconds(raidStartMode ? 150 : 60));
     // B5 (Stage 2): verify is best-effort and never gates ring advance. On a
     // budget overrun the tail re-enters via s_admitVerifyBacklog next pass;
     // new spawns are unaffected (they are re-listed by the prio diff).
     std::vector<uintptr_t> pending;
     pending.reserve(s_admitVerifyBacklog.size() + admitCandidates.size());
-    pending.insert(pending.end(), s_admitVerifyBacklog.begin(), s_admitVerifyBacklog.end());
     pending.insert(pending.end(), admitCandidates.begin(), admitCandidates.end());
+    pending.insert(pending.end(), s_admitVerifyBacklog.begin(), s_admitVerifyBacklog.end());
     s_admitVerifyBacklog.clear();
     size_t vi = 0;
     for (; vi < pending.size(); ++vi)
@@ -2384,7 +2419,11 @@ void Engine::RobotList()
         // B1 (Fix #8): skip actors whose verify already failed recently.
         if (!localCache.contains(actor)) {
             if (HasFreshBotVerifyNeg(actor)) {
-                // Fresh definitive reject — its TTL memo owns the retry.
+                // Fresh definitive reject — its TTL memo owns the retry. This is
+                // the longest fixed invisibility in admission (10-17s), so it is
+                // counted and named rather than left to the TTL to explain.
+                ++dbgRejVerifyMemo;
+                LogBotAdmitReject(actor, "verify_memo_fresh", fname, rejectLogBudget);
                 s_admitQueue.Settle(actor);
                 continue;
             }
@@ -2412,15 +2451,56 @@ void Engine::RobotList()
                 else
                     ++dbgFailOther;
 
+                // Name the sub-gate. Which of the four it was is the whole
+                // question: no_root / no_mesh are spawn-shape problems (worth a
+                // retry), no_identity is the pollution guard doing its job, and
+                // contradicted means component evidence says bot while verify
+                // said no -- the shape that must never be memoized silently.
+                LogBotAdmitReject(actor,
+                    !hasRoot ? "verify_no_root"
+                    : (!hasMesh && !anyBot) ? "verify_no_mesh"
+                    : (!hasId && !anyBot && !strongDa) ? "verify_no_identity"
+                    : "verify_contradicted",
+                    fname, rejectLogBudget, anyBot, strongDa, hasRoot, hasMesh,
+                    hasId, false);
+
                 // Transient shape (spawn still streaming in — no root / no
-                // mesh yet, or the name has not decrypted): stay queued so the
-                // priority lane retries next pass. The old memo hid these for
-                // 10-17s after ONE failed probe.
+                // mesh yet, or the name has not decrypted): keep it queued and
+                // retrying for the whole STREAMING WINDOW instead of the old
+                // 8-try budget that settled it as gone after ~8 passes.
                 const bool transient = fname.empty() || !hasRoot || !hasMesh;
-                if (transient && !s_admitQueue.NoteTransient(actor))
+                if (transient) {
+                    const auto fsIt = s_botCandFirstSeen.find(actor);
+                    const uint64_t ageMs = (fsIt != s_botCandFirstSeen.end())
+                        ? static_cast<uint64_t>(
+                              std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now()
+                                      - fsIt->second).count())
+                        : 0ULL;
+                    if (ageMs < kBotTransientWindowMs) {
+                        ++dbgRejVerifyTransient;
+                        LogBotAdmitReject(actor, "verify_transient_retry", fname,
+                            rejectLogBudget, anyBot, strongDa, hasRoot, hasMesh,
+                            hasId, false);
+                        s_admitQueue.NoteTry(actor); // keeps retry-first ordering
+                        continue; // still streaming — retried next pass
+                    }
+                    // Window expired without root+mesh+name ever appearing:
+                    // the actor is gone. No memo — it was never proven a
+                    // non-bot, so the band ring may re-check it.
+                    ++dbgRejVerifyExpired;
+                    LogBotAdmitReject(actor, "verify_window_expired", fname,
+                        rejectLogBudget, anyBot, strongDa, hasRoot, hasMesh,
+                        hasId, false);
+                    s_admitQueue.Settle(actor);
                     continue;
-                // Definitive reject (or try budget spent): settle and, per B1
-                // (Fix #8), memoize only when the name decoded.
+                }
+                // Definitive reject: fname+root+mesh all present but verify
+                // still failed — memoize so the ring does not re-probe serially
+                // every pass (TTL still re-checks).
+                LogBotAdmitReject(actor, "verify_memoized_reject", fname,
+                    rejectLogBudget, anyBot, strongDa, hasRoot, hasMesh, hasId,
+                    true);
                 s_admitQueue.Settle(actor);
                 if (!fname.empty()) {
                     if (s_botVerifyNeg.size() > 16384)
@@ -2496,7 +2576,7 @@ void Engine::RobotList()
             itemName = kBotStructAdmissionToken;
 
         const uint8_t broken = ReadBotBrokenFlag(actor);
-        if (broken != 0 && !var::show_dead_bots) {
+        if (broken != 0 && var::DeadBotsHidden()) {
             continue;
         }
 
@@ -2586,18 +2666,19 @@ void Engine::RobotList()
             s_botDeadSince.erase(actor); // fresh admit = fresh life
             const long long admitMs =
                 seenMs ? static_cast<long long>(admittedMs - seenMs) : -1;
-            std::ofstream f(kArcVerifyPath, std::ios::app);
-            if (f) {
+            {
                 char nameEsc[48]{};
                 snprintf(nameEsc, sizeof(nameEsc), "%.40s", itemName.c_str());
                 const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
-                f << "{\"sessionId\":\"c190fb\",\"runId\":\"appear\","
+                std::ostringstream oss;
+                oss << "{\"sessionId\":\"c190fb\",\"runId\":\"appear\","
                   << "\"location\":\"RobotList.cpp:RobotList\",\"message\":\"bot_admit\","
                   << "\"data\":{\"key\":" << actor
                   << ",\"name\":\"" << nameEsc
                   << "\",\"admitMs\":" << admitMs << "}"
                   << ",\"timestamp\":" << ts << "}\n";
+                EntityDiagnostics::LogRaw(oss.str());
             }
         }
         // #endregion
@@ -2612,6 +2693,7 @@ void Engine::RobotList()
     // ReadBotSceneWorldPosLive that was starving the DMA bus.
     int dbgScenePosOk = 0;
     int dbgScenePosFail = 0;
+    int dbgScenePosJump = 0;
     int dbgBatchRootHits = 0;
     int dbgBatchPosHits = 0;
     int dbgBatchPosAlt = 0;
@@ -2719,6 +2801,35 @@ void Engine::RobotList()
                     row.key, row.root, it->second.Mesh);
             }
             if (IsPlausibleWorldPos(scene)) {
+                // Same consistency gate the 16 ms sampler applies, for the same
+                // reason: this is the bot sampler whenever PositionRefreshPass is
+                // blocked, and a plausible-but-wrong vector committed here puts a
+                // box kilometres away from the bot that owns it. Refusal keeps the
+                // previous position and does not advance the stamps, so paint and
+                // the expiry policy see "no new sample" rather than a bad one.
+                {
+                    const BotPosSanity::Sample newestNow{
+                        it->second.WorldPos,
+                        it->second.positionSampleMs,
+                        IsPlausibleWorldPos(it->second.WorldPos)};
+                    const BotPosSanity::Sample olderNow{
+                        it->second.prevSampleWorldPos,
+                        it->second.prevSampleMs,
+                        it->second.prevSampleMs != 0
+                            && IsPlausibleWorldPos(it->second.prevSampleWorldPos)};
+                    const uint64_t judgeMs = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count());
+                    const BotPosSanity::Verdict verdict = BotPosSanity::Judge(
+                        newestNow, olderNow, scene, judgeMs, it->second.posJumpRejects);
+                    if (!verdict.accept) {
+                        if (it->second.posJumpRejects < 255)
+                            ++it->second.posJumpRejects;
+                        ++dbgScenePosJump;
+                        continue;
+                    }
+                    it->second.posJumpRejects = 0;
+                }
                 // This is the bot sampler whenever PositionRefreshPass is
                 // blocked, so it must maintain the sample pair paint interpolates
                 // across (Core/BotMotion.hpp).
@@ -2751,6 +2862,20 @@ void Engine::RobotList()
     // processed every pass (all distSkip) while nearby bots never got
     // Drawing=true (drawing:0 with a full cache). Sort by distance so the
     // bots actually on screen are processed first.
+    // Liveness stamp for EVERY cached bot, not just the ones the budgeted loop
+    // below reaches. That loop breaks at its 500ms budget, so bots past the cut
+    // kept a stale lastActorSeenMs and the paint gate hid them as
+    // actor_not_current (3s limit) even while still in the actor array. A set
+    // lookup is CPU-only; no DMA.
+    {
+        const uint64_t seenNowMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        for (auto& kv : localCache) {
+            if (currentActorSet.contains(static_cast<uint64_t>(kv.first)))
+                kv.second.lastActorSeenMs = seenNowMs;
+        }
+    }
     std::vector<uintptr_t> retainOrder;
     retainOrder.reserve(localCache.size());
     for (const auto& kv : localCache)
@@ -2786,7 +2911,9 @@ void Engine::RobotList()
             // Do not refresh liveness for a cache entry that disappeared from
             // the current actor array. The frame gate will reject it once this
             // bounded grace expires instead of treating a stale root as live.
-            actor.lastActorSeenMs = 0;
+            // Keep the last sighting: the frame gate (kMaxActorSeenAgeMs) expires it after
+            // the bounded grace. Zeroing here hid the bot on any single pass whose
+            // actor-array read came back short — the on/off blink.
         }
         if (retainBudget.expired() || turnBudget.expired())
             break;
@@ -2942,14 +3069,21 @@ void Engine::RobotList()
         // Broken flag read BEFORE the Drawing reset: a garbage/DMA-flapped read
         // must not blank the box for one frame then re-draw it (flicker).
         uint8_t broken = ReadBotBrokenFlag(key);
-        // Secondary SDK-backed death evidence. Probe at 2 Hz rather than in
-        // the 16ms position pass; a single zero/partially-read frame is never
-        // enough to remove a live flying bot.
+        actor.broken = broken != 0; // published for DMA-free consumers (aim/paint)
+        actor.brokenSampleMs = SteadyMsFrom(nowRetain);
+        // Secondary SDK-backed death evidence. Probe at the HealthMs tolerance
+        // rather than in the 16ms position pass; a single zero/partially-read
+        // frame is never enough to remove a live flying bot. The interval and
+        // the consumers' tolerance are the same number (FeaturePolicy), so a
+        // reader that finds the value older than that knows the probe is behind
+        // rather than silently trusting a stale health bar.
         {
             const auto probeIt = s_lastBotHealthProbe.find(key);
             if (probeIt == s_lastBotHealthProbe.end()
-                || nowRetain - probeIt->second >= std::chrono::milliseconds(500)) {
+                || nowRetain - probeIt->second >=
+                    std::chrono::milliseconds(FeaturePolicy::Staleness::HealthMs)) {
                 s_lastBotHealthProbe[key] = nowRetain;
+                ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Health);
                 float partHp[Engine::WorldCacheEntry::kMaxBotParts]{};
                 int destroyedParts = 0;
                 const int count = ReadBotPartHp(
@@ -2973,6 +3107,9 @@ void Engine::RobotList()
                     }
                     actor.health = static_cast<float>(healthSum / valid * 100.0);
                     actor.maxhealth = 100.f;
+                    // Stamp what the reader is about to trust.
+                    actor.healthSampleMs = SteadyMsFrom(nowRetain);
+                    actor.partHpSampleMs = actor.healthSampleMs;
                 }
                 if (allZero) {
                     const auto zeroIt = s_botAllZeroHealthSince.try_emplace(
@@ -2985,6 +3122,12 @@ void Engine::RobotList()
             }
         }
         actor.IsBreaked = broken != 0;
+        // Publish the FINAL decision, not the raw probe taken before the health
+        // evidence above. Consumers (aim, paint) read entry.broken through the
+        // frame; publishing only the pre-health value meant a bot whose parts
+        // all read zero for 600 ms never appeared broken to them at all.
+        actor.broken = broken != 0;
+        actor.brokenSampleMs = SteadyMsFrom(nowRetain);
         if (broken != 0) {
             // Dead-ESP expiry (BotEspExpiry): the old grace kept Drawing=true
             // and waited out kBotVisualMissEvict — 5-25s of frozen box after
@@ -3007,17 +3150,16 @@ void Engine::RobotList()
                 // bot_expire (verify log): death -> erase window. heldMs is
                 // the number this fix exists to shrink.
                 {
-                    std::ofstream f(kArcVerifyPath, std::ios::app);
-                    if (f) {
-                        const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
-                        f << "{\"sessionId\":\"c190fb\",\"runId\":\"verify\","
-                          << "\"location\":\"RobotList.cpp:retain\",\"message\":\"bot_expire\","
-                          << "\"data\":{\"key\":" << key
-                          << ",\"heldMs\":" << deadForMs
-                          << ",\"corpse\":" << (var::show_dead_bots ? 1 : 0)
-                          << "},\"timestamp\":" << ts << "}\n";
-                    }
+                    std::ostringstream f;
+                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"verify\","
+                      << "\"location\":\"RobotList.cpp:retain\",\"message\":\"bot_expire\","
+                      << "\"data\":{\"key\":" << key
+                      << ",\"heldMs\":" << deadForMs
+                      << ",\"corpse\":" << (var::show_dead_bots ? 1 : 0)
+                      << "},\"timestamp\":" << ts << "}\n";
+                    EntityDiagnostics::LogRaw(f.str());
                 }
                 // #endregion
                 ClearBotVisualMiss(key);
@@ -3034,6 +3176,12 @@ void Engine::RobotList()
         }
 
         actor.category = 3;
+        // Capture the previous draw state BEFORE the reset below: the distance
+        // gate's Schmitt hysteresis ("a bot already drawing stays on up to 15%
+        // past the cutoff") must read THIS. Reading actor.Drawing after the
+        // reset made the hold dead code, so bots at the range boundary blinked
+        // on every scan.
+        const bool wasDrawing = actor.Drawing;
         actor.Drawing = false;
 
         // Health is refreshed in the same SDK-backed probe above. Preserve the
@@ -3121,7 +3269,7 @@ void Engine::RobotList()
                     it = localCache.erase(it);
                 } else if (IsPlausibleWorldPos(actor.WorldPos)) {
                     s_botLastGoodPos[key] = { actor.WorldPos, nowRetain };
-                    Vector3 delta = actor.WorldPos - cam.Location;
+                    Vector3 delta = actor.WorldPos - localPos;
                     const float distanceSq = static_cast<float>(
                         delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
                     actor.Distance = sqrtf(distanceSq) / 100.0f;
@@ -3130,8 +3278,14 @@ void Engine::RobotList()
                     // from flickering at the distance boundary (41% of all flickers).
                     static std::unordered_map<uintptr_t, uint8_t> s_botDistMisses;
                     constexpr uint8_t kBotDistMissClear = 3;
-                    const bool distInside = distanceSq <= maxDistSq;
-                    const bool distHeld = actor.Drawing && distanceSq <= maxDistOffSq;
+                    // distHeld is the 1.15x Schmitt band and must read
+                    // wasDrawing (state BEFORE this pass's reset), and a bad
+                    // anchor holds the previous state instead of culling on
+                    // garbage distance.
+                    // FAIL-OPEN: a bad anchor must not hide every bot — an
+                    // unmeasurable range is treated as in-range.
+                    const bool distInside = distRefOk ? distanceSq <= maxDistSq : true;
+                    const bool distHeld = wasDrawing && distanceSq <= maxDistOffSq;
                     if (distInside || distHeld) {
                         actor.Drawing = true;
                         s_botDistMisses.erase(key);
@@ -3164,12 +3318,12 @@ void Engine::RobotList()
                             actor.prevSampleMs = actor.positionSampleMs;
                         }
                         actor.WorldPos = fit->second.pos;
-                        Vector3 delta = actor.WorldPos - cam.Location;
+                        Vector3 delta = actor.WorldPos - localPos;
                         const float distanceSq = static_cast<float>(
                             delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
                         actor.Distance = sqrtf(distanceSq) / 100.0f;
-                        if (distanceSq <= maxDistSq
-                            || (actor.Drawing && distanceSq <= maxDistOffSq)) {
+                        if ((distRefOk ? distanceSq <= maxDistSq : true)
+                            || (wasDrawing && distanceSq <= maxDistOffSq)) {
                             actor.Drawing = true;
                             ++dbgDrawing;
                         } else {
@@ -3182,19 +3336,18 @@ void Engine::RobotList()
                             if (s_lastFreezeLog.time_since_epoch().count() == 0
                                 || nowRetain - s_lastFreezeLog >= std::chrono::seconds(3)) {
                                 s_lastFreezeLog = nowRetain;
-                                std::ofstream f(kArcDebugLogPath, std::ios::app);
-                                if (f) {
-                                    char fnEsc[64]{};
-                                    snprintf(fnEsc, sizeof(fnEsc), "%.48s",
-                                        engine.GetActorFNameStringCached(key).c_str());
-                                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        std::chrono::system_clock::now().time_since_epoch()).count();
-                                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"post-fix\",\"hypothesisId\":\"F1\","
-                                      << "\"location\":\"RobotList.cpp:RobotList\",\"message\":\"bot_pos_freeze\","
-                                      << "\"data\":{\"fname\":\"" << fnEsc
-                                      << "\",\"key\":" << key << "}"
-                                      << ",\"timestamp\":" << ts << "}\n";
-                                }
+                                std::ostringstream f;
+                                char fnEsc[64]{};
+                                snprintf(fnEsc, sizeof(fnEsc), "%.48s",
+                                    engine.GetActorFNameStringCached(key).c_str());
+                                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()).count();
+                                f << "{\"sessionId\":\"c190fb\",\"runId\":\"post-fix\",\"hypothesisId\":\"F1\","
+                                  << "\"location\":\"RobotList.cpp:RobotList\",\"message\":\"bot_pos_freeze\","
+                                  << "\"data\":{\"fname\":\"" << fnEsc
+                                  << "\",\"key\":" << key << "}"
+                                  << ",\"timestamp\":" << ts << "}\n";
+                                EntityDiagnostics::LogRaw(f.str());
                             }
                         }
                         // #endregion
@@ -3212,69 +3365,68 @@ void Engine::RobotList()
                         if (s_lastNoPos.time_since_epoch().count() == 0
                             || nowNoPos - s_lastNoPos >= std::chrono::seconds(2)) {
                             s_lastNoPos = nowNoPos;
-                            std::ofstream f(kArcDebugLogPath, std::ios::app);
-                            if (f) {
-                                char nameEsc[64]{}, fnEsc[64]{};
-                                snprintf(nameEsc, sizeof(nameEsc), "%.48s", actor.ActorName.c_str());
-                                snprintf(fnEsc, sizeof(fnEsc), "%.48s",
-                                    engine.GetActorFNameStringCached(key).c_str());
-                                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::system_clock::now().time_since_epoch()).count();
-                                // R4: zero-pos drones (Rocketeer/Firefly) — dump every
-                                // alternative position source to find the live one.
-                                Vector3 childPos{};
-                                int childIdx = -1;
-                                int childN = 0;
-                                if (actor.rootComponent) {
-                                    std::vector<uintptr_t> kids;
-                                    ReadChildComponentsLocal(actor.rootComponent, kids, 1);
-                                    childN = static_cast<int>(kids.size());
-                                    for (size_t ci = 0; ci < kids.size() && ci < 8; ++ci) {
-                                        const Vector3 cp =
-                                            Engine::ReadWorldLocationNocache(kids[ci], false);
-                                        if (IsPlausibleWorldPos(cp)) {
-                                            childPos = cp;
-                                            childIdx = static_cast<int>(ci);
-                                            break;
-                                        }
+                            std::ostringstream f;
+                            char nameEsc[64]{}, fnEsc[64]{};
+                            snprintf(nameEsc, sizeof(nameEsc), "%.48s", actor.ActorName.c_str());
+                            snprintf(fnEsc, sizeof(fnEsc), "%.48s",
+                                engine.GetActorFNameStringCached(key).c_str());
+                            const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count();
+                            // R4: zero-pos drones (Rocketeer/Firefly) — dump every
+                            // alternative position source to find the live one.
+                            Vector3 childPos{};
+                            int childIdx = -1;
+                            int childN = 0;
+                            if (actor.rootComponent) {
+                                std::vector<uintptr_t> kids;
+                                ReadChildComponentsLocal(actor.rootComponent, kids, 1);
+                                childN = static_cast<int>(kids.size());
+                                for (size_t ci = 0; ci < kids.size() && ci < 8; ++ci) {
+                                    const Vector3 cp =
+                                        Engine::ReadWorldLocationNocache(kids[ci], false);
+                                    if (IsPlausibleWorldPos(cp)) {
+                                        childPos = cp;
+                                        childIdx = static_cast<int>(ci);
+                                        break;
                                     }
                                 }
-                                const uintptr_t embarkM = Memory::read_nocache<uintptr_t>(
-                                    key + Offsets::EmbarkMesh);
-                                Vector3 embarkPos{};
-                                if (embarkM && engine.IsValidPointer(embarkM))
-                                    embarkPos = Engine::ReadWorldLocationNocache(embarkM, false);
-                                // R6: cached root may be stale — reread live.
-                                const uintptr_t liveRoot = Memory::read_nocache<uintptr_t>(
-                                    key + Offsets::RootComponent);
-                                Vector3 liveRootPos{};
-                                if (liveRoot && engine.IsValidPointer(liveRoot))
-                                    liveRootPos = Engine::ReadWorldLocationNocache(liveRoot, true);
-                                f << "{\"sessionId\":\"c190fb\",\"runId\":\"roller\",\"hypothesisId\":\"R4\","
-                                  << "\"location\":\"RobotList.cpp:RobotList\",\"message\":\"bot_nopos\","
-                                  << "\"data\":{\"label\":\"" << nameEsc
-                                  << "\",\"fname\":\"" << fnEsc
-                                  << "\",\"root\":" << actor.rootComponent
-                                  << ",\"mesh\":" << actor.Mesh
-                                  << ",\"posZ\":" << static_cast<long long>(actor.WorldPos.z)
-                                  << ",\"headOk\":" << (actor.hasBotHeadWorldPos ? 1 : 0)
-                                  << ",\"headX\":" << static_cast<long long>(actor.BotHeadWorldPos.x)
-                                  << ",\"headZ\":" << static_cast<long long>(actor.BotHeadWorldPos.z)
-                                  << ",\"parts\":" << actor.BotPartCount
-                                  << ",\"part0X\":" << static_cast<long long>(
-                                         actor.BotPartCount > 0 ? actor.BotPartPos[0].x : 0.f)
-                                  << ",\"childN\":" << childN
-                                  << ",\"childIdx\":" << childIdx
-                                  << ",\"childX\":" << static_cast<long long>(childPos.x)
-                                  << ",\"childZ\":" << static_cast<long long>(childPos.z)
-                                  << ",\"embark\":" << embarkM
-                                  << ",\"embarkX\":" << static_cast<long long>(embarkPos.x)
-                                  << ",\"liveRoot\":" << liveRoot
-                                  << ",\"liveRootX\":" << static_cast<long long>(liveRootPos.x)
-                                  << ",\"liveRootZ\":" << static_cast<long long>(liveRootPos.z)
-                                  << ",\"key\":" << key << "}"
-                                  << ",\"timestamp\":" << ts << "}\n";
                             }
+                            const uintptr_t embarkM = Memory::read_nocache<uintptr_t>(
+                                key + Offsets::EmbarkMesh);
+                            Vector3 embarkPos{};
+                            if (embarkM && engine.IsValidPointer(embarkM))
+                                embarkPos = Engine::ReadWorldLocationNocache(embarkM, false);
+                            // R6: cached root may be stale — reread live.
+                            const uintptr_t liveRoot = Memory::read_nocache<uintptr_t>(
+                                key + Offsets::RootComponent);
+                            Vector3 liveRootPos{};
+                            if (liveRoot && engine.IsValidPointer(liveRoot))
+                                liveRootPos = Engine::ReadWorldLocationNocache(liveRoot, true);
+                            f << "{\"sessionId\":\"c190fb\",\"runId\":\"roller\",\"hypothesisId\":\"R4\","
+                              << "\"location\":\"RobotList.cpp:RobotList\",\"message\":\"bot_nopos\","
+                              << "\"data\":{\"label\":\"" << nameEsc
+                              << "\",\"fname\":\"" << fnEsc
+                              << "\",\"root\":" << actor.rootComponent
+                              << ",\"mesh\":" << actor.Mesh
+                              << ",\"posZ\":" << static_cast<long long>(actor.WorldPos.z)
+                              << ",\"headOk\":" << (actor.hasBotHeadWorldPos ? 1 : 0)
+                              << ",\"headX\":" << static_cast<long long>(actor.BotHeadWorldPos.x)
+                              << ",\"headZ\":" << static_cast<long long>(actor.BotHeadWorldPos.z)
+                              << ",\"parts\":" << actor.BotPartCount
+                              << ",\"part0X\":" << static_cast<long long>(
+                                     actor.BotPartCount > 0 ? actor.BotPartPos[0].x : 0.f)
+                              << ",\"childN\":" << childN
+                              << ",\"childIdx\":" << childIdx
+                              << ",\"childX\":" << static_cast<long long>(childPos.x)
+                              << ",\"childZ\":" << static_cast<long long>(childPos.z)
+                              << ",\"embark\":" << embarkM
+                              << ",\"embarkX\":" << static_cast<long long>(embarkPos.x)
+                              << ",\"liveRoot\":" << liveRoot
+                              << ",\"liveRootX\":" << static_cast<long long>(liveRootPos.x)
+                              << ",\"liveRootZ\":" << static_cast<long long>(liveRootPos.z)
+                              << ",\"key\":" << key << "}"
+                              << ",\"timestamp\":" << ts << "}\n";
+                            EntityDiagnostics::LogRaw(f.str());
                         }
                     }
                     // #endregion
@@ -3288,6 +3440,14 @@ void Engine::RobotList()
         if (!IsPlausibleWorldPos(actor.WorldPos)) {
             // Ghost-flicker fix: a transient zero read must not erase the bot;
             // hold the last plausible position within the freeze TTL.
+            //
+            // Hidden trap behind this path: the position it restores comes from
+            // the module-side last-good table, which is written from whatever was
+            // last committed (below). It is a plausible vector by construction and
+            // carries no history of its own, so it is deliberately NOT run through
+            // Core/BotPosSanity.hpp -- re-anchoring to it would let one poisoned read
+            // become the reference every later good sample is judged against. The
+            // table is stamped with nowRetain and TTL-bounded for exactly that reason.
             if (const auto fit = s_botLastGoodPos.find(key);
                 fit != s_botLastGoodPos.end()
                 && nowRetain - fit->second.when <= kBotPosFreezeTtl) {
@@ -3309,289 +3469,26 @@ void Engine::RobotList()
         // velocity here as well: RobotList runs at a different cadence and the
         // two writers produced sawtooth velocity estimates and choppy lead.
 
-        // LRTS visibility: raw fast-path first, encrypted scan/key fallback.
-        // Every read here must bypass the VMM cache — render timestamps change
-        // per frame and the cached path serves the same bytes twice, so the
-        // scan would never see a value move and could never lock a key.
-        // Bots: constructive-pawns frequently leave BOTH the 0x438 mesh slot
-        // and EmbarkMesh (0x7E8) unbound, so resolve the component that
-        // actually carries a render flag — probe the mesh slots, then the root
-        // component and its children (boxes draw from root). Gate on any probe
-        // candidate, not actor.Mesh alone.
-        if (var::LrtsVisActive()
-            && (actor.Mesh || actor.rootComponent) && worldTime > 10.f) {
-            uintptr_t visMesh = 0;
-            const auto nowResolve = std::chrono::steady_clock::now();
-            auto& ent = s_botVisMeshResolve[actor.APawn];
-            if (nowResolve - ent.at < std::chrono::seconds(1))
-                visMesh = ent.mesh;
-            if (!visMesh) {
-                visMesh = ResolveBotVisMesh(
-                    actor.APawn, actor.Mesh, actor.rootComponent, ent);
-                ent.mesh = visMesh;
-                ent.at = nowResolve;
-            }
-            if (s_botVisMeshResolve.size() > 8192) {
-                const auto tooOld = nowResolve - std::chrono::seconds(10);
-                for (auto it = s_botVisMeshResolve.begin();
-                     it != s_botVisMeshResolve.end();) {
-                    if (it->second.at < tooOld)
-                        it = s_botVisMeshResolve.erase(it);
-                    else
-                        ++it;
-                }
-            }
-            // Prefer the session-discovered offset/key pair — hardcoded pairs
-            // go stale every game build (the current one reads 0x4C4 as zero).
-            // Until Scan lands a discovery, fall back to the hardcoded constant.
-            uint32_t lrtsOff =
-                static_cast<uint32_t>(Offsets::Mesh_LastRenderTimeOnScreenEnc);
-            uint32_t lrtsKey = Offsets::Mesh_LastRenderTimeOnScreenKey;
-            {
-                // Read the shared session pair under its mutex: Scan publishes
-                // them asynchronously from the same worker, so an unlocked read
-                // could tear a half-published offset/key pair.
-                std::lock_guard<std::mutex> sk(LrtsVis::g_session.mu);
-                if (LrtsVis::g_session.lrtsOffset != 0
-                    && LrtsVis::g_session.keyCount > 0) {
-                    lrtsOff = static_cast<uint32_t>(LrtsVis::g_session.lrtsOffset);
-                    lrtsKey = LrtsVis::g_session.keys[0];
-                }
-            }
-            auto vis = LrtsVis::CheckDirect(
-                [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
-                visMesh, LrtsVis::g_session, worldTime,
-                lrtsOff, lrtsKey);
-            if (vis == LrtsVis::Result::Unknown) {
-                const uintptr_t alt = Memory::read<uintptr_t>(actor.APawn + Offsets::EmbarkMesh);
-                if (alt && alt != visMesh && engine.IsValidPointer(alt)) {
-                    vis = LrtsVis::CheckDirect(
-                        [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
-                        alt, LrtsVis::g_session, worldTime,
-                        lrtsOff, lrtsKey);
-                    if (vis != LrtsVis::Result::Unknown)
-                        visMesh = alt;
-                }
-            }
-            if (vis == LrtsVis::Result::Unknown) {
-                // Feed Scan while unverified: a rendered mesh (flag byte set)
-                // is the one thing Scan needs to rediscover the current
-                // build's offset+key. One mesh per pass — once verified,
-                // CheckDirect above is primary and this costs nothing.
-                if (!LrtsVis::g_session.verified
-                    && !s_botScanFedThisPass && visMesh) {
-                    const uint8_t brrFed = Memory::read_nocache<uint8_t>(
-                        visMesh + LrtsVis::BrrOffset);
-                    if (brrFed & LrtsVis::BrrMask) {
-                        auto& ms = s_lrtsBotMeshStates[visMesh];
-                        if (!ms.meshComp) ms.meshComp = visMesh;
-                        LrtsVis::Scan(ms, LrtsVis::g_session,
-                            [](uint64_t a) { return Memory::read_nocache<uint8_t>(a); },
-                            [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
-                            [](uint64_t a, void* b, uint32_t s) {
-                                return PCIMemory::ReadVirtualMemoryNoCache(a, b, s);
-                            },
-                            worldTime, sGWorld);
-                        s_botScanFedThisPass = true;
-                    }
-                }
-                vis = LrtsVis::CheckRendered(
-                    [](uint64_t a) { return Memory::read_nocache<uint8_t>(a); },
-                    visMesh, LrtsVis::g_session,
-                    LrtsVis::BrrOffset, LrtsVis::BrrMask);
-            }
-            if (vis == LrtsVis::Result::Unknown) {
-                vis = LrtsVis::CheckRaw(
-                    [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
-                    visMesh, LrtsVis::g_session, worldTime);
-            }
-            if (vis == LrtsVis::Result::Unknown) {
-                auto& ms = s_lrtsBotMeshStates[visMesh];
-                if (!ms.meshComp) ms.meshComp = visMesh;
-                LrtsVis::Scan(ms, LrtsVis::g_session,
-                    [](uint64_t a) { return Memory::read_nocache<uint8_t>(a); },
-                    [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
-                    [](uint64_t a, void* b, uint32_t s) {
-                        return PCIMemory::ReadVirtualMemoryNoCache(a, b, s);
-                    },
-                    worldTime, sGWorld);
-                vis = LrtsVis::Check(ms, LrtsVis::g_session,
-                    [](uint64_t a) { return Memory::read_nocache<uint8_t>(a); },
-                    [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
-                    worldTime, sGWorld);
-            }
-            // Hysteresis: require 2 confirmed Occluded checks before hiding
-            // (kills flag-byte flicker + transient 0x00 reads); Unknown keeps
-            // the last verdict so read failures never pop boxes through walls.
-            const uint64_t nowMs = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count());
-            // BRR-aware hysteresis: fast-hide ONLY on a successfully-read byte
-            // (non-zero) with the rendered bit clear. brr == 0x00 means the DMA
-            // read failed — falling back to the 2-check hysteresis keeps a
-            // transient flap from blinking the box (ghost-flicker regression).
-            const uint8_t brrSmooth = Memory::read_nocache<uint8_t>(
-                visMesh + LrtsVis::BrrOffset);
-            const bool confirmedNotRendered =
-                brrSmooth != 0 && (brrSmooth & LrtsVis::BrrMask) == 0;
+        // Bots always draw (fail-open).
+        actor.isVisible = true;
 
-            // Stage 3: LRTS + collision combined voting. LRTS is primary;
-            // collision is the tie-breaker for stale stamps (Visible+blocked
-            // → Occluded) and the fallback for Unknown. Occluded wins outright
-            // (renderer truth). Fail-open when the tree isn't ready.
-            if (var::collision_vis_enabled && CollisionMirror::IsReady()
-                && (actor.WorldPos.x != 0.0 || actor.WorldPos.y != 0.0 || actor.WorldPos.z != 0.0)) {
-                const bool blocked = !CollisionMirror::QueryVisible(
-                    cam.Location, actor.WorldPos);
-                switch (vis) {
-                case LrtsVis::Result::Occluded:
-                    break;  // renderer truth wins
-                case LrtsVis::Result::Visible:
-                    if (blocked)
-                        vis = LrtsVis::Result::Occluded;  // stale stamp behind wall
-                    break;
-                case LrtsVis::Result::Unknown:
-                default:
-                    vis = blocked
-                        ? LrtsVis::Result::Occluded
-                        : LrtsVis::Result::Visible;  // collision fills LRTS gaps
-                    break;
-                }
-            }
-            actor.isVisible = s_botVisSmooth[key].Update(
-                vis, nowMs, confirmedNotRendered);
-
-            // Burst capture: full-frame-rate rows for ONE (first) bot so the
-            // true LOS->verdict latency is measurable. The shared 1 Hz trace
-            // cannot. Auto-disables after a duration or row cap.
-            if (var::lrts_debug_burst) {
-                const auto nowBurst = std::chrono::steady_clock::now();
-                if (s_burstPawn == 0) {
-                    s_burstPawn = actor.APawn;
-                    s_burstRows = 0;
-                    s_burstCaptureUntil =
-                        nowBurst + std::chrono::seconds(kBotBurstMaxSecs);
-                }
-                if (s_burstPawn == actor.APawn) {
-                    const uint8_t brrBurst = Memory::read_nocache<uint8_t>(
-                        visMesh + LrtsVis::BrrOffset);
-                    ObserveBotVisChild(ent, visMesh, brrBurst);
-                    std::ofstream bf(kArcVerifyPath, std::ios::app);
-                    if (bf) {
-                        const auto bts = std::chrono::duration_cast<
-                            std::chrono::milliseconds>(
-                                std::chrono::system_clock::now()
-                                    .time_since_epoch()).count();
-                        Vector3 scr{};
-                        const bool inFront = IsPlausibleWorldPos(actor.WorldPos)
-                            && engine.ProjectWorldLocationToScreen(
-                                actor.WorldPos, scr, cam);
-                        bf << "{\"location\":\"RobotList.cpp\","
-                           << "\"message\":\"vis_burst\","
-                           << "\"timestamp\":" << bts
-                           << ",\"mesh\":\"0x" << std::hex << visMesh
-                           << "\",\"brr\":\"0x"
-                           << static_cast<unsigned>(brrBurst) << std::dec << "\""
-                           << ",\"vis\":" << static_cast<int>(vis)
-                           << ",\"inFront\":" << (inFront ? 1 : 0)
-                           << ",\"wt\":" << worldTime
-                           << "}\n";
-                    }
-                    ++s_burstRows;
-                    if (s_burstRows >= kBotBurstMaxRows
-                        || nowBurst > s_burstCaptureUntil) {
-                        var::lrts_debug_burst = false;
-                        s_burstPawn = 0;
-                        s_burstRows = 0;
-                    }
-                }
-            }
-
-            // Per-actor trace, 1 Hz. Answers two things the aggregate counters
-            // cannot: whether distinct actors get distinct flag bytes, and how
-            // long the byte takes to follow a line-of-sight change.
-            if (var::lrts_debug_trace) {
-                static std::chrono::steady_clock::time_point sLastVisTrace{};
-                static int sVisTraceThisPass = 0;
-                const auto nowTrace = std::chrono::steady_clock::now();
-                if (nowTrace - sLastVisTrace > std::chrono::seconds(1)) {
-                    sLastVisTrace = nowTrace;
-                    sVisTraceThisPass = 0;
-                }
-                if (sVisTraceThisPass < 8) {
-                    ++sVisTraceThisPass;
-                    const uint8_t brrTrace = Memory::read_nocache<uint8_t>(
-                        visMesh + LrtsVis::BrrOffset);
-                    ObserveBotVisChild(ent, visMesh, brrTrace);
-                    std::ofstream vf(kArcVerifyPath, std::ios::app);
-                    if (vf) {
-                        const auto vts = std::chrono::duration_cast<
-                            std::chrono::milliseconds>(
-                                std::chrono::system_clock::now()
-                                    .time_since_epoch()).count();
-                        std::vector<BotVisNode> tree;
-                        CollectBotVisTree(actor.APawn, actor.Mesh,
-                            actor.rootComponent, tree, var::lrts_debug_tree);
-                        vf << "{\"location\":\"RobotList.cpp\","
-                           << "\"message\":\"vis_trace\","
-                           << "\"timestamp\":" << vts
-                           << ",\"mesh\":\"0x" << std::hex << visMesh
-                           << "\",\"orig\":\"0x" << actor.Mesh
-                           << "\",\"brr\":\"0x" << static_cast<unsigned>(brrTrace)
-                           << std::dec << "\""
-                           << ",\"vis\":" << static_cast<int>(vis);
-                        if (!tree.empty()) {
-                            vf << ",\"tree\":[";
-                            for (size_t ti = 0; ti < tree.size(); ++ti) {
-                                if (ti) vf << ',';
-                                vf << "{\"c\":\"0x" << std::hex << tree[ti].comp
-                                   << "\",\"w\":\"";
-                                for (int wi = 0; wi < 7; ++wi) {
-                                    if (wi) vf << ',';
-                                    vf << "0x" << static_cast<unsigned>(tree[ti].flag[wi]);
-                                }
-                                vf << "\"}";
-                            }
-                            vf << ']';
-                        }
-                        vf << "}\n";
-                    }
-                }
-            }
-        } else {
-            actor.isVisible = true;
-
-            // The gate skipped this actor, so nothing above ran. Record why.
-            if (var::lrts_debug_trace) {
-                static std::chrono::steady_clock::time_point sLastGateTrace{};
-                const auto nowGate = std::chrono::steady_clock::now();
-                if (nowGate - sLastGateTrace > std::chrono::seconds(1)) {
-                    sLastGateTrace = nowGate;
-                    std::ofstream gf(kArcVerifyPath, std::ios::app);
-                    if (gf) {
-                        const auto gts = std::chrono::duration_cast<
-                            std::chrono::milliseconds>(
-                                std::chrono::system_clock::now()
-                                    .time_since_epoch()).count();
-                        gf << "{\"location\":\"RobotList.cpp\","
-                           << "\"message\":\"vis_gate\","
-                           << "\"timestamp\":" << gts
-                           << ",\"visEnabled\":" << (var::vis_enabled ? 1 : 0)
-                           << ",\"mesh\":\"0x" << std::hex << actor.Mesh << std::dec
-                           << "\",\"worldTime\":" << worldTime
-                           << "}\n";
-                    }
-                }
-            }
-        }
-
-        Vector3 delta = actor.WorldPos - cam.Location;
+        Vector3 delta = actor.WorldPos - localPos;
         const float distanceSq = static_cast<float>(
             delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
 
         actor.Distance = sqrtf(distanceSq) / 100.0f;
+        // Bad anchor (camera reset AND pawn root unreadable): the distance is
+        // meaningless — culling on it blanks the whole cache for a pass (the
+        // "all bots blink off together" bug). FAIL-OPEN per "Bots always draw":
+        // skip the range gate instead of hiding the bot.
+        if (!distRefOk) {
+            actor.Drawing = true;
+            ++dbgDrawing;
+            ++it;
+            continue;
+        }
         if (distanceSq > maxDistSq
-            && !(actor.Drawing && distanceSq <= maxDistOffSq)) {
+            && !(wasDrawing && distanceSq <= maxDistOffSq)) {
             ++dbgDistSkip;
             actor.Drawing = false;
             ++it;
@@ -3651,6 +3548,10 @@ void Engine::RobotList()
             // Position sample, velocity and every derived offset were moved as
             // one consistent group by PositionRefreshPass — take them together.
             it->second.WorldPos = live.WorldPos;
+            // Consecutive-jump memory travels with the sample group: the live
+            // sampler is the newest judge of whether this entry's positions agree
+            // with each other, so its count is the current one.
+            it->second.posJumpRejects = live.posJumpRejects;
             it->second.lastWorldPos = live.lastWorldPos;
             it->second.lastVelocityUpdate = live.lastVelocityUpdate;
             it->second.cachedVelocity = live.cachedVelocity;
@@ -3710,39 +3611,173 @@ void Engine::RobotList()
                 std::shared_lock<std::shared_mutex> lock(m_robotCacheMutex);
                 botCacheSz = robotCache.size();
             }
-            char bbuf[760]{};
+            // 1664, not 1280: the rej{} block below names every way an actor can
+            // leave the lane, and each size so far has been within ~100 bytes of
+            // truncating (760 -> 1280 -> here, for the first-probe fields). A
+            // truncated stats line would silently lose the tail.
+            char bbuf[1792]{};
+            // First-probe results: fp* is cumulative since the last world-gen
+            // clear (a cold load's flood lives there), fw* is the last
+            // kProbeWindowSamples probes and is the one that answers "is a new
+            // actor verified within a second NOW". A large cumulative fpMaxMs
+            // with a small fwMaxMs is the shape to expect after a raid load; a
+            // large fwMaxMs means the lane's per-pass capacity is the limit, not
+            // the ordering.
+            const AdmitQueue::PendingQueue::FirstProbeStats fpStats =
+                s_admitQueue.ProbeStats();
             snprintf(bbuf, sizeof(bbuf),
                 "{\"scanned\":%d,\"admitted\":%d,\"cache\":%zu,\"drawing\":%d,"
                 "\"structHit\":%d,\"quickPass\":%d,\"verifyFail\":%d,\"reEvict\":%d,"
                 "\"admitAny\":%d,\"failRoot\":%d,\"failMesh\":%d,\"failId\":%d,"
                 "\"failOther\":%d,\"fnameMiss\":%d,\"visSkip\":%d,\"distSkip\":%d,"
                 "\"zeroPos\":%d,\"sceneOk\":%d,\"sceneFail\":%d,\"enemyCount\":%d,"
-                "\"posAlt\":%d,"
-                "\"slice\":%zu,\"prioNew\":%d,\"pend\":%zu,\"tries\":%zu,"
-                "\"cycleMs\":%d,\"brokenSkip\":%d}",
+                "\"posAlt\":%d,\"posJump\":%d,"
+                "\"slice\":%zu,\"prioNew\":%d,\"prioOverdue\":%d,"
+                "\"prioSight\":%d,\"prioRetry\":%d,\"pend\":%zu,\"tries\":%zu,"
+                "\"cycleMs\":%d,\"brokenSkip\":%d,"
+                "\"fpN\":%llu,\"fpOver\":%llu,\"fpMeanMs\":%llu,\"fpMaxMs\":%llu,"
+                "\"fwN\":%llu,\"fwOver\":%llu,\"fwMeanMs\":%llu,\"fwMaxMs\":%llu,"
+                "\"rej\":{\"playerClass\":%d,\"localPs\":%d,\"cachedPlayer\":%d,"
+                "\"worldItem\":%d,\"fnameNeg\":%d,\"undecrypted\":%d,"
+                "\"verifyMemo\":%d,\"verifyTransient\":%d,\"verifyExpired\":%d}}",
                 dbgScanned, dbgAdmitted, botCacheSz, dbgDrawing,
                 dbgStructHit, dbgQuickPass, dbgVerifyFail, dbgReEvict,
                 dbgAdmitAnyBot, dbgFailNoRoot, dbgFailNoMesh, dbgFailNoId,
                 dbgFailOther, dbgFnameHit, dbgVisSkip, dbgDistSkip,
                 dbgZeroPos, dbgScenePosOk, dbgScenePosFail, dbgEnemyCount,
-                dbgBatchPosAlt,
-                dbgAdmitSlice, dbgAdmitPrioNew, s_admitQueue.Size(),
-                s_admitQueue.TrySize(), s_admitLastCycleMs, dbgBrokenSkip);
+                dbgBatchPosAlt, dbgScenePosJump,
+                dbgAdmitSlice, dbgAdmitPrioNew, dbgAdmitPrioOverdue,
+                dbgAdmitPrioFirstSight, dbgAdmitPrioRetry,
+                s_admitQueue.Size(),
+                s_admitQueue.TrySize(), s_admitLastCycleMs, dbgBrokenSkip,
+                static_cast<unsigned long long>(fpStats.n),
+                static_cast<unsigned long long>(fpStats.overBound),
+                static_cast<unsigned long long>(fpStats.n ? fpStats.sumMs / fpStats.n : 0),
+                static_cast<unsigned long long>(fpStats.maxMs),
+                static_cast<unsigned long long>(fpStats.winN),
+                static_cast<unsigned long long>(fpStats.winOverBound),
+                static_cast<unsigned long long>(
+                    fpStats.winN ? fpStats.winSumMs / fpStats.winN : 0),
+                static_cast<unsigned long long>(fpStats.winMaxMs),
+                dbgRejPlayerClass, dbgRejLocalPs, dbgRejCachedPlayer,
+                dbgRejWorldItem, dbgRejFnameNeg, dbgRejUndecrypted,
+                dbgRejVerifyMemo, dbgRejVerifyTransient, dbgRejVerifyExpired);
             EntityDiagnostics::LogScan("bots", bbuf);
-            std::ofstream f(kArcVerifyPath, std::ios::app);
-            if (f) {
-                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                f << "{\"sessionId\":\"c190fb\",\"runId\":\"bot-admit\","
-                  << "\"hypothesisId\":\"B10\",\"location\":\"RobotList.cpp:RobotList\","
-                  << "\"message\":\"bot_admit_stats\",\"data\":" << bbuf
-                  << ",\"timestamp\":" << ts << "}\n";
+            std::ostringstream f;
+            const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            f << "{\"sessionId\":\"c190fb\",\"runId\":\"bot-admit\","
+              << "\"hypothesisId\":\"B10\",\"location\":\"RobotList.cpp:RobotList\","
+              << "\"message\":\"bot_admit_stats\",\"data\":" << bbuf
+              << ",\"timestamp\":" << ts << "}\n";
+            EntityDiagnostics::LogRaw(f.str());
+        }
+    }
+
+    // ── Native enemy-container probe ─────────────────────────────────────────
+    // Players resolve from GameState.PlayerArray in one read; bots have no such
+    // array and are brute-forced from the ~2k-actor level list, so coverage is
+    // partial ("some bots never show"). This looks for a native TArray<actor*>
+    // in PioneerGameState (EnemyCount lives at 0xA40) and scores each candidate
+    // by how many of its elements are already-admitted bots — a machine-derived
+    // way to find the real enemy list from live data (the dump has no members).
+    // Throttled to the same 2s cadence as the stats line; always written to
+    // entity_diagnostics.ndjson.
+    {
+        static IntervalTimer probeTimer(2000);
+        uintptr_t gs = 0;
+        {
+            std::shared_lock<std::shared_mutex> slock(m_stateMutex);
+            gs = AGameStateBase;
+        }
+        std::unordered_set<uintptr_t> botKeys;
+        {
+            std::shared_lock<std::shared_mutex> lock(m_robotCacheMutex);
+            botKeys.reserve(robotCache.size());
+            for (const auto& kv : robotCache)
+                botKeys.insert(kv.first);
+        }
+        if (probeTimer.fire() && gs && IsValidPointer(gs) && !botKeys.empty()) {
+            // Single ReadRaw site: the whole GameState window is read as one
+            // block, then each candidate array's element block. Keeps this
+            // diagnostic to +1 direct-read site (ratcheted in the baseline).
+            auto rd = [](uintptr_t addr, void* buf, size_t n) {
+                return Memory::ReadRaw(addr, buf, n);
+            };
+            constexpr std::ptrdiff_t kWinBase = 0x4D0;
+            constexpr size_t kWinSize = static_cast<size_t>(0xD10 - kWinBase);
+            std::vector<uint8_t> win(kWinSize, 0);
+            int candidates = 0, bestBotHits = 0;
+            std::ptrdiff_t bestOff = 0;
+            if (rd(gs + kWinBase, win.data(), win.size())) {
+                for (std::ptrdiff_t off = kWinBase; off <= 0xD00; off += 0x8) {
+                    const size_t b = static_cast<size_t>(off - kWinBase);
+                    uintptr_t data = 0;
+                    int32_t n = 0, mx = 0;
+                    std::memcpy(&data, win.data() + b, sizeof(data));
+                    std::memcpy(&n, win.data() + b + 8, sizeof(n));
+                    std::memcpy(&mx, win.data() + b + 12, sizeof(mx));
+                    if (!data || !IsUsermodePtr(data))
+                        continue;
+                    if (n <= 0 || n > 512 || mx < n)
+                        continue;
+                    // Read the WHOLE array (capped at the 512 element filter) and
+                    // score every element, not just a sample: a true enemy list
+                    // should contain most admitted bots, so full coverage makes
+                    // bestBotHits conclusive instead of a first-8 coincidence.
+                    const int probeN = (n < 512) ? n : 512;
+                    std::vector<uint64_t> elems(static_cast<size_t>(probeN), 0);
+                    if (!rd(data, elems.data(), elems.size() * sizeof(uint64_t)))
+                        continue;
+                    int valid = 0, botHits = 0;
+                    uintptr_t first = 0;
+                    for (int i = 0; i < probeN; ++i) {
+                        const uintptr_t e = static_cast<uintptr_t>(elems[i]);
+                        if (e && IsValidPointer(e)) {
+                            ++valid;
+                            if (first == 0) first = e;
+                            if (botKeys.contains(e)) ++botHits;
+                        }
+                    }
+                    if (valid == 0 && botHits == 0)
+                        continue;
+                    ++candidates;
+                    if (botHits > bestBotHits) { bestBotHits = botHits; bestOff = off; }
+                    std::string firstName, firstClass;
+                    if (valid >= 4 && first) {
+                        firstName = engine.GetActorFNameStringCached(first);
+                        if (firstName.empty()) firstName = engine.GetActorFNameString(first);
+                        if (botHits > 0) firstClass = engine.GetActorClassFName(first);
+                    }
+                    std::ostringstream p;
+                    p << "{\"ev\":\"enemy_array_probe\",\"off\":" << off
+                      << ",\"gameState\":" << gs
+                      << ",\"data\":" << data << ",\"n\":" << n << ",\"max\":" << mx
+                      << ",\"probeN\":" << probeN << ",\"valid\":" << valid
+                      << ",\"botHits\":" << botHits
+                      << ",\"first\":" << first
+                      << ",\"firstName\":\"" << firstName << "\""
+                      << ",\"firstClass\":\"" << firstClass << "\""
+                      << ",\"botCache\":" << botKeys.size() << "}\n";
+                    EntityDiagnostics::LogRaw(p.str());
+                }
             }
+            std::ostringstream s;
+            s << "{\"ev\":\"enemy_array_probe_scan\",\"gameState\":" << gs
+              << ",\"botCache\":" << botKeys.size()
+              << ",\"candidates\":" << candidates
+              << ",\"bestOff\":" << bestOff
+              << ",\"bestBotHits\":" << bestBotHits << "}\n";
+            EntityDiagnostics::LogRaw(s.str());
         }
     }
 
     if (var::show_debug_overlay) {
         std::shared_lock<std::shared_mutex> lock(m_robotCacheMutex);
+        // Same first-probe numbers as the 2s file tap, so the overlay and the
+        // log cannot disagree about whether the bound held.
+        const AdmitQueue::PendingQueue::FirstProbeStats fpStats =
+            s_admitQueue.ProbeStats();
         std::cout << "[debugRobot] scanned=" << dbgScanned
             << " admitted=" << dbgAdmitted
             << " drawing=" << dbgDrawing
@@ -3769,6 +3804,17 @@ void Engine::RobotList()
             << " band=" << dbgAdmitSliceBase << "-" << dbgAdmitSliceEnd
             << " sliceActors=" << dbgAdmitSliceActors
             << " prioNew=" << dbgAdmitPrioNew
+            << " prioOverdue=" << dbgAdmitPrioOverdue
+            << " prioSight=" << dbgAdmitPrioFirstSight
+            << " prioRetry=" << dbgAdmitPrioRetry
+            << " fpN=" << fpStats.n
+            << " fpOver=" << fpStats.overBound
+            << " fpMeanMs=" << (fpStats.n ? fpStats.sumMs / fpStats.n : 0)
+            << " fpMaxMs=" << fpStats.maxMs
+            << " fwN=" << fpStats.winN
+            << " fwOver=" << fpStats.winOverBound
+            << " fwMeanMs=" << (fpStats.winN ? fpStats.winSumMs / fpStats.winN : 0)
+            << " fwMaxMs=" << fpStats.winMaxMs
             << " pend=" << s_admitQueue.Size()
             << " cover=0x" << std::hex << s_admitCoveredMask << std::dec
             << " cycleMs=" << s_admitLastCycleMs
@@ -3778,6 +3824,172 @@ void Engine::RobotList()
 }
 
 namespace WorldScan {
+
+// ── First-probe ordering: executed, not just documented ─────────────────────
+// The lane's ordering is the admission latency (a queued actor is probed only
+// from the lane — the band skips it), and the tests project cannot build here
+// (no compile targets in Project.Tests.vcxproj, and scripts/build.ps1 -Test
+// refuses by policy), so the decision table runs inside the shipping exe on the
+// overlay thread, in microseconds, and logs its own record. Same shape as
+// CollisionDebug::RunVerdictSelfTest.
+void EnsureFirstProbeSelfTestRan()
+{
+    static bool s_ran = false;
+    if (s_ran)
+        return;
+    s_ran = true;
+
+    using Queue = AdmitQueue::PendingQueue;
+    constexpr uint64_t now = 100000;
+    const auto plan = [](size_t rows) {
+        Queue::PassPlan p;
+        p.maxRows = rows;
+        return p;
+    };
+    const auto laneOf = [](Queue& q, size_t retries, size_t firstSight, uint64_t nowMs,
+                            std::vector<uint64_t>& order) {
+        for (size_t i = 0; i < retries; ++i) {
+            const uint64_t a = i;
+            q.NoteNew(a, nowMs);
+            q.NoteProbed(a, nowMs);
+            order.push_back(a);
+        }
+        for (size_t i = 0; i < firstSight; ++i) {
+            const uint64_t a = 1000 + i;
+            q.NoteNew(a, nowMs);
+            order.push_back(a);
+        }
+    };
+
+    // 1. A fresh actor is collected on the pass that noticed it — no rotation,
+    //    no waiting for the ring band that skips it anyway.
+    bool freshOk = false;
+    {
+        Queue q;
+        q.NoteNew(5150, now);
+        const std::vector<uint64_t> order{ 5150 };
+        std::vector<uint64_t> rows;
+        q.CollectPrio(order.begin(), order.end(), now, plan(96), rows);
+        freshOk = rows.size() == 1 && rows[0] == 5150
+            && q.Classify(5150, now) == Queue::Lane::FirstSight;
+    }
+
+    // 2. A retry storm cannot take the reserved share from never-probed work.
+    bool shareOk = false;
+    {
+        Queue q;
+        std::vector<uint64_t> order;
+        laneOf(q, 300, 40, now, order);
+        std::vector<uint64_t> rows;
+        q.CollectPrio(order.begin(), order.end(), now, plan(96), rows);
+        size_t sight = 0;
+        for (uint64_t a : rows) {
+            if (q.Classify(a, now) == Queue::Lane::FirstSight)
+                ++sight;
+        }
+        shareOk = rows.size() == 96 && sight == Queue::kFirstSightRowsPerPass;
+    }
+
+    // 3. Past the bound, a never-probed actor leads the lane over every retry.
+    bool preemptOk = false;
+    {
+        Queue q;
+        std::vector<uint64_t> order;
+        laneOf(q, 300, 0, now, order);
+        const uint64_t laggard = 9999;
+        q.NoteNew(laggard, now - (Queue::kFirstProbeBoundMs + 250));
+        order.push_back(laggard);
+        std::vector<uint64_t> rows;
+        q.CollectPrio(order.begin(), order.end(), now, plan(96), rows);
+        preemptOk = !rows.empty() && rows[0] == laggard;
+    }
+
+    // 4. A set larger than the budget drains oldest first, not in caller order.
+    bool oldestOk = false;
+    {
+        Queue q;
+        const uint64_t beyond = Queue::kFirstProbeBoundMs + 100;
+        q.NoteNew(33, now - beyond);
+        q.NoteNew(11, now - (beyond + 200));
+        q.NoteNew(22, now - (beyond + 100));
+        const std::vector<uint64_t> order{ 33, 22, 11 };   // hostile order
+        std::vector<uint64_t> rows;
+        q.CollectPrio(order.begin(), order.end(), now, plan(2), rows);
+        oldestOk = rows.size() == 2 && rows[0] == 11 && rows[1] == 22;
+    }
+
+    // 5. A re-note (ring reset, N jump) must not restart the latency clock, or a
+    //    reset could erase a wait that had already passed the bound.
+    bool renoteOk = false;
+    {
+        Queue q;
+        q.NoteNew(5, now);
+        q.NoteNew(5, now + 5000);
+        renoteOk =
+            q.Classify(5, now + Queue::kFirstProbeBoundMs) == Queue::Lane::OverdueFirst;
+    }
+
+    // 6. The wait is recorded once per actor, and the over-bound ones counted.
+    bool statsOk = false;
+    {
+        Queue q;
+        q.NoteNew(77, now);
+        q.NoteProbed(77, now + 120);
+        q.NoteProbed(77, now + 9000);   // not a first probe
+        q.NoteNew(88, now);
+        q.NoteProbed(88, now + 1100);
+        const Queue::FirstProbeStats s = q.ProbeStats();
+        statsOk = s.n == 2 && s.overBound == 1 && s.sumMs == 1220 && s.maxMs == 1100;
+    }
+
+    // 7. The window reports the STEADY state, not the cold load: a 5000ms spike
+    //    must leave the window once it scrolls out, or the number can never
+    //    answer "is a new actor verified within a second now".
+    bool windowOk = false;
+    {
+        Queue q;
+        q.NoteNew(1, 0);
+        q.NoteProbed(1, 5000);
+        const bool spikeSeen = q.ProbeStats().winMaxMs == 5000;
+        for (size_t i = 0; i < Queue::kProbeWindowSamples; ++i) {
+            const uint64_t actor = 100 + i;
+            q.NoteNew(actor, 0);
+            q.NoteProbed(actor, 40);
+        }
+        const Queue::FirstProbeStats s = q.ProbeStats();
+        windowOk = spikeSeen && s.winN == Queue::kProbeWindowSamples
+            && s.winMaxMs == 40 && s.winOverBound == 0
+            && s.n == Queue::kProbeWindowSamples + 1 && s.maxMs == 5000;
+    }
+
+    const bool cases[7] = {
+        freshOk, shareOk, preemptOk, oldestOk, renoteOk, statsOk, windowOk
+    };
+    int failed = 0;
+    for (const bool ok : cases) {
+        if (!ok)
+            ++failed;
+    }
+
+    std::ostringstream detail;
+    detail << "fresh_probed_now=" << (freshOk ? "pass" : "fail") << " ";
+    detail << "reserved_share=" << (shareOk ? "pass" : "fail") << " ";
+    detail << "overdue_preempts=" << (preemptOk ? "pass" : "fail") << " ";
+    detail << "oldest_first=" << (oldestOk ? "pass" : "fail") << " ";
+    detail << "renote_keeps_clock=" << (renoteOk ? "pass" : "fail") << " ";
+    detail << "stats_once=" << (statsOk ? "pass" : "fail") << " ";
+    detail << "window_is_steady_state=" << (windowOk ? "pass" : "fail") << " ";
+
+    std::ostringstream f;
+    f << "{\"location\":\"RobotList.cpp\",\"message\":\"bot_admit_first_probe_selftest\","
+      << "\"timestamp\":" << EntityDiagnostics::NowMs()
+      << ",\"passed\":" << (failed == 0 ? "true" : "false")
+      << ",\"cases\":7,\"failed\":" << failed
+      << ",\"boundMs\":" << Queue::kFirstProbeBoundMs
+      << ",\"reservedRows\":" << Queue::kFirstSightRowsPerPass
+      << ",\"detail\":\"" << EntityDiagnostics::Sanitize(detail.str(), 200) << "\"}\n";
+    EntityDiagnostics::LogRaw(f.str());
+}
 
 void ClearRobotScannerStaticState()
 {

@@ -104,8 +104,7 @@ NS_BLURB = {
     "AISenseConfigSight": "AI sight config (sight/lose-sight radius, peripheral vision, affiliation detection).",
     "AIStateService": "Bot alertness/combat/emotion state (alertness, combat phase, sight overrides).",
     "GeometryCollection": "Chaos geometry collection (GC component, rest transforms, simulating flag).",
-    "GuTriangleMesh": "PhysX triangle mesh (vertices/indices/AABB/16-bit flag).",
-    "PxHeightField": "PhysX heightfield (rows/cols/samples) for landscape collision reads.",
+
     "FHeightfieldRef": "Heightfield reference (rb pointer, refcount).",
     "FBodyInstance": "FBodyInstance actor handle.",
     "Landscape": "Landscape actor (collision components, component size quads, num subsections).",

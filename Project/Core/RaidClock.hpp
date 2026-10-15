@@ -39,14 +39,29 @@ inline std::string FormatClock(double seconds)
     return out;
 }
 
-// PioneerGameState::GamePhase is a numeric phase; its enum names are not in
-// the offline sources, so the panel shows the raw phase number honestly
-// instead of inventing labels. Empty for out-of-range reads.
+// SDK1.txt:12482 EGamePhase. MAX is a sentinel, not a valid phase.
 inline std::string PhaseText(int phase)
 {
-    if (phase < 0 || phase > 16)
-        return "";
-    return "Phase " + std::to_string(phase);
+    switch (phase) {
+    case 0: return "Pre-game";
+    case 1: return "Early game";
+    case 2: return "Mid-game";
+    case 3: return "Late game";
+    case 4: return "Not initialized";
+    default: return "";
+    }
+}
+
+// SDK1.txt:26136 EPerformanceHealthStatus; this is the replicated client
+// status only, not a measured CPU/GPU value or complete server telemetry.
+inline const char* ServerHealthText(int status)
+{
+    switch (status) {
+    case 0: return "OK";
+    case 1: return "Warning";
+    case 2: return "Bad";
+    default: return "Unknown";
+    }
 }
 
 } // namespace RaidClock

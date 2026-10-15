@@ -6,6 +6,7 @@
 #include "../Core/Engine.h"
 #include "../Core/Memory.h"
 #include "../Core/SteamDecrypt.hpp"
+#include "../Core/StringUtils.hpp"
 
 #include <Windows.h>
 
@@ -23,12 +24,6 @@
 #include <unordered_set>
 #include <vector>
 
-std::string ToLowerCopy(std::string s)
-{
-    for (char& ch : s)
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    return s;
-}
 
 namespace {
 
@@ -334,13 +329,7 @@ std::string ExeDirectory()
     return dir;
 }
 
-std::string TrimCopy(std::string s)
-{
-    auto notSpace = [](unsigned char c) { return !std::isspace(c); };
-    s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
-    s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
-    return s;
-}
+
 
 std::string CollapseSpaces(std::string s)
 {
@@ -359,12 +348,12 @@ std::string CollapseSpaces(std::string s)
             prevSpace = false;
         }
     }
-    return TrimCopy(out);
+    return StringUtils::TrimCopy(out);
 }
 
 std::string NormalizeNameKey(std::string s)
 {
-    s = CollapseSpaces(ToLowerCopy(TrimCopy(std::move(s))));
+    s = CollapseSpaces(StringUtils::ToLowerCopy(StringUtils::TrimCopy(std::move(s))));
     return s;
 }
 
@@ -517,7 +506,7 @@ bool LoadAssetIndexCsv(const std::string& path)
     int displayCol = -1;
     int worldCategoryCol = -1;
     for (size_t i = 0; i < header.size(); ++i) {
-        const std::string h = TrimCopy(header[i]);
+        const std::string h = StringUtils::TrimCopy(header[i]);
         if (h == "asset_id") assetIdCol = static_cast<int>(i);
         else if (h == "asset_name") assetCol = static_cast<int>(i);
         else if (h == "display_name_en") displayCol = static_cast<int>(i);
@@ -534,13 +523,13 @@ bool LoadAssetIndexCsv(const std::string& path)
         if (static_cast<int>(cols.size()) <= assetCol)
             continue;
 
-        const std::string assetName = TrimCopy(cols[static_cast<size_t>(assetCol)]);
+        const std::string assetName = StringUtils::TrimCopy(cols[static_cast<size_t>(assetCol)]);
         if (assetName.empty())
             continue;
 
         std::string assetId;
         if (assetIdCol >= 0 && static_cast<int>(cols.size()) > assetIdCol)
-            assetId = TrimCopy(cols[static_cast<size_t>(assetIdCol)]);
+            assetId = StringUtils::TrimCopy(cols[static_cast<size_t>(assetIdCol)]);
         if (!assetId.empty()) {
             g_assetIdToName[assetId] = assetName;
             g_nameToAssetId[assetName] = assetId;
@@ -548,13 +537,13 @@ bool LoadAssetIndexCsv(const std::string& path)
 
         std::string displayName;
         if (displayCol >= 0 && static_cast<int>(cols.size()) > displayCol)
-            displayName = TrimCopy(cols[static_cast<size_t>(displayCol)]);
+            displayName = StringUtils::TrimCopy(cols[static_cast<size_t>(displayCol)]);
         if (!assetId.empty() && !displayName.empty())
             g_assetIdToDisplay[assetId] = displayName;
 
         std::string worldCategory;
         if (worldCategoryCol >= 0 && static_cast<int>(cols.size()) > worldCategoryCol)
-            worldCategory = TrimCopy(cols[static_cast<size_t>(worldCategoryCol)]);
+            worldCategory = StringUtils::TrimCopy(cols[static_cast<size_t>(worldCategoryCol)]);
 
         if (!displayName.empty()) {
             g_assetByName[assetName] = displayName;
@@ -607,7 +596,7 @@ bool LoadAssetLocalizationsCsv(const std::string& path)
     int localeCol = -1;
     int displayCol = -1;
     for (size_t i = 0; i < header.size(); ++i) {
-        const std::string h = TrimCopy(header[i]);
+        const std::string h = StringUtils::TrimCopy(header[i]);
         if (h == "asset_id") assetIdCol = static_cast<int>(i);
         else if (h == "locale") localeCol = static_cast<int>(i);
         else if (h == "display_name") displayCol = static_cast<int>(i);
@@ -625,12 +614,12 @@ bool LoadAssetLocalizationsCsv(const std::string& path)
             || static_cast<int>(cols.size()) <= displayCol)
             continue;
 
-        const std::string locale = TrimCopy(cols[static_cast<size_t>(localeCol)]);
+        const std::string locale = StringUtils::TrimCopy(cols[static_cast<size_t>(localeCol)]);
         if (locale != "en")
             continue;
 
-        const std::string assetId = TrimCopy(cols[static_cast<size_t>(assetIdCol)]);
-        const std::string displayName = TrimCopy(cols[static_cast<size_t>(displayCol)]);
+        const std::string assetId = StringUtils::TrimCopy(cols[static_cast<size_t>(assetIdCol)]);
+        const std::string displayName = StringUtils::TrimCopy(cols[static_cast<size_t>(displayCol)]);
         if (assetId.empty() || displayName.empty())
             continue;
 
@@ -911,7 +900,7 @@ std::string LookupBotClassToken(const std::string& actorFName)
     // Separator-preserving key so short class tokens ("tick", "pop") can
     // word-boundary match — the min-5 substring rule blocked them entirely
     // (debug-c190fb: Ticks admitted with no label => no ESP).
-    std::string fnameWords = ToLowerCopy(actorFName);
+    std::string fnameWords = StringUtils::ToLowerCopy(actorFName);
     for (char& c : fnameWords) {
         if (!std::isalnum(static_cast<unsigned char>(c)))
             c = ' ';
@@ -980,13 +969,13 @@ bool AssetNamesInit()
     // Build the display-name vocabulary after all tables are loaded.
     for (const auto& kv : g_assetIdToDisplay)
         if (kv.second.size() >= 2)
-            g_knownDisplayLower.insert(ToLowerCopy(kv.second));
+            g_knownDisplayLower.insert(StringUtils::ToLowerCopy(kv.second));
     for (const auto& kv : g_assetByName)
         if (kv.second.size() >= 2)
-            g_knownDisplayLower.insert(ToLowerCopy(kv.second));
+            g_knownDisplayLower.insert(StringUtils::ToLowerCopy(kv.second));
     for (const auto& kv : g_locByKey)
         if (kv.second.size() >= 2)
-            g_knownDisplayLower.insert(ToLowerCopy(kv.second));
+            g_knownDisplayLower.insert(StringUtils::ToLowerCopy(kv.second));
 
     FinalizeWorldObjectPatterns();
     FinalizeAssetWorldPropPatterns();
@@ -1064,7 +1053,7 @@ bool IsKnownItemDisplayName(const std::string& displayName)
 {
     if (displayName.size() < 2)
         return false;
-    return g_knownDisplayLower.contains(ToLowerCopy(displayName));
+    return g_knownDisplayLower.contains(StringUtils::ToLowerCopy(displayName));
 }
 
 int64_t TryReadItemGameAssetIdFromActor(uint64_t actor)
@@ -1242,6 +1231,14 @@ std::string LookupEnemyBotByFName(const std::string& actorFName)
     if (actorFName.empty())
         return {};
 
+    // These class FNames are observed directly in the current game build;
+    // keep their labels deterministic even when the localization tables lag.
+    const std::string explicitFname = StringUtils::ToLowerCopy(actorFName);
+    if (explicitFname.find("c_meerkat_c") != std::string::npos)
+        return "Skulker Enemy";
+    if (explicitFname.find("c_tarragon_c") != std::string::npos)
+        return "Bully Enemy";
+
     const std::string fnameNorm = NormalizePlainKey(actorFName);
     if (fnameNorm.empty())
         return {};
@@ -1251,7 +1248,7 @@ std::string LookupEnemyBotByFName(const std::string& actorFName)
     // deletes separators outright ("bptickc"), which makes boundaries
     // meaningless and forced the old min-5 rule that blocked real short bot
     // names — Ticks were admitted but had no label, so no ESP (debug-c190fb).
-    std::string fnameWords = ToLowerCopy(actorFName);
+    std::string fnameWords = StringUtils::ToLowerCopy(actorFName);
     for (char& c : fnameWords) {
         if (!std::isalnum(static_cast<unsigned char>(c)))
             c = ' ';
@@ -1545,12 +1542,12 @@ bool IsStrictWorldLootFname(const std::string& actorFName)
     if (actorFName.empty())
         return false;
 
-    const std::string lower = ToLowerCopy(actorFName);
+    const std::string lower = StringUtils::ToLowerCopy(actorFName);
     static const char* kStrictPrefixes[] = {
         "da_item_", "wid_", "bp_pickupbase", "bp_pickup", "pickupbase",
         "bp_item_", "bp_itemactor_",
         "lootcontainer", "worldobject",
-        "corpse", "raidercache", "raider_cache",
+        "corpse", "raidercache", "raider_cache", "nomadcache", "bp_nomadcache",
         "cargoship", "fieldcrate", "weaponcase", "supplycall",
     };
     for (const char* prefix : kStrictPrefixes) {
@@ -1593,7 +1590,7 @@ bool WorldObjectAdmitsByFName(const std::string& actorFName)
     if (actorFName.empty())
         return false;
 
-    const std::string lower = ToLowerCopy(actorFName);
+    const std::string lower = StringUtils::ToLowerCopy(actorFName);
     if (lower.find("worldobject") != std::string::npos
         || lower.find("id_worldobject") != std::string::npos) {
         return true;
@@ -1618,7 +1615,7 @@ std::string LookupByInternalToken(const std::string& token)
     if (token.empty())
         return {};
 
-    const std::string tokenLower = ToLowerCopy(token);
+    const std::string tokenLower = StringUtils::ToLowerCopy(token);
     std::string best;
     size_t bestLen = 0;
 
@@ -1820,13 +1817,13 @@ static std::string StripUeClassSuffix(std::string s)
     if (s.size() > 2 && s.compare(s.size() - 2, 2, "_C") == 0)
         s.resize(s.size() - 2);
 
-    const std::string lower = ToLowerCopy(s);
+    const std::string lower = StringUtils::ToLowerCopy(s);
     if (lower.rfind("default__", 0) == 0)
         s = s.substr(9);
 
     // World Partition / UAID instance suffixes (help/esp.txt NormalizeClassName).
     {
-        const std::string lo = ToLowerCopy(s);
+        const std::string lo = StringUtils::ToLowerCopy(s);
         const size_t uaid = lo.find("_uaid_");
         if (uaid != std::string::npos)
             s.resize(uaid);
@@ -1859,7 +1856,7 @@ static bool FnameLooksWorldOrLoot(const std::string& actorFName)
     if (FnameAdmitsWorldActor(actorFName))
         return true;
 
-    const std::string lower = ToLowerCopy(actorFName);
+    const std::string lower = StringUtils::ToLowerCopy(actorFName);
     static const char* kHints[] = {
         "container", "pickup", "worldobject", "loot", "crate", "locker",
         "trash", "medical", "grenade", "weaponcase", "harvest", "backpack",
@@ -1937,14 +1934,14 @@ static std::string ApplyEspTitleCase(std::string s)
         }
     }
     flushWord();
-    return TrimCopy(std::move(out));
+    return StringUtils::TrimCopy(std::move(out));
 }
 
 static bool IsEspFnameJunkSegment(const std::string& seg)
 {
     if (seg.empty())
         return true;
-    const std::string lower = ToLowerCopy(seg);
+    const std::string lower = StringUtils::ToLowerCopy(seg);
     static const char* kJunk[] = {
         "wa", "medium", "small", "large", "deployable", "wid", "witem", "w",
         "default", "dynamic", "lid", "c", "instance", "inst",
@@ -1965,7 +1962,7 @@ static bool IsEspDisplayJunkWord(const std::string& word)
 {
     if (word.empty())
         return true;
-    const std::string lower = ToLowerCopy(word);
+    const std::string lower = StringUtils::ToLowerCopy(word);
     static const char* kJunk[] = {
         "wa", "medium", "small", "large", "deployable", "wid", "witem", "w",
         "item", "bp", "da", "default", "dynamic", "world", "instance", "inst",
@@ -2004,7 +2001,7 @@ static std::string StripEspDisplayJunkWords(std::string s)
             word.push_back(c);
     }
     flushWord();
-    return CollapseSpaces(TrimCopy(std::move(out)));
+    return CollapseSpaces(StringUtils::TrimCopy(std::move(out)));
 }
 
 static void StripEspFnamePrefixes(std::string& cleaned)
@@ -2230,6 +2227,7 @@ static std::string LookupExplicitCompoundLabel(const std::string& plainKey)
         { "bintrash", "Trash Can" },
         { "wastebin", "Waste Bin" },
         { "wastebasket", "Waste Basket" },
+        { "nomadcache", "Raider Cache" },
         { "raidercache", "Raider Cache" },
         { "raider cache", "Raider Cache" },
         { "deaddrop", "Dead Drop" },
@@ -2303,9 +2301,9 @@ static std::string LookupExplicitCompoundLabel(const std::string& plainKey)
 static std::string StripSalvageDisplayPrefix(std::string s)
 {
     for (;;) {
-        const std::string lower = ToLowerCopy(s);
+        const std::string lower = StringUtils::ToLowerCopy(s);
         if (lower.rfind("salvage ", 0) == 0 && s.size() > 8) {
-            s = TrimCopy(s.substr(8));
+            s = StringUtils::TrimCopy(s.substr(8));
             continue;
         }
         break;
@@ -2318,7 +2316,7 @@ std::string FormatEspDisplayLabel(const std::string& label)
     if (label.empty())
         return {};
 
-    std::string s = CollapseSpaces(TrimCopy(label));
+    std::string s = CollapseSpaces(StringUtils::TrimCopy(label));
     if (s.size() < 2)
         return {};
 
@@ -2373,7 +2371,7 @@ std::string HumanizeActorFName(const std::string& actorFName)
         return {};
 
     {
-        const std::string lower = ToLowerCopy(actorFName);
+        const std::string lower = StringUtils::ToLowerCopy(actorFName);
         if (lower.find("da_oi_outfit") != std::string::npos
             || lower.find("oi_outfit") != std::string::npos)
             return {};
@@ -2454,11 +2452,11 @@ std::string HumanizeActorFName(const std::string& actorFName)
         }
     }
 
-    cleaned = TrimCopy(cleaned);
+    cleaned = StringUtils::TrimCopy(cleaned);
     if (cleaned.size() < 2)
         return {};
 
-    if (IsLocationPrefixToken(ToLowerCopy(cleaned)))
+    if (IsLocationPrefixToken(StringUtils::ToLowerCopy(cleaned)))
         return {};
 
     {
@@ -2480,7 +2478,7 @@ std::string HumanizeActorFName(const std::string& actorFName)
             return {};
     }
 
-    if (ToLowerCopy(cleaned) == "other" || ToLowerCopy(cleaned) == "loot item")
+    if (StringUtils::ToLowerCopy(cleaned) == "other" || StringUtils::ToLowerCopy(cleaned) == "loot item")
         return {};
     return FormatEspDisplayLabel(cleaned);
 }
@@ -2490,7 +2488,7 @@ bool FnameLooksLikeHarvestableActor(const std::string& actorFName)
     if (actorFName.empty())
         return false;
 
-    const std::string lower = ToLowerCopy(actorFName);
+    const std::string lower = StringUtils::ToLowerCopy(actorFName);
     static const char* kTokens[] = {
         "bp_actor_consumable",
         "bpactorconsumable",
@@ -2545,7 +2543,7 @@ bool FnameAdmitsWorldActor(const std::string& actorFName)
     if (!LookupByAssetName(actorFName).empty())
         return true;
 
-    const std::string lower = ToLowerCopy(actorFName);
+    const std::string lower = StringUtils::ToLowerCopy(actorFName);
     if (IsInventoryWorldFnameExcluded(lower))
         return false;
 
@@ -2592,7 +2590,7 @@ bool FnameLooksLikeDroppedPickup(const std::string& actorFName)
     if (actorFName.empty())
         return false;
 
-    const std::string lower = ToLowerCopy(actorFName);
+    const std::string lower = StringUtils::ToLowerCopy(actorFName);
 
     // Pickup tokens win. Historically "itemactor" in inventory-exclude blocked
     // every BP_ItemActor_* floor drop (Canister) while BP_PickupBase still matched.
@@ -2620,7 +2618,7 @@ bool FnameLooksLikeWorldContainer(const std::string& actorFName)
     if (actorFName.empty())
         return false;
 
-    const std::string lower = ToLowerCopy(actorFName);
+    const std::string lower = StringUtils::ToLowerCopy(actorFName);
     if (IsInventoryWorldFnameExcluded(lower))
         return false;
 
@@ -2632,7 +2630,7 @@ bool FnameLooksLikeWorldContainer(const std::string& actorFName)
 
     static const char* kTokens[] = {
         "bpsocketcontainer", "bpsalvagecontainer",
-        "socketcontainer", "salvagecontainer", "burieddetectable", "raidercache",
+        "socketcontainer", "salvagecontainer", "burieddetectable", "raidercache", "nomadcache",
         "cargoship", "arc_cargo", "arc_cargoship", "bp_arc_cargoship",
         "lootcontainer", "genericcontainer", "shippingcontainer",
         "fieldcrate", "field_crate",

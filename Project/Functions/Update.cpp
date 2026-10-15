@@ -3,9 +3,9 @@
 #include "../Core/AgentLog.h"
 #include "../Core/ActorType.h"
 #include "../Core/IntervalTimer.h"
+#include "../Core/EntityDiagnostics.hpp"
 #include "../Interface/Utils/Variables/index.h"
 #include "WorldScanCommon.h"
-#include "CollisionMirror.h"
 
 #include <chrono>
 #include <cctype>
@@ -28,6 +28,7 @@ namespace {
 
 bool ChainHasWorldPosition(uintptr_t pc, uintptr_t pawn, uintptr_t root)
 {
+	ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Position);
 	(void)pc;
 	if (!pawn || !root || !Memory::IsValidPtrFast2(pawn))
 		return false;
@@ -126,17 +127,13 @@ static bool PawnLooksLikeHubCharacter(uintptr_t pawn)
 
 static bool PawnHasRaidCombatComponents(uintptr_t pawn)
 {
+	ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Link);
 	if (!pawn || !Memory::IsValidPtrFast2(pawn))
 		return false;
 
-	const uintptr_t ps = Memory::read<uintptr_t>(pawn + Offsets::APlayerState);
-	if (ps && Memory::IsValidPtrFast2(ps)) {
-		const double maxHp =
-			Memory::read<double>(ps + Offsets::PlayerState_MaxHealth);
-		if (maxHp > 1.0 && maxHp < 10000.0)
-			return true;
-	}
-
+	// No health block lives on the PlayerState (0x550 block = PlayerStatus +
+	// ServerStatus + bIsInEncounter + PioneerCharacter per the dump); the pawn's
+	// HealthComponent / InventoryComponent are the combat-components signal.
 	const uintptr_t healthComp =
 		Memory::read<uintptr_t>(pawn + Offsets::HealthComponent);
 	if (healthComp && Memory::IsValidPtrFast2(healthComp))
@@ -257,15 +254,17 @@ static void AgentRaidLog(
 	const bool verifyTap =
 		msg == "raid_hb" || msg == "raid_edge" || msg == "raid_entered"
 		|| msg == "raid_left" || msg == "world_lost";
-	std::ofstream f(verifyTap ? kArcVerifyPath : kArcDebugLogPath, std::ios::app);
-	if (!f)
-		return;
+
+	if (!verifyTap) return;
+
 	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		std::chrono::system_clock::now().time_since_epoch()).count();
-	f << "{\"sessionId\":\"c190fb\",\"runId\":\"pre-fix\",\"hypothesisId\":\""
+	std::ostringstream oss;
+	oss << "{\"sessionId\":\"c190fb\",\"runId\":\"pre-fix\",\"hypothesisId\":\""
 		<< hypothesisId << "\",\"location\":\"" << location
 		<< "\",\"message\":\"" << message << "\",\"data\":" << dataJson
 		<< ",\"timestamp\":" << ms << "}\n";
+	EntityDiagnostics::LogRaw(oss.str());
 }
 // #endregion
 
@@ -290,21 +289,32 @@ static void TracePcDiscovery(
 
 void Engine::Update() {
 	const uint64_t base = Memory::getBaseAddress();
+	const auto updT0 = std::chrono::steady_clock::now();
 
-	// SDK FString self-check (one-shot per session): reads the game's
-	// verification FString (Offsets::FStringVerificationRva) and records which
-	// player-name scramble actually decodes it; the proven one is then tried
-	// first for every name read.
+	// SDK FString self-check: reads the game's verification FString
+	// (Offsets::FStringVerificationRva) and records which player-name scramble
+	// actually decodes it; the proven one is then tried first for every name
+	// read. This build carries no verification RVA (see Core/SDK.hpp), so after
+	// a few retries the row reports not-applicable rather than failing red —
+	// nothing downstream depends on the verdict.
 	if (!m_fstrChecked && base) {
 		const Reflection::FStringCheck check = Reflection::CheckFStringPipeline(base);
-		m_fstrChecked = true;
-		m_fstrOk = check.readOk;
-		m_fstrKey = check.candidate;
-		m_fstrText = check.text;
-		// candidate 4 is the SDK drop's own FString pipeline (rol 14, state
-		// advance before the XOR) — see steam_decrypt::DecryptPlayerNameSdk.
-		if (check.candidate >= 0 && check.candidate <= 4)
-			steam_decrypt::SetPreferredNameKey(check.candidate);
+		if (check.readOk) {
+			m_fstrChecked = true;
+			m_fstrOk = true;
+			m_fstrKey = check.candidate;
+			m_fstrText = check.text.empty() ? "ok" : check.text;
+			// candidate 4 is the SDK drop's own FString pipeline (rol 14, state
+			// advance before the XOR) — see steam_decrypt::DecryptPlayerNameSdk.
+			// candidate 5 is the v20261009 reference scramble (0xA1900265 / rol 15).
+			if (check.candidate >= 0 && check.candidate <= 5)
+				steam_decrypt::SetPreferredNameKey(check.candidate);
+		} else if (++m_fstrAttempts >= 40) {
+			m_fstrChecked = true;
+			m_fstrOk = true;      // informational — cannot fail on this build
+			m_fstrKey = -1;
+			m_fstrText = "n/a (no verify RVA)";
+		}
 	}
 
 	// ── The player chain: one ladder, one state (Core/PlayerChain.hpp) ──
@@ -333,6 +343,7 @@ void Engine::Update() {
 	uintptr_t tActors = 0;
 	int actorCount = 0;
 	ResolvePlayerChain(base, seed, tActors, actorCount);
+	const auto updT1 = std::chrono::steady_clock::now();
 	const PlayerChain::State chain = GetChainState();
 
 	const uintptr_t tGWorld = chain.Ptr(PlayerChain::Hop::World);
@@ -434,34 +445,108 @@ void Engine::Update() {
 		if (tPCM)
 			PlayerCameraManager = tPCM;
 		AGameStateBase = ResolveGameStateFromWorld(tGWorld);
-		if (var::show_raid_hud || var::show_radar)
-			RefreshRaidDashboard();
 	}
 
-	// SDK reflection walker (Core/Reflection.hpp): when the pawn changes, decode
-	// its UClass through the SDK's FField/FProperty routines (SuperStruct chain +
-	// PropertyLink chain, property name + offset decoders). Bounded to the first
-	// properties so the walk stays cheap; DMA reads happen outside the lock.
-	if (base && tAcknowledgedPawn && tAcknowledgedPawn != m_reflectPawn) {
-		const uintptr_t uclass = Reflection::ClassOf(tAcknowledgedPawn);
-		const Reflection::ClassReport report =
-			Reflection::BuildReport(uclass, base, 48, /*wantTypes=*/false);
+	// The dashboard refresh does DMA (radar bounds, objectives, HUD reads), so it
+	// runs after the state lock is released. This thread is the only writer of
+	// the state it reads, so no lock is needed here; paint is never blocked on it.
+	if (var::show_raid_hud || var::show_radar)
+		RefreshRaidDashboard();
 
-		std::string sample;
-		for (size_t i = 0; i < report.properties.size() && i < 3; ++i) {
-			char line[128];
-			std::snprintf(line, sizeof(line), "%s%s=0x%X", i ? ", " : "",
-				report.properties[i].name.c_str(), report.properties[i].offset);
-			sample += line;
-		}
+	// SDK reflection walker (Core/Reflection.hpp): decode the pawn's UClass
+	// through the FField/FProperty routines (SuperStruct chain + PropertyLink
+	// chain). Re-walk on pawn change AND retry (throttled) while the walk is
+	// still empty, so a single transient failure no longer latches red for the
+	// whole session. DMA reads happen outside the lock.
+	if (base && tAcknowledgedPawn) {
+		const uint64_t nowMs = static_cast<uint64_t>(
+			std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count());
+		const bool pawnChanged = tAcknowledgedPawn != m_reflectPawn;
+		const bool retryDue = !m_reflectOk && (nowMs - m_reflectTryMs) >= 1000;
+		if (pawnChanged || retryDue) {
+			m_reflectTryMs = nowMs;
+			const uintptr_t uclass = Reflection::ClassOf(tAcknowledgedPawn);
+			const Reflection::ClassReport report =
+				Reflection::BuildReport(uclass, base, 48, /*wantTypes=*/false);
 
-		{
-			std::unique_lock<std::shared_mutex> stateLock(m_stateMutex);
-			m_reflectPawn = tAcknowledgedPawn;
-			m_reflectDepth = static_cast<int>(report.chain.size());
-			m_reflectProps = static_cast<int>(report.properties.size());
-			m_reflectOk = !report.chain.empty() && !report.properties.empty();
-			m_reflectSample = std::move(sample);
+			std::string sample;
+			for (size_t i = 0; i < report.properties.size() && i < 3; ++i) {
+				char line[128];
+				std::snprintf(line, sizeof(line), "%s%s=0x%X", i ? ", " : "",
+					report.properties[i].name.c_str(), report.properties[i].offset);
+				sample += line;
+			}
+
+			{
+				std::unique_lock<std::shared_mutex> stateLock(m_stateMutex);
+				m_reflectPawn = tAcknowledgedPawn;
+				m_reflectDepth = static_cast<int>(report.chain.size());
+				m_reflectProps = static_cast<int>(report.properties.size());
+				m_reflectOk = !report.chain.empty() && !report.properties.empty();
+				m_reflectSample = std::move(sample);
+			}
+
+			{
+				static uint64_t s_lastReflLog = 0;
+				if (nowMs - s_lastReflLog >= 3000) {
+					s_lastReflLog = nowMs;
+					std::string sample2;
+					for (size_t i = 0; i < report.properties.size() && i < 4; ++i) {
+						char b[96];
+						std::snprintf(b, sizeof(b), "%s%s=0x%X",
+							i ? ", " : "", report.properties[i].name.c_str(),
+							report.properties[i].offset);
+						sample2 += b;
+					}
+					std::ostringstream f;
+					const uintptr_t pwn = tAcknowledgedPawn;
+					const uint64_t refCls = GNames::RefReadClassPtr(pwn);
+					const uint64_t plainCls =
+						steam_decrypt::MemReadVal<uint64_t>(
+							pwn + Offsets::UObject_ClassPrivate);
+					const uint64_t sdkCls = GNames::ReadClassSlot16(pwn);
+					const uint64_t legacyCls = GNames::ReadSlot16Decoded(
+						pwn, GNames::ClassSlotLegacy(pwn));
+					const uint64_t modb = Memory::getBaseAddress();
+					uint8_t maskb[16]{}, keyb[16]{};
+					steam_decrypt::MemRead(modb + 0xD4DF8E0ull, maskb, 16);
+					steam_decrypt::MemRead(modb + 0xD4DF910ull, keyb, 16);
+					uint64_t keyLo = 0;
+					std::memcpy(&keyLo, keyb, 8);
+					uint64_t slotDec[4]{};
+					for (int sl = 0; sl < 4; ++sl) {
+						uint8_t st[16]{}, sh[16]{};
+						steam_decrypt::MemRead(
+							pwn + 0x20 + (uint64_t)sl * 0x20, st, 16);
+						for (int bi = 0; bi < 16; ++bi) {
+							const uint8_t mi = maskb[bi];
+							sh[bi] = (mi & 0x80) ? 0 : st[mi & 0x0F];
+						}
+						uint64_t lo = 0;
+						std::memcpy(&lo, sh, 8);
+						slotDec[sl] = lo ^ keyLo;
+					}
+					f << "{\"sessionId\":\"c190fb\",\"runId\":\"verify\","
+					  << "\"location\":\"Update.cpp\",\"message\":\"refl_probe\","
+					  << "\"data\":{\"pawn\":0x" << std::hex << tAcknowledgedPawn
+					  << ",\"uclass\":0x" << report.uclass
+					  << ",\"refCls\":0x" << refCls
+					  << ",\"plainCls\":0x" << plainCls
+					  << ",\"sdkCls\":0x" << sdkCls
+					  << ",\"legacyCls\":0x" << legacyCls
+					  << ",\"mask\":0x" << keyLo
+					  << ",\"s0\":0x" << slotDec[0]
+					  << ",\"s1\":0x" << slotDec[1]
+					  << ",\"s2\":0x" << slotDec[2]
+					  << ",\"s3\":0x" << slotDec[3]
+					  << ",\"chain\":" << std::dec << report.chain.size()
+					  << ",\"props\":" << report.properties.size()
+					  << ",\"sample\":\"" << sample2 << "\"},"
+					  << "\"timestamp\":" << nowMs << "}\n";
+					EntityDiagnostics::LogRaw(f.str());
+				}
+			}
 		}
 	}
 
@@ -484,6 +569,20 @@ void Engine::Update() {
 	// ended. Keep Update focused on state publication and raid transitions.
 	TickRaidGate();
 	TickEspCacheReadiness();
+	{
+		// Phase split of this pass, once a second: chain = player ladder DMA,
+		// rest = publish + raid gate + cache readiness.
+		const auto updT2 = std::chrono::steady_clock::now();
+		static auto s_updPrint = std::chrono::steady_clock::time_point{};
+		if (updT2 - s_updPrint >= std::chrono::seconds(1)) {
+			s_updPrint = updT2;
+			std::cout << "[updatePhase] chainMs="
+				<< std::chrono::duration_cast<std::chrono::milliseconds>(updT1 - updT0).count()
+				<< " restMs="
+				<< std::chrono::duration_cast<std::chrono::milliseconds>(updT2 - updT1).count()
+				<< std::endl;
+		}
+	}
 
 	// Do NOT clear s_cachedPC every hub tick. That forced ResolvePcFromLevelCameraManager
 	// over the menu actor list every Update and caused multi-hundred-ms DMA stalls
@@ -495,13 +594,6 @@ void Engine::Update() {
 		entityStarted.store(true, std::memory_order_release);
 	}
 
-	// Collision mirror: throttled background rebuild of world static collision.
-	// Gate-checks inside (movement / 20s force / first build); the heavy DMA
-	// runs on its own spawned thread, never here.
-	if (IsEspRaidActive()) {
-		CollisionMirror::ScheduleRebuild(GWorld, PersistentLevel,
-			Vector3(g_Camera.Location.x, g_Camera.Location.y, g_Camera.Location.z));
-	}
 }
 
 bool Engine::IsInRaidRaw() const
@@ -560,6 +652,7 @@ bool Engine::IsInRaidRaw() const
 	if (!root)
 		return false;
 
+	ReadBudget::PurposeScope purposePos(ReadBudget::Purpose::Position);
 	Vector3 pos = Memory::read<Vector3>(root + Offsets::RelativeLocation);
 	if (!IsPlausibleWorldPos(pos))
 		pos = Engine::ReadSceneWorldPos(root);
@@ -574,10 +667,18 @@ bool Engine::IsInRaidRaw() const
 	return true;
 }
 
-Engine::EngineStateSnapshot Engine::GetStateSnapshot() const
+Engine::EngineStateSnapshot Engine::GetStateSnapshot(bool allowStale) const
 {
 	EngineStateSnapshot snap{};
-	std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+	std::shared_lock<std::shared_mutex> lock(m_stateMutex, std::defer_lock);
+	if (allowStale && !lock.try_lock()) {
+		// A writer holds the state lock: serve the last published snapshot.
+		std::lock_guard<std::mutex> cacheLock(m_snapCacheMutex);
+		if (m_snapCacheValid)
+			return m_snapCache;
+	}
+	if (!lock.owns_lock())
+		lock.lock();
 	snap.gWorld = GWorld;
 	// The whole chain in one shot: every hop's pointer, the rung that answered it,
 	// its identity proof and the rung counts. Replaces the four src tags.
@@ -599,6 +700,11 @@ Engine::EngineStateSnapshot Engine::GetStateSnapshot() const
 	snap.fstrOk = m_fstrOk;
 	snap.fstrKey = m_fstrKey;
 	snap.fstrText = m_fstrText;
+	{
+		std::lock_guard<std::mutex> cacheLock(m_snapCacheMutex);
+		m_snapCache = snap;
+		m_snapCacheValid = true;
+	}
 	return snap;
 }
 
@@ -618,6 +724,19 @@ void Engine::ResetRaidTransitionState()
 	{
 		std::unique_lock<std::shared_mutex> cameraLock(m_cameraMutex);
 		g_Camera = {};
+	}
+	{
+		std::unique_lock<std::shared_mutex> lock(m_raidHudMutex);
+		m_raidHud = {};
+	}
+	{
+		std::unique_lock<std::shared_mutex> lock(m_feedMutex);
+		m_activityFeed = {};
+	}
+	{
+		std::unique_lock<std::shared_mutex> lock(m_radarBoundsMutex);
+		m_radarBounds = {};
+		m_radarBoundsValid = false;
 	}
 	ClearFNameCache();
 	g_fnameTablesReady = false;
@@ -786,6 +905,7 @@ int Engine::CountGameStatePlayerArray() const
 	if (!gs || !IsUsableObjectPtr(gs))
 		return 0;
 
+	ReadBudget::PurposeScope purposeWorld(ReadBudget::Purpose::World);
 	const int32_t arrNum =
 		Memory::read<int32_t>(gs + Offsets::GameState_PlayerArray + 8);
 	if (arrNum < 0 || arrNum > 64)
@@ -907,6 +1027,72 @@ void Engine::TickRaidGate()
 				<< ",\"fStep\":" << chain.worldFailStep;
 			if (slotRaw && slotRaw != gw)
 				d << ",\"slotName\":\"" << RaidJsonEscape(PeekObjFName(slotRaw)) << "\"";
+			// B4: GameState.ElapsedTime (int32 seconds since match start).
+			int32_t elapsed = -1;
+			// Copy the pointer under the lock, then do the DMA read outside it so
+			// writers (and the paint try_lock path) are not held up by the read.
+			uintptr_t gsForElapsed = 0;
+			{
+				std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+				gsForElapsed = AGameStateBase;
+			}
+			if (gsForElapsed && IsUsableObjectPtr(gsForElapsed)) {
+				ReadBudget::PurposeScope purpose(ReadBudget::Purpose::World);
+				const int32_t v = Memory::read_nocache<int32_t>(
+					gsForElapsed + Offsets::EmbarkGS_ElapsedTime);
+				if (v >= 0 && v < 86400)
+					elapsed = v;
+			}
+			d << ",\"elapsed\":" << elapsed;			if (var::show_debug_overlay) {
+				// Ledger: the local-player chain (GameInstance -> PlayerController ->
+				// PlayerState -> Pawn) is a pointer chase; the camera POV read is
+				// its own purpose below.
+				ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Link);
+				const uintptr_t liveGi = IsUsableObjectPtr(gw)
+					? Memory::read_nocache<uintptr_t>(gw + Offsets::OwningGameInstance) : 0;
+                const uintptr_t ps = IsUsableObjectPtr(pc)
+                    ? Memory::read_nocache<uintptr_t>(pc + Offsets::AController_PlayerState) : 0;
+                const uintptr_t pcm = chain.Ptr(PlayerChain::Hop::CameraManager);
+                d << ",\"pc\":" << pc << ",\"pawn\":" << pawn << ",\"root\":" << root
+                  << ",\"liveGi\":" << liveGi << ",\"ps\":" << ps
+                  << ",\"statePawn\":" << (IsUsableObjectPtr(ps)
+                      ? Memory::read_nocache<uintptr_t>(ps + Offsets::PlayerState_PawnPrivate) : 0)
+                  << ",\"pcm\":" << pcm;
+                const uintptr_t statePawn = IsUsableObjectPtr(ps)
+                    ? Memory::read_nocache<uintptr_t>(ps + Offsets::PlayerState_PawnPrivate) : 0;
+                const uintptr_t direct = IsUsableObjectPtr(pc)
+                    ? Memory::read_nocache<uintptr_t>(pc + Offsets::AcknowledgedPawn) : 0;
+                auto rootOf = [](uintptr_t actor) -> uintptr_t {
+                    return IsUsableObjectPtr(actor)
+                        ? Memory::read_nocache<uintptr_t>(actor + Offsets::RootComponent) : 0;
+                };
+                d << ",\"statePawnRoot\":" << rootOf(statePawn)
+                  << ",\"directPawn\":" << direct << ",\"directRoot\":" << rootOf(direct)
+                  << ",\"directOwner\":" << (IsUsableObjectPtr(direct)
+                      ? Memory::read_nocache<uintptr_t>(direct + Offsets::PCOwner) : 0)
+                  << ",\"directFov\":" << (IsUsableObjectPtr(direct)
+                      ? Memory::read_nocache<float>(direct + Offsets::CameraPOV_FOV) : 0.f);
+                // Pawn-diagnosis: is the controller's Character slot (0x418) also
+                // empty, and does the GI-array LocalPlayer's own PlayerController
+                // agree with the cached PC? A mismatch means the cached PC is stale.
+                const uintptr_t pc418 = IsUsableObjectPtr(pc)
+                    ? Memory::read_nocache<uintptr_t>(pc + Offsets::Controller_Character) : 0;
+                const uintptr_t lp = chain.Ptr(PlayerChain::Hop::LocalPlayer);
+                const uintptr_t lpPc = IsUsableObjectPtr(lp)
+                    ? Memory::read_nocache<uintptr_t>(lp + Offsets::LocalPlayer_PlayerController) : 0;
+                const uintptr_t pcOwner = IsUsableObjectPtr(pc)
+                    ? Memory::read_nocache<uintptr_t>(pc + Offsets::PCOwner) : 0;
+                d << ",\"pc418\":" << pc418
+                  << ",\"pc418Root\":" << rootOf(pc418)
+                  << ",\"pcOwner\":" << pcOwner
+                  << ",\"lp\":" << lp << ",\"lpPc\":" << lpPc
+                  << ",\"lpPcMatch\":" << ((lpPc && lpPc == pc) ? 1 : 0)
+                  << ",\"psSpec\":" << (IsUsableObjectPtr(ps)
+                      ? static_cast<int>(Memory::read_nocache<uint8_t>(ps + 0x3da)) : -1)
+                  << ",\"pcClass\":\"" << RaidJsonEscape(PeekObjFName(pc)) << "\""
+                  << ",\"pc418Class\":\"" << RaidJsonEscape(PeekObjFName(pc418)) << "\""
+                  << ",\"lpPcClass\":\"" << RaidJsonEscape(PeekObjFName(lpPc)) << "\"";
+            }
 			d << "}";
 			AgentRaidLog(edge ? "R" : "R", "Update.cpp:TickRaidGate",
 				edge ? "raid_edge" : "raid_hb", d.str());
@@ -971,6 +1157,21 @@ void Engine::TickRaidGate()
 			std::cout << "[raid] backup_rescan" << std::endl;
 			// #region agent log
 			AgentRaidLog("H3", "Update.cpp:TickRaidGate", "backup_rescan", "{}");
+			// #endregion
+		}
+
+		// Force rescan (B4, Alt+R): the same work as the backup scan, on
+		// request. Cooldown is what makes this safe — ClearEspCaches() drops
+		// live data and flickers the overlay, so a key that repeats or is
+		// pressed twice inside 3s is consumed and ignored.
+		if (m_forceRescanRequested.exchange(false)
+			&& now - m_lastForceRescan >= std::chrono::seconds(3)) {
+			m_lastForceRescan = now;
+			PCIMemory::FullRefresh();
+			ClearEspCaches();
+			std::cout << "[raid] force_rescan" << std::endl;
+			// #region agent log
+			AgentRaidLog("H3", "Update.cpp:TickRaidGate", "force_rescan", "{}");
 			// #endregion
 		}
 		return;

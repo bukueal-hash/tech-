@@ -188,7 +188,7 @@ void Visuals::DrawScaledText(const char* text, float centerX, float y, const Esp
     dl->AddText(font, scale.textPx, pos, color, text);
 }
 
-void Visuals::FovCircle(float aimbotFovDegrees, float gameFovDegrees)
+void Visuals::FovCircle(float aimbotFovDegrees, float gameFovDegrees, ImU32 color)
 {
     if (aimbotFovDegrees <= 0.f)
         return;
@@ -205,7 +205,7 @@ void Visuals::FovCircle(float aimbotFovDegrees, float gameFovDegrees)
     ImGui::GetForegroundDrawList()->AddCircle(
         ImVec2(screenW * 0.5f, screenH * 0.5f),
         radius,
-        IM_COL32(255, 255, 255, 220),
+        color,
         64,
         2.0f);
 }
@@ -785,7 +785,6 @@ void Visuals::DrawCorneredBox(float X, float Y, float W, float H, const ImU32& c
 void Visuals::Box(const Vector3& headScreenPos, const Vector3& feetScreenPos, bool visible, ImU32 color, int boxType, const EspDrawScale& scale)
 {
     (void)visible;
-    (void)boxType;
 
     auto BottomPos = feetScreenPos;
     auto TopPos = headScreenPos;
@@ -803,9 +802,52 @@ void Visuals::Box(const Vector3& headScreenPos, const Vector3& feetScreenPos, bo
     const float startPosX = static_cast<float>(TopPos.x - boxWidth / 2.0f);
     const float startPosY = static_cast<float>(TopPos.y);
 
-    // Black outline for crisp contrast against any background
     auto dl = ImGui::GetForegroundDrawList();
-    const float outlineW = std::max(1.0f, scale.lineThickness * 0.5f);
-    DrawCorneredBox(startPosX - outlineW, startPosY - outlineW, boxWidth + outlineW * 2.f, boxHeight + outlineW * 2.f, IM_COL32(0, 0, 0, 180), outlineW);
-    DrawCorneredBox(startPosX, startPosY, boxWidth, boxHeight, color, scale.lineThickness);
+    // Negative boxType selects player settings; other callers retain their
+    // existing rounded bot box and distance-scaled stroke.
+    const bool player = boxType < 0;
+    const int style = player ? std::clamp(var::player_box_style, 0, 3) : 3;
+    const float thickness = player ? std::clamp(var::player_box_thickness, 0.5f, 5.f) : scale.lineThickness;
+    const ImVec2 lo(startPosX, startPosY), hi(startPosX + boxWidth, startPosY + boxHeight);
+    const float rounding = style == 3 ? (std::min)(6.f, boxWidth * 0.15f) : 0.f;
+    if (player && var::player_box_fill) {
+        ImVec4 fill(var::player_box_fill_color[0], var::player_box_fill_color[1],
+            var::player_box_fill_color[2], var::player_box_fill_color[3]);
+        fill.w *= static_cast<float>((color >> IM_COL32_A_SHIFT) & 255u) / 255.f;
+        dl->AddRectFilled(lo, hi, ImGui::ColorConvertFloat4ToU32(fill), rounding);
+    }
+    auto stroke = [&](ImU32 c, float w) {
+        if (style == 0 || style == 3) {
+            dl->AddRect(lo, hi, c, rounding, ImDrawFlags_None, w);
+            return;
+        }
+        auto segment = [&](ImVec2 a, ImVec2 b) { dl->AddLine(a, b, c, w); };
+        if (style == 1) {
+            const float x = boxWidth * 0.25f, y = boxHeight * 0.2f;
+            segment(lo, ImVec2(lo.x + x, lo.y)); segment(lo, ImVec2(lo.x, lo.y + y));
+            segment(ImVec2(hi.x, lo.y), ImVec2(hi.x - x, lo.y));
+            segment(ImVec2(hi.x, lo.y), ImVec2(hi.x, lo.y + y));
+            segment(ImVec2(lo.x, hi.y), ImVec2(lo.x + x, hi.y));
+            segment(ImVec2(lo.x, hi.y), ImVec2(lo.x, hi.y - y));
+            segment(hi, ImVec2(hi.x - x, hi.y)); segment(hi, ImVec2(hi.x, hi.y - y));
+        } else {
+            auto dashed = [&](ImVec2 a, ImVec2 b) {
+                const float dx = b.x - a.x, dy = b.y - a.y;
+                const float len = std::hypot(dx, dy);
+                if (len < 1.f) return;
+                for (float d = 0.f; d < len; d += 12.f) {
+                    const float e = (std::min)(d + 8.f, len);
+                    segment(ImVec2(a.x + dx * d / len, a.y + dy * d / len),
+                        ImVec2(a.x + dx * e / len, a.y + dy * e / len));
+                }
+            };
+            dashed(lo, ImVec2(hi.x, lo.y)); dashed(ImVec2(hi.x, lo.y), hi);
+            dashed(hi, ImVec2(lo.x, hi.y)); dashed(ImVec2(lo.x, hi.y), lo);
+        }
+    };
+    if (!player || var::player_box_outline) {
+        const unsigned alpha = (color >> IM_COL32_A_SHIFT) & 255u;
+        stroke(IM_COL32(0, 0, 0, alpha * 180u / 255u), thickness + 2.f);
+    }
+    stroke(color, thickness);
 }

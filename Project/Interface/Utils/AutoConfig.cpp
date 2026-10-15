@@ -1,5 +1,9 @@
 #include "AutoConfig.h"
 #include "Variables/index.h"
+#include "Visuals/CrosshairConfig.hpp"
+#include "UpgradeOptions.hpp"
+#include "../../Core/EntityDiagnostics.hpp"
+#include "../../Core/EntityFilters.hpp"
 #include "../../Core/WorldItemCategory.h"
 #include "../../Hardware/KmBox.h"
 #include "../OverlayHost.h"
@@ -9,12 +13,20 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
+#include <locale>
+#include <sstream>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <iostream>
+#include <map>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -41,8 +53,22 @@ std::string ConfigPath()
 bool ParseColor4(const std::string& val, float out[4])
 {
     float r = 0.f, g = 0.f, b = 0.f, a = 1.f;
-    if (sscanf_s(val.c_str(), "%f,%f,%f,%f", &r, &g, &b, &a) != 4)
+    char comma1 = 0, comma2 = 0, comma3 = 0;
+    std::istringstream input(val);
+    input.imbue(std::locale::classic());
+    if (!(input >> r >> comma1 >> g >> comma2 >> b >> comma3 >> a)
+        || comma1 != ',' || comma2 != ',' || comma3 != ',')
         return false;
+    input >> std::ws;
+    if (!input.eof())
+        return false;
+    if (!std::isfinite(r) || !std::isfinite(g)
+        || !std::isfinite(b) || !std::isfinite(a))
+        return false;
+    r = std::clamp(r, 0.f, 1.f);
+    g = std::clamp(g, 0.f, 1.f);
+    b = std::clamp(b, 0.f, 1.f);
+    a = std::clamp(a, 0.f, 1.f);
     out[0] = r;
     out[1] = g;
     out[2] = b;
@@ -50,7 +76,7 @@ bool ParseColor4(const std::string& val, float out[4])
     return true;
 }
 
-void WriteColor4(std::ofstream& file, const char* key, const float col[4])
+void WriteColor4(std::ostream& file, const char* key, const float col[4])
 {
     file << key << '=' << col[0] << ',' << col[1] << ',' << col[2] << ',' << col[3] << '\n';
 }
@@ -78,6 +104,15 @@ void TrimInPlace(std::string& s)
 struct Snapshot {
     bool enableesp{};
     bool box{};
+    bool show_head_dot{};
+    float color_hatches[4]{};
+    float head_dot_radius_px{};
+    float head_dot_color[4]{};
+    int player_box_style{};
+    bool player_box_outline{};
+    bool player_box_fill{};
+    float player_box_thickness{};
+    float player_box_fill_color[4]{};
     bool health{};
     bool names{};
     bool show_weapon{};
@@ -99,6 +134,8 @@ struct Snapshot {
     bool debug_aim_shake{};
     bool debug_hatch_detect{};
     bool debug_ghost_bots{};
+    bool debug_world_trace{};
+    bool debug_esp_paint{};
     float esp_text_scale{};
     float radar_scale{};
     float radar_range{};
@@ -108,15 +145,27 @@ struct Snapshot {
     bool show_radar_special{};
     bool show_raid_hud{};
     bool show_activity_feed{};
+    bool show_objectives{};
     bool radar_shape_circle{};
     bool radar_map_mode{};
     bool radar_underground_dim{};
     bool radar_ally_arrows{};
+    float radar_dot_scale{};
+    bool radar_show_altitude{};
+    bool radar_compass{};
+    int radar_focus{};
+    bool radar_ghost{};
+    float radar_ghost_secs{};
+    bool radar_ghost_suppress_poi{};
+    bool show_pois{};
+    bool poi_show_labels{};
+    int poi_categories{};
+    bool show_search_window{};
+    int color_profile_slot{};
     float esp_distance{};
     float esp_color_visible[4]{};
     // (color_look_arrow lives next to its toggle in the block above)
     float esp_color_invisible[4]{};
-    bool vis_enabled{};
 
     bool bot_box{};
     bool bot_names{};
@@ -128,10 +177,12 @@ struct Snapshot {
     float color_dead_bots[4]{};
     float bot_color_visible[4]{};
     float bot_color_invisible[4]{};
+    float bot_color_occluded[4]{};
 
     bool enable_aimbot{};
     bool robotAimEnabled{};
     int aim_hold_key{};
+    int debug_overlay_key{};
     int aim_bone_mode{};
     bool humanizer{};
     float humanizer_intensity{};
@@ -144,6 +195,9 @@ struct Snapshot {
     bool show_fov{};
     bool show_crosshair{};
     bool camPovUsePending{};
+    std::string upgrade_options;
+    std::string entity_filters;
+    std::string crosshair_options;
     int crosshair_style{};
     float crosshair_color[4]{};
     float crosshair_size{};
@@ -160,7 +214,6 @@ struct Snapshot {
     float aim_sticky_fov_bias_px{};
     int aim_loss_of_sight_grace_ms{};
     bool aim_loss_of_sight_grace_enabled{};
-    int aim_vis_mode{};
 
     float aim_bullet_speed_cm_s{};
 
@@ -193,6 +246,7 @@ struct Snapshot {
     bool show_world_probe{};
     bool show_world_vehicles{};
     bool show_world_weapon_case{};
+    bool show_world_weapon_rack{};
     bool show_world_field_crate{};
     bool show_world_supply_station{};
     bool show_world_keys{};
@@ -220,6 +274,7 @@ struct Snapshot {
     float color_world_probe[4]{};
     float color_world_vehicles[4]{};
     float color_world_weapon_case[4]{};
+    float color_world_weapon_rack[4]{};
     float color_world_field_crate[4]{};
     float color_world_supply_station[4]{};
     float color_world_keys[4]{};
@@ -240,6 +295,9 @@ struct Snapshot {
     bool show_crate_contents{};
     bool show_stack_counts{};
     bool grey_looted_containers{};
+    int state_opened_mode{};
+    int state_dead_mode{};
+    float state_dim_alpha{};
     bool show_armor_line{};
     bool show_player_kit{};
     bool show_bot_loadout{};
@@ -260,10 +318,6 @@ struct Snapshot {
     std::string kmbox_uuid;
     int kmbox_minDelay{};
     int kmbox_monitorIndex{};
-
-    bool collision_debug_draw{};
-    bool collision_debug_rays{};
-    bool collision_vis_enabled{};
 };
 
 Snapshot s_last{};
@@ -293,6 +347,7 @@ void MigrateWorldColorsFromLoot()
         var::color_world_probe,
         var::color_world_vehicles,
         var::color_world_weapon_case,
+        var::color_world_weapon_rack,
         var::color_world_field_crate,
         var::color_world_supply_station,
         var::color_world_keys,
@@ -312,6 +367,17 @@ Snapshot CaptureSnapshot()
     Snapshot s{};
     s.enableesp = var::enableesp;
     s.box = var::box;
+    s.show_head_dot = var::show_head_dot;
+    s.radar_ghost_suppress_poi = var::radar_ghost_suppress_poi;
+    s.show_search_window = var::show_search_window;
+    std::copy_n(var::color_hatches, 4, s.color_hatches);
+    s.head_dot_radius_px = var::head_dot_radius_px;
+    std::copy_n(var::head_dot_color, 4, s.head_dot_color);
+    s.player_box_style = var::player_box_style;
+    s.player_box_outline = var::player_box_outline;
+    s.player_box_fill = var::player_box_fill;
+    s.player_box_thickness = var::player_box_thickness;
+    std::copy_n(var::player_box_fill_color, 4, s.player_box_fill_color);
     s.health = var::health;
     s.names = var::names;
     s.show_weapon = var::show_weapon;
@@ -333,6 +399,8 @@ Snapshot CaptureSnapshot()
     s.debug_aim_shake = var::debug_aim_shake;
     s.debug_hatch_detect = var::debug_hatch_detect;
     s.debug_ghost_bots = var::debug_ghost_bots;
+    s.debug_world_trace = var::debug_world_trace;
+    s.debug_esp_paint = var::debug_esp_paint;
     s.esp_text_scale = var::esp_text_scale;
     s.radar_scale = var::radar_scale;
     s.radar_range = var::radar_range;
@@ -342,14 +410,24 @@ Snapshot CaptureSnapshot()
     s.show_radar_special = var::show_radar_special;
     s.show_raid_hud = var::show_raid_hud;
     s.show_activity_feed = var::show_activity_feed;
+    s.show_objectives = var::show_objectives;
     s.radar_shape_circle = var::radar_shape_circle;
     s.radar_map_mode = var::radar_map_mode;
     s.radar_underground_dim = var::radar_underground_dim;
     s.radar_ally_arrows = var::radar_ally_arrows;
+    s.radar_dot_scale = var::radar_dot_scale;
+    s.radar_show_altitude = var::radar_show_altitude;
+    s.radar_compass = var::radar_compass;
+    s.radar_focus = var::radar_focus;
+    s.radar_ghost = var::radar_ghost;
+    s.radar_ghost_secs = var::radar_ghost_secs;
+    s.show_pois = var::show_pois;
+    s.poi_show_labels = var::poi_show_labels;
+    s.poi_categories = var::poi_categories;
+    s.color_profile_slot = var::color_profile_slot;
     s.esp_distance = var::esp_distance;
     std::memcpy(s.esp_color_visible, var::esp_color_visible, sizeof(s.esp_color_visible));
     std::memcpy(s.esp_color_invisible, var::esp_color_invisible, sizeof(s.esp_color_invisible));
-    s.vis_enabled = var::vis_enabled;
     s.bot_box = var::bot_box;
     s.bot_names = var::bot_names;
     s.bot_snaplines = var::bot_snaplines;
@@ -359,11 +437,13 @@ Snapshot CaptureSnapshot()
     s.bot_esp_distance = var::bot_esp_distance;
     std::memcpy(s.bot_color_visible, var::bot_color_visible, sizeof(s.bot_color_visible));
     std::memcpy(s.bot_color_invisible, var::bot_color_invisible, sizeof(s.bot_color_invisible));
+    std::memcpy(s.bot_color_occluded, var::bot_color_occluded, sizeof(s.bot_color_occluded));
     std::memcpy(s.color_dead_bots, var::color_dead_bots, sizeof(s.color_dead_bots));
 
     s.enable_aimbot = var::enable_aimbot;
     s.robotAimEnabled = var::robotAimEnabled;
     s.aim_hold_key = var::aim_hold_key;
+    s.debug_overlay_key = var::debug_overlay_key;
     s.aim_bone_mode = static_cast<int>(var::aim_bone_mode);
     s.predict = var::predict;
     s.humanizer = var::humanizer;
@@ -376,6 +456,9 @@ Snapshot CaptureSnapshot()
     s.show_fov = var::show_fov;
     s.show_crosshair = var::show_crosshair;
     s.camPovUsePending = var::camPovUsePending;
+    s.upgrade_options = UpgradeOptions::Capture();
+    s.entity_filters = EntityFilters::Capture();
+    s.crosshair_options = ArcCrosshair::CaptureOptions();
     s.crosshair_style = var::crosshair_style;
     std::memcpy(s.crosshair_color, var::crosshair_color, sizeof(s.crosshair_color));
     s.crosshair_size = var::crosshair_size;
@@ -392,7 +475,6 @@ Snapshot CaptureSnapshot()
     s.aim_sticky_fov_bias_px = var::aim_sticky_fov_bias_px;
     s.aim_loss_of_sight_grace_ms = var::aim_loss_of_sight_grace_ms;
     s.aim_loss_of_sight_grace_enabled = var::aim_loss_of_sight_grace_enabled;
-    s.aim_vis_mode = static_cast<int>(var::aim_vis_mode);
     s.aim_bullet_speed_cm_s = var::aim_bullet_speed_cm_s;
 
     s.enable_triggerbot = var::enable_triggerbot;
@@ -423,6 +505,7 @@ Snapshot CaptureSnapshot()
     s.show_world_probe = var::show_world_probe;
     s.show_world_vehicles = var::show_world_vehicles;
     s.show_world_weapon_case = var::show_world_weapon_case;
+    s.show_world_weapon_rack = var::show_world_weapon_rack;
     s.show_world_field_crate = var::show_world_field_crate;
     s.show_world_supply_station = var::show_world_supply_station;
     s.show_world_keys = var::show_world_keys;
@@ -450,6 +533,7 @@ Snapshot CaptureSnapshot()
     std::memcpy(s.color_world_probe, var::color_world_probe, sizeof(s.color_world_probe));
     std::memcpy(s.color_world_vehicles, var::color_world_vehicles, sizeof(s.color_world_vehicles));
     std::memcpy(s.color_world_weapon_case, var::color_world_weapon_case, sizeof(s.color_world_weapon_case));
+    std::memcpy(s.color_world_weapon_rack, var::color_world_weapon_rack, sizeof(s.color_world_weapon_rack));
     std::memcpy(s.color_world_field_crate, var::color_world_field_crate, sizeof(s.color_world_field_crate));
     std::memcpy(s.color_world_supply_station, var::color_world_supply_station, sizeof(s.color_world_supply_station));
     std::memcpy(s.color_world_keys, var::color_world_keys, sizeof(s.color_world_keys));
@@ -470,6 +554,9 @@ Snapshot CaptureSnapshot()
     s.show_crate_contents = var::show_crate_contents;
     s.show_stack_counts = var::show_stack_counts;
     s.grey_looted_containers = var::grey_looted_containers;
+    s.state_opened_mode = var::state_opened_mode;
+    s.state_dead_mode = var::state_dead_mode;
+    s.state_dim_alpha = var::state_dim_alpha;
     s.show_armor_line = var::show_armor_line;
     s.show_player_kit = var::show_player_kit;
     s.show_bot_loadout = var::show_bot_loadout;
@@ -491,10 +578,6 @@ Snapshot CaptureSnapshot()
     s.kmbox_uuid = g_kmbox.kmboxConfig.uuid;
     s.kmbox_minDelay = g_kmbox.kmboxConfig.minDelay;
     s.kmbox_monitorIndex = g_kmbox.kmboxConfig.monitorIndex;
-
-    s.collision_debug_draw = var::collision_debug_draw;
-    s.collision_debug_rays = var::collision_debug_rays;
-    s.collision_vis_enabled = var::collision_vis_enabled;
     return s;
 }
 
@@ -502,6 +585,17 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
 {
     return a.enableesp == b.enableesp &&
         a.box == b.box &&
+        a.radar_ghost_suppress_poi == b.radar_ghost_suppress_poi &&
+        a.show_search_window == b.show_search_window &&
+        ColorsEqual(a.color_hatches, b.color_hatches) &&
+        a.show_head_dot == b.show_head_dot &&
+        a.head_dot_radius_px == b.head_dot_radius_px &&
+        ColorsEqual(a.head_dot_color, b.head_dot_color) &&
+        a.player_box_style == b.player_box_style &&
+        a.player_box_outline == b.player_box_outline &&
+        a.player_box_fill == b.player_box_fill &&
+        a.player_box_thickness == b.player_box_thickness &&
+        ColorsEqual(a.player_box_fill_color, b.player_box_fill_color) &&
         a.health == b.health &&
         a.names == b.names &&
         a.show_weapon == b.show_weapon &&
@@ -523,6 +617,8 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.debug_aim_shake == b.debug_aim_shake &&
         a.debug_hatch_detect == b.debug_hatch_detect &&
         a.debug_ghost_bots == b.debug_ghost_bots &&
+        a.debug_world_trace == b.debug_world_trace &&
+        a.debug_esp_paint == b.debug_esp_paint &&
         a.esp_text_scale == b.esp_text_scale &&
         a.radar_scale == b.radar_scale &&
         a.radar_range == b.radar_range &&
@@ -532,14 +628,24 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.show_radar_special == b.show_radar_special &&
         a.show_raid_hud == b.show_raid_hud &&
         a.show_activity_feed == b.show_activity_feed &&
+        a.show_objectives == b.show_objectives &&
         a.radar_shape_circle == b.radar_shape_circle &&
         a.radar_map_mode == b.radar_map_mode &&
         a.radar_underground_dim == b.radar_underground_dim &&
         a.radar_ally_arrows == b.radar_ally_arrows &&
+        a.radar_dot_scale == b.radar_dot_scale &&
+        a.radar_show_altitude == b.radar_show_altitude &&
+        a.radar_compass == b.radar_compass &&
+        a.radar_focus == b.radar_focus &&
+        a.radar_ghost == b.radar_ghost &&
+        a.radar_ghost_secs == b.radar_ghost_secs &&
+        a.show_pois == b.show_pois &&
+        a.poi_show_labels == b.poi_show_labels &&
+        a.poi_categories == b.poi_categories &&
+        a.color_profile_slot == b.color_profile_slot &&
         a.esp_distance == b.esp_distance &&
         ColorsEqual(a.esp_color_visible, b.esp_color_visible) &&
         ColorsEqual(a.esp_color_invisible, b.esp_color_invisible) &&
-        a.vis_enabled == b.vis_enabled &&
         a.bot_box == b.bot_box &&
         a.bot_names == b.bot_names &&
         a.bot_snaplines == b.bot_snaplines &&
@@ -549,10 +655,12 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.bot_esp_distance == b.bot_esp_distance &&
         ColorsEqual(a.bot_color_visible, b.bot_color_visible) &&
         ColorsEqual(a.bot_color_invisible, b.bot_color_invisible) &&
+        ColorsEqual(a.bot_color_occluded, b.bot_color_occluded) &&
         ColorsEqual(a.color_dead_bots, b.color_dead_bots) &&
         a.enable_aimbot == b.enable_aimbot &&
         a.robotAimEnabled == b.robotAimEnabled &&
         a.aim_hold_key == b.aim_hold_key &&
+        a.debug_overlay_key == b.debug_overlay_key &&
         a.aim_bone_mode == b.aim_bone_mode &&
         a.predict == b.predict &&
         a.humanizer == b.humanizer &&
@@ -565,6 +673,9 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.show_fov == b.show_fov &&
         a.show_crosshair == b.show_crosshair &&
         a.camPovUsePending == b.camPovUsePending &&
+        a.upgrade_options == b.upgrade_options &&
+        a.entity_filters == b.entity_filters &&
+        a.crosshair_options == b.crosshair_options &&
         a.crosshair_style == b.crosshair_style &&
         ColorsEqual(a.crosshair_color, b.crosshair_color) &&
         a.crosshair_size == b.crosshair_size &&
@@ -581,7 +692,6 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.aim_sticky_fov_bias_px == b.aim_sticky_fov_bias_px &&
         a.aim_loss_of_sight_grace_ms == b.aim_loss_of_sight_grace_ms &&
         a.aim_loss_of_sight_grace_enabled == b.aim_loss_of_sight_grace_enabled &&
-        a.aim_vis_mode == b.aim_vis_mode &&
         a.aim_bullet_speed_cm_s == b.aim_bullet_speed_cm_s &&
         a.enable_triggerbot == b.enable_triggerbot &&
         a.trigger_hold_mode == b.trigger_hold_mode &&
@@ -610,6 +720,7 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.show_world_probe == b.show_world_probe &&
         a.show_world_vehicles == b.show_world_vehicles &&
         a.show_world_weapon_case == b.show_world_weapon_case &&
+        a.show_world_weapon_rack == b.show_world_weapon_rack &&
         a.show_world_field_crate == b.show_world_field_crate &&
         a.show_world_supply_station == b.show_world_supply_station &&
         a.show_world_keys == b.show_world_keys &&
@@ -637,6 +748,7 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         ColorsEqual(a.color_world_probe, b.color_world_probe) &&
         ColorsEqual(a.color_world_vehicles, b.color_world_vehicles) &&
         ColorsEqual(a.color_world_weapon_case, b.color_world_weapon_case) &&
+        ColorsEqual(a.color_world_weapon_rack, b.color_world_weapon_rack) &&
         ColorsEqual(a.color_world_field_crate, b.color_world_field_crate) &&
         ColorsEqual(a.color_world_supply_station, b.color_world_supply_station) &&
         ColorsEqual(a.color_world_keys, b.color_world_keys) &&
@@ -656,6 +768,9 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.show_crate_contents == b.show_crate_contents &&
         a.show_stack_counts == b.show_stack_counts &&
         a.grey_looted_containers == b.grey_looted_containers &&
+        a.state_opened_mode == b.state_opened_mode &&
+        a.state_dead_mode == b.state_dead_mode &&
+        a.state_dim_alpha == b.state_dim_alpha &&
         a.show_armor_line == b.show_armor_line &&
         a.show_player_kit == b.show_player_kit &&
         a.show_bot_loadout == b.show_bot_loadout &&
@@ -674,10 +789,7 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.kmbox_port == b.kmbox_port &&
         a.kmbox_uuid == b.kmbox_uuid &&
         a.kmbox_minDelay == b.kmbox_minDelay &&
-        a.kmbox_monitorIndex == b.kmbox_monitorIndex &&
-        a.collision_debug_draw == b.collision_debug_draw &&
-        a.collision_debug_rays == b.collision_debug_rays &&
-        a.collision_vis_enabled == b.collision_vis_enabled;
+        a.kmbox_monitorIndex == b.kmbox_monitorIndex;
 }
 
 bool ParseBool(const std::string& val, bool defaultVal)
@@ -715,6 +827,9 @@ bool ApplyLootConfigKey(const std::string& key, const std::string& val)
     if (key == "show_crate_contents") { var::show_crate_contents = ParseBool(val, var::show_crate_contents); return true; }
     if (key == "show_stack_counts") { var::show_stack_counts = ParseBool(val, var::show_stack_counts); return true; }
     if (key == "grey_looted_containers") { var::grey_looted_containers = ParseBool(val, var::grey_looted_containers); return true; }
+    if (key == "state_opened_mode") { var::state_opened_mode = std::clamp(std::atoi(val.c_str()), 0, 3); return true; }
+    if (key == "state_dead_mode") { var::state_dead_mode = std::clamp(std::atoi(val.c_str()), 0, 3); return true; }
+    if (key == "state_dim_alpha") { var::state_dim_alpha = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.f, 1.f); return true; }
     if (key == "show_armor_line") { var::show_armor_line = ParseBool(val, var::show_armor_line); return true; }
     if (key == "show_player_kit") { var::show_player_kit = ParseBool(val, var::show_player_kit); return true; }
     if (key == "show_bot_loadout") { var::show_bot_loadout = ParseBool(val, var::show_bot_loadout); return true; }
@@ -746,11 +861,6 @@ static bool ApplyAimbotConfigKey(const std::string& key, const std::string& val)
     if (key == "aim_bullet_speed_cm_s") {
         var::aim_bullet_speed_cm_s = static_cast<float>(std::atof(val.c_str()));
         var::aim_bullet_speed_cm_s = std::clamp(var::aim_bullet_speed_cm_s, 10000.f, 200000.f);
-        return true;
-    }
-    if (key == "aim_vis_mode") {
-        var::aim_vis_mode = static_cast<AimVisMode>(
-            std::clamp(static_cast<int>(std::atoi(val.c_str())), 0, 1));
         return true;
     }
     /* Triggerbot */
@@ -818,6 +928,7 @@ static bool ApplyWorldColorConfigKey(const std::string& key, const std::string& 
         {"color_world_probe", var::color_world_probe},
         {"color_world_vehicles", var::color_world_vehicles},
         {"color_world_weapon_case", var::color_world_weapon_case},
+        {"color_world_weapon_rack", var::color_world_weapon_rack},
         {"color_world_field_crate", var::color_world_field_crate},
         {"color_world_supply_station", var::color_world_supply_station},
         {"color_world_keys", var::color_world_keys},
@@ -867,6 +978,7 @@ static bool ApplyWorldConfigKey(const std::string& key, const std::string& val)
     if (key == "show_world_probe") { var::show_world_probe = ParseBool(val, var::show_world_probe); return true; }
     if (key == "show_world_vehicles") { var::show_world_vehicles = ParseBool(val, var::show_world_vehicles); return true; }
     if (key == "show_world_weapon_case") { var::show_world_weapon_case = ParseBool(val, var::show_world_weapon_case); return true; }
+    if (key == "show_world_weapon_rack") { var::show_world_weapon_rack = ParseBool(val, var::show_world_weapon_rack); return true; }
     if (key == "show_world_field_crate") { var::show_world_field_crate = ParseBool(val, var::show_world_field_crate); return true; }
     if (key == "show_world_supply_station") { var::show_world_supply_station = ParseBool(val, var::show_world_supply_station); return true; }
     if (key == "show_world_keys") { var::show_world_keys = ParseBool(val, var::show_world_keys); return true; }
@@ -883,6 +995,12 @@ static bool ApplyWorldConfigKey(const std::string& key, const std::string& val)
 
 void ApplyKeyValue(const std::string& key, const std::string& val)
 {
+    if (UpgradeOptions::Load(key, val))
+        return;
+    if (EntityFilters::Load(key, val))
+        return;
+    if (ArcCrosshair::LoadOption(key, val))
+        return;
     if (ApplyLootConfigKey(key, val))
         return;
     if (ApplyAimbotConfigKey(key, val))
@@ -892,6 +1010,23 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
 
     if (key == "enableesp") var::enableesp = ParseBool(val, var::enableesp);
     else if (key == "box") var::box = ParseBool(val, var::box);
+    else if (key == "show_head_dot") var::show_head_dot = ParseBool(val, var::show_head_dot);
+    else if (key == "practice_mode") var::practice_mode = ParseBool(val, var::practice_mode);
+    else if (key == "radar_ghost_suppress_poi") var::radar_ghost_suppress_poi = ParseBool(val, var::radar_ghost_suppress_poi);
+    else if (key == "show_search_window") var::show_search_window = ParseBool(val, var::show_search_window);
+    else if (key == "head_dot_radius_px") {
+        const float radius = static_cast<float>(std::atof(val.c_str()));
+        if (std::isfinite(radius)) var::head_dot_radius_px = std::clamp(radius, 1.f, 10.f);
+    }
+    else if (key == "head_dot_color") ParseColor4(val, var::head_dot_color);
+    else if (key == "player_box_style") var::player_box_style = std::clamp(std::atoi(val.c_str()), 0, 3);
+    else if (key == "player_box_outline") var::player_box_outline = ParseBool(val, var::player_box_outline);
+    else if (key == "player_box_fill") var::player_box_fill = ParseBool(val, var::player_box_fill);
+    else if (key == "player_box_thickness") {
+        const float v = static_cast<float>(std::atof(val.c_str()));
+        if (std::isfinite(v)) var::player_box_thickness = std::clamp(v, 0.5f, 5.f);
+    }
+    else if (key == "player_box_fill_color") ParseColor4(val, var::player_box_fill_color);
     else if (key == "health") var::health = ParseBool(val, var::health);
     else if (key == "names") var::names = ParseBool(val, var::names);
     else if (key == "show_weapon") var::show_weapon = ParseBool(val, var::show_weapon);
@@ -915,27 +1050,39 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     else if (key == "debug_aim_shake") var::debug_aim_shake = ParseBool(val, var::debug_aim_shake);
     else if (key == "debug_hatch_detect") var::debug_hatch_detect = ParseBool(val, var::debug_hatch_detect);
     else if (key == "debug_ghost_bots") var::debug_ghost_bots = ParseBool(val, var::debug_ghost_bots);
-    else if (key == "esp_text_scale") var::esp_text_scale = static_cast<float>(std::atof(val.c_str()));
-    else if (key == "radar_scale") var::radar_scale = static_cast<float>(std::atof(val.c_str()));
+    else if (key == "debug_world_trace") var::debug_world_trace = ParseBool(val, var::debug_world_trace);
+    else if (key == "debug_esp_paint") var::debug_esp_paint = ParseBool(val, var::debug_esp_paint);
+    else if (key == "esp_text_scale") var::esp_text_scale = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.5f, 3.f);
+    else if (key == "radar_scale") var::radar_scale = std::clamp(static_cast<float>(std::atof(val.c_str())), 30.f, 120.f);
     else if (key == "radar_range") {
         var::radar_range = std::clamp(static_cast<float>(std::atof(val.c_str())), 20.f, var::kMaxDistanceSliderM);
     }
-    else if (key == "radar_pos_x_norm") var::radar_pos_x_norm = static_cast<float>(std::atof(val.c_str()));
-    else if (key == "radar_pos_y_norm") var::radar_pos_y_norm = static_cast<float>(std::atof(val.c_str()));
+    else if (key == "radar_pos_x_norm") var::radar_pos_x_norm = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.f, 1.f);
+    else if (key == "radar_pos_y_norm") var::radar_pos_y_norm = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.f, 1.f);
     else if (key == "radar_loot_min_rarity") var::radar_loot_min_rarity = std::atoi(val.c_str());
     else if (key == "show_radar_special") var::show_radar_special = ParseBool(val, var::show_radar_special);
     else if (key == "show_raid_hud") var::show_raid_hud = ParseBool(val, var::show_raid_hud);
     else if (key == "show_activity_feed") var::show_activity_feed = ParseBool(val, var::show_activity_feed);
+    else if (key == "show_objectives") var::show_objectives = ParseBool(val, var::show_objectives);
     else if (key == "radar_shape_circle") var::radar_shape_circle = ParseBool(val, var::radar_shape_circle);
     else if (key == "radar_map_mode") var::radar_map_mode = ParseBool(val, var::radar_map_mode);
     else if (key == "radar_underground_dim") var::radar_underground_dim = ParseBool(val, var::radar_underground_dim);
     else if (key == "radar_ally_arrows") var::radar_ally_arrows = ParseBool(val, var::radar_ally_arrows);
+    else if (key == "radar_dot_scale") var::radar_dot_scale = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.5f, 2.5f);
+    else if (key == "radar_show_altitude") var::radar_show_altitude = ParseBool(val, var::radar_show_altitude);
+    else if (key == "radar_compass") var::radar_compass = ParseBool(val, var::radar_compass);
+    else if (key == "radar_focus") var::radar_focus = std::clamp(std::atoi(val.c_str()), 0, 3);
+    else if (key == "radar_ghost") var::radar_ghost = ParseBool(val, var::radar_ghost);
+    else if (key == "radar_ghost_secs") var::radar_ghost_secs = std::clamp(static_cast<float>(std::atof(val.c_str())), 1.f, 30.f);
+    else if (key == "show_pois") var::show_pois = ParseBool(val, var::show_pois);
+    else if (key == "poi_show_labels") var::poi_show_labels = ParseBool(val, var::poi_show_labels);
+    else if (key == "poi_categories") var::poi_categories = std::atoi(val.c_str());
+    else if (key == "color_profile_slot") var::color_profile_slot = std::clamp(std::atoi(val.c_str()), -1, 7);
     else if (key == "esp_distance") {
         var::esp_distance = std::clamp(static_cast<float>(std::atof(val.c_str())), 50.f, var::kMaxDistanceSliderM);
     }
     else if (key == "esp_color_visible") ParseColor4(val, var::esp_color_visible);
     else if (key == "esp_color_invisible") ParseColor4(val, var::esp_color_invisible);
-    else if (key == "vis_enabled") var::vis_enabled = ParseBool(val, var::vis_enabled);
     else if (key == "bot_box") var::bot_box = ParseBool(val, var::bot_box);
     else if (key == "bot_names") var::bot_names = ParseBool(val, var::bot_names);
     else if (key == "bot_snaplines") var::bot_snaplines = ParseBool(val, var::bot_snaplines);
@@ -948,9 +1095,11 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     }
     else if (key == "bot_color_visible") ParseColor4(val, var::bot_color_visible);
     else if (key == "bot_color_invisible") ParseColor4(val, var::bot_color_invisible);
+    else if (key == "bot_color_occluded") ParseColor4(val, var::bot_color_occluded);
     else if (key == "enable_aimbot") var::enable_aimbot = ParseBool(val, var::enable_aimbot);
     else if (key == "robotAimEnabled") var::robotAimEnabled = ParseBool(val, var::robotAimEnabled);
     else if (key == "aim_hold_key") var::aim_hold_key = std::atoi(val.c_str());
+    else if (key == "debug_overlay_key") var::debug_overlay_key = std::atoi(val.c_str());
     else if (key == "aim_bone_mode") {
         const int m = std::clamp(std::atoi(val.c_str()), 0, 5);
         var::aim_bone_mode = static_cast<AimBoneMode>(m);
@@ -970,7 +1119,7 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     else if (key == "camPovUsePending") var::camPovUsePending = ParseBool(val, var::camPovUsePending);
     else if (key == "show_crosshair") var::show_crosshair = ParseBool(val, var::show_crosshair);
     else if (key == "crosshair_style") {
-        var::crosshair_style = std::clamp(std::atoi(val.c_str()), 0, 7);
+        var::crosshair_style = std::clamp(std::atoi(val.c_str()), 0, static_cast<int>(IM_ARRAYSIZE(ArcCrosshair::kStyles)) - 1);
     }
     else if (key == "crosshair_color") ParseColor4(val, var::crosshair_color);
     else if (key == "crosshair_size") var::crosshair_size = static_cast<float>(std::atof(val.c_str()));
@@ -1012,19 +1161,23 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
         g_kmbox.kmboxConfig.monitorIndex = std::atoi(val.c_str());
         OverlayDisplay_SetSelectedMonitor(g_kmbox.kmboxConfig.monitorIndex);
     }
-    else if (key == "collision_debug_draw") var::collision_debug_draw = ParseBool(val, var::collision_debug_draw);
-    else if (key == "collision_debug_rays") var::collision_debug_rays = ParseBool(val, var::collision_debug_rays);
-    else if (key == "collision_vis_enabled") var::collision_vis_enabled = ParseBool(val, var::collision_vis_enabled);
 }
+
+void SerializeIni(std::ostream& file);
 
 bool LoadIniFile(const std::string& path)
 {
-    s_anyWorldColorKeyInIni = false;
 
-    std::ifstream file(path);
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open())
         return false;
+    constexpr std::streamoff kMaxConfigBytes = 1024 * 1024;
+    const auto size = file.tellg();
+    if (size < std::streampos(0) || size > std::streampos(kMaxConfigBytes))
+        return false;
+    file.seekg(0);
 
+    std::vector<std::pair<std::string, std::string>> pending;
     std::string line;
     while (std::getline(file, line)) {
         TrimInPlace(line);
@@ -1041,7 +1194,101 @@ bool LoadIniFile(const std::string& path)
         std::string val = line.substr(eq + 1);
         TrimInPlace(key);
         TrimInPlace(val);
-        ApplyKeyValue(key, val);
+        pending.emplace_back(std::move(key), std::move(val));
+    }
+    if (file.bad())
+        return false;
+
+    // Use the persisted key inventory, including delegated registries, as the
+    // allowlist. Validate everything before mutating live settings.
+    std::ostringstream current;
+    current.imbue(std::locale::classic());
+    current.precision(std::numeric_limits<float>::max_digits10);
+    SerializeIni(current);
+    std::map<std::string, std::string> known;
+    std::istringstream schema(current.str());
+    while (std::getline(schema, line)) {
+        const size_t eq = line.find('=');
+        if (eq != std::string::npos)
+            known.emplace(line.substr(0, eq), line.substr(eq + 1));
+    }
+    // Legacy key names the current schema no longer emits must stay loadable.
+    // The shipped auto_config.ini still carries vis_enabled /
+    // collision_vis_enabled / collision_debug_draw, and because the allowlist is
+    // built from what SerializeIni emits TODAY, those lines were dropped without
+    // a word — after which the next save rewrote the file under the new names.
+    // UpgradeOptions owns the mapping (its legacyBools table); this only admits
+    // the names so ApplyKeyValue can reach them.
+    for (const auto& legacy : UpgradeOptions::legacyBools)
+        known.emplace(legacy.key, "0");
+
+    std::vector<std::pair<std::string, std::string>> valid;
+    int droppedKeys = 0;
+    char firstDroppedKey[64]{};
+    for (auto& entry : pending) {
+        const auto it = known.find(entry.first);
+        if (it == known.end()) {
+            // A key this build does not know: counted and remembered so it can
+            // be reported instead of vanishing. Silently discarding it is
+            // indistinguishable, from the user's side, from a setting that
+            // simply refuses to stick.
+            ++droppedKeys;
+            if (!firstDroppedKey[0])
+                std::snprintf(firstDroppedKey, sizeof(firstDroppedKey), "%.48s",
+                    entry.first.c_str());
+            continue;
+        }
+        std::string& value = entry.second;
+        const bool text = entry.first.rfind("kmbox_", 0) == 0
+            && entry.first != "kmbox_minDelay" && entry.first != "kmbox_monitorIndex";
+        if (!text) {
+            if (it->second.find(',') != std::string::npos) {
+                float rgba[4]{};
+                if (!ParseColor4(value, rgba))
+                    return false;
+            } else if (entry.first.rfind("filter_", 0) == 0) {
+                char* end = nullptr;
+                errno = 0;
+                (void)std::strtoull(value.c_str(), &end, 10);
+                if (value.empty() || value.front() == '-' || errno == ERANGE
+                    || end == value.c_str() || *end != '\0')
+                    return false;
+            } else {
+                // Preserve accepted legacy boolean spellings.
+                if (value == "true" || value == "yes" || value == "on") value = "1";
+                if (value == "false" || value == "no" || value == "off") value = "0";
+                char* end = nullptr;
+                errno = 0;
+                const double number = std::strtod(value.c_str(), &end);
+                if (errno == ERANGE || end == value.c_str() || *end != '\0'
+                    || !std::isfinite(number)
+                    || number < (std::numeric_limits<int>::min)()
+                    || number > (std::numeric_limits<int>::max)())
+                    return false;
+            }
+        }
+        valid.push_back(entry);
+    }
+    if (valid.empty())
+        return false;
+    s_anyWorldColorKeyInIni = false;
+    for (const auto& entry : valid)
+        ApplyKeyValue(entry.first, entry.second);
+
+    // Report the lines that were ignored, through the diagnostics ledger: the
+    // overlay's stdout/stderr never reaches disk, so std::cerr alone would leave
+    // this invisible. One bounded record per load.
+    if (droppedKeys) {
+        char rec[256];
+        std::snprintf(rec, sizeof(rec),
+            "{\"location\":\"AutoConfig.cpp:LoadIniFile\",\"message\":\"config_keys_dropped\","
+            "\"timestamp\":%llu,\"dropped\":%d,\"applied\":%zu,\"firstKey\":\"%.48s\"}\n",
+            static_cast<unsigned long long>(EntityDiagnostics::NowMs()),
+            droppedKeys, valid.size(), firstDroppedKey);
+        EntityDiagnostics::LogRaw(rec);
+        std::cerr << "[config] " << droppedKeys << " key(s) in " << kConfigFileName
+            << " are not recognised by this build (first: " << firstDroppedKey
+            << "); they were ignored.\n";
     }
 
     if (g_kmbox.kmboxConfig.monitorIndex < 0)
@@ -1051,18 +1298,23 @@ bool LoadIniFile(const std::string& path)
     return true;
 }
 
-void WriteIni()
+void SerializeIni(std::ostream& file)
 {
-    const std::string path = ConfigPath();
-    std::ofstream file(path, std::ios::trunc);
-    if (!file.is_open()) {
-        return;
-    }
-
     file << "# Arc Raiders auto config (saved automatically)\n\n";
 
     file << "enableesp=" << (var::enableesp ? 1 : 0) << '\n';
     file << "box=" << (var::box ? 1 : 0) << '\n';
+    file << "show_head_dot=" << var::show_head_dot << '\n';
+    file << "practice_mode=" << (var::practice_mode ? 1 : 0) << '\n';
+    file << "radar_ghost_suppress_poi=" << (var::radar_ghost_suppress_poi ? 1 : 0) << '\n';
+    file << "show_search_window=" << (var::show_search_window ? 1 : 0) << '\n';
+    file << "head_dot_radius_px=" << var::head_dot_radius_px << '\n';
+    WriteColor4(file, "head_dot_color", var::head_dot_color);
+    file << "player_box_style=" << var::player_box_style << '\n';
+    file << "player_box_outline=" << var::player_box_outline << '\n';
+    file << "player_box_fill=" << var::player_box_fill << '\n';
+    file << "player_box_thickness=" << var::player_box_thickness << '\n';
+    WriteColor4(file, "player_box_fill_color", var::player_box_fill_color);
     file << "health=" << (var::health ? 1 : 0) << '\n';
     file << "names=" << (var::names ? 1 : 0) << '\n';
     file << "show_weapon=" << (var::show_weapon ? 1 : 0) << '\n';
@@ -1084,6 +1336,8 @@ void WriteIni()
     file << "debug_aim_shake=" << (var::debug_aim_shake ? 1 : 0) << '\n';
     file << "debug_hatch_detect=" << (var::debug_hatch_detect ? 1 : 0) << '\n';
     file << "debug_ghost_bots=" << (var::debug_ghost_bots ? 1 : 0) << '\n';
+    file << "debug_world_trace=" << (var::debug_world_trace ? 1 : 0) << '\n';
+    file << "debug_esp_paint=" << (var::debug_esp_paint ? 1 : 0) << '\n';
     file << "esp_text_scale=" << var::esp_text_scale << '\n';
     file << "radar_scale=" << var::radar_scale << '\n';
     file << "radar_range=" << var::radar_range << '\n';
@@ -1093,14 +1347,24 @@ void WriteIni()
     file << "show_radar_special=" << (var::show_radar_special ? 1 : 0) << '\n';
     file << "show_raid_hud=" << (var::show_raid_hud ? 1 : 0) << '\n';
     file << "show_activity_feed=" << (var::show_activity_feed ? 1 : 0) << '\n';
+    file << "show_objectives=" << (var::show_objectives ? 1 : 0) << '\n';
     file << "radar_shape_circle=" << (var::radar_shape_circle ? 1 : 0) << '\n';
     file << "radar_map_mode=" << (var::radar_map_mode ? 1 : 0) << '\n';
     file << "radar_underground_dim=" << (var::radar_underground_dim ? 1 : 0) << '\n';
     file << "radar_ally_arrows=" << (var::radar_ally_arrows ? 1 : 0) << '\n';
+    file << "radar_dot_scale=" << var::radar_dot_scale << '\n';
+    file << "radar_show_altitude=" << (var::radar_show_altitude ? 1 : 0) << '\n';
+    file << "radar_compass=" << (var::radar_compass ? 1 : 0) << '\n';
+    file << "radar_focus=" << var::radar_focus << '\n';
+    file << "radar_ghost=" << (var::radar_ghost ? 1 : 0) << '\n';
+    file << "radar_ghost_secs=" << var::radar_ghost_secs << '\n';
+    file << "show_pois=" << (var::show_pois ? 1 : 0) << '\n';
+    file << "poi_show_labels=" << (var::poi_show_labels ? 1 : 0) << '\n';
+    file << "poi_categories=" << var::poi_categories << '\n';
+    file << "color_profile_slot=" << var::color_profile_slot << '\n';
     file << "esp_distance=" << var::esp_distance << '\n';
     WriteColor4(file, "esp_color_visible", var::esp_color_visible);
     WriteColor4(file, "esp_color_invisible", var::esp_color_invisible);
-    file << "vis_enabled=" << (var::vis_enabled ? 1 : 0) << '\n';
     file << "bot_box=" << (var::bot_box ? 1 : 0) << '\n';
     file << "bot_names=" << (var::bot_names ? 1 : 0) << '\n';
     file << "bot_snaplines=" << (var::bot_snaplines ? 1 : 0) << '\n';
@@ -1111,10 +1375,12 @@ void WriteIni()
     file << "bot_esp_distance=" << var::bot_esp_distance << '\n';
     WriteColor4(file, "bot_color_visible", var::bot_color_visible);
     WriteColor4(file, "bot_color_invisible", var::bot_color_invisible);
+    WriteColor4(file, "bot_color_occluded", var::bot_color_occluded);
 
     file << "enable_aimbot=" << (var::enable_aimbot ? 1 : 0) << '\n';
     file << "robotAimEnabled=" << (var::robotAimEnabled ? 1 : 0) << '\n';
     file << "aim_hold_key=" << var::aim_hold_key << '\n';
+    file << "debug_overlay_key=" << var::debug_overlay_key << '\n';
     file << "aim_bone_mode=" << static_cast<int>(var::aim_bone_mode) << '\n';
     file << "predict=" << (var::predict ? 1 : 0) << '\n';
     file << "humanizer=" << (var::humanizer ? 1 : 0) << '\n';
@@ -1127,6 +1393,9 @@ void WriteIni()
     file << "show_fov=" << (var::show_fov ? 1 : 0) << '\n';
     file << "camPovUsePending=" << (var::camPovUsePending ? 1 : 0) << '\n';
     file << "show_crosshair=" << (var::show_crosshair ? 1 : 0) << '\n';
+    UpgradeOptions::Save(file);
+    EntityFilters::Save(file);
+    ArcCrosshair::SaveOptions(file);
     file << "crosshair_style=" << var::crosshair_style << '\n';
     WriteColor4(file, "crosshair_color", var::crosshair_color);
     file << "crosshair_size=" << var::crosshair_size << '\n';
@@ -1144,7 +1413,6 @@ void WriteIni()
     file << "aim_loss_of_sight_grace_ms=" << var::aim_loss_of_sight_grace_ms << '\n';
     file << "aim_loss_of_sight_grace_enabled=" << (var::aim_loss_of_sight_grace_enabled ? 1 : 0) << '\n';
     file << "aim_bullet_speed_cm_s=" << var::aim_bullet_speed_cm_s << '\n';
-    file << "aim_vis_mode=" << static_cast<int>(var::aim_vis_mode) << '\n';
     file << "enable_triggerbot=" << (var::enable_triggerbot ? 1 : 0) << '\n';
     file << "trigger_hold_mode=" << var::trigger_hold_mode << '\n';
     file << "trigger_hold_key=" << var::trigger_hold_key << '\n';
@@ -1171,6 +1439,7 @@ void WriteIni()
     file << "show_world_probe=" << (var::show_world_probe ? 1 : 0) << '\n';
     file << "show_world_vehicles=" << (var::show_world_vehicles ? 1 : 0) << '\n';
     file << "show_world_weapon_case=" << (var::show_world_weapon_case ? 1 : 0) << '\n';
+    file << "show_world_weapon_rack=" << (var::show_world_weapon_rack ? 1 : 0) << '\n';
     file << "show_world_field_crate=" << (var::show_world_field_crate ? 1 : 0) << '\n';
     file << "show_world_supply_station=" << (var::show_world_supply_station ? 1 : 0) << '\n';
     file << "show_world_keys=" << (var::show_world_keys ? 1 : 0) << '\n';
@@ -1200,6 +1469,7 @@ void WriteIni()
     WriteColor4(file, "color_world_probe", var::color_world_probe);
     WriteColor4(file, "color_world_vehicles", var::color_world_vehicles);
     WriteColor4(file, "color_world_weapon_case", var::color_world_weapon_case);
+    WriteColor4(file, "color_world_weapon_rack", var::color_world_weapon_rack);
     WriteColor4(file, "color_world_field_crate", var::color_world_field_crate);
     WriteColor4(file, "color_world_supply_station", var::color_world_supply_station);
     WriteColor4(file, "color_world_keys", var::color_world_keys);
@@ -1230,6 +1500,9 @@ void WriteIni()
     file << "show_crate_contents=" << (var::show_crate_contents ? 1 : 0) << '\n';
     file << "show_stack_counts=" << (var::show_stack_counts ? 1 : 0) << '\n';
     file << "grey_looted_containers=" << (var::grey_looted_containers ? 1 : 0) << '\n';
+    file << "state_opened_mode=" << var::state_opened_mode << '\n';
+    file << "state_dead_mode=" << var::state_dead_mode << '\n';
+    file << "state_dim_alpha=" << var::state_dim_alpha << '\n';
     file << "show_armor_line=" << (var::show_armor_line ? 1 : 0) << '\n';
     file << "show_player_kit=" << (var::show_player_kit ? 1 : 0) << '\n';
     file << "show_bot_loadout=" << (var::show_bot_loadout ? 1 : 0) << '\n';
@@ -1250,10 +1523,62 @@ void WriteIni()
     file << "kmbox_uuid=" << g_kmbox.kmboxConfig.uuid << '\n';
     file << "kmbox_minDelay=" << g_kmbox.kmboxConfig.minDelay << '\n';
     file << "kmbox_monitorIndex=" << g_kmbox.kmboxConfig.monitorIndex << '\n';
+}
 
-    file << "collision_debug_draw=" << (var::collision_debug_draw ? 1 : 0) << '\n';
-    file << "collision_debug_rays=" << (var::collision_debug_rays ? 1 : 0) << '\n';
-    file << "collision_vis_enabled=" << (var::collision_vis_enabled ? 1 : 0) << '\n';
+// Serializes the live settings to text. Pure in-memory work, safe on paint.
+std::string SerializeIniToString()
+{
+    std::ostringstream text;
+    text.imbue(std::locale::classic());
+    text.precision(std::numeric_limits<float>::max_digits10);
+    SerializeIni(text);
+    return text.str();
+}
+
+// Writes text via temp file + atomic replace. Does the disk I/O only.
+bool WriteTextAtomic(const std::string& path, const std::string& text)
+{
+    const std::string temporary = path + ".tmp";
+    std::ofstream file(temporary, std::ios::trunc);
+    if (!file.is_open())
+        return false;
+    file << text;
+    file.flush();
+    const bool written = file.good();
+    file.close();
+    if (!written || file.fail()) {
+        DeleteFileA(temporary.c_str());
+        return false;
+    }
+    if (!MoveFileExA(temporary.c_str(), path.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(temporary.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool WriteIniTo(const std::string& path)
+{
+    return WriteTextAtomic(path, SerializeIniToString());
+}
+
+// The one in-flight background save, if any.
+std::future<bool> s_pendingSave;
+
+// Collects the background write. Returns false only while it is still in flight
+// (non-blocking mode). A failed write re-arms the debounced save.
+bool ReapPendingSave(bool block)
+{
+    if (!s_pendingSave.valid())
+        return true;
+    if (!block && s_pendingSave.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return false;
+    if (!s_pendingSave.get()) {
+        std::cerr << "[config] Background save failed; retry pending.\n";
+        AutoConfig_MarkDirty();
+    }
+    return true;
 }
 
 } // namespace
@@ -1287,8 +1612,33 @@ void AutoConfig_MarkDirty()
 
 void AutoConfig_SaveNow()
 {
-    const std::string path = ConfigPath();
-    WriteIni();
+    // Exit path: wait out any background write so the two never race on the file.
+    ReapPendingSave(true);
+    if (!WriteIniTo(ConfigPath())) {
+        s_dirty = true;
+        s_dirtySince = std::chrono::steady_clock::now();
+        std::cerr << "[config] Save failed; previous config retained and retry pending.\n";
+        return;
+    }
+    s_last = CaptureSnapshot();
+    s_snapshotValid = true;
+    s_dirty = false;
+}
+
+// Serializes on the caller (no I/O) and writes the file on a background thread.
+// Safe to call from paint: it never waits on the disk.
+void AutoConfig_SaveNowAsync()
+{
+    if (!ReapPendingSave(false)) {
+        // Previous write still in flight: keep dirty so Tick retries it.
+        AutoConfig_MarkDirty();
+        return;
+    }
+    std::string text = SerializeIniToString();
+    s_pendingSave = std::async(std::launch::async,
+        [path = ConfigPath(), text = std::move(text)]() {
+            return WriteTextAtomic(path, text);
+        });
     s_last = CaptureSnapshot();
     s_snapshotValid = true;
     s_dirty = false;
@@ -1296,6 +1646,8 @@ void AutoConfig_SaveNow()
 
 void AutoConfig_Tick()
 {
+    ReapPendingSave(false);
+
     if (!s_snapshotValid) {
         s_last = CaptureSnapshot();
         s_snapshotValid = true;
@@ -1314,6 +1666,122 @@ void AutoConfig_Tick()
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - s_dirtySince).count();
     if (elapsed >= kSaveDelayMs) {
-        AutoConfig_SaveNow();
+        AutoConfig_SaveNowAsync();
     }
+}
+
+// ---------------------------------------------------------------------------
+// D20 — baseline, diff, export, apply.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string DataFilePath(const char* name)
+{
+    const std::string cfg = ConfigPath();
+    const size_t slash = cfg.find_last_of("\\/");
+    const std::string dir = (slash == std::string::npos)
+        ? std::string()
+        : cfg.substr(0, slash + 1);
+    return dir + "Data\\" + name;
+}
+
+// Read a key=value config file into a map for diffing. Comments, blank lines
+// and [section] headers are skipped exactly the way LoadIniFile skips them, so
+// both sides of the diff agree on what counts as a setting.
+bool ParseKeyValues(const std::string& path, std::map<std::string, std::string>& out)
+{
+    std::ifstream in(path);
+    if (!in)
+        return false;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        TrimInPlace(line);
+        if (line.empty() || line[0] == '#' || line[0] == ';' || line[0] == '[')
+            continue;
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos)
+            continue;
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+        TrimInPlace(key);
+        TrimInPlace(val);
+        out[key] = val;
+    }
+    return true;
+}
+
+// Export directly through the same serializer used by autosave.
+bool CopyConfigTo(const std::string& dst)
+{
+    // Serialize live values directly. A failed autosave must never cause an
+    // apparently successful export of stale disk settings.
+    return WriteIniTo(dst);
+}
+
+} // namespace
+
+std::string AutoConfig_BaselinePath()
+{
+    return DataFilePath("config_baseline.ini");
+}
+
+std::string AutoConfig_ExportPath()
+{
+    return DataFilePath("config_export.ini");
+}
+
+bool AutoConfig_SnapshotBaseline()
+{
+    return CopyConfigTo(AutoConfig_BaselinePath());
+}
+
+bool AutoConfig_ExportCurrent()
+{
+    return CopyConfigTo(AutoConfig_ExportPath());
+}
+
+bool AutoConfig_ImportExported()
+{
+    const std::string path = AutoConfig_ExportPath();
+    if (!LoadIniFile(path))
+        return false;
+    AutoConfig_MarkDirty();
+    return true;
+}
+
+std::vector<std::string> AutoConfig_DiffBaseline()
+{
+    std::vector<std::string> out;
+
+    std::map<std::string, std::string> base;
+    if (!ParseKeyValues(AutoConfig_BaselinePath(), base))
+        return out;   // no baseline taken yet — nothing to compare against
+
+    std::map<std::string, std::string> cur;
+    std::ostringstream live;
+    live.imbue(std::locale::classic());
+    live.precision(std::numeric_limits<float>::max_digits10);
+    SerializeIni(live);
+    std::istringstream input(live.str());
+    std::string line;
+    while (std::getline(input, line)) {
+        const size_t eq = line.find('=');
+        if (eq != std::string::npos)
+            cur[line.substr(0, eq)] = line.substr(eq + 1);
+    }
+
+    for (const auto& kv : cur) {
+        const auto it = base.find(kv.first);
+        if (it == base.end())
+            out.push_back("+ " + kv.first + " (new) = " + kv.second);
+        else if (it->second != kv.second)
+            out.push_back(kv.first + ": " + it->second + " -> " + kv.second);
+    }
+    for (const auto& kv : base) {
+        if (cur.find(kv.first) == cur.end())
+            out.push_back("- " + kv.first + " (removed, was " + kv.second + ")");
+    }
+    return out;
 }

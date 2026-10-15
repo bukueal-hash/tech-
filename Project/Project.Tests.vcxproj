@@ -19,13 +19,13 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
+    <ConfigurationType>Utility</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>v145</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
+    <ConfigurationType>Utility</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>v145</PlatformToolset>
     <!-- No LTCG (/GL): the VS 18.x backend ICEs (C1001 in p2::main) on the
@@ -97,12 +97,14 @@
   <ItemGroup>
     <ClCompile Include="Tests\main.cpp"/>
     <ClCompile Include="Tests\vector_tests.cpp"/>
+    <ClCompile Include="Tests\visual_state_tests.cpp"/>
+    <ClCompile Include="Tests\poi_parser_tests.cpp"/>
+    <ClCompile Include="Tests\color_profile_tests.cpp"/>
     <ClCompile Include="Tests\bone_transform_tests.cpp"/>
     <ClCompile Include="Tests\aim_math_tests.cpp"/>
     <ClCompile Include="Tests\json_parser_tests.cpp"/>
     <ClCompile Include="Tests\memory_interface_tests.cpp"/>
     <ClCompile Include="Tests\bot_esp_expiry_tests.cpp"/>
-    <ClCompile Include="Tests\collision_mirror_tests.cpp"/>
     <ClCompile Include="Tests\name_crypto_tests.cpp"/>
     <ClCompile Include="Tests\reflection_tests.cpp"/>
     <ClCompile Include="Tests\player_chain_tests.cpp">
@@ -118,6 +120,9 @@
       <DisableSpecificWarnings>5285</DisableSpecificWarnings>
     </ClCompile>
     <ClCompile Include="Tests\scan_gate_policy_tests.cpp">
+      <DisableSpecificWarnings>5285</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="Tests\bot_pos_sanity_tests.cpp">
       <DisableSpecificWarnings>5285</DisableSpecificWarnings>
     </ClCompile>
     <ClCompile Include="Tests\crate_contents_tests.cpp">
@@ -151,7 +156,8 @@
       <DisableSpecificWarnings>5285</DisableSpecificWarnings>
     </ClCompile>
     <ClCompile Include="Tests\worker_lifecycle_tests.cpp" />
-    <ClCompile Include="Tests\esp_frame_policy_tests.cpp" />    <ClCompile Include="Tests\feature_policy_tests.cpp"/>
+    <ClCompile Include="Tests\esp_frame_policy_tests.cpp" />
+    <ClCompile Include="Tests\feature_policy_tests.cpp"/>
     <ClCompile Include="Tests\entity_diagnostics_tests.cpp"/>
     <ClCompile Include="Tests\player_esp_miss_tests.cpp">
       <DisableSpecificWarnings>5285</DisableSpecificWarnings>
@@ -160,6 +166,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Core\SDK.hpp"/>
+    <ClInclude Include="Core\PoiParser.hpp"/>
+    <ClInclude Include="Core\ColorProfiles.hpp"/>
     <ClInclude Include="Core\BotMotion.hpp"/>
     <ClInclude Include="Core\BoneRoster.hpp"/>
     <ClInclude Include="Core\BotAdmitQueue.hpp"/>
@@ -179,6 +187,7 @@
     <ClInclude Include="Core\EntityDiagnostics.hpp"/>
     <ClInclude Include="Core\PlayerEspMissLog.hpp"/>
     <ClInclude Include="Core\BotEspPosition.hpp"/>
+    <ClInclude Include="Core\BotPosSanity.hpp"/>
     <ClInclude Include="Tests\tests_main.hpp"/>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets"/>

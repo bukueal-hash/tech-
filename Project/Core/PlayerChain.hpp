@@ -73,7 +73,7 @@ enum class Rung : int {
     // GameInstance
     OwningSlot, OwningBackRef,
     OuterSdkSlot, OuterSdkSlotRol, OuterDrop, OuterPlainA0, OuterPlain20,
-    SimdDecrypt, LegacySlot, Scan,
+    TlsDecrypt, SimdDecrypt, LegacySlot, Scan, ObjectScan,
     // Controller
     CachedFlag, CachedPair, CamManager, ActorScan, LpArrayFlag, LpArrayChain,
     // LocalPlayer
@@ -103,9 +103,11 @@ inline const char* RungName(Rung rung)
     case Rung::OuterDrop: return "outerDrop";
     case Rung::OuterPlainA0: return "outerPlainA0";
     case Rung::OuterPlain20: return "outerPlain20";
+    case Rung::TlsDecrypt: return "tlsDecrypt";
     case Rung::SimdDecrypt: return "simdDecrypt";
     case Rung::LegacySlot: return "legacySlot";
     case Rung::Scan: return "scan";
+    case Rung::ObjectScan: return "objectScan";
     case Rung::CachedFlag: return "cachedFlag";
     case Rung::CachedPair: return "cachedPair";
     case Rung::CamManager: return "camManager";
@@ -232,9 +234,11 @@ inline void Accept(State& st, Hop hop, uintptr_t ptr, Rung rung, bool confirmed 
 //   bool      LevelActors(uintptr_t level, uintptr_t&, int&)
 //   uintptr_t GiOwningSlot(uintptr_t world, bool& backRef)
 //   uintptr_t GiFromOuter(uintptr_t lp, Rung& which)      OuterLink rungs
+//   uintptr_t GiFromTls()                                 per-thread TLS block (CL-1424961)
 //   uintptr_t GiFromDecrypt(uintptr_t world)
 //   uintptr_t GiFromLegacySlot(uintptr_t world)
 //   uintptr_t GiFromScan(uintptr_t world)
+//   uintptr_t GiFromObjectScan()             GUObjectArray class scan (live-object collection)
 //   bool      IsGameInstance(uintptr_t gi)
 //   bool      PcFromCachedFlag(uintptr_t cachedPc, uintptr_t& pc)
 //   bool      PcFromCachedPair(uintptr_t cachedPc, uintptr_t cachedPawn,
@@ -324,7 +328,8 @@ void Resolve(State& st, Host& host, const Seed& seed)
 
     // ── GameInstance ─────────────────────────────────────────────────────────
     // Dump-backed slot first (world back-ref is the strongest cheap proof), then
-    // the LP outer hop, then the retired CLs' schemes, then a scan of UWorld.
+    // the LP outer hop, then the per-thread TLS block, then the retired CLs'
+    // schemes, then a scan of UWorld.
     uintptr_t gi = 0;
     {
         detail::Attempt(st, Hop::GameInstance);
@@ -351,6 +356,16 @@ void Resolve(State& st, Host& host, const Seed& seed)
     }
     if (!gi) {
         detail::Attempt(st, Hop::GameInstance);
+        const uintptr_t v = host.GiFromTls();
+        if (v) {
+            detail::Accept(st, Hop::GameInstance, v, Rung::TlsDecrypt);
+            gi = v;
+        } else {
+            ++st.Get(Hop::GameInstance).rejected;
+        }
+    }
+    if (!gi) {
+        detail::Attempt(st, Hop::GameInstance);
         const uintptr_t v = host.GiFromDecrypt(world);
         if (v) {
             detail::Accept(st, Hop::GameInstance, v, Rung::SimdDecrypt);
@@ -369,6 +384,13 @@ void Resolve(State& st, Host& host, const Seed& seed)
             ++st.Get(Hop::GameInstance).rejected;
         }
     }
+    // The cached GI is validated by class + LocalPlayers in one cheap read, so it
+    // answers before the expensive UWorld and object walks. It is still behind the
+    // cheap legacy slot, so a fresh pointer found there wins over the cache.
+    if (!gi && seed.gi && host.IsGameInstance(seed.gi)) {
+        detail::Accept(st, Hop::GameInstance, seed.gi, Rung::Cached);
+        gi = seed.gi;
+    }
     if (!gi) {
         detail::Attempt(st, Hop::GameInstance);
         const uintptr_t v = host.GiFromScan(world);
@@ -379,22 +401,37 @@ void Resolve(State& st, Host& host, const Seed& seed)
             ++st.Get(Hop::GameInstance).rejected;
         }
     }
-    if (!gi && seed.gi && host.IsGameInstance(seed.gi)) {
-        detail::Accept(st, Hop::GameInstance, seed.gi, Rung::Cached);
-        gi = seed.gi;
+    // Nothing in UWorld can hold the GI on this build (the runtime export swept
+    // world +0x8..+0x800 plain and encoded and the engine +0x8..+0x2000: all
+    // "not found"), so the deterministic answer is the object array: the single
+    // GI object, proven by its class + LocalPlayers array. Kept last because the
+    // walk costs reads, but a hit answers in under 10 s regardless of game state.
+    if (!gi) {
+        detail::Attempt(st, Hop::GameInstance);
+        const uintptr_t v = host.GiFromObjectScan();
+        if (v) {
+            detail::Accept(st, Hop::GameInstance, v, Rung::ObjectScan);
+            gi = v;
+        } else {
+            ++st.Get(Hop::GameInstance).rejected;
+        }
     }
 
     // ── PlayerController ─────────────────────────────────────────────────────
     // Order preserved from the (pre-ladder) discovery: the engine's own flag and
     // the pair cache are one read each, the camera manager is dump-backed, the
     // actor scan is the heavy one, and the GI array is the last resort because
-    // GI->LocalPlayers is the hop that is encrypted on some CLs.
+    // GI->LocalPlayers is the hop that is encrypted on some CLs. If the current
+    // GI array can identify its controller, do not keep a cached controller that
+    // disagrees: its local-controller flag may survive a raid transition.
     uintptr_t pc = 0, pawn = 0, pcm = 0;
     Rung pcRung = Rung::None;
+    const bool cachedPcMatchesLocalPlayer = !seed.pc
+        || host.CachedPcMatchesLocalPlayer(gi, seed.pc);
     if (seed.pc) {
         detail::Attempt(st, Hop::Controller);
         uintptr_t v = 0;
-        if (host.PcFromCachedFlag(seed.pc, v)) {
+        if (cachedPcMatchesLocalPlayer && host.PcFromCachedFlag(seed.pc, v)) {
             pc = v;
             pcRung = Rung::CachedFlag;
         } else {
@@ -404,7 +441,8 @@ void Resolve(State& st, Host& host, const Seed& seed)
     if (!pc && seed.pc && seed.pawn) {
         detail::Attempt(st, Hop::Controller);
         uintptr_t v = 0, p = 0;
-        if (host.PcFromCachedPair(seed.pc, seed.pawn, v, p)) {
+        if (cachedPcMatchesLocalPlayer
+            && host.PcFromCachedPair(seed.pc, seed.pawn, v, p)) {
             pc = v;
             pawn = p;
             pcRung = Rung::CachedPair;
@@ -447,7 +485,7 @@ void Resolve(State& st, Host& host, const Seed& seed)
             ++st.Get(Hop::Controller).rejected;
         }
     }
-    if (!pc && seed.retainValid && seed.pc) {
+    if (!pc && seed.retainValid && seed.pc && cachedPcMatchesLocalPlayer) {
         detail::Accept(st, Hop::Controller, seed.pc, Rung::Cached);
         pc = seed.pc;
         pawn = seed.pawn;

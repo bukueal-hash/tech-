@@ -4,6 +4,8 @@
 
 #include <cfloat>
 #include <cstdarg>
+#include <cctype>
+#include <cstring>
 
 namespace ArcMenuLayout {
 
@@ -25,6 +27,30 @@ void RowTooltip(const char* txt)
 {
     if (txt && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("%s", txt);
+}
+
+// Menu search (C1). Session-only on purpose: a persisted term would come back
+// next launch and silently hide rows with nothing on screen explaining why.
+char g_searchBuf[64] = {};
+bool g_searchFocusPending = false;
+
+bool ContainsNoCase(const char* hay, size_t hayLen, const char* needle)
+{
+    const size_t needleLen = std::strlen(needle);
+    if (needleLen == 0)
+        return true;
+    if (needleLen > hayLen)
+        return false;
+    for (size_t i = 0; i + needleLen <= hayLen; ++i) {
+        size_t j = 0;
+        while (j < needleLen
+            && std::tolower(static_cast<unsigned char>(hay[i + j]))
+               == std::tolower(static_cast<unsigned char>(needle[j])))
+            ++j;
+        if (j == needleLen)
+            return true;
+    }
+    return false;
 }
 
 // Screen rect of the most recently drawn Label(). Consumed by
@@ -108,6 +134,53 @@ void PushControlWidth()
     ImGui::SetNextItemWidth(-FLT_MIN);
 }
 
+void DrawSearchBox()
+{
+    // "/" jumps into the box. WantTextInput guards it so typing "/" inside the
+    // box stays a literal character instead of stealing focus back to the start.
+    if (ImGui::IsKeyPressed(ImGuiKey_Slash, false) && !ImGui::GetIO().WantTextInput)
+        g_searchFocusPending = true;
+
+    ImGui::PushID("##menu_search");
+    if (g_searchFocusPending) {
+        ImGui::SetKeyboardFocusHere();
+        g_searchFocusPending = false;
+    }
+    // Raw ImGui::InputText on purpose: routing this through InputText() would
+    // push "Search" through SearchHides(), and a term matching nothing would
+    // delete the search box itself.
+    ImGui::InputText(
+        "Search", g_searchBuf, sizeof(g_searchBuf),
+        ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_EscapeClearsAll);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Filters menu rows by their label as you type. Press / to jump to "
+            "this box, Esc to clear it. Session only — it is never saved.");
+    ImGui::PopID();
+
+    if (g_searchBuf[0] != '\0') {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.75f, 0.3f, 1.f));
+        ImGui::TextUnformatted("filtering rows");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("clear"))
+            g_searchBuf[0] = '\0';
+    }
+}
+
+bool SearchHides(const char* label)
+{
+    if (g_searchBuf[0] == '\0' || !label)
+        return false;
+    // ImGui labels carry id suffixes ("Box##bot"); match the visible part only.
+    const char* cut = std::strstr(label, "##");
+    const size_t n = cut ? static_cast<size_t>(cut - label) : std::strlen(label);
+    // Nothing visible to match: keep the row rather than lose it silently.
+    if (n == 0)
+        return false;
+    return !ContainsNoCase(label, n, g_searchBuf);
+}
+
 bool SliderFloat(
     const char* label,
     const char* id,
@@ -116,6 +189,8 @@ bool SliderFloat(
     float vMax,
     const char* fmt)
 {
+    if (SearchHides(label))
+        return false;
     Label(label);
     PushControlWidth();
     const bool changed = ImGui::SliderFloat(id, value, vMin, vMax, fmt);
@@ -131,6 +206,8 @@ bool Combo(
     const char* const* items,
     int count)
 {
+    if (SearchHides(label))
+        return false;
     Label(label);
     PushControlWidth();
     const bool changed = ImGui::Combo(id, current, items, count);
@@ -141,6 +218,8 @@ bool Combo(
 
 bool Checkbox(const char* label, bool* value)
 {
+    if (SearchHides(label))
+        return false;
     const bool changed = ImGui::Checkbox(label, value);
     if (changed)
         AutoConfig_MarkDirty();
@@ -177,6 +256,8 @@ bool CheckboxWithColorRow(
     const char* colorId,
     const char* rowTooltip)
 {
+    if (SearchHides(label))
+        return false;
     const float startX = ImGui::GetCursorStartPos().x;
     ImGui::PushID(colorId);
     bool changed = false;
@@ -206,6 +287,8 @@ bool CheckboxWithDualColorRow(
     const char* idB,
     const char* rowTooltip)
 {
+    if (SearchHides(label))
+        return false;
     const float startX = ImGui::GetCursorStartPos().x;
     ImGui::PushID(idA);
     bool changed = false;
@@ -236,6 +319,8 @@ bool CheckboxWithDualColorRow(
 
 bool BeginCombo(const char* label, const char* id, const char* previewValue)
 {
+    if (SearchHides(label))
+        return false;
     Label(label);
     PushControlWidth();
     return ImGui::BeginCombo(id, previewValue);
@@ -243,6 +328,8 @@ bool BeginCombo(const char* label, const char* id, const char* previewValue)
 
 bool InputText(const char* label, const char* id, char* buf, int bufSize, ImGuiInputTextFlags flags)
 {
+    if (SearchHides(label))
+        return false;
     Label(label);
     PushControlWidth();
     return ImGui::InputText(id, buf, static_cast<size_t>(bufSize), flags);

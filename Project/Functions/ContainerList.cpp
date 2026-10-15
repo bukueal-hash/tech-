@@ -2,6 +2,7 @@
 #include "../Core/AgentLog.h"
 #include "../Core/ActorType.h"
 #include "../Core/AssetNames.h"
+#include "../Core/StringUtils.hpp"
 #include "../Core/EntityDiagnostics.hpp"
 #include "../Core/Offsets.h"
 #include "../Core/WorldItemCategory.h"
@@ -28,7 +29,8 @@ inline bool AnyContainerEspEnabled()
         var::raiderStock || var::showArc || var::showDeadPlayers ||
         var::show_world_crate || var::show_world_furniture || var::show_world_harvestable ||
         var::show_world_industrial || var::show_world_other || var::show_world_probe ||
-        var::show_world_vehicles || var::show_world_weapon_case || var::show_world_field_crate ||
+        var::show_world_vehicles || var::show_world_weapon_case || var::show_world_weapon_rack ||
+        var::show_world_field_crate ||
         var::show_world_supply_station || var::show_world_locker || var::show_world_trash ||
         var::show_world_safe || var::show_world_buried || var::show_world_deaddrop ||
         var::show_world_open_container);
@@ -76,6 +78,15 @@ int s_contAdmitRingResets = 0;
 int s_contAdmitLastCycleMs = 0;
 std::chrono::steady_clock::time_point s_contAdmitCycleStart{};
 std::unordered_set<uintptr_t> s_contAdmitPrevActors;
+// Where the current slice stopped when its DMA budget ran out. ScanBudget's own
+// contract (WorldScanCommon.h) is "a pass that hits the budget does NOT advance
+// the admission ring band — it retries next pass", and this cursor is what makes
+// that true: the old code advanced the band unconditionally, so a band that the
+// budget only partly covered was abandoned with its tail never probed. With a
+// band of ~220 actors and a budget that died before the first probe, the ring
+// still walked 0->1->2..7 and reported coverMask cycling through EVERY band
+// while the container cache stayed at 7 entries and crates never drew.
+static size_t s_contAdmitResumeIndex = 0;
 
 bool ContainerScanNegMemoHit(uintptr_t actor, int& outMemoSkip)
 {
@@ -137,7 +148,7 @@ bool QuickContainerCandidate(
         return true;
 
     if (!fname.empty()) {
-        const std::string lower = ToLowerCopy(fname);
+        const std::string lower = StringUtils::ToLowerCopy(fname);
         if (lower.find("raidercache") != std::string::npos
             || lower.find("raider_cache") != std::string::npos
             || lower.find("bp_raidercache") != std::string::npos
@@ -194,7 +205,7 @@ bool AdmitContainerActor(
         return true;
 
     if (!fname.empty()) {
-        const std::string lower = ToLowerCopy(fname);
+        const std::string lower = StringUtils::ToLowerCopy(fname);
         if (lower.find("raidercache") != std::string::npos
             || lower.find("raider_cache") != std::string::npos
             || lower.find("bp_raidercache") != std::string::npos
@@ -249,7 +260,7 @@ bool AdmitContainerActor(
             if (IsSalvageContainerActor(probe, key)
                 || IsRealSocketSalvageContainer(probe, key))
                 return true;
-            const std::string lower = ToLowerCopy(probe);
+            const std::string lower = StringUtils::ToLowerCopy(probe);
             if (IsWorldPropLootContainer(
                     hasLootInteraction, classChest || actorTypeChest, lower, std::string{}))
                 return true;
@@ -267,7 +278,7 @@ bool AdmitContainerActor(
         if (fnameIsContainer || classChest || actorTypeChest)
             return true;
         if (hasLootInteraction && !classGroundLoot) {
-            const std::string lower = ToLowerCopy(fname);
+            const std::string lower = StringUtils::ToLowerCopy(fname);
             if (IsWorldPropLootContainer(
                     hasLootInteraction, classChest || actorTypeChest, lower, std::string{}))
                 return true;
@@ -332,15 +343,14 @@ static void AgentCrateLog(
     const char* message,
     const std::string& dataJson)
 {
-    std::ofstream f(kArcDebugLogPath, std::ios::app);
-    if (!f)
-        return;
+    std::ostringstream f;
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     f << "{\"sessionId\":\"c190fb\",\"runId\":\"crates\",\"hypothesisId\":\""
         << hypothesisId << "\",\"location\":\"ContainerList.cpp\",\"message\":\""
         << message << "\",\"data\":" << dataJson
         << ",\"timestamp\":" << ms << "}\n";
+    EntityDiagnostics::LogRaw(f.str());
 }
 // #endregion
 
@@ -370,7 +380,17 @@ void Engine::ContainerList()
     }
 
     // LAG1: cap this pass's DMA so camera/position/frame-builder keeps cadence.
-    WorldScan::ScanBudget scanBudget(std::chrono::milliseconds(90));
+    // Raid-start mode: an empty container cache means nothing to retain yet,
+    // so spend more bus time probing; tapers to 90ms once containers are
+    // cached.
+    const bool contRaidStart = localCache.size() < 4;
+    // NOTE: no pass-wide budget here on purpose. One budget used to cover the
+    // pre-loop DMA, the probe loop and the retain loop; the pre-loop work spends
+    // it, so both loops entered already expired and broke on their first entry
+    // every pass. Each phase now takes a fresh budget where it starts (see
+    // probeBudget / retainBudget below), which is the pattern ItemList already
+    // uses ("the pre-walk DMA above must not consume the walk's time").
+    const int contPhaseBudgetMs = contRaidStart ? 180 : 90;
 
     const std::unordered_set<uint64_t> currentSet(
         ctx.currentActors.begin(),
@@ -435,6 +455,29 @@ void Engine::ContainerList()
     int dbgRingSliceActors = 0;
     size_t dbgRingSlice = 0;
     size_t contN = 0;
+    // Skip-reason split for the ring record. A slice that probes nothing can be
+    // caused by any of four early-continues; without the split they all read as
+    // "checked: 0" and the cause is unnameable from the log.
+    int dbgSkipCached = 0;
+    int dbgSkipExclude = 0;
+    int dbgSkipHeld = 0;
+    int dbgLoopEntries = 0;
+    size_t dbgResumeFrom = 0;
+    bool dbgBudgetBroke = false;
+    bool dbgBudgetExpiredAtEntry = false;
+    std::string dbgFirstSkipReason;
+    std::string dbgFirstSkipLabel;
+    const auto NoteRingSkip = [&](const char* reason, uintptr_t key) {
+        if (!dbgFirstSkipReason.empty())
+            return;
+        dbgFirstSkipReason = reason;
+        std::string cls = GetActorClassFName(key);
+        if (cls.empty())
+            cls = GetActorFNameStringCached(key);
+        if (cls.empty())
+            cls = GetActorFNameString(key);
+        dbgFirstSkipLabel = cls;
+    };
 
     if (doAdmission) {
     // C7: prune memo entries for actors that left the world.
@@ -492,6 +535,7 @@ void Engine::ContainerList()
     }
     if (contRingReset) {
         s_contAdmitSliceCursor = 0;
+        s_contAdmitResumeIndex = 0;
         s_contAdmitCoveredMask = 0;
         s_contAdmitPrevActors.clear();
         s_contAdmitCycleStart = std::chrono::steady_clock::now();
@@ -581,9 +625,44 @@ void Engine::ContainerList()
     s_contAdmitPrevActors.clear();
     s_contAdmitPrevActors.insert(admitIndex.begin(), admitIndex.end());
 
-    for (uintptr_t key : probeSet) {
-        if (scanBudget.expired())
+    // Deterministic probe order: slice band first, then the retry window, then
+    // newly-seen actors. probeSet (unordered_set) cannot be resumed mid-band, so
+    // the loop iterates this vector by index instead.
+    std::vector<uintptr_t> probeOrder;
+    probeOrder.reserve(probeSet.size());
+    for (uintptr_t key : probeSet)
+        probeOrder.push_back(key);
+    if (s_contAdmitResumeIndex > probeOrder.size())
+        s_contAdmitResumeIndex = 0;
+    dbgResumeFrom = s_contAdmitResumeIndex;
+
+    // Own budget for the probe phase, created HERE and not at the top of the
+    // pass. ItemList carries the same fix with the same reason: "the pre-walk
+    // DMA above must not consume the walk's time". ContainerList shared one
+    // budget between the pre-loop work (CollectHeldItemActors chases the local
+    // pawn's inventory and its item actors' class names) and this loop, so the
+    // loop could enter with the budget already spent — it then broke on its
+    // FIRST iteration, every pass, while the ring advanced anyway. That is
+    // container_admit_ring's "checked: 0" with the container cache frozen at a
+    // handful of entries: nothing was ever probed, so crates and open containers
+    // never admitted and ground loot never drew.
+    // Braces, not parens: `ScanBudget x(std::chrono::milliseconds(y))` is a
+    // function declaration (MSVC C4930), not a variable.
+    WorldScan::ScanBudget probeBudget{
+        std::chrono::milliseconds(contPhaseBudgetMs) };
+    dbgBudgetExpiredAtEntry = probeBudget.expired();
+
+    for (size_t pi = dbgResumeFrom; pi < probeOrder.size(); ++pi) {
+        const uintptr_t key = probeOrder[pi];
+        if (probeBudget.expired()) {
+            // Contract: do NOT advance the ring band. Remember where the slice
+            // stopped so the very next pass resumes here instead of abandoning
+            // the tail of this band for a whole cycle (or forever).
+            s_contAdmitResumeIndex = pi;
+            dbgBudgetBroke = true;
             break;
+        }
+        ++dbgLoopEntries;
         // Decisive probe #1 (before ALL excludes): does an extraction-hatch-class
         // actor even reach this loop? If yes, the excludes below are hiding it.
         if (var::debug_hatch_detect) {
@@ -607,17 +686,38 @@ void Engine::ContainerList()
                 }
             }
         }
-        if (localCache.contains(key))
+        // #region agent log — WHY a slice produced no probe at all.
+        // "checked: 0" on its own has four candidate causes and no way to pick
+        // one from a log, so each early-continue is counted and the first one of
+        // the pass is sampled with the actor's class name.
+        if (localCache.contains(key)) {
+            ++dbgSkipCached;
+            NoteRingSkip("cached", key);
             continue;
-        if (ContainerScanNegMemoHit(key, dbgMemoSkip))
+        }
+        if (ContainerScanNegMemoHit(key, dbgMemoSkip)) {
+            NoteRingSkip("memo", key);
             continue;
-        if (WorldScan::ShouldExcludeFromWorldCaches(key, localPawn))
+        }
+        if (WorldScan::ShouldExcludeFromWorldCaches(key, localPawn)) {
+            ++dbgSkipExclude;
+            NoteRingSkip("exclude", key);
             continue;
-        if (WorldScan::IsHeldEquipmentActor(key))
+        }
+        if (WorldScan::IsHeldEquipmentActor(key)) {
+            ++dbgSkipHeld;
+            NoteRingSkip("held", key);
             continue;
+        }
+        // #endregion
 
         ++dbgScanned;
         ++dbgRingChecked;
+
+        // Ledger: this per-key block is an identity classification (actor type
+        // id, class FName, item data asset). The position probe below re-tags
+        // itself, so a scan_turn row separates "what is this" from "where is it".
+        ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Name);
 
         const uint32_t maskedType =
             ArcActorType::MaskActorTypeId(ArcActorType::ReadActorTypeId(key));
@@ -667,8 +767,8 @@ void Engine::ContainerList()
                 // Broad keyword probe: log ANY actor whose name smells like a
                 // hatch/extraction point, even if the strict matcher rejected it,
                 // so we can see the real fnames and why nothing is admitted.
-                std::string hl = ToLowerCopy(hatchFname);
-                std::string hcl = ToLowerCopy(hatchClassFname);
+                std::string hl = StringUtils::ToLowerCopy(hatchFname);
+                std::string hcl = StringUtils::ToLowerCopy(hatchClassFname);
                 const bool kHit =
                     (hMatch)
                     || hl.find("hatch") != std::string::npos
@@ -691,6 +791,7 @@ void Engine::ContainerList()
                 }
             }
             if (hMatch) {
+                ReadBudget::PurposeScope purposePos(ReadBudget::Purpose::Position);
                 const uintptr_t root = Engine::ResolveActorRoot(key);
                 if (var::debug_hatch_detect)
                     std::cout << " root=" << std::hex << root << std::dec;
@@ -750,7 +851,7 @@ void Engine::ContainerList()
                 ContainerScanNegMemoize(key);
                 continue;
             }
-            if (FnameExcludedFromContainerEsp(ToLowerCopy(classFname))) {
+            if (FnameExcludedFromContainerEsp(StringUtils::ToLowerCopy(classFname))) {
                 ContainerScanNegMemoize(key);
                 continue;
             }
@@ -824,7 +925,7 @@ void Engine::ContainerList()
             && !fnameIsContainer && !classChest && !actorTypeChest)
             continue;
 
-        if (!fname.empty() && FnameExcludedFromContainerEsp(ToLowerCopy(fname))) {
+        if (!fname.empty() && FnameExcludedFromContainerEsp(StringUtils::ToLowerCopy(fname))) {
             ContainerScanNegMemoize(key);
             continue;
         }
@@ -960,8 +1061,8 @@ void Engine::ContainerList()
                 displayName = memName;
         }
 
-        const std::string fnameLower = ToLowerCopy(fname);
-        const std::string displayLower = ToLowerCopy(displayName);
+        const std::string fnameLower = StringUtils::ToLowerCopy(fname);
+        const std::string displayLower = StringUtils::ToLowerCopy(displayName);
 
         WorldItemCategory cat = ClassifyContainer(
             fnameLower, displayLower, hasLootInteraction, classChest, fnameIsContainer);
@@ -1085,10 +1186,16 @@ void Engine::ContainerList()
 
     }
 
-    // C7: advance the ring only after the slice fully ran.
-    s_contAdmitCoveredMask |= (1ull << (dbgRingSlice % kContAdmitSlices));
-    s_contAdmitSliceCursor = (dbgRingSlice + 1) % kContAdmitSlices;
-    if (s_contAdmitSliceCursor == 0) {
+    // C7: advance the ring only after the slice fully ran. "Fully ran" means the
+    // band was exhausted, not that the pass merely reached the end of its budget:
+    // advancing on a budget-truncated band is how whole slices went unprobed
+    // while coverMask still reported every band as covered.
+    if (!dbgBudgetBroke) {
+        s_contAdmitResumeIndex = 0;
+        s_contAdmitCoveredMask |= (1ull << (dbgRingSlice % kContAdmitSlices));
+        s_contAdmitSliceCursor = (dbgRingSlice + 1) % kContAdmitSlices;
+    }
+    if (!dbgBudgetBroke && s_contAdmitSliceCursor == 0) {
         const auto nowCycle = std::chrono::steady_clock::now();
         if (s_contAdmitCycleStart.time_since_epoch().count() != 0)
             s_contAdmitLastCycleMs = static_cast<int>(
@@ -1105,17 +1212,36 @@ void Engine::ContainerList()
         if (s_lastRingLog.time_since_epoch().count() == 0
             || nowRl - s_lastRingLog >= std::chrono::seconds(2)) {
             s_lastRingLog = nowRl;
-            char buf[320];
+            // Entries this pass did NOT reach, counted from where it stopped —
+            // not `sliceActors - loopEntries`, which reads as ~the whole band
+            // whenever the pass is resuming a band a previous pass started.
+            const size_t stoppedAt = dbgResumeFrom + static_cast<size_t>(dbgLoopEntries);
+            const int dbgBandRemaining = static_cast<int>(
+                stoppedAt < probeOrder.size() ? probeOrder.size() - stoppedAt : 0);
+            char buf[768];
             snprintf(buf, sizeof(buf),
                 "{\"actors\":%zu,\"slice\":%zu,\"sliceActors\":%d,\"prioNew\":%d,"
                 "\"prioRetry\":%d,"
                 "\"checked\":%d,\"memoSkip\":%d,\"memoSize\":%zu,\"coverMask\":%llu,"
-                "\"cycleMs\":%d,\"ringResets\":%d}",
+                "\"cycleMs\":%d,\"ringResets\":%d,"
+                // The split that names a zero-probe slice: every early-continue
+                // counted, plus how much of the band the pass never reached.
+                "\"loopEntries\":%d,\"skipCached\":%d,\"skipExclude\":%d,"
+                "\"skipHeld\":%d,\"unexamined\":%d,\"resumeFrom\":%zu,"
+                "\"budgetBroke\":%d,\"budgetDeadAtEntry\":%d,"
+                "\"cacheSize\":%zu,\"firstSkip\":\"%.16s\",\"firstSkipLabel\":\"%.40s\"}",
                 contN, dbgRingSlice, dbgRingSliceActors, dbgRingPrioNew,
                 dbgPrioRetry,
                 dbgRingChecked, dbgMemoSkip, s_containerScanNeg.size(),
                 static_cast<unsigned long long>(s_contAdmitCoveredMask),
-                s_contAdmitLastCycleMs, s_contAdmitRingResets);
+                s_contAdmitLastCycleMs, s_contAdmitRingResets,
+                dbgLoopEntries, dbgSkipCached, dbgSkipExclude, dbgSkipHeld,
+                dbgBandRemaining,
+                dbgResumeFrom,
+                dbgBudgetBroke ? 1 : 0, dbgBudgetExpiredAtEntry ? 1 : 0,
+                localCache.size(),
+                dbgFirstSkipReason.empty() ? "-" : dbgFirstSkipReason.c_str(),
+                dbgFirstSkipLabel.c_str());
             AgentCrateLog("C7", "container_admit_ring", buf);
         }
     }
@@ -1131,9 +1257,15 @@ void Engine::ContainerList()
     retainRoots.reserve(localCache.size());
     retainClassFnames.reserve(localCache.size());
 
+    // Fresh budget for the retain phase as well, for the same reason as the
+    // probe loop: a cached container only refreshes its name/position/Drawing
+    // state here, so a starved retain phase is the other half of "crates never
+    // draw" even after admission starts working.
+    WorldScan::ScanBudget retainBudget{
+        std::chrono::milliseconds(contPhaseBudgetMs) };
     for (auto it = localCache.begin(); it != localCache.end(); ) {
         const uintptr_t key = it->first;
-        if (scanBudget.expired())
+        if (retainBudget.expired())
             break;
 
         if (occupiedCharacterKeys.contains(key)) {
@@ -1160,12 +1292,12 @@ void Engine::ContainerList()
         }
 
         const std::string classFname = GetActorClassFName(key);
-        if (!fname.empty() && FnameExcludedFromContainerEsp(ToLowerCopy(fname))) {
+        if (!fname.empty() && FnameExcludedFromContainerEsp(StringUtils::ToLowerCopy(fname))) {
             it = localCache.erase(it);
             continue;
         }
         if (!classFname.empty()
-            && (FnameExcludedFromContainerEsp(ToLowerCopy(classFname))
+            && (FnameExcludedFromContainerEsp(StringUtils::ToLowerCopy(classFname))
                 || FnameLooksLikeEngineSubobjectClass(classFname))) {
             it = localCache.erase(it);
             continue;
@@ -1293,7 +1425,7 @@ void Engine::ContainerList()
 
             const std::string& retainFname = retainIters[i]->second.ActorName;
             const std::string& retainClassFname = retainClassFnames[i];
-            const std::string retainFnameLower = ToLowerCopy(
+            const std::string retainFnameLower = StringUtils::ToLowerCopy(
                 retainFname.empty() ? retainClassFname : retainFname);
             const bool classChest =
                 !retainClassFname.empty()
@@ -1499,16 +1631,15 @@ void Engine::ContainerList()
             if (s_lastOpenBatch.time_since_epoch().count() == 0
                 || nowB - s_lastOpenBatch >= std::chrono::seconds(2)) {
                 s_lastOpenBatch = nowB;
-                std::ofstream f(kArcDebugLogPath, std::ios::app);
-                if (f) {
-                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"batch\",\"hypothesisId\":\"P4\","
-                      << "\"location\":\"ContainerList.cpp:ContainerList\",\"message\":\"container_open_batch\","
-                      << "\"data\":{\"probed\":" << rows.size()
-                      << ",\"scatterExecs\":" << scatterExecs << "}"
-                      << ",\"timestamp\":" << ts << "}\n";
-                }
+                std::ostringstream f;
+                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"sessionId\":\"c190fb\",\"runId\":\"batch\",\"hypothesisId\":\"P4\","
+                  << "\"location\":\"ContainerList.cpp:ContainerList\",\"message\":\"container_open_batch\","
+                  << "\"data\":{\"probed\":" << rows.size()
+                  << ",\"scatterExecs\":" << scatterExecs << "}"
+                  << ",\"timestamp\":" << ts << "}\n";
+                EntityDiagnostics::LogRaw(f.str());
             }
         }
         // #endregion

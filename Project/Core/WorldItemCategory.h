@@ -31,6 +31,10 @@ enum class WorldItemCategory : uint8_t {
     RaiderCache,
     Vehicles,
     WeaponCase,
+    // Weapon racks are separate from weapon cases on purpose: they are large
+    // structural props that sit in the open, so they want the extended (SP)
+    // distance and their own on/off row, not the case's tight drawer range.
+    WeaponRack,
     FieldCrate,
     SupplyCallStation,
     Corpse,

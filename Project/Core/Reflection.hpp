@@ -211,21 +211,41 @@ inline uint64_t SuperStruct(uint64_t cls)
         Dma(), cls + Offsets::UStruct_SuperStruct);
 }
 
-// The linked-properties head (the dump's UStruct.Children).
+// The linked-properties head. The 20261008 dump maps UStruct.Children to 0xD0
+// but this build's UStruct::ChildProperties head lives at 0xE8
+// (sdk/arc_decrypt_export.json child_properties); take whichever slot holds a
+// plausible FField pointer so the walk survives either layout.
 inline uint64_t PropertyLink(uint64_t cls)
 {
     if (!namecrypto::IsPlausibleNamePtr(cls))
         return 0;
-    return namecrypto::ReadVal<uint64_t>(
-        Dma(), cls + Offsets::UStruct_PropertyLink);
+    const MemoryReader reader = Dma();
+    const uintptr_t heads[2] = {
+        0xE8u, static_cast<uintptr_t>(Offsets::UStruct_PropertyLink) };
+    for (const uintptr_t off : heads) {
+        const uint64_t head = namecrypto::ReadVal<uint64_t>(reader, cls + off);
+        if (namecrypto::IsPlausibleNamePtr(head))
+            return head;
+    }
+    return 0;
 }
 
+// FField::Next. The dump maps Field.Next to 0x98 but the this-build reference
+// (sdk/arc_decrypt_export.json ffield_next) puts it at 0xB8; try both so a
+// layout drift does not truncate the chain.
 inline uint64_t NextProperty(uint64_t prop)
 {
     if (!namecrypto::IsPlausibleNamePtr(prop))
         return 0;
-    return namecrypto::ReadVal<uint64_t>(
-        Dma(), prop + Offsets::FProperty_PropertyLinkNext);
+    const MemoryReader reader = Dma();
+    const uintptr_t nexts[2] = {
+        0xB8u, static_cast<uintptr_t>(Offsets::FProperty_PropertyLinkNext) };
+    for (const uintptr_t off : nexts) {
+        const uint64_t next = namecrypto::ReadVal<uint64_t>(reader, prop + off);
+        if (namecrypto::IsPlausibleNamePtr(next))
+            return next;
+    }
+    return 0;
 }
 
 // The inheritance chain: class, super, super's super, ... (cycle-guarded).
@@ -344,6 +364,14 @@ inline uint64_t ClassOf(uint64_t obj)
 {
     if (!namecrypto::IsPlausibleNamePtr(obj))
         return 0;
+    // The engine's own resolver (reference tier -> plain ClassPrivate -> SDK
+    // slot -> legacy slot) is the proven path GetActorFNameString already
+    // leans on; lead with it so the reflection walk agrees with the rest of
+    // the project instead of decoding the slots independently.
+    const uint64_t proven = steam_decrypt::GetActorClassPtr(
+        static_cast<uintptr_t>(obj));
+    if (namecrypto::IsPlausibleNamePtr(proven))
+        return proven;
     const MemoryReader reader = Dma();
     const uint32_t order[6] = {
         namecrypto::ObjSlotIndexBase(obj), // drop: class slot = index base
@@ -422,15 +450,16 @@ inline FStringCheck CheckFStringPipeline(uint64_t gameBase)
     out.readOk = true;
 
     using Scramble = void (*)(std::vector<uint16_t>&, int);
-    static const Scramble kScrambles[5] = {
+    static const Scramble kScrambles[6] = {
         &steam_decrypt::DecryptPlayerName,
         &steam_decrypt::DecryptPlayerNameSimd,
         &steam_decrypt::DecryptPlayerNameLegacy,
         &steam_decrypt::DecryptPlayerNameForum,
         &steam_decrypt::DecryptPlayerNameSdk,
+        &steam_decrypt::DecryptPlayerNameRef,
     };
-    static const char* kLabels[6] = {
-        "cur", "simd", "legacy", "forum", "sdk", "plain"
+    static const char* kLabels[7] = {
+        "cur", "simd", "legacy", "forum", "sdk", "ref", "plain"
     };
 
     // Num includes the terminator: try the real length first, then the padded.
@@ -438,7 +467,7 @@ inline FStringCheck CheckFStringPipeline(uint64_t gameBase)
     for (int len : lens) {
         if (len < 1)
             continue;
-        for (int k = 0; k < 5; ++k) {
+        for (int k = 0; k < 6; ++k) {
             std::vector<uint16_t> copy(chars.begin(), chars.begin() + len);
             kScrambles[k](copy, len);
             const std::string text =
@@ -453,8 +482,8 @@ inline FStringCheck CheckFStringPipeline(uint64_t gameBase)
         const std::string raw =
             steam_decrypt::WideCharsToPlayerName(chars, len);
         if (IsPrintableAscii(raw)) {
-            out.candidate = 5;
-            out.text = std::string(kLabels[5]) + ":" + raw;
+            out.candidate = 6;
+            out.text = std::string(kLabels[6]) + ":" + raw;
             return out;
         }
     }

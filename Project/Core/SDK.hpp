@@ -14,7 +14,10 @@ using u64 = uint64_t;
 
 namespace game
 {
-    // GNAMES / the layout offsets agree with the 20260922 dump: its own header
+    // GWORLD/GNAMES/KEYTABLE are CL-1426848 (sdk/sdk.txt, 2026-10-13) and are
+    // mirrored by Core/Offsets.h; the trailing constants below still carry
+    // pre-CL-1426848 values and are only used by the retired fallback walks.
+    // Historical September provenance (not current compatibility evidence):
     // (sdk/CppSDK/SDK/Basic.hpp, namespace Offsets) carries GWORLD 0x10839A98,
     // GNAMES 0x10987D40, GObjects 0x10C56FE0, ProcessEvent 0x5AF560 (index 0x4C)
     // and nothing else. GWORLD is a double-dereferenced global in this drop:
@@ -25,9 +28,12 @@ namespace game
     // feed the fallback slot/keystream paths (gated on the key table loading).
     namespace offsets
     {
-        constexpr u32 GWORLD = 0x10839A98;   // sdk/sdk.txt Global::UWORLD_BASE_RVA; double-deref
-        constexpr u32 GNAMES = 0x10987D40;
-        constexpr u32 KEYTABLE = 0x1082B26C;
+        // CL-1426848 (game build 25879518, FName pipeline v20261008), all three
+        // straight from sdk/sdk.txt: the dumper header states "GWorld RVA:
+        // 0x1096ba98 (double-deref)", and FName:: pins the pool and keystream.
+        constexpr u32 GWORLD = 0x1096BA98;   // GWorld global, [RVA] -> intermediary -> [+0] UWorld
+        constexpr u32 GNAMES = 0x10EAA140;   // FName::RVA_GNAMEPOOL
+        constexpr u32 KEYTABLE = 0x10D4B30C; // FName::RVA_FNAME_KEY_TABLE - 64 x u16 keystream words
         constexpr u32 UStruct_SuperStruct = 0xB0;
         constexpr u32 FString_Verification_Offset = 0xD3C29A0;
         constexpr u32 UStruct_PropertyLink = 0x118;
@@ -223,7 +229,7 @@ namespace game
         }
         inline u64 decode_ffproperty_offset(const u8* property_buf) {
             const u32 encrypted = *reinterpret_cast<const u32*>(property_buf + 0xBC);
-            return detail::bswap32(encrypted ^ 0xDE28E18Du);
+            return detail::bswap32(encrypted ^ 0x08BAD282u);
         }
         // Seed slot lives at mesh_component + 0x7B0; callers that already hold
         // the 8-byte window (Bones::DecryptBoneArray) use the _slot overload

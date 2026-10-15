@@ -1,15 +1,21 @@
 #include "../Core/Engine.h"
+#include "../Core/FeaturePolicy.hpp"
+#include "../Core/RunReport.hpp"
 #include "../Core/AgentLog.h"
+#include "../Core/ActorType.h"
 #include "../Core/EntityDiagnostics.hpp"
 #include "../Core/ScanGatePolicy.hpp"
+#include "../Core/ReadBudget.hpp"
 #include "../../DMA/Memory.h"
 #include "../Interface/Utils/Variables/index.h"
-#include "CollisionMirror.h"
 #include "WorldScanCommon.h"
+#include "CollisionRead.h"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -79,15 +85,14 @@ void LogPerfSpike(const char* threadName, int ms)
         return;
     last = now;
 
-    std::ofstream f(kArcDebugLogPath, std::ios::app);
-    if (!f)
-        return;
+    std::ostringstream f;
     const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     f << "{\"sessionId\":\"c190fb\",\"runId\":\"baseline\",\"hypothesisId\":\"LAG1\","
       << "\"location\":\"EngineThreads.cpp\",\"message\":\"perf_spike\","
       << "\"data\":{\"thread\":\"" << threadName << "\",\"ms\":" << ms << "}"
       << ",\"timestamp\":" << ts << "}\n";
+    EntityDiagnostics::LogRaw(f.str());
 }
 // #endregion
 
@@ -149,21 +154,20 @@ struct CadenceStats {
                   << "  drift=" << (drift >= 0 ? "+" : "") << static_cast<int>(drift + 0.5) << "ms"
                   << std::endl;
         // Also write to session log for post-hoc analysis.
-        std::ofstream f(kArcDebugLogPath, std::ios::app);
-        if (f) {
-            const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            f << "{\"sessionId\":\"c190fb\",\"runId\":\"cadence\",\"hypothesisId\":\"TC\","
-              << "\"location\":\"EngineThreads.cpp\",\"message\":\"cadence_stats\","
-              << "\"data\":{\"thread\":\"" << name << "\""
-              << ",\"targetMs\":" << targetMs
-              << ",\"count\":" << count
-              << ",\"minMs\":" << minInterval
-              << ",\"maxMs\":" << maxInterval
-              << ",\"avgMs\":" << static_cast<int>(avg + 0.5)
-              << ",\"driftMs\":" << static_cast<int>(drift + 0.5)
-              << "},\"timestamp\":" << ts << "}\n";
-        }
+        std::ostringstream f;
+        const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        f << "{\"sessionId\":\"c190fb\",\"runId\":\"cadence\",\"hypothesisId\":\"TC\","
+          << "\"location\":\"EngineThreads.cpp\",\"message\":\"cadence_stats\","
+          << "\"data\":{\"thread\":\"" << name << "\""
+          << ",\"targetMs\":" << targetMs
+          << ",\"count\":" << count
+          << ",\"minMs\":" << minInterval
+          << ",\"maxMs\":" << maxInterval
+          << ",\"avgMs\":" << static_cast<int>(avg + 0.5)
+          << ",\"driftMs\":" << static_cast<int>(drift + 0.5)
+          << "},\"timestamp\":" << ts << "}\n";
+        EntityDiagnostics::LogRaw(f.str());
     }
 
     void reset() {
@@ -209,18 +213,17 @@ void LogScanGate(const char* scanner, int waitMs, int heldMs, int waiters, const
         return;
     last = now;
 
-    std::ofstream f(kArcDebugLogPath, std::ios::app);
-    if (!f)
-        return;
     const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    f << "{\"sessionId\":\"c190fb\",\"runId\":\"scan-gate\",\"hypothesisId\":\"OV1\","
+    std::ostringstream oss;
+    oss << "{\"sessionId\":\"c190fb\",\"runId\":\"scan-gate\",\"hypothesisId\":\"OV1\","
       << "\"location\":\"EngineThreads.cpp:gate\",\"message\":\"scan_gate\","
       << "\"data\":{\"scanner\":\"" << scanner << "\",\"waitMs\":" << waitMs
       << ",\"heldMs\":" << heldMs
       << ",\"waiters\":" << waiters
       << ",\"blockedBy\":\"" << (blockedBy ? blockedBy : "") << "\"}"
       << ",\"timestamp\":" << ts << "}\n";
+    EntityDiagnostics::LogRaw(oss.str());
 }
 // #endregion
 
@@ -256,12 +259,10 @@ void LogGateTurn(const char* scanner, int cadenceMs, int waitMs, int heldMs,
         return;
     last = now;
 
-    std::ofstream f(kArcVerifyPath, std::ios::app);
-    if (!f)
-        return;
     const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    f << "{\"sessionId\":\"c190fb\",\"runId\":\"gate\","
+    std::ostringstream oss;
+    oss << "{\"sessionId\":\"c190fb\",\"runId\":\"gate\","
       << "\"location\":\"EngineThreads.cpp:gate\",\"message\":\"gate_turn\","
       << "\"data\":{\"scanner\":\"" << scanner << "\",\"cadenceMs\":" << cadenceMs
       << ",\"waitMs\":" << waitMs
@@ -269,6 +270,114 @@ void LogGateTurn(const char* scanner, int cadenceMs, int waitMs, int heldMs,
       << ",\"gapMs\":" << gapMs
       << ",\"sinceMs\":" << sinceMs << "}"
       << ",\"timestamp\":" << ts << "}\n";
+    EntityDiagnostics::LogRaw(oss.str());
+}
+// #endregion
+
+// ── Turning "who waits" into "what the player sees" ────────────────────────
+// The scan-time record (perf_spike) from a 1330-actor raid: Update p50 498 ms,
+// EntityList 665 ms, RobotList 681 ms, ContainerList 254 ms, ItemList 401 ms —
+// ~2.4 s of DMA work per gate cycle, so every consumer, ESP included, refreshed
+// roughly once every 2.5 s. These constants are the split that gives the bus
+// back to the passes whose staleness is visible on screen.
+constexpr int64_t kDutyWindowMs = 2000;      // window the duty estimate covers
+constexpr int kDeferLoadPermille = 850;      // bus above this = saturated
+constexpr int kDeferCadenceFactor = 3;       // deferrable passes slow by this
+constexpr int64_t kDeferMinIntervalMs = 1200; // ...and never more often than this
+constexpr int kMaxEffectiveCadenceMs = 1000; // a pass still gets one turn/s
+constexpr int kTurnLogMinHeldMs = 80;        // scan_turn: held-time threshold
+constexpr int kTurnLogMinWaitMs = 150;       // scan_turn: wait-time threshold
+constexpr int64_t kCycleReportMs = 5000;     // scan_cycle cadence
+
+/** Rounded percentile of a sample vector (0.5 = median). */
+inline int Percentile(std::vector<int>& samples, double p)
+{
+    if (samples.empty())
+        return 0;
+    std::sort(samples.begin(), samples.end());
+    const size_t i = static_cast<size_t>(
+        p * static_cast<double>(samples.size() - 1) + 0.5);
+    return samples[i];
+}
+
+inline int64_t SteadyNowMs()
+{
+    return static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// #region agent log
+// LogScanTurn: what ONE pass actually spent on the bus. scan_gate reports
+// contention and gate_turn reports pacing, but neither could answer "which
+// pass burned the bus", because the read ledger's per-pass totals are shared
+// by every thread. This carries the reading thread's own before/after delta, so
+// the cost of a turn is attributable to the pass that caused it.
+void LogScanTurn(const char* scanner, int cadenceMs, int effCadenceMs,
+    int waitMs, int heldMs, int64_t sinceMs,
+    const ReadBudget::ThreadTotals& before, const ReadBudget::ThreadTotals& after)
+{
+    if (heldMs < kTurnLogMinHeldMs && waitMs < kTurnLogMinWaitMs)
+        return;
+    thread_local std::unordered_map<std::string, std::chrono::steady_clock::time_point> s_lastTurn;
+    const auto now = std::chrono::steady_clock::now();
+    auto& last = s_lastTurn[scanner];
+    if (last.time_since_epoch().count() != 0
+        && now - last < std::chrono::milliseconds(500))
+        return;
+    last = now;
+
+    const uint64_t reads = after.reads - before.reads;
+    const uint64_t pull = after.pull - before.pull;
+    const uint64_t scatter = after.scatter - before.scatter;
+    const uint64_t bytes = after.bytes - before.bytes;
+    const uint64_t us = after.us - before.us;
+    const int top = ReadBudget::TopPurpose(before, after);
+
+    // The split, not just the total. "reads": 36 per actor is only actionable
+    // once it is broken down by field, so every purpose that moved is reported
+    // busiest-first. untaggedReads is called out separately because it is the
+    // count of reads whose site has no PurposeScope yet.
+    ReadBudget::PurposeDelta deltas[ReadBudget::kPurposeCount]{};
+    const size_t deltaCount = ReadBudget::PurposeDeltas(before, after, deltas);
+    uint64_t untagged = 0;
+    for (size_t i = 0; i < deltaCount; ++i) {
+        if (static_cast<ReadBudget::Purpose>(deltas[i].purpose)
+            == ReadBudget::Purpose::Untagged)
+            untagged = deltas[i].reads;
+    }
+
+    std::ostringstream oss;
+    oss << "{\"sessionId\":\"c190fb\",\"runId\":\"scan-turn\",\"hypothesisId\":\"LG2\","
+      << "\"location\":\"EngineThreads.cpp:gate\",\"message\":\"scan_turn\","
+      << "\"data\":{\"scanner\":\"" << scanner << "\""
+      << ",\"cadenceMs\":" << cadenceMs
+      << ",\"effCadenceMs\":" << effCadenceMs
+      << ",\"waitMs\":" << waitMs
+      << ",\"heldMs\":" << heldMs
+      << ",\"sinceMs\":" << sinceMs
+      << ",\"reads\":" << reads
+      << ",\"pull\":" << pull
+      << ",\"scatter\":" << scatter
+      << ",\"bytes\":" << bytes
+      << ",\"readUs\":" << us
+      << ",\"topPurpose\":\"" << (top >= 0 ? ReadBudget::PurposeName(top) : "none") << "\""
+      << ",\"topPurposeReads\":"
+      << ((deltaCount && top >= 0) ? deltas[0].reads : 0)
+      << ",\"untaggedReads\":" << untagged
+      << ",\"purposeCount\":" << deltaCount
+      << ",\"purposes\":{";
+    for (size_t i = 0; i < deltaCount; ++i) {
+        if (i)
+            oss << ",";
+        oss << "\"" << ReadBudget::PurposeName(deltas[i].purpose) << "\":"
+            << deltas[i].reads;
+    }
+    oss << "}}"
+      << ",\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch()).count()
+      << "}\n";
+    EntityDiagnostics::LogRaw(oss.str());
 }
 // #endregion
 
@@ -280,21 +389,30 @@ void LogGateTurn(const char* scanner, int cadenceMs, int waitMs, int heldMs,
 class ScanGate {
 public:
     template <typename Fn>
-    void Run(const char* scanner, int cadenceMs, Fn&& fn)
+    void Run(const char* scanner, int cadenceMs, bool deferrable, Fn&& fn)
     {
+        // A deferrable pass (loot) stands down while the bus is saturated, so
+        // the gate is left to the passes whose staleness the player actually
+        // sees: the player/bot roster. Counted, never silent — scan_cycle
+        // reports the deferrals per pass.
+        if (deferrable && ShouldDefer(scanner))
+            return;
+
         const auto w0 = std::chrono::steady_clock::now();
         const char* blockedBy = nullptr;
         int64_t sinceMs = -1;
         int gapMs = 0;
+        int effCadenceMs = cadenceMs;
         std::chrono::steady_clock::time_point t_acquired;
         {
             std::unique_lock<std::mutex> lock(m_mu);
             blockedBy = m_holder;
+            effCadenceMs = EffectiveCadenceLocked(scanner, cadenceMs, deferrable);
             const auto lastStart = LastStartLocked(scanner);
             if (lastStart.time_since_epoch().count() != 0)
                 sinceMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                     w0 - lastStart).count();
-            m_queue.push_back({ scanner, cadenceMs, w0, lastStart });
+            m_queue.push_back({ scanner, effCadenceMs, w0, lastStart });
             g_scanGateWaiters.fetch_add(1, std::memory_order_relaxed);
             m_cv.wait(lock, [&] { return !m_busy && IsMyTurnLocked(scanner); });
             g_scanGateWaiters.fetch_sub(1, std::memory_order_relaxed);
@@ -311,24 +429,35 @@ public:
                 }
             }
             RemoveLocked(scanner);
+            // The map update can allocate/throw; do it before publishing a
+            // busy gate that would otherwise never reach the release guard.
+            m_lastStarts[scanner] = std::chrono::steady_clock::now();
             m_busy = true;
             m_holder = scanner;
-            m_lastStarts[scanner] = std::chrono::steady_clock::now();
         }
 
+        // Release on both normal completion and exception unwinding. The
+        // worker's outer exception handler must never inherit a busy gate.
+        struct TurnRelease {
+            ScanGate& gate;
+            bool active = true;
+            void Release() {
+                if (active) {
+                    gate.ReleaseTurn();
+                    active = false;
+                }
+            }
+            ~TurnRelease() { Release(); }
+        } release{ *this };
         const auto t0 = std::chrono::steady_clock::now();
         g_scanGateHolder.store(scanner, std::memory_order_relaxed);
+        // This thread's own ledger counters, so the turn's reads are attributed
+        // to this pass rather than to the engine-wide per-frame total.
+        const ReadBudget::ThreadTotals readBefore = ReadBudget::ThreadSnapshot();
         fn();
+        const ReadBudget::ThreadTotals readAfter = ReadBudget::ThreadSnapshot();
         const auto t1 = std::chrono::steady_clock::now();
-        g_scanGateHolder.store(nullptr, std::memory_order_relaxed);
-
-        {
-            std::lock_guard<std::mutex> lock(m_mu);
-            m_lastRelease = std::chrono::steady_clock::now();
-            m_busy = false;
-            m_holder = nullptr;
-        }
-        m_cv.notify_all();
+        release.Release();
 
         // #region agent log
         const int waitMs = static_cast<int>(
@@ -337,11 +466,194 @@ public:
             std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
         LogScanGate(scanner, waitMs, heldMs,
             g_scanGateWaiters.load(std::memory_order_relaxed), blockedBy);
-        LogGateTurn(scanner, cadenceMs, waitMs, heldMs, gapMs, sinceMs);
+        LogGateTurn(scanner, effCadenceMs, waitMs, heldMs, gapMs, sinceMs);
+        LogScanTurn(scanner, cadenceMs, effCadenceMs, waitMs, heldMs, sinceMs,
+            readBefore, readAfter);
         // #endregion
+        NoteTurn(scanner, effCadenceMs, heldMs);
     }
 
 private:
+    void ReleaseTurn()
+    {
+        g_scanGateHolder.store(nullptr, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(m_mu);
+            m_lastRelease = std::chrono::steady_clock::now();
+            m_busy = false;
+            m_holder = nullptr;
+        }
+        m_cv.notify_all();
+    }
+
+    // Per-pass accounting for the cycle record. Bounded: the names are the
+    // scanner literals, and the sample vectors are cleared every report.
+    struct PassStats {
+        const char* name = nullptr;
+        int cadenceMs = 0;
+        int lastHeldMs = 0;
+        int64_t lastEndMs = 0;
+        int turns = 0;
+        int deferred = 0;
+        std::vector<int> held;
+        std::vector<int> intervals;
+    };
+
+    PassStats* FindStatsLocked(const char* scanner)
+    {
+        for (PassStats& s : m_stats) {
+            if (std::strcmp(s.name, scanner) == 0)
+                return &s;
+        }
+        return nullptr;
+    }
+
+    PassStats& StatsLocked(const char* scanner, int cadenceMs)
+    {
+        if (PassStats* found = FindStatsLocked(scanner))
+            return *found;
+        if (m_stats.size() >= kMaxPassStats)
+            return m_stats.back();   // never expected; bounded regardless
+        m_stats.push_back(PassStats{});
+        PassStats& s = m_stats.back();
+        s.name = scanner;
+        s.cadenceMs = cadenceMs;
+        return s;
+    }
+
+    /**
+     * Fraction of recent wall time the bus spent holding a turn, in permille.
+     * This is the number the priority split keys off: a pass cannot be given
+     * the bus "more often" by policy alone — something else has to want it
+     * less, and this is the measurement of how much contention there is.
+     */
+    int BusyPermilleLocked() const
+    {
+        if (m_recentTurns.size() < 4)
+            return 0;
+        const int64_t nowMs = SteadyNowMs();
+        int64_t busyMs = 0;
+        int64_t firstStartMs = nowMs;
+        for (const std::pair<int64_t, int>& t : m_recentTurns) {
+            if (t.first < nowMs - kDutyWindowMs)
+                continue;
+            busyMs += t.second;
+            if (t.first - t.second < firstStartMs)
+                firstStartMs = t.first - t.second;
+        }
+        const int64_t span = nowMs - firstStartMs;
+        if (span <= 0)
+            return 0;
+        const int64_t permille = busyMs * 1000 / span;
+        return static_cast<int>((std::min)(permille, int64_t(1000)));
+    }
+
+    /**
+     * The cadence a pass is REQUESTED at. Two corrections, both measured:
+     *  1. A pass cannot turn faster than it executes. Update asked for 16 ms
+     *     while taking 498 ms, so it was permanently due and every turn it won
+     *     was a turn the 665 ms EntityList pass did not get.
+     *  2. Under saturation a deferrable pass asks less often, which is the only
+     *     way to hand bus time to the ESP passes without starving community
+     *     data outright.
+     */
+    int EffectiveCadenceLocked(const char* scanner, int cadenceMs, bool deferrable)
+    {
+        int base = cadenceMs;
+        if (const PassStats* s = FindStatsLocked(scanner); s && s->lastHeldMs > base)
+            base = s->lastHeldMs;
+        if (deferrable && BusyPermilleLocked() >= kDeferLoadPermille)
+            base *= kDeferCadenceFactor;
+        return (std::min)(base, kMaxEffectiveCadenceMs);
+    }
+
+    bool ShouldDefer(const char* scanner)
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (BusyPermilleLocked() < kDeferLoadPermille)
+            return false;
+        PassStats* s = FindStatsLocked(scanner);
+        const int64_t nowMs = SteadyNowMs();
+        if (s && s->lastEndMs != 0 && nowMs - s->lastEndMs < kDeferMinIntervalMs) {
+            ++s->deferred;
+            return true;
+        }
+        return false;
+    }
+
+    void NoteTurn(const char* scanner, int effCadenceMs, int heldMs)
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        const int64_t nowMs = SteadyNowMs();
+        PassStats& s = StatsLocked(scanner, effCadenceMs);
+        if (s.lastEndMs != 0)
+            s.intervals.push_back(static_cast<int>(nowMs - s.lastEndMs));
+        s.lastHeldMs = heldMs;
+        s.lastEndMs = nowMs;
+        s.cadenceMs = effCadenceMs;
+        ++s.turns;
+        s.held.push_back(heldMs);
+        m_recentTurns.push_back({ nowMs, heldMs });
+        while (m_recentTurns.size() > kDutyWindowSamples)
+            m_recentTurns.pop_front();
+
+        // #region agent log
+        // LogScanCycle: one line every kCycleReportMs that answers, for the pass
+        // the raid was actually slow in: how often each pass turned, how long it
+        // held, how stale it got (interval), how much it was told to stand down,
+        // and how much the type memo absorbed. Built under the lock on purpose —
+        // it runs at 0.2 Hz, and copying the sample vectors out to format them
+        // unlocked would cost more than the string does.
+        if (m_cycleStartMs == 0)
+            m_cycleStartMs = nowMs;
+        if (nowMs - m_cycleStartMs < kCycleReportMs) {
+            return;
+        }
+        uint64_t memoHits = 0;
+        uint64_t memoMisses = 0;
+        ArcActorType::TypeMemoStats(memoHits, memoMisses);
+        const int64_t sysNowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        std::ostringstream oss;
+        oss << "{\"sessionId\":\"c190fb\",\"runId\":\"scan-cycle\","
+            << "\"hypothesisId\":\"LG2\","
+            << "\"location\":\"EngineThreads.cpp:gate\",\"message\":\"scan_cycle\","
+            << "\"data\":{\"windowMs\":" << (nowMs - m_cycleStartMs)
+            << ",\"busyPermille\":" << BusyPermilleLocked()
+            << ",\"typeMemo\":{\"hits\":" << memoHits
+            << ",\"misses\":" << memoMisses << "}"
+            << ",\"passes\":[";
+        bool first = true;
+        for (PassStats& p : m_stats) {
+            if (!p.turns && !p.deferred)
+                continue;
+            if (!first)
+                oss << ',';
+            first = false;
+            oss << "{\"name\":\"" << p.name << "\""
+                << ",\"cadenceMs\":" << p.cadenceMs
+                << ",\"turns\":" << p.turns
+                << ",\"heldP50Ms\":" << Percentile(p.held, 0.5)
+                << ",\"heldMaxMs\":" << Percentile(p.held, 1.0)
+                << ",\"intervalP50Ms\":" << Percentile(p.intervals, 0.5)
+                << ",\"intervalMaxMs\":" << Percentile(p.intervals, 1.0)
+                << ",\"deferred\":" << p.deferred << '}';
+        }
+        // Closes the passes array, then data, then the record — and carries the
+        // wall-clock stamp the other records use, so this line lands in the same
+        // time-ordered view as gate_turn and perf_spike instead of sorting to 0.
+        oss << "]},\"timestamp\":" << sysNowMs << "}\n";
+        EntityDiagnostics::LogRaw(oss.str());
+        for (PassStats& p : m_stats) {
+            p.held.clear();
+            p.intervals.clear();
+            p.turns = 0;
+            p.deferred = 0;
+        }
+        m_cycleStartMs = nowMs;
+        // #endregion
+    }
+
     struct Waiter {
         const char* name;
         int cadenceMs;
@@ -391,6 +703,9 @@ private:
         }
     }
 
+    static constexpr size_t kMaxPassStats = 8;
+    static constexpr size_t kDutyWindowSamples = 64;
+
     mutable std::mutex m_mu;
     std::condition_variable m_cv;
     bool m_busy = false;
@@ -398,14 +713,24 @@ private:
     std::vector<Waiter> m_queue;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> m_lastStarts;
     std::chrono::steady_clock::time_point m_lastRelease{};
+    std::vector<PassStats> m_stats;
+    std::deque<std::pair<int64_t, int>> m_recentTurns;   // (endMs, heldMs)
+    int64_t m_cycleStartMs = 0;
 };
 
 static ScanGate g_scanGate;
 
+// deferrable: this pass may stand down while the bus is saturated. True only
+// for the passes whose staleness the player does not see on screen (loot).
+// Skipping an ESP pass would make the symptom worse, so those never defer.
 template <typename Fn>
-void RunGatedScan(const char* scanner, int cadenceMs, Fn&& fn)
+void RunGatedScan(const char* scanner, int cadenceMs, bool deferrable, Fn&& fn)
 {
-    g_scanGate.Run(scanner, cadenceMs, fn);
+    // Name this worker in the DMA read ledger. Every gated scan thread funnels
+    // through here, so requester attribution covers the whole engine without a
+    // per-thread edit, and the name is the same one the scan gate reports.
+    ReadBudget::SetCurrentRequester(scanner);
+    g_scanGate.Run(scanner, cadenceMs, deferrable, fn);
 }
 
 // Scanner cadences: single source for the SyncedThread pacing AND the scan
@@ -532,13 +857,18 @@ void Engine::StartWorkerThreads()
     if (m_workerThreadsStarted.exchange(true))
         return;
 
+    // Initialize callback-owned telemetry before any constructor launches a worker.
+    g_camCadence.init("camera", 8);
+    g_posCadence.init("position", 16);
+    g_aimCadence.init("aim", 4);
+
     // DMA throttle: slower periods cut PCIe/FPGA "packet loss" under load.
     // Frame velocity extrapolate still bridges gaps; aim 8 ms is plenty for kmbox.
     m_worldThread = std::make_unique<SyncedThread>([this] {
         // #region agent log
         const auto t0 = std::chrono::steady_clock::now();
         // #endregion
-        RunGatedScan("Update", kUpdateCadenceMs, [this] { Update(); });
+        RunGatedScan("Update", kUpdateCadenceMs, false, [this] { Update(); });
         // #region agent log
         LogPerfSpike("Update", static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count()));
@@ -550,7 +880,7 @@ void Engine::StartWorkerThreads()
         // #region agent log
         const auto t0 = std::chrono::steady_clock::now();
         // #endregion
-        RunGatedScan("EntityList", kEntityCadenceMs, [this] { EntityList(); });
+        RunGatedScan("EntityList", kEntityCadenceMs, false, [this] { EntityList(); });
         // #region agent log
         LogPerfSpike("EntityList", static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count()));
@@ -567,7 +897,7 @@ void Engine::StartWorkerThreads()
         // #region agent log
         const auto t0 = std::chrono::steady_clock::now();
         // #endregion
-        RunGatedScan("RobotList", kRobotCadenceMs, [this] { RobotList(); });
+        RunGatedScan("RobotList", kRobotCadenceMs, false, [this] { RobotList(); });
         // #region agent log
         LogPerfSpike("RobotList", static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count()));
@@ -579,13 +909,13 @@ void Engine::StartWorkerThreads()
         // #region agent log
         const auto t0 = std::chrono::steady_clock::now();
         // #endregion
-        RunGatedScan("ContainerList", kContainerCadenceMs, [this] { ContainerList(); });
+        RunGatedScan("ContainerList", kContainerCadenceMs, true, [this] { ContainerList(); });
         // #region agent log
         LogPerfSpike("ContainerList", static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count()));
         const auto tItem0 = std::chrono::steady_clock::now();
         // #endregion
-        RunGatedScan("ItemList", kItemCadenceMs, [this] { ItemList(); });
+        RunGatedScan("ItemList", kItemCadenceMs, true, [this] { ItemList(); });
         // #region agent log
         LogPerfSpike("ItemList", static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - tItem0).count()));
@@ -632,28 +962,25 @@ void Engine::StartWorkerThreads()
     }, 12);
     m_aimThread = std::make_unique<SyncedThread>([this] {
         if (!IsEspRaidActive() || showmenu) {
+            // Publish WHY the pass is not running before returning. Without this,
+            // "paused because the menu is open" and "ran and examined no
+            // candidate" are the same zeroes on screen, and a deliberately
+            // suspended pass is indistinguishable from a dead worker.
+            FeaturePolicy::NoteAimPassSkipped(!IsEspRaidActive(), RunReport::SteadyNowMs());
             ReleaseAimOutputs();
             return;
         }
         g_aimCadence.tick();
+        FeaturePolicy::NoteAimPassTick(RunReport::SteadyNowMs());
         AimAssistence();
     }, 4);
     m_aimThread->set_priority(THREAD_PRIORITY_HIGHEST);
-
-    g_camCadence.init("camera", 8);
-    g_posCadence.init("position", 16);
-    g_aimCadence.init("aim", 4);
 }
 
 void Engine::StopWorkerThreads()
 {
     if (!m_workerThreadsStarted.exchange(false))
         return;
-
-    // Flush any incomplete 60s cadence window before threads stop.
-    g_camCadence.dump();
-    g_posCadence.dump();
-    g_aimCadence.dump();
 
     // Stop the scheduler that can submit background jobs before joining the
     // other workers. This prevents a world/ESP pass from racing shutdown.
@@ -665,10 +992,15 @@ void Engine::StopWorkerThreads()
     m_frameBuilderThread.reset();
     m_cameraThread.reset();
     m_positionThread.reset();
+    
+    // All tracker writers are joined; aggregation cannot race tick().
+    g_camCadence.dump();
+    g_posCadence.dump();
+    g_aimCadence.dump();
     ReleaseAimOutputs();
 
     // All engine workers are now stopped, so no new background job can be
     // submitted. Join diagnostic/rebuild jobs before destroying dependencies.
-    CollisionMirror::StopBackgroundJobs();
     WorldScan::StopBackgroundJobs();
+    CollisionRead::StopJobs();
 }

@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 
 enum class AimbotPriority : int {
     Fov = 0,
@@ -22,12 +23,6 @@ enum class AimAlgorithm : int {
     Accelerated = 1,
 };
 
-/** When VisibleOnly, aim/trigger skip targets with stale LRTS (behind wall). */
-enum class AimVisMode : int {
-    Always = 0,
-    VisibleOnly = 1,
-};
-
 namespace var {
     /** Max range (m) for all distance sliders — matches practical game replication limit. */
     inline constexpr float kMaxDistanceSliderM = 500.f;
@@ -35,6 +30,18 @@ namespace var {
     /* Esp */
     extern bool enableesp;
     extern bool box;
+    inline bool show_head_dot = false;
+    // T4.4: practice / calibration reference mode. Draws the named reference
+    // objects in Core/PracticeMode.hpp and nothing else; normal ESP output does not
+    // depend on it. Off by default.
+    inline bool practice_mode = false;
+    inline float head_dot_radius_px = 3.f;
+    inline float head_dot_color[4] = { 1.f, 1.f, 1.f, 1.f };
+    extern int player_box_style; // 0 Full, 1 Corners, 2 Dashed, 3 Rounded
+    extern bool player_box_outline;
+    extern bool player_box_fill;
+    extern float player_box_thickness;
+    extern float player_box_fill_color[4];
     extern bool health;
     extern bool names;
     extern bool show_weapon;
@@ -55,20 +62,6 @@ namespace var {
     }
     extern float esp_color_visible[4];
     extern float esp_color_invisible[4];
-    extern bool vis_enabled;    // LRTS occlusion-based visibility check
-    extern bool lrts_debug_trace; // append per-second vis trace NDJSON rows
-    extern bool lrts_debug_tree;  // include component tree bytes in each row
-    extern bool lrts_debug_burst; // full-frame-rate one-bot latency capture
-    extern bool collision_debug_draw; // draw collision KD-tree wireframe blocks
-    extern bool collision_debug_rays; // draw camera→target LOS rays (green/red)
-    extern bool collision_vis_enabled; // LRTS+collision combined voting
-    extern AimVisMode aim_vis_mode;
-
-    /** Run LRTS reads when ESP vis and/or aim visible-only need isVisible. */
-    inline bool LrtsVisActive()
-    {
-        return vis_enabled || aim_vis_mode == AimVisMode::VisibleOnly;
-    }
 
     /* Bot ESP */
     extern bool bot_box;
@@ -81,11 +74,17 @@ namespace var {
     extern float color_dead_bots[4];
     extern float bot_color_visible[4];
     extern float bot_color_invisible[4];
+    /** Bots behind cover (occluded from the camera). Own colour, not the not-visible one. */
+    extern float bot_color_occluded[4];
 
     /* Aimbot */
     extern bool enable_aimbot;
     extern bool robotAimEnabled;
     extern int aim_hold_key;
+    // Offset debug overlay (green timers) toggle key (VK code; 0 = unbound).
+    // Pickable via Settings -> Debug -> "Debug overlay hotkey"; edge-detected
+    // in HandleRaidHotkeys.
+    extern int debug_overlay_key;
     extern AimBoneMode aim_bone_mode;
     extern bool predict;
     extern bool humanizer;
@@ -103,6 +102,24 @@ namespace var {
     extern float crosshair_thickness;
     extern float crosshair_gap;
     extern float crosshair_spin_rpm;
+    inline bool crosshair_outline = true;
+    inline bool crosshair_center_dot = false;
+    inline bool crosshair_rounded = false;
+    inline bool crosshair_use_accent = false;
+    inline bool crosshair_pulse = false;
+    inline float crosshair_rotation = 0.f;
+    inline float crosshair_horizontal_scale = 1.f;
+    inline float crosshair_vertical_scale = 1.f;
+    inline float crosshair_dot_size = 2.f;
+    inline float crosshair_ring_scale = 1.f;
+    inline float crosshair_bracket_length = 8.f;
+    inline float crosshair_chevron_angle = 45.f;
+    inline int crosshair_segment_count = 4;
+    inline float crosshair_segment_gap = 12.f;
+    inline float crosshair_pulse_speed = 1.5f;
+    inline float crosshair_pulse_amount = 2.f;
+    inline float crosshair_outline_color[4] = { 0.f, 0.f, 0.f, 0.8f };
+    inline float crosshair_accent_color[4] = { 0.35f, 0.85f, 1.f, 0.9f };
     extern float aimbot_distance;
     extern float aim_deadzone_px;
     /** Aim smoothing. 1 = instant snap. Higher = smoother. Range [1, 20]. */
@@ -154,6 +171,7 @@ namespace var {
     extern bool show_world_probe;
     extern bool show_world_vehicles;
     extern bool show_world_weapon_case;
+    extern bool show_world_weapon_rack;
     extern bool show_world_field_crate;
     extern bool show_world_supply_station;
     extern bool show_world_keys;
@@ -181,6 +199,7 @@ namespace var {
     extern float color_world_probe[4];
     extern float color_world_vehicles[4];
     extern float color_world_weapon_case[4];
+    extern float color_world_weapon_rack[4];
     extern float color_world_field_crate[4];
     extern float color_world_supply_station[4];
     extern float color_world_keys[4];
@@ -206,6 +225,18 @@ namespace var {
     extern bool show_stack_counts;
     /** Looted containers draw grey + "(Looted)" instead of hiding/re-homing. */
     extern bool grey_looted_containers;
+    /** How a looted/opened container draws: 0 Normal, 1 Dim, 2 Grey, 3 Hide. */
+    extern int state_opened_mode;
+    /** How a destroyed bot/Arc draws: 0 Normal, 1 Dim, 2 Grey, 3 Hide. */
+    extern int state_dead_mode;
+    /** Alpha multiplier used by VisualState Dim mode (clamped 0..1). */
+    extern float state_dim_alpha;
+
+    /** Destroyed bots/Arcs are not drawn: master toggle off, or mode = Hide. */
+    inline bool DeadBotsHidden()
+    {
+        return !show_dead_bots || state_dead_mode == 3;
+    }
     // Loadout readout (guns/armor/ammo feature): armor tier + plate line for
     // players, best-effort weapon/armor line for bots.
     extern bool show_armor_line;
@@ -225,6 +256,8 @@ namespace var {
     // Raid intel (features #9-#11): dashboard panel, activity feed, map radar.
     extern bool show_raid_hud;
     extern bool show_activity_feed;
+    /** Part 6: cached mission-objective brief in the top-center panel. */
+    extern bool show_objectives;
     extern bool radar_map_mode;
     extern bool radar_underground_dim;
     extern float loot_min_value;
@@ -243,6 +276,11 @@ namespace var {
     extern bool debug_hatch_detect;
     /** Log each bot rejection/ghost decision to entity_diagnostics.ndjson. */
     extern bool debug_ghost_bots;
+    /** Throttled world-draw trace (World.cpp FinalizeWorldCacheMap) to the
+     *  trace file. Off by default: this was the one diagnostic that wrote to
+     *  disk unconditionally, which is how the trace grew during normal play. */
+    extern bool debug_world_trace;
+    extern bool debug_esp_paint;
 
 
     /* Camera debug */
@@ -258,6 +296,27 @@ namespace var {
     extern bool show_radar_special;
     extern bool radar_shape_circle;
     extern bool radar_ally_arrows;
+    // Block B: live radar ergonomics.
+    extern float radar_dot_scale;      // multiplies every blip radius (0.5-2.5)
+    extern bool radar_show_altitude;   // draw +Z/-Z metres beside player/bot blips
+    extern bool radar_compass;         // N/E/S/W ticks around the radar edge
+    // Block C: focus + ghost.
+    extern int radar_focus;            // C3: which blip class draws at all
+    extern bool radar_ghost;           // C2: keep vanished player/bot blips briefly
+    extern float radar_ghost_secs;     // C2: how long before a ghost expires
+    extern bool radar_ghost_suppress_poi;  // C2: hide ghosts inside POI boundaries
+    // Block D: points of interest.
+    extern bool show_pois;             // D17 master switch
+    extern bool poi_show_labels;       // D17 draw the POI name beside the marker
+    extern int poi_categories;         // D17 bit i = kCategoryNames[i] visible
+    extern bool show_search_window;    // D17 unified search window visible
+    extern int color_profile_slot;     // D19: -1 = none, 0..7 = applied slot
+
+    inline constexpr int kRadarFocusAll = 0;
+    inline constexpr int kRadarFocusPlayers = 1;
+    inline constexpr int kRadarFocusBots = 2;
+    inline constexpr int kRadarFocusLoot = 3;
+    
 }
 
 bool WorldCategoryEnabled(int category);
@@ -274,7 +333,7 @@ inline bool AnyWorldEspEnabled()
         var::show_world_backpack || var::show_world_crate || var::show_world_furniture ||
         var::show_world_grenade || var::show_world_harvestable || var::show_world_industrial ||
         var::show_world_medical || var::show_world_other || var::show_world_probe ||
-        var::show_world_vehicles || var::show_world_weapon_case ||
+        var::show_world_vehicles || var::show_world_weapon_case || var::show_world_weapon_rack ||
         var::show_world_field_crate || var::show_world_supply_station ||
         var::show_world_keys || var::show_world_locker || var::show_world_trash ||
         var::show_world_safe || var::show_world_buried || var::show_world_deaddrop ||

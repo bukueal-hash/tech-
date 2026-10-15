@@ -538,8 +538,11 @@ inline bool TryCalibrate(uint64_t meshComponent, uint64_t gameBase,
 
     // SkeletalMesh asset pointer — offset is contested between the dump
     // (0x720) and ArcOffsets (0x740/0x748); try them all, names validate.
+    // The merged SDK dump (USkinnedMeshComponent::SkinnedAsset) is 0x720, so
+    // try it first — Offsets::SkeletalMeshAsset was pinned to the stale 0x718.
     const uint64_t skelCands[] = {
-        Offsets::SkeletalMeshAsset,      // 0x720 (dump)
+        0x720,                           // USkinnedMeshComponent::SkinnedAsset (dump)
+        Offsets::SkeletalMeshAsset,      // 0x718 (stale constant)
         Offsets::SkeletalMeshAsset_Alt,  // 0x740 (ArcOffsets SKELETAL_MESH)
         0x748,                           // ArcOffsets SKINNED_ASSET
         0x730,                           // dump-side neighbour of 0x720

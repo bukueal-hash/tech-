@@ -1,4 +1,5 @@
 #include "../Core/Engine.h"
+#include "../Interface/Utils/UpgradeOptions.hpp"
 #include "../Core/ActorType.h"
 #include "../Core/IntervalTimer.h"
 #include "../Core/AssetNames.h"
@@ -8,10 +9,9 @@
 #include "../Core/PlayerEspMissLog.hpp"
 #include "EspDraw.h"
 #include "WorldScanCommon.h"
-#include "LrtsVisibility.h"
-#include "CollisionMirror.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <iostream>
 #include <chrono>
@@ -34,20 +34,15 @@ static constexpr uint8_t kPlayerDistMissClearDrawing = 3;
 static std::unordered_map<uintptr_t, uint8_t> s_playerActorSetMisses;
 static constexpr uint8_t kPlayerActorSetGracePasses = 5;
 
-// LRTS per-mesh visibility state (persisted across frames)
-static std::unordered_map<uintptr_t, LrtsVis::MeshState> s_lrtsMeshStates;
-// Per-actor verdict smoothing: keyed on cache key (NOT mesh) so MeshState
-// Resets during scan retries cannot wipe verdict history and flicker the box.
-static std::unordered_map<uintptr_t, LrtsVis::VerdictSmoother> s_playerVisSmooth;
-// One Scan feed per pass while the session key is unverified (Scan's Phase 2
-// costs a handful of reads per candidate; one rendered mesh is enough to lock
-// the session-wide offset+key).
-static bool s_playerScanFedThisPass = false;
-
 static std::unordered_map<uintptr_t, uint8_t> s_playerRootMisses;
 static std::unordered_map<uintptr_t, uint8_t> s_playerPosMisses;
 static std::unordered_map<uintptr_t, uint8_t> s_playerHealthZeroMisses;
 static constexpr uint8_t kPlayerGhostEvict = 10;
+
+// Player death evidence: HealthComponent current health reads 0 continuously
+// for this long. Drives actor.bIsDead only; liveness is still position-gated.
+static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> s_playerZeroHealthSince;
+static constexpr auto kPlayerDeadZeroHealthMs = std::chrono::milliseconds(600);
 
 static void ClearPlayerGhostMisses(uintptr_t key)
 {
@@ -137,6 +132,7 @@ constexpr std::ptrdiff_t kPioneerCurrentPawn = Offsets::PioneerPlayerState_Curre
 
 bool PsBacklinksToPawn(uintptr_t ps, uintptr_t pawn)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Link);
     const std::ptrdiff_t offs[] = {
         kPioneerCurrentPawn,
         kPioneerCharacter,
@@ -144,7 +140,11 @@ bool PsBacklinksToPawn(uintptr_t ps, uintptr_t pawn)
         kPsPawnPrivateAlt,
     };
     for (const std::ptrdiff_t off : offs) {
-        const uintptr_t linked = Memory::read<uintptr_t>(ps + off);
+        // nocache: this runs on the REMOTE path. Through the VMM data cache the
+        // back-link reads 0 while the probe (nocache) reads the live pawn at the
+        // same slot in the same instant, so every remote PS was refused as
+        // admit_pawn_missing and no remote player could be admitted.
+        const uintptr_t linked = Memory::read_nocache<uintptr_t>(ps + off);
         if (linked == pawn)
             return true;
     }
@@ -153,6 +153,7 @@ bool PsBacklinksToPawn(uintptr_t ps, uintptr_t pawn)
 
 bool TryResolvePawnPlayerState(uintptr_t pawn, uintptr_t& outPs)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Link);
     if (!pawn || !Memory::IsValidPtrFast2(pawn))
         return false;
     // Step 3: nocache on forward PS read — stale VMM page cache was suspected.
@@ -168,6 +169,7 @@ bool TryResolvePawnPlayerState(uintptr_t pawn, uintptr_t& outPs)
 
 bool IsActorTypePlayerPawn(uintptr_t actor)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Name);
     if (!actor || !Memory::IsValidPtrFast2(actor))
         return false;
     const uint32_t masked =
@@ -178,6 +180,7 @@ bool IsActorTypePlayerPawn(uintptr_t actor)
 /** Primary pawn+0x3C0 PS chase; fallback ActorType + 0x3C0 without backlink. */
 bool TryResolvePlayerStateAny(uintptr_t pawn, uintptr_t& outPs, bool& outViaActorType)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Link);
     outViaActorType = false;
     if (TryResolvePawnPlayerState(pawn, outPs))
         return true;
@@ -201,14 +204,29 @@ constexpr uint8_t kPlayerStateBIsABotMask = Offsets::PS_BotStateBotMask;
 
 bool PlayerStateIsBot(uintptr_t ps)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Name);
     if (!ps || !Memory::IsValidPtrFast2(ps))
         return false;
     const uint8_t flags = Memory::read<uint8_t>(ps + kPlayerStateBIsABot);
     return (flags & kPlayerStateBIsABotMask) != 0;
 }
 
+// Humans only: a real player's PlayerState class is BP_PioneerPlayerState_C.
+// Empty class name (FName not decrypted yet) is treated as not-a-player.
+bool PlayerStateIsPioneerClass(uintptr_t ps)
+{
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Name);
+    if (!ps || !Memory::IsValidPtrFast2(ps))
+        return false;
+    std::string cls = steam_decrypt::GetActorClassFName(ps);
+    for (char& c : cls)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return cls.find("pioneerplayerstate") != std::string::npos;
+}
+
 uintptr_t ResolvePawnFromPlayerState(uintptr_t ps)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Link);
     if (!ps || !Memory::IsValidPtrFast2(ps))
         return 0;
     const std::ptrdiff_t offs[] = {
@@ -218,21 +236,29 @@ uintptr_t ResolvePawnFromPlayerState(uintptr_t ps)
         kPsPawnPrivateAlt,
     };
     for (const std::ptrdiff_t off : offs) {
-        const uintptr_t pawn = Memory::read<uintptr_t>(ps + off);
+        // nocache: remotes are the whole point of this helper ("Primary
+        // admission: GameState PlayerArray -> PS -> pawn"). The cached read
+        // returned 0 for slots the nocache probe read as a live pawn, which is
+        // what starved remote players out with admit_pawn_missing while robots,
+        // which never take this hop, kept working.
+        const uintptr_t pawn = Memory::read_nocache<uintptr_t>(ps + off);
         if (pawn && Memory::IsValidPtrFast2(pawn))
             return pawn;
     }
     return 0;
 }
 
-/** PioneerPlayerState+0x530 is bIsInEncounter, not HealthInfo — use HealthComponent. */
+/** PioneerPlayerState has no health block — 0x560 is bIsInEncounter; use the pawn's HealthComponent. */
 float ReadPawnHealthForAdmit(uintptr_t pawn)
 {
+    // The scope covers the nested HealthComponent chase and stat read too.
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Health);
     return static_cast<float>(Engine::ReadHealthComponentStat(pawn, Offsets::Health));
 }
 
 Vector3 ResolvePlayerWorldPos(uintptr_t pawn, uintptr_t root, uintptr_t /*legacy*/)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Position);
     // Bypass VMM page cache — Memory::read was freezing remotes (posSame=N).
     auto trySceneNC = [](uintptr_t comp) -> Vector3 {
         return Engine::ReadWorldLocationNocache(comp, /*allowRelativeFallback=*/true);
@@ -246,7 +272,20 @@ Vector3 ResolvePlayerWorldPos(uintptr_t pawn, uintptr_t root, uintptr_t /*legacy
     };
 
     if (pawn && Memory::IsValidPtrFast2(pawn)) {
-        // Prefer live CompToWorld — RelativeLocation stays frozen on remotes (posSame).
+        // Root component RelativeLocation (0x280) is the reflected, live world
+        // position: a root component has no parent, so its relative transform IS
+        // its world transform. Child components (the mesh) only carry a frozen
+        // offset to the root, and the unreflected ComponentToWorld slot the
+        // readers used to trust (0x330) reads plausible rotation junk on this
+        // build, so root rel must win before any 0x330 read.
+        if (root && Memory::IsValidPtrFast2(root)) {
+            const Vector3 rel =
+                Memory::read_nocache<Vector3>(root + Offsets::RelativeLocation);
+            if (IsPlausibleWorldPos(rel))
+                return rel;
+        }
+
+        // Fallback: live CompToWorld on the mesh/capsule components.
         const uintptr_t comps[] = {
             Memory::read_nocache<uintptr_t>(pawn + Offsets::EmbarkMesh),
             Memory::read_nocache<uintptr_t>(pawn + kACharacterMesh),
@@ -259,13 +298,7 @@ Vector3 ResolvePlayerWorldPos(uintptr_t pawn, uintptr_t root, uintptr_t /*legacy
         if (const Vector3 p = trySceneNC(root); IsPlausibleWorldPos(p))
             return p;
 
-        // Fallback: root RelativeLocation (local may update; remotes often stale).
-        if (root && Memory::IsValidPtrFast2(root)) {
-            const Vector3 rel =
-                Memory::read_nocache<Vector3>(root + Offsets::RelativeLocation);
-            if (IsPlausibleWorldPos(rel))
-                return rel;
-        }
+        // Fallback: root RelativeLocation again (kept for the mesh-less case).
 
         // StateInterpolator → ReplicatedRootTransform.Location
         {
@@ -301,6 +334,7 @@ Vector3 ResolvePlayerWorldPos(uintptr_t pawn, uintptr_t root, uintptr_t /*legacy
 
 uintptr_t ResolvePlayerSkeletalMesh(uintptr_t pawn)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Link);
     if (!pawn || !Memory::IsValidPtrFast2(pawn))
         return 0;
     const uintptr_t embark = Memory::read<uintptr_t>(pawn + Offsets::EmbarkMesh);
@@ -319,6 +353,7 @@ bool BuildGameStatePlayerStateAllowlist(
     std::unordered_set<uintptr_t>& outPs,
     int& outArraySize)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::World);
     outPs.clear();
     outArraySize = 0;
 
@@ -396,24 +431,6 @@ void Engine::EntityList()
     if (!sGWorld || !sPersistentLevel || !sAcknowledgedPawn || !sActors || !sPlayerController)
         return;
 
-    // Read UWorld::TimeSeconds (double in UE5) for LRTS visibility check
-    const float worldTime = var::LrtsVisActive()
-        ? static_cast<float>(Memory::read_nocache<double>(sGWorld + Offsets::UWorld_TimeSeconds))
-        : 0.f;
-
-    // Surface the raw read even when the per-actor gate never opens, so the
-    // LRTS tab distinguishes "bad TimeSeconds offset" from "no meshes reached".
-    if (var::LrtsVisActive()) {
-        // RealTimeSeconds sits 0x10 past TimeSeconds and runs ahead by the
-        // level load time. Render stamps may be based on either, so both are
-        // surfaced to compare against what the decrypt actually produces.
-        const float realTime = static_cast<float>(Memory::read_nocache<double>(
-            sGWorld + Offsets::UWorld_TimeSeconds + 0x10));
-        std::lock_guard<std::mutex> lk(LrtsVis::g_session.mu);
-        LrtsVis::g_session.lastWorldTime = worldTime;
-        LrtsVis::g_session.lastRealTime = realTime;
-    }
-
     const uint64_t gen = m_worldGeneration.load(std::memory_order_acquire);
 
     // help/esp.txt: walk all UWorld::Levels — PersistentLevel alone misses
@@ -430,6 +447,13 @@ void Engine::EntityList()
     int dbgPreAdmit = 0;
     int dbgDrawing = 0;
     int dbgTeamEvict = 0;
+    // hide_allies evidence. Ally identity has one silent failure mode: a team
+    // byte that cannot be read (or reads 0/255) makes NOTHING an ally, so every
+    // teammate is drawn as an enemy with no error and no counter to prove it.
+    // These split the verdict by the signal that produced it.
+    int dbgAllyByTeam = 0;
+    int dbgAllyBySquad = 0;
+    int dbgAllyMyTeamInvalid = 0;
     int dbgPsEvict = 0;
     int dbgPosEvict = 0;
     int dbgDistSkip = 0;
@@ -454,6 +478,12 @@ void Engine::EntityList()
     int dbgFwdMismatch = 0;
     int dbgActorTypeAdmit = 0;
     int dbgGsBot = 0;
+    // PlayerStates dropped by the pioneer-class gate in the GameState pass —
+    // a missing player whose class isn't BP_PioneerPlayerState_C shows up here.
+    int dbgNotPioneer = 0;
+    // Enemies inside ESP range (2m..collect range) that an admission gate
+    // rejected this pass and that never reached the player cache.
+    int dbgInRangeNotAdmitted = 0;
 
     std::unordered_set<uint64_t> currentActorSet(
         currentActors.begin(),
@@ -465,8 +495,11 @@ void Engine::EntityList()
         cam = g_Camera;
     }
 
-    const float maxDistSq =
-        static_cast<float>(var::esp_distance * var::esp_distance * 10000.0f);
+    // Must match the frame cull (Esp.cpp PlayerCollectMaxM). Previously this
+    // ignored var::enableesp, so with ESP off it admitted at esp_distance while
+    // the frame cull used the smaller radius and dropped them every frame.
+    const float collectRange = PlayerCollectMaxM();
+    const float maxDistSq = collectRange * collectRange * 10000.0f;
     // Keep the scanner's Drawing state hysteretic. Without this, a player near
     // the configured edge flips Drawing every other EntityList pass and the
     // frame builder reports a readmit even though the target never left.
@@ -499,7 +532,21 @@ void Engine::EntityList()
         const Vector3 delta = pos - cam.Location;
         entry.Distance = static_cast<float>(std::sqrt(
             delta.x * delta.x + delta.y * delta.y + delta.z * delta.z) / 100.0);
-        entry.Drawing = entry.Distance >= 2.f && entry.Distance <= var::esp_distance;
+        entry.Drawing = entry.Distance >= 2.f && entry.Distance <= collectRange;
+    };
+
+    // Debug counter: resolves the reject candidate's world position (reject
+    // paths only) and counts it when it sits inside the same range the frame
+    // cull uses. Admitted players never reach this.
+    auto countInRangeNotAdmitted = [&](uintptr_t actor, uintptr_t root) {
+        const Vector3 pos = ResolvePlayerWorldPos(actor, root, 0);
+        if (!IsPlausibleWorldPos(pos))
+            return;
+        const Vector3 delta = pos - cam.Location;
+        const float dist = static_cast<float>(std::sqrt(
+            delta.x * delta.x + delta.y * delta.y + delta.z * delta.z) / 100.0);
+        if (dist >= 2.f && dist <= collectRange)
+            ++dbgInRangeNotAdmitted;
     };
 
     std::unordered_map<uintptr_t, PlayerCacheEntry> localCache;
@@ -541,6 +588,48 @@ void Engine::EntityList()
         localPlayerState = Memory::read<uintptr_t>(
             sPlayerController + Offsets::AController_PlayerState);
 
+    // DIAGNOSTIC (temporary): derive the PS->pawn link offset from the LOCAL
+    // chain (golden reference). localPawn is known, so scanning its PlayerState
+    // for the slot == localPawn yields the true back-link offset for remotes.
+    {
+        static auto s_lastChain = std::chrono::steady_clock::time_point{};
+        const auto chainNow = std::chrono::steady_clock::now();
+        if (chainNow - s_lastChain >= std::chrono::seconds(2)) {
+            s_lastChain = chainNow;
+            const uintptr_t pawn = sAcknowledgedPawn;
+            const uintptr_t psFwd = pawn
+                ? Memory::read_nocache<uintptr_t>(pawn + kPawnPlayerState) : 0;
+            std::ptrdiff_t foundOff = -1;
+            if (psFwd && Memory::IsValidPtrFast2(psFwd)) {
+                for (std::ptrdiff_t off = 0x3F0; off <= 0x620; off += 8) {
+                    if (Memory::read_nocache<uintptr_t>(psFwd + off) == pawn) {
+                        foundOff = off; break;
+                    }
+                }
+            }
+            const uintptr_t pcPs = sPlayerController
+                ? Memory::read_nocache<uintptr_t>(
+                      sPlayerController + Offsets::AController_PlayerState) : 0;
+            std::ptrdiff_t foundOffCtl = -1;
+            if (pcPs && Memory::IsValidPtrFast2(pcPs)) {
+                for (std::ptrdiff_t off = 0x3F0; off <= 0x620; off += 8) {
+                    if (Memory::read_nocache<uintptr_t>(pcPs + off) == pawn) {
+                        foundOffCtl = off; break;
+                    }
+                }
+            }
+            std::ostringstream oss;
+            oss << "{\"ev\":\"local_chain\",\"pawn\":\"" << std::hex << pawn
+               << "\",\"psFwd\":\"" << psFwd
+               << "\",\"psCtl\":\"" << pcPs
+               << "\",\"foundOff\":\"" << foundOff
+               << "\",\"foundOffCtl\":\"" << foundOffCtl
+               << "\",\"localPs\":\"" << localPlayerState
+               << std::dec << "\"}\n";
+            EntityDiagnostics::LogRaw(oss.str());
+        }
+    }
+
     // gsArray is diagnostic only — do not gate admission on GameState membership.
     // Wrong/stale GS PlayerArray pointers were zeroing PlayerCache (gsEvict).
     std::unordered_set<uintptr_t> gsPlayerStates;
@@ -548,9 +637,21 @@ void Engine::EntityList()
 
     // Primary admission: GameState PlayerArray → PS → pawn (proven by gsPawnHit).
     // Forward pawn→PS chase fails remotes; HealthInfo@PS+0x530 is wrong on PioneerPS.
+    // DIAGNOSTIC (temporary): once per 2s dump every PS->pawn candidate slot so a
+    // missing remote pawn is one log line away from its correct offset.
+    const bool logPsProbe = [] {
+        static auto s_last = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now - s_last >= std::chrono::seconds(2)) { s_last = now; return true; }
+        return false;
+    }();
     for (const uintptr_t ps : gsPlayerStates) {
         if (ps == localPlayerState)
             continue;
+        if (!PlayerStateIsPioneerClass(ps)) {
+            ++dbgNotPioneer;
+            continue;
+        }
         if (PlayerStateIsBot(ps)) {
             ++dbgGsBot;
             // A real player misclassified as a bot is exactly the "missing
@@ -564,6 +665,22 @@ void Engine::EntityList()
         const uintptr_t backPawn = ResolvePawnFromPlayerState(ps);
         if (!backPawn) {
             ++dbgGsPawnNull;
+            if (logPsProbe) {
+                const uintptr_t cur570 = Memory::read_nocache<uintptr_t>(ps + 0x570);
+                const uintptr_t char568 = Memory::read_nocache<uintptr_t>(ps + 0x568);
+                const uintptr_t cur560 = Memory::read_nocache<uintptr_t>(ps + 0x560);
+                const uintptr_t char558 = Memory::read_nocache<uintptr_t>(ps + 0x558);
+                const uintptr_t priv438 = Memory::read_nocache<uintptr_t>(ps + kPsPawnPrivate);
+                std::ostringstream oss;
+                oss << "{\"ev\":\"ps_probe\",\"ps\":\"" << std::hex << ps
+                  << "\",\"cur570\":\"" << cur570
+                  << "\",\"char568\":\"" << char568
+                  << "\",\"cur560\":\"" << cur560
+                  << "\",\"char558\":\"" << char558
+                  << "\",\"priv438\":\"" << priv438
+                  << std::dec << "\",\"name\":\"" << GetPlayerName(ps) << "\"}\n";
+                EntityDiagnostics::LogRaw(oss.str());
+            }
             PlayerEspMiss::Global().NoteLazy(ps, -1.f,
                 PlayerEspMiss::Reason::AdmitPawnMissing,
                 [this, ps] { return GetPlayerName(ps); });
@@ -582,6 +699,7 @@ void Engine::EntityList()
                 ++dbgFwdMismatch;
         } else {
             ++dbgGsPawnMiss;
+            countInRangeNotAdmitted(backPawn, 0);
             PlayerEspMiss::Global().NoteLazy(backPawn, -1.f,
                 PlayerEspMiss::Reason::AdmitPawnNotInLevels,
                 [this, ps, backPawn] { return GetPlayerName(ps, backPawn); });
@@ -602,6 +720,7 @@ void Engine::EntityList()
             Memory::read<uintptr_t>(backPawn + Offsets::RootComponent);
         if (!root) {
             ++dbgRootSkip;
+            countInRangeNotAdmitted(backPawn, 0);
             PlayerEspMiss::Global().NoteLazy(backPawn, -1.f,
                 PlayerEspMiss::Reason::AdmitRootMissing,
                 [this, ps, backPawn] { return GetPlayerName(ps, backPawn); });
@@ -613,6 +732,7 @@ void Engine::EntityList()
         const uintptr_t charMesh = ResolvePlayerSkeletalMesh(backPawn);
         if (!charMesh && !mesh) {
             ++dbgMeshSkip;
+            countInRangeNotAdmitted(backPawn, root);
             PlayerEspMiss::Global().NoteLazy(backPawn, -1.f,
                 PlayerEspMiss::Reason::AdmitMeshMissing,
                 [this, ps, backPawn] { return GetPlayerName(ps, backPawn); });
@@ -628,26 +748,25 @@ void Engine::EntityList()
                 s_lastNameLog = nNow;
                 const auto nMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
-                std::ofstream nf(kArcVerifyPath, std::ios::app);
-                if (nf) {
-                    // Raw FString fields at PS+0x448 for the name diagnosis:
-                    // textData + count + first 16 bytes as hex (scramble check).
-                    uint64_t fsPtr = 0; int32_t fsCount = 0;
-                    uint64_t fsHex[2] = { 0, 0 };
-                    if (Engine::IsUsermodePtr(ps)) {
-                        fsPtr = Memory::read<uint64_t>(ps + Offsets::PlayerNamePrivate);
-                        fsCount = Memory::read<int32_t>(ps + Offsets::PlayerNamePrivate + 8);
-                        const uintptr_t src = Engine::IsUsermodePtr(fsPtr)
-                            ? static_cast<uintptr_t>(fsPtr) : ps + Offsets::PlayerNamePrivate;
-                        Memory::ReadRaw(src, fsHex, sizeof(fsHex));
-                    }
-                    nf << "{\"sessionId\":\"c190fb\",\"runId\":\"names\",\"hypothesisId\":\"N1\","
-                       << "\"location\":\"EntityList.cpp\",\"message\":\"player_name\",\"data\":{\"ps\":"
-                       << ps << ",\"pawn\":" << backPawn << ",\"name\":\"" << playerName
-                       << "\",\"fs\":" << fsPtr << ",\"fc\":" << fsCount
-                       << ",\"h0\":" << fsHex[0] << ",\"h1\":" << fsHex[1]
-                       << "},\"timestamp\":" << nMs << "}\n";
+                std::ostringstream nf;
+                // Raw FString fields at PS+0x448 for the name diagnosis:
+                // textData + count + first 16 bytes as hex (scramble check).
+                uint64_t fsPtr = 0; int32_t fsCount = 0;
+                uint64_t fsHex[2] = { 0, 0 };
+                if (Engine::IsUsermodePtr(ps)) {
+                    fsPtr = Memory::read<uint64_t>(ps + Offsets::PlayerNamePrivate);
+                    fsCount = Memory::read<int32_t>(ps + Offsets::PlayerNamePrivate + 8);
+                    const uintptr_t src = Engine::IsUsermodePtr(fsPtr)
+                        ? static_cast<uintptr_t>(fsPtr) : ps + Offsets::PlayerNamePrivate;
+                    Memory::ReadRaw(src, fsHex, sizeof(fsHex));
                 }
+                nf << "{\"sessionId\":\"c190fb\",\"runId\":\"names\",\"hypothesisId\":\"N1\","
+                   << "\"location\":\"EntityList.cpp\",\"message\":\"player_name\",\"data\":{\"ps\":"
+                   << ps << ",\"pawn\":" << backPawn << ",\"name\":\"" << playerName
+                   << "\",\"fs\":" << fsPtr << ",\"fc\":" << fsCount
+                   << ",\"h0\":" << fsHex[0] << ",\"h1\":" << fsHex[1]
+                   << "},\"timestamp\":" << nMs << "}\n";
+                EntityDiagnostics::LogRaw(nf.str());
             }
         }
         auto [it, inserted] = localCache.emplace(
@@ -702,6 +821,129 @@ void Engine::EntityList()
     const size_t N = admitIndex.size();
     dbgAdmitN = N;
 
+    // DIAGNOSTIC (temporary): sample the admit band to see whether ANY actor
+    // classifies as a player pawn (typeId mask) or owns a valid +0x3F0 PS.
+    {
+        static auto s_lastGate = std::chrono::steady_clock::time_point{};
+        const auto gateNow = std::chrono::steady_clock::now();
+        if (gateNow - s_lastGate >= std::chrono::seconds(2)) {
+            s_lastGate = gateNow;
+            int nSampled = 0, nValidPs = 0, nPlayer = 0;
+            std::string samples;
+            size_t i = 0;
+            for (; i < admitIndex.size() && nSampled < 512; ++i) {
+                const uintptr_t a = admitIndex[i];
+                const uintptr_t ps = Memory::read_nocache<uintptr_t>(a + kPawnPlayerState);
+                const uint32_t tid = ArcActorType::ReadActorTypeId(a);
+                const uint32_t m = ArcActorType::MaskActorTypeId(tid);
+                ++nSampled;
+                if (ps && Memory::IsValidPtrFast2(ps)) ++nValidPs;
+                if (ArcActorType::IsPlayerClassId(m)) ++nPlayer;
+                if (nSampled <= 8) {
+                    char buf[64];
+            std::snprintf(buf, sizeof(buf), "(%08X,%s) ", m,
+                (ps && Memory::IsValidPtrFast2(ps)) ? "ps" : "--");
+            samples += buf;
+        }
+    }
+    std::ostringstream gf;
+    gf << "{\"ev\":\"gate_probe\",\"sampled\":" << nSampled
+       << ",\"validPs\":" << nValidPs
+       << ",\"player\":" << nPlayer
+       << ",\"actors\":" << admitIndex.size()
+       << ",\"typeOff\":" << ArcActorType::RuntimeActorTypeOffset()
+       << ",\"samples\":\"" << samples << "\"}\n";
+    EntityDiagnostics::LogRaw(gf.str());
+}
+}
+
+    // DIAGNOSTIC (temporary): old-vs-new offset migration probe for the
+    // dump-backed correctives (A1 character cluster, A2 PS misc, A4 inventory,
+    // B6 SquadmateInfo). Logs BOTH slot values per chain so a regression is
+    // immediately attributable: when the NEW slot resolves while the OLD one is
+    // null/garbage, the migration did its job; when NEW is worse, revert that
+    // constant and re-verify the rest.
+    {
+        static auto s_lastMig = std::chrono::steady_clock::time_point{};
+        const auto migNow = std::chrono::steady_clock::now();
+        if (migNow - s_lastMig >= std::chrono::seconds(2)) {
+            s_lastMig = migNow;
+            std::ostringstream mf;
+            for (size_t i = 0; i < admitIndex.size() && i < 8; ++i) {
+                const uintptr_t a = admitIndex[i];
+                mf << "{\"ev\":\"migration_probe\",\"i\":" << i
+                   << ",\"actor\":\"" << std::hex << a << "\"";
+                const uintptr_t hcN = Memory::read_nocache<uintptr_t>(a + Offsets::HealthComponent);
+                const uintptr_t hcO = Memory::read_nocache<uintptr_t>(a + 0xDC0);
+                const uintptr_t invN = Memory::read_nocache<uintptr_t>(a + Offsets::InventoryComponent);
+                const uintptr_t invO = Memory::read_nocache<uintptr_t>(a + 0xC80);
+                const uintptr_t meshN = Memory::read_nocache<uintptr_t>(a + Offsets::EmbarkMesh);
+                const uintptr_t meshO = Memory::read_nocache<uintptr_t>(a + 0x7B8);
+                const uint8_t teamN = Memory::read_nocache<uint8_t>(a + Offsets::TeamID);
+                const uint8_t teamO = Memory::read_nocache<uint8_t>(a + 0x7F2);
+                int32_t cN = -1, cO = -1;
+                if (invN && Memory::IsValidPtrFast2(invN)) {
+                    cN = Memory::read_nocache<int32_t>(invN + Offsets::CurrentItemActors + 0x8);
+                    cN = (cN >= 0 && cN <= 256) ? cN : -1;
+                }
+                if (invO && Memory::IsValidPtrFast2(invO)) {
+                    cO = Memory::read_nocache<int32_t>(invO + 0x520 + 0x8);
+                    cO = (cO >= 0 && cO <= 256) ? cO : -1;
+                }
+                mf << ",\"hc\":[\"" << hcO << "\",\"" << hcN << "\"]"
+                   << ",\"inv\":[\"" << invO << "\",\"" << invN << "\"]"
+                   << ",\"mesh\":[\"" << meshO << "\",\"" << meshN << "\"]"
+                   << ",\"team\":[" << static_cast<int>(teamO) << ',' << static_cast<int>(teamN) << ']'
+                   << ",\"currItems\":[" << cO << ',' << cN << ']'
+                   << ",\"smInfo\":[\"" << std::hex
+                   << Memory::read_nocache<uint64_t>(a + Offsets::SquadmateInfo0) << "\",\""
+                   << Memory::read_nocache<uint64_t>(a + Offsets::SquadmateInfo1)
+                   << "\"]";
+                const uintptr_t ps = Memory::read_nocache<uintptr_t>(a + kPawnPlayerState);
+                if (ps && Memory::IsValidPtrFast2(ps)) {
+                    const uint8_t finN = Memory::read_nocache<uint8_t>(ps + 0x5B8);
+                    const uint8_t finO = Memory::read_nocache<uint8_t>(ps + 0x5A8);
+                    const uintptr_t achN = Memory::read_nocache<uintptr_t>(ps + 0x5C0);
+                    const uintptr_t achO = Memory::read_nocache<uintptr_t>(ps + 0x5B0);
+                    mf << ",\"ps\":\"" << std::hex << ps << "\""
+                       << ",\"fin\":[" << static_cast<int>(finO & 1U) << ',' << static_cast<int>(finN & 1U) << ']'
+                       << ",\"ach\":[\"" << achO << "\",\"" << achN << "\"]";
+                }
+                mf << std::dec << "}\n";
+            }
+            EntityDiagnostics::LogRaw(mf.str());
+        }
+    }
+
+    // ---- PLAYER-lane streaming window (mirror of the bot-lane fix) ----------
+    // A transient failure (no root / no mesh / undecrypted name yet) used to
+    // spend the queue's try budget (~8 passes), get settled, then wait for the
+    // 8-slice band ring — a spawn whose mesh streams slowly stayed invisible
+    // for well over a minute. Instead: keep the actor queued and retried every
+    // pass until it has been observed for kPlayerTransientWindowMs; after
+    // that the band ring still re-checks it at ring rate.
+    static constexpr uint64_t kPlayerTransientWindowMs = 45000;
+    static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point>
+        s_playerCandFirstSeen;
+    auto playerTransientRetryOrSettle = [&](uintptr_t actor) {
+        const auto fsIt = s_playerCandFirstSeen.find(actor);
+        const uint64_t ageMs = (fsIt != s_playerCandFirstSeen.end())
+            ? static_cast<uint64_t>(
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - fsIt->second)
+                      .count())
+            : 0ULL;
+        if (ageMs < kPlayerTransientWindowMs) {
+            s_playerAdmitQueue.NoteTry(actor); // keeps retry-first ordering
+            return; // still streaming — stays queued, retried next pass
+        }
+        // Window expired without root+mesh+name ever appearing: the actor is
+        // gone. Release it WITHOUT a memo (never proven a non-player), so the
+        // band ring may re-check it at ring rate.
+        s_playerAdmitQueue.Settle(actor);
+        s_playerCandFirstSeen.erase(fsIt);
+    };
+
     bool ringReset = false;
     if (s_playerAdmitRingGen != gen) {
         ringReset = true;
@@ -733,14 +975,25 @@ void Engine::EntityList()
         // A world-generation change invalidates every pointer; a plain ring
         // reset (N jump / array identity) must KEEP the pending lane — its
         // actors are still unclassified and would be lost again.
-        if (s_playerAdmitRingGen != gen)
+        if (s_playerAdmitRingGen != gen) {
             s_playerAdmitQueue.Clear();
+            // World-gen change invalidates every actor pointer — drop the
+            // first-seen stamps too, or a re-used address would inherit a
+            // stale age and a fresh spawn would skip its streaming window.
+            s_playerCandFirstSeen.clear();
+        }
     }
     s_playerAdmitRingGen = gen;
     s_playerAdmitRingActorsPtr = sActors;
     s_playerAdmitRingActorCount = N;
     if (s_playerAdmitCycleStart.time_since_epoch().count() == 0)
         s_playerAdmitCycleStart = std::chrono::steady_clock::now();
+
+    // One clock for the pass: the lane ages its rows against the same instant
+    // its first probes are measured against (Core/BotAdmitQueue.hpp).
+    const uint64_t playerAdmitNowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
 
     // P10 pending lane: every newly-seen actor joins the queue and STAYS until
     // a definitive outcome (admitted / proven non-player / memoized reject /
@@ -754,7 +1007,11 @@ void Engine::EntityList()
         int memoSink = 0;
         if (PlayerScanNegMemoHit(actor, memoSink))
             continue; // fresh definitive reject — the TTL memo owns the retry
-        s_playerAdmitQueue.NoteNew(actor);
+        if (s_playerCandFirstSeen.size() > 16384)
+            s_playerCandFirstSeen.clear();
+        s_playerCandFirstSeen.try_emplace(
+            actor, std::chrono::steady_clock::now());
+        s_playerAdmitQueue.NoteNew(actor, playerAdmitNowMs);
     }
 
     const size_t slice = s_playerAdmitSliceCursor % kPlayerAdmitSlices;
@@ -774,14 +1031,45 @@ void Engine::EntityList()
         double distSq = 0.0;
         bool hasDist = false;
     };
+    // P10: priority rows come from the PENDING QUEUE (not a one-shot diff), and
+    // they are collected FIRST so the band below knows which of its own rows the
+    // lane already took this pass. The lane orders them by AGE, not by class or
+    // array position (mirrors the bot lane, Core/BotAdmitQueue.hpp): a
+    // never-probed actor past the first probe bound leads, never-probed work
+    // keeps a reserved share of the pass, and retries take the rest.
+    std::vector<PlayerProbeRow> prioRows;
+    std::unordered_set<uintptr_t> laneSet;
+    {
+        AdmitQueue::PendingQueue::PassPlan plan;
+        plan.maxRows = s_playerAdmitQueue.Cap();
+        std::vector<uint64_t> prioActors;
+        prioActors.reserve(plan.maxRows);
+        s_playerAdmitQueue.CollectPrio(
+            admitIndex.begin(), admitIndex.end(), playerAdmitNowMs, plan, prioActors);
+        prioRows.reserve(prioActors.size());
+        laneSet.reserve(prioActors.size());
+        for (uint64_t actorU64 : prioActors) {
+            const uintptr_t actor = static_cast<uintptr_t>(actorU64);
+            laneSet.insert(actor);
+            PlayerProbeRow row;
+            row.actor = actor;
+            prioRows.push_back(row);
+        }
+    }
+    dbgAdmitPrioNew = static_cast<int>(prioRows.size());
+
+    // The band keeps its old rule (same as the bot path, where the alternative
+    // was measured): queued actors belong to the lane, so a band row is only for
+    // actors the lane did not take AND is not holding. Rows the lane took this
+    // pass are excluded, so nothing is probed twice in one pass.
     std::vector<PlayerProbeRow> bandRows;
     bandRows.reserve(sliceEnd - sliceBase);
     for (size_t i = sliceBase; i < sliceEnd; ++i) {
         const uintptr_t actor = admitIndex[i];
         if (localCache.contains(actor))
             continue;
-        // The pending lane owns unclassified actors (probed first, every
-        // pass, until they settle) — never let the band double-probe them.
+        if (laneSet.count(actor) != 0)
+            continue;
         if (s_playerAdmitQueue.Contains(actor))
             continue;
         PlayerProbeRow row;
@@ -789,25 +1077,6 @@ void Engine::EntityList()
         bandRows.push_back(row);
     }
     dbgAdmitSliceActors = static_cast<int>(bandRows.size());
-
-    // P10: priority rows come from the PENDING QUEUE (not a one-shot diff).
-    // Deterministic admitIndex order; the cap rises with the backlog so a
-    // streaming burst drains in a pass or two.
-    std::vector<PlayerProbeRow> prioRows;
-    {
-        const size_t prioCap = s_playerAdmitQueue.Cap();
-        prioRows.reserve(prioCap);
-        for (uintptr_t actor : admitIndex) {
-            if (prioRows.size() >= prioCap)
-                break;
-            if (!s_playerAdmitQueue.Contains(actor))
-                continue;
-            PlayerProbeRow row;
-            row.actor = actor;
-            prioRows.push_back(row);
-        }
-    }
-    dbgAdmitPrioNew = static_cast<int>(prioRows.size());
 
     // P7b: batched pre-gate (mirrors RobotList P6b). One scatter exec reads
     // PlayerState@0x3C0 + ActorTypeId for the whole band; serial PS-chase and
@@ -840,7 +1109,26 @@ void Engine::EntityList()
     // LAG1: cap this pass's DMA. Camera @8ms, position @16ms and the
     // frame-builder bone reads @12ms share the one DMA link; a scanner that
     // hogs it starves them all and bones/boxes lag behind moving targets.
-    WorldScan::ScanBudget scanBudget(std::chrono::milliseconds(90));
+    //
+    // 2.2: one ceiling for the whole pass. The probe scatter / distance sort
+    // and the process+admit loop used to run on two independent clocks (90 ms
+    // probe + 40/100 ms process) so a single turn could hold the shared DMA
+    // link for ~190 ms against a 90 ms ScanBudget. Everything now measures
+    // against one start; the probe phase reserves the tail (70 ms) so the
+    // admission ring still advances under load, and the hard ceiling is 110 ms.
+    const auto passStart = std::chrono::steady_clock::now();
+    constexpr auto kEntityPassCeiling = std::chrono::milliseconds(110);
+    constexpr auto kEntityProbeCap = std::chrono::milliseconds(70);
+    const auto elapsedMs = [&passStart]() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - passStart);
+    };
+    const auto passExpired = [&]() {
+        return elapsedMs() >= kEntityPassCeiling;
+    };
+    const auto probeExpired = [&]() {
+        return elapsedMs() >= kEntityProbeCap;
+    };
     bool slicePartial = false;
 
     // Small scatter chunks + yield after each exec so the HIGHEST-priority
@@ -851,7 +1139,7 @@ void Engine::EntityList()
     constexpr size_t kPlayerAdmitChunk = 48;
     size_t base = 0;
     for (; base < probeRows.size(); base += kPlayerAdmitChunk) {
-        if (scanBudget.expired()) { slicePartial = true; break; }
+        if (probeExpired()) { slicePartial = true; break; }
         const size_t chunkEnd = (std::min)(base + kPlayerAdmitChunk, probeRows.size());
         ScatterSession scatter;
         if (!scatter.isValid())
@@ -890,7 +1178,7 @@ void Engine::EntityList()
         if (IsPlausibleWorldPos(localPos)) {
             std::vector<Engine::FVector3d> locBuf(probeRows.size());
             for (size_t distBase = 0; distBase < probeRows.size(); distBase += kPlayerAdmitChunk) {
-                if (scanBudget.expired())
+                if (probeExpired())
                     break;
                 const size_t distEnd = (std::min)(distBase + kPlayerAdmitChunk, probeRows.size());
                 ScatterSession distScatter;
@@ -931,15 +1219,20 @@ void Engine::EntityList()
         }
     }
 
-    // Fresh micro-budget (same as the bot path): the probe scatter may have
-    // consumed the pass budget under DMA load, but scattered rows must still
-    // be processed or the ring sticks and admission starves.
-    WorldScan::ScanBudget procBudget(std::chrono::milliseconds(40));
+    // 2.2: the process+admit loop shares the single pass ceiling instead of a
+    // second, independent micro-budget (the two used to stack to ~190 ms). The
+    // probe phase reserves the tail, so scattered rows still get processed and
+    // the admission ring keeps advancing under DMA load.
     size_t processEnd = 0;
     for (size_t ri = 0; ri < scatteredEnd; ++ri) {
         const PlayerProbeRow& row = probeRows[ri];
-        if (procBudget.expired()) { slicePartial = true; break; }
+        if (passExpired()) { slicePartial = true; break; }
         processEnd = ri + 1;
+        // First-probe stopwatch, same rule as the bot lane: a row that reached
+        // screening was probed, and only queued actors are ever screened from
+        // the lane (band rows skip them).
+        if (s_playerAdmitQueue.Contains(row.actor))
+            s_playerAdmitQueue.NoteProbed(row.actor, playerAdmitNowMs);
         if (PlayerScanNegMemoHit(row.actor, dbgAdmitMemoSkip)) {
             // Fresh definitive reject — its TTL memo owns the retry.
             s_playerAdmitQueue.Settle(row.actor);
@@ -980,7 +1273,7 @@ void Engine::EntityList()
                     PlayerScanNegMemoize(actor);
                     s_playerAdmitQueue.Settle(actor);
                 } else {
-                    (void)s_playerAdmitQueue.NoteTransient(actor);
+                    playerTransientRetryOrSettle(actor); // streaming window, not try-budget
                 }
                 continue;
             }
@@ -1032,12 +1325,13 @@ void Engine::EntityList()
                 Memory::read<uintptr_t>(actor + Offsets::RootComponent);
             if (!root) {
                 ++dbgRootSkip;
+                countInRangeNotAdmitted(actor, 0);
                 PlayerEspMiss::Global().NoteLazy(actor, -1.f,
                     PlayerEspMiss::Reason::AdmitRootMissing,
                     [this, playerState, actor] {
                         return GetPlayerName(playerState, actor);
                     });
-                (void)s_playerAdmitQueue.NoteTransient(actor); // spawn not ready
+                playerTransientRetryOrSettle(actor); // streaming window, not try-budget // spawn not ready
                 continue;
             }
 
@@ -1046,12 +1340,13 @@ void Engine::EntityList()
             const uintptr_t charMesh = ResolvePlayerSkeletalMesh(actor);
             if (!charMesh && !mesh) {
                 ++dbgMeshSkip;
+                countInRangeNotAdmitted(actor, root);
                 PlayerEspMiss::Global().NoteLazy(actor, -1.f,
                     PlayerEspMiss::Reason::AdmitMeshMissing,
                     [this, playerState, actor] {
                         return GetPlayerName(playerState, actor);
                     });
-                (void)s_playerAdmitQueue.NoteTransient(actor); // mesh not ready
+                playerTransientRetryOrSettle(actor); // streaming window, not try-budget // mesh not ready
                 continue;
             }
 
@@ -1077,7 +1372,7 @@ void Engine::EntityList()
         if (classFname.empty()) {
             // Undecrypted — retry via the pending lane (bounded tries), no
             // memoize.
-            (void)s_playerAdmitQueue.NoteTransient(actor);
+            playerTransientRetryOrSettle(actor); // streaming window, not try-budget
             continue;
         }
 
@@ -1098,7 +1393,7 @@ void Engine::EntityList()
             s_playerAdmitQueue.Settle(actor);
             continue;
         }
-        if (playerState && PlayerStateIsBot(playerState)) {
+        if (!playerState || !PlayerStateIsPioneerClass(playerState) || PlayerStateIsBot(playerState)) {
             PlayerScanNegMemoize(actor);
             s_playerAdmitQueue.Settle(actor);
             continue;
@@ -1107,18 +1402,20 @@ void Engine::EntityList()
         const uintptr_t root =
             Memory::read<uintptr_t>(actor + Offsets::RootComponent);
         if (!root) {
+            countInRangeNotAdmitted(actor, 0);
             PlayerEspMiss::Global().Note(actor, std::string(), -1.f,
                 PlayerEspMiss::Reason::AdmitRootMissing);
-            (void)s_playerAdmitQueue.NoteTransient(actor); // spawn not ready
+            playerTransientRetryOrSettle(actor); // streaming window, not try-budget // spawn not ready
             continue;
         }
         const uintptr_t mesh =
             Memory::read<uintptr_t>(actor + Offsets::USkeletalMeshComponent);
         const uintptr_t charMesh = ResolvePlayerSkeletalMesh(actor);
         if (!charMesh && !mesh) {
+            countInRangeNotAdmitted(actor, root);
             PlayerEspMiss::Global().Note(actor, std::string(), -1.f,
                 PlayerEspMiss::Reason::AdmitMeshMissing);
-            (void)s_playerAdmitQueue.NoteTransient(actor); // mesh not ready
+            playerTransientRetryOrSettle(actor); // streaming window, not try-budget // mesh not ready
             continue;
         }
 
@@ -1179,13 +1476,33 @@ void Engine::EntityList()
     // and zero (DMA garbage returns 0, which is NOT a valid team).
     const bool myTeamValid = (myTeamId != 255 && myTeamId != 0);
 
+    // The evidence that survives a bad byte read: real UEmbarkSquad membership.
+    // This is the same pointer the squad-tag pass reads for enemies, from this
+    // pawn's own player state, and it costs one read per pass. Only read when
+    // hide_allies actually asks a question, so the feature is free when off.
+    uintptr_t mySquadPtr = 0;
+    if (var::hide_allies && localPlayerState
+        && Memory::IsValidPtrFast2(localPlayerState)) {
+        const uintptr_t mySquad = Memory::read_nocache<uintptr_t>(
+            localPlayerState + Offsets::PS_Squad);
+        if (IsValidPointer(mySquad))
+            mySquadPtr = mySquad;
+    }
+
+    // Distinct team bytes seen on the candidates this pass (bounded, players
+    // only), so the probe can show whether any teammate even shares this pawn's
+    // team value — the difference between "the byte is wrong" and "the byte is
+    // right and something else is drawing them".
+    struct TeamSeen { uint8_t id; int n; };
+    TeamSeen teamsSeen[8]{};
+    int teamsSeenCount = 0;
+
     // Prefer mesh CompToWorld (bot parity); root fallback — root alone stays frozen on remotes.
-    s_playerScanFedThisPass = false;
     for (auto it = localCache.begin(); it != localCache.end(); ++it) {
         const uintptr_t key = it->first;
         if (key == sAcknowledgedPawn)
             continue;
-        if (scanBudget.expired())
+        if (passExpired())
             break;
 
         uintptr_t root = Memory::read<uintptr_t>(key + Offsets::RootComponent);
@@ -1218,7 +1535,7 @@ void Engine::EntityList()
         auto& actor = it->second;
         const uintptr_t key = it->first;
         actor.APawn = key;
-        if (scanBudget.expired())
+        if (passExpired())
             break;
 
         if (key == sAcknowledgedPawn) {
@@ -1262,6 +1579,7 @@ void Engine::EntityList()
         // manager's view clamps gate free-cam garbage rotations. No toggle means
         // no controller/PCM reads on the player worker.
         actor.hasAimYaw = false;
+        actor.hasAimPitch = false;
         if (var::show_look_arrows) {
             const uintptr_t ctrl =
                 Memory::read<uintptr_t>(key + Offsets::Pawn_Controller);
@@ -1281,6 +1599,24 @@ void Engine::EntityList()
                     && LookArrow::AimPitchValid(aimPitch, clampMin, clampMax)) {
                     actor.aimYawDeg = static_cast<float>(aimYaw);
                     actor.hasAimYaw = true;
+                    actor.aimPitchDeg = static_cast<float>(aimPitch);
+                    actor.hasAimPitch = true;
+                }
+            }
+            // B3: when the controller path fails, the server-replicated
+            // RemoteViewPitch (uint8 on the Pawn, 0..255 → -180..180) is the
+            // remote pawn's actual aim pitch. Store it as the aim signal; the
+            // current 2D arrow renders yaw only, so it tightens the aim
+            // validity (via hasAimPitch) rather than the arrow geometry.
+            if (!actor.hasAimPitch) {
+                const uint8_t rvp =
+                    Memory::read_nocache<uint8_t>(key + Offsets::Pawn_RemoteViewPitch);
+                if (rvp > 16 && rvp < 240) {
+                    double pitch = static_cast<double>(rvp) * (360.0 / 255.0);
+                    if (pitch > 180.0)
+                        pitch -= 360.0;
+                    actor.aimPitchDeg = static_cast<float>(pitch);
+                    actor.hasAimPitch = true;
                 }
             }
             if (!actor.hasAimYaw && std::isfinite(actor.facingYaw)) {
@@ -1291,8 +1627,49 @@ void Engine::EntityList()
 
         const uint8_t enemyTeamId = Memory::read<uint8_t>(key + Offsets::TeamID);
         actor.enemyTeamId = enemyTeamId;
-        actor.isAlly =
+        {
+            int seen = -1;
+            for (int i = 0; i < teamsSeenCount; ++i) {
+                if (teamsSeen[i].id == enemyTeamId) {
+                    seen = i;
+                    break;
+                }
+            }
+            if (seen >= 0)
+                ++teamsSeen[seen].n;
+            else if (teamsSeenCount < 8) {
+                teamsSeen[teamsSeenCount].id = enemyTeamId;
+                teamsSeen[teamsSeenCount].n = 1;
+                ++teamsSeenCount;
+            }
+        }
+
+        // Two signals, in priority order. TeamID equality is the cheap one, but
+        // it fails closed: an unreadable or garbage byte makes every teammate
+        // look like an enemy. The real squad pointer is consulted whenever the
+        // byte comparison did not already settle the question, and the branch
+        // that decided is counted so the probe can name it.
+        const bool teamAlly =
             (myTeamValid && enemyTeamId != 255 && enemyTeamId != 0 && myTeamId == enemyTeamId);
+        bool squadAlly = false;
+        if (!teamAlly && mySquadPtr != 0) {
+            uintptr_t allyPs = actor.actorState;
+            bool allyViaActorType = false;
+            if (!allyPs || !Memory::IsValidPtrFast2(allyPs))
+                TryResolvePlayerStateAny(key, allyPs, allyViaActorType);
+            if (allyPs && Memory::IsValidPtrFast2(allyPs)) {
+                const uintptr_t squad = Memory::read_nocache<uintptr_t>(
+                    allyPs + Offsets::PS_Squad);
+                squadAlly = IsValidPointer(squad) && squad == mySquadPtr;
+            }
+        }
+        actor.isAlly = teamAlly || squadAlly;
+        if (teamAlly)
+            ++dbgAllyByTeam;
+        else if (squadAlly)
+            ++dbgAllyBySquad;
+        if (var::hide_allies && !myTeamValid)
+            ++dbgAllyMyTeamInvalid;
         if (actor.isAlly && var::hide_allies) {
             ++dbgTeamEvict;
             PlayerEspMiss::Global().Note(key, actor.ActorName,
@@ -1341,9 +1718,9 @@ void Engine::EntityList()
         // Identity (feature #6): permanent SteamID64 + real UEmbarkSquad*
         // membership (the TeamID grouping stays the fallback).
         bool steamPathResolved = false;
-        actor.steamId64 = var::show_steam_ids
+        actor.steamId64 = (var::show_steam_ids || UpgradeOptions::platformBadges)
             ? ReadPlayerSteamId(playerState, &steamPathResolved) : 0;
-        actor.steamIdResolved = var::show_steam_ids && steamPathResolved;
+        actor.steamIdResolved = (var::show_steam_ids || UpgradeOptions::platformBadges) && steamPathResolved;
         // Status tags ([Bot]/[Spec]/[Done]) ride the identity toggle so the
         // PioneerPlayerState block reads cost zero DMA while it is off.
         actor.statusFlags =
@@ -1354,6 +1731,15 @@ void Engine::EntityList()
         if (!IsValidPointer(actor.squadPtr))
             actor.squadPtr = 0;
         actor.squadResolved = var::show_squad_idx && actor.squadPtr != 0;
+        // B5: real squad slot (1..8) when the squad resolves; the pointer-rank
+        // numbering remains the grouping fallback in the squad-tag pass.
+        actor.squadSlotIdx = 0;
+        if (actor.squadResolved) {
+            const int32_t slot = Memory::read_nocache<int32_t>(
+                playerState + Offsets::EPS_SquadSlotIndex);
+            if (slot >= 1 && slot <= 8)
+                actor.squadSlotIdx = static_cast<uint8_t>(slot);
+        }
 
         const std::string liveName = GetPlayerName(playerState, key);
         if (!liveName.empty())
@@ -1425,6 +1811,16 @@ void Engine::EntityList()
             actor.health = static_cast<float>(liveHealth);
             actor.maxhealth = static_cast<float>(liveMaxHealth);
         }
+        {
+            const auto nowHp = std::chrono::steady_clock::now();
+            if (healthPairOk && liveHealth <= 0.0) {
+                const auto zeroIt = s_playerZeroHealthSince.try_emplace(key, nowHp).first;
+                actor.bIsDead = nowHp - zeroIt->second >= kPlayerDeadZeroHealthMs;
+            } else {
+                s_playerZeroHealthSince.erase(key);
+                actor.bIsDead = false;
+            }
+        }
         const bool wantArmor = var::health || var::show_armor_line;
         const double liveArmor = wantArmor ? get_armor(key) : 0.0;
         const double liveMaxArmor = wantArmor ? get_maxarmor(key) : 0.0;
@@ -1446,7 +1842,7 @@ void Engine::EntityList()
         // When every consumer is off, preserve no stale DBNO presentation state
         // and skip the PlayerState/HealthComponent/timer DMA chain.
         const bool wasDbno = actor.isDbno;
-        if (var::show_dbno_badge || var::show_activity_feed) {
+        if (var::show_dbno_badge || var::show_activity_feed || UpgradeOptions::playerStates) {
             bool dbnoPathResolved = false;
             actor.isDbno = ReadPlayerDbnoState(
                 playerState, actor.hasBrokenArmor, &dbnoPathResolved);
@@ -1580,206 +1976,7 @@ void Engine::EntityList()
             actor.ScreenBottom = footScr;
         }
 
-        // LRTS visibility: raw fast-path first, encrypted scan/key fallback.
-        // Every read here must bypass the VMM cache — render timestamps change
-        // per frame and the cached path serves the same bytes twice, so the
-        // scan would never see a value move and could never lock a key.
-        if (var::LrtsVisActive() && actor.actorMesh && worldTime > 10.f) {
-            // Fast-switch precedence: the per-frame decrypted render stamp
-            // (CheckDirect) reflects the last time the renderer drew the mesh,
-            // so it flips within a frame of occlusion. The bRecentlyRendered
-            // flag (CheckRendered) is render-side sticky and holds set for a
-            // few seconds — keep it only as fallback for when decrypt can't
-            // resolve, never as the primary verdict.
-            const char* stage = "unknown";
-            float directVal = -1.f;
-            // Prefer the session-discovered offset/key pair — hardcoded pairs
-            // go stale every game build (the current one reads 0x4C4 as zero).
-            // Until Scan lands a discovery, fall back to the hardcoded constant.
-            uint32_t lrtsOff =
-                static_cast<uint32_t>(Offsets::Mesh_LastRenderTimeOnScreenEnc);
-            uint32_t lrtsKey = Offsets::Mesh_LastRenderTimeOnScreenKey;
-            {
-                // Read the shared session pair under its mutex: Scan publishes
-                // them asynchronously from the same worker, so an unlocked read
-                // could tear a half-published offset/key pair.
-                std::lock_guard<std::mutex> sk(LrtsVis::g_session.mu);
-                if (LrtsVis::g_session.lrtsOffset != 0
-                    && LrtsVis::g_session.keyCount > 0) {
-                    lrtsOff = static_cast<uint32_t>(LrtsVis::g_session.lrtsOffset);
-                    lrtsKey = LrtsVis::g_session.keys[0];
-                }
-            }
-            auto vis = LrtsVis::CheckDirect(
-                [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
-                actor.actorMesh, LrtsVis::g_session, worldTime,
-                lrtsOff, lrtsKey);
-            if (vis != LrtsVis::Result::Unknown) {
-                stage = "direct";
-                std::lock_guard<std::mutex> dl(LrtsVis::g_session.mu);
-                directVal = LrtsVis::g_session.lastDirectValue;
-            } else {
-                // Feed Scan while unverified: a rendered mesh (flag byte set)
-                // is the one thing Scan needs to rediscover the current
-                // build's offset+key. One mesh per pass — once verified,
-                // CheckDirect above is primary and this costs nothing.
-                if (!LrtsVis::g_session.verified
-                    && !s_playerScanFedThisPass) {
-                    const uint8_t brrFed = Memory::read_nocache<uint8_t>(
-                        actor.actorMesh + LrtsVis::BrrOffset);
-                    if (brrFed & LrtsVis::BrrMask) {
-                        auto& ms = s_lrtsMeshStates[actor.actorMesh];
-                        if (!ms.meshComp) ms.meshComp = actor.actorMesh;
-                        LrtsVis::Scan(ms, LrtsVis::g_session,
-                            [](uint64_t a) { return Memory::read_nocache<uint8_t>(a); },
-                            [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
-                            [](uint64_t a, void* b, uint32_t s) {
-                                return PCIMemory::ReadVirtualMemoryNoCache(a, b, s);
-                            },
-                            worldTime, sGWorld);
-                        s_playerScanFedThisPass = true;
-                    }
-                }
-                vis = LrtsVis::CheckRendered(
-                    [](uint64_t a) { return Memory::read_nocache<uint8_t>(a); },
-                    actor.actorMesh, LrtsVis::g_session,
-                    LrtsVis::BrrOffset, LrtsVis::BrrMask);
-                if (vis != LrtsVis::Result::Unknown)
-                    stage = "flag";
-            }
-            if (vis == LrtsVis::Result::Unknown) {
-                vis = LrtsVis::CheckRaw(
-                    [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
-                    actor.actorMesh, LrtsVis::g_session, worldTime);
-                if (vis != LrtsVis::Result::Unknown)
-                    stage = "raw";
-            }
-            if (vis == LrtsVis::Result::Unknown) {
-                auto& ms = s_lrtsMeshStates[actor.actorMesh];
-                if (!ms.meshComp) ms.meshComp = actor.actorMesh;
-                LrtsVis::Scan(ms, LrtsVis::g_session,
-                    [](uint64_t a) { return Memory::read_nocache<uint8_t>(a); },
-                    [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
-                    [](uint64_t a, void* b, uint32_t s) {
-                        return PCIMemory::ReadVirtualMemoryNoCache(a, b, s);
-                    },
-                    worldTime, sGWorld);
-                vis = LrtsVis::Check(ms, LrtsVis::g_session,
-                    [](uint64_t a) { return Memory::read_nocache<uint8_t>(a); },
-                    [](uint64_t a) { return Memory::read_nocache<uint32_t>(a); },
-                    worldTime, sGWorld);
-                if (vis != LrtsVis::Result::Unknown)
-                    stage = "scan";
-            }
-            // Hysteresis: require 2 confirmed Occluded checks before hiding
-            // (kills flag-byte flicker + transient 0x00 reads); Unknown keeps
-            // the last verdict so read failures never pop boxes through walls.
-            const uint64_t nowMs = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count());
-            // BRR-aware hysteresis: fast-hide ONLY on a successfully-read byte
-            // (non-zero) with the rendered bit clear. brr == 0x00 means the DMA
-            // read failed — falling back to the 2-check hysteresis keeps a
-            // transient flap from blinking the box (ghost-flicker regression).
-            const uint8_t brrSmooth = Memory::read_nocache<uint8_t>(
-                actor.actorMesh + LrtsVis::BrrOffset);
-            const bool confirmedNotRendered =
-                brrSmooth != 0 && (brrSmooth & LrtsVis::BrrMask) == 0;
-
-            // Stage 3: LRTS + collision combined voting. LRTS is primary;
-            // collision is the tie-breaker for stale stamps (Visible+blocked
-            // → Occluded) and the fallback for Unknown. Occluded wins outright
-            // (renderer truth). Fail-open when the tree isn't ready.
-            if (var::collision_vis_enabled && CollisionMirror::IsReady()
-                && (actor.WorldPos.x != 0.0 || actor.WorldPos.y != 0.0 || actor.WorldPos.z != 0.0)) {
-                const bool blocked = !CollisionMirror::QueryVisible(
-                    cam.Location, actor.WorldPos);
-                switch (vis) {
-                case LrtsVis::Result::Occluded:
-                    break;  // renderer truth wins
-                case LrtsVis::Result::Visible:
-                    if (blocked)
-                        vis = LrtsVis::Result::Occluded;  // stale stamp behind wall
-                    break;
-                case LrtsVis::Result::Unknown:
-                default:
-                    vis = blocked
-                        ? LrtsVis::Result::Occluded
-                        : LrtsVis::Result::Visible;  // collision fills LRTS gaps
-                    break;
-                }
-            }
-            actor.isVisible = s_playerVisSmooth[key].Update(
-                vis, nowMs, confirmedNotRendered);
-
-            // Per-actor trace, 1 Hz. Answers two things the aggregate counters
-            // cannot: whether distinct actors get distinct flag bytes, and how
-            // long the byte takes to follow a line-of-sight change.
-            {
-                static std::chrono::steady_clock::time_point sLastVisTrace{};
-                static int sVisTraceThisPass = 0;
-                const auto nowTrace = std::chrono::steady_clock::now();
-                if (nowTrace - sLastVisTrace > std::chrono::seconds(1)) {
-                    sLastVisTrace = nowTrace;
-                    sVisTraceThisPass = 0;
-                }
-                if (sVisTraceThisPass < 8) {
-                    ++sVisTraceThisPass;
-                    const uint8_t brrTrace = Memory::read_nocache<uint8_t>(
-                        actor.actorMesh + LrtsVis::BrrOffset);
-                    // Raw encrypted render-stamp dwords + worldTime so the
-                    // correct XOR key can be derived offline (CheckDirect's
-                    // key is stale for this build — direct stays -1).
-                    const uint32_t raw4c4 = Memory::read_nocache<uint32_t>(
-                        actor.actorMesh + Offsets::LastSubmitTime);
-                    const uint32_t raw4cc = Memory::read_nocache<uint32_t>(
-                        actor.actorMesh + Offsets::LastRenderTimeOnScreen);
-                    std::ofstream vf(kArcVerifyPath, std::ios::app);
-                    if (vf) {
-                        const auto vts = std::chrono::duration_cast<
-                            std::chrono::milliseconds>(
-                                std::chrono::system_clock::now()
-                                    .time_since_epoch()).count();
-                        vf << "{\"location\":\"EntityList.cpp\","
-                           << "\"message\":\"vis_trace\","
-                           << "\"timestamp\":" << vts
-                           << ",\"mesh\":\"0x" << std::hex << actor.actorMesh
-                           << "\",\"brr\":\"0x" << static_cast<unsigned>(brrTrace)
-                           << std::dec << "\""
-                           << ",\"vis\":" << static_cast<int>(vis)
-                           << ",\"stage\":\"" << stage << "\""
-                           << ",\"direct\":" << directVal
-                           << ",\"raw4c4\":\"0x" << std::hex << raw4c4
-                           << "\",\"raw4cc\":\"0x" << raw4cc << std::dec << "\""
-                           << ",\"worldTime\":" << worldTime
-                           << "}\n";
-                    }
-                }
-            }
-        } else {
-            actor.isVisible = true;
-
-            // The gate skipped this actor, so nothing above ran. Record why.
-            static std::chrono::steady_clock::time_point sLastGateTrace{};
-            const auto nowGate = std::chrono::steady_clock::now();
-            if (nowGate - sLastGateTrace > std::chrono::seconds(1)) {
-                sLastGateTrace = nowGate;
-                std::ofstream gf(kArcVerifyPath, std::ios::app);
-                if (gf) {
-                    const auto gts = std::chrono::duration_cast<
-                        std::chrono::milliseconds>(
-                            std::chrono::system_clock::now()
-                                .time_since_epoch()).count();
-                    gf << "{\"location\":\"EntityList.cpp\","
-                       << "\"message\":\"vis_gate\","
-                       << "\"timestamp\":" << gts
-                       << ",\"visEnabled\":" << (var::vis_enabled ? 1 : 0)
-                       << ",\"mesh\":\"0x" << std::hex << actor.actorMesh << std::dec
-                       << "\",\"worldTime\":" << worldTime
-                       << "}\n";
-                }
-            }
-        }
+        actor.isVisible = true;
 
         // Audit #3: Drawing must not hinge on health. get_health() returns NaN on
         // a failed read and NaN >= 1.0f is false, so one bad health read erased a
@@ -1882,10 +2079,16 @@ void Engine::EntityList()
             if (entry.isAlly)
                 continue;
             if (entry.squadPtr) {
-                auto it = std::lower_bound(
-                    uniqueSquads.begin(), uniqueSquads.end(), entry.squadPtr);
-                entry.squadIdx = static_cast<uint8_t>(
-                    std::distance(uniqueSquads.begin(), it) + 1);
+                if (entry.squadSlotIdx >= 1 && entry.squadSlotIdx <= 8) {
+                    // B5: the real slot number IS the squad label (all members
+                    // of a squad share their slot's label).
+                    entry.squadIdx = entry.squadSlotIdx;
+                } else {
+                    auto squadIt = std::lower_bound(
+                        uniqueSquads.begin(), uniqueSquads.end(), entry.squadPtr);
+                    entry.squadIdx = static_cast<uint8_t>(
+                        std::distance(uniqueSquads.begin(), squadIt) + 1);
+                }
             } else if (entry.enemyTeamId != 255 && entry.enemyTeamId != 0) {
                 auto it = std::find(
                     uniqueTeams.begin(), uniqueTeams.end(), entry.enemyTeamId);
@@ -1919,7 +2122,13 @@ void Engine::EntityList()
     {
         static IntervalTimer playerFileTimer(2000);
         if (playerFileTimer.fire()) {
-            char pbuf[840]{};
+            // fp* is cumulative since the last world-gen clear (a cold load's
+            // flood lives there); fw* is the last kProbeWindowSamples probes and
+            // is the one that says whether a new actor is looked at inside the
+            // bound NOW.
+            const AdmitQueue::PendingQueue::FirstProbeStats fpStats =
+                s_playerAdmitQueue.ProbeStats();
+            char pbuf[1152]{};
             snprintf(pbuf, sizeof(pbuf),
                 "{\"scanned\":%d,\"admitted\":%d,\"cache\":%zu,\"listEvict\":%d,"
                 "\"teamEvict\":%d,\"psEvict\":%d,\"posEvict\":%d,\"distSkip\":%d,"
@@ -1928,7 +2137,9 @@ void Engine::EntityList()
                 "\"actorTypeAdmit\":%d,\"prioNew\":%d,\"checked\":%d,"
                 "\"memoSkip\":%d,\"slice\":%zu,\"cycleMs\":%d,\"ringResets\":%d,"
                 "\"admitN\":%zu,\"lastDelta\":%zu,"
-                "\"pend\":%zu,\"tries\":%zu}",
+                "\"fpN\":%llu,\"fpOver\":%llu,\"fpMeanMs\":%llu,\"fpMaxMs\":%llu,"
+                "\"fwN\":%llu,\"fwOver\":%llu,\"fwMeanMs\":%llu,\"fwMaxMs\":%llu,"
+                "\"pend\":%zu,\"tries\":%zu,\"inRangeMiss\":%d}",
                 dbgScanned, dbgAdmitted, playerCache.size(), dbgListEvict,
                 dbgTeamEvict, dbgPsEvict, dbgPosEvict, dbgDistSkip,
                 dbgGhostEvict, dbgRootSkip, dbgMeshSkip, dbgPsSkip,
@@ -1936,27 +2147,68 @@ void Engine::EntityList()
                 dbgActorTypeAdmit, dbgAdmitPrioNew, dbgAdmitChecked,
                 dbgAdmitMemoSkip, dbgAdmitSlice, s_playerAdmitLastCycleMs,
                 s_playerAdmitRingResets, dbgAdmitN, s_playerAdmitLastDelta,
-                s_playerAdmitQueue.Size(), s_playerAdmitQueue.TrySize());
+                static_cast<unsigned long long>(fpStats.n),
+                static_cast<unsigned long long>(fpStats.overBound),
+                static_cast<unsigned long long>(fpStats.n ? fpStats.sumMs / fpStats.n : 0),
+                static_cast<unsigned long long>(fpStats.maxMs),
+                static_cast<unsigned long long>(fpStats.winN),
+                static_cast<unsigned long long>(fpStats.winOverBound),
+                static_cast<unsigned long long>(
+                    fpStats.winN ? fpStats.winSumMs / fpStats.winN : 0),
+                static_cast<unsigned long long>(fpStats.winMaxMs),
+                s_playerAdmitQueue.Size(), s_playerAdmitQueue.TrySize(),
+                dbgInRangeNotAdmitted);
             EntityDiagnostics::LogScan("players", pbuf);
             // player_miss_summary: WHO is missing and WHICH gate dropped them
             // (PlayerEspMissLog) — the per-actor answer to "player ran up, no
             // ESP" that the aggregate player_admit_stats cannot give.
-            std::ofstream mf(kArcVerifyPath, std::ios::app);
-            if (mf) {
-                mf << PlayerEspMiss::Global().FormatSummaryLine(
-                    PlayerEspMiss::NowMs(), 16)
-                   << "\n";
-            }
+            std::ostringstream mf;
+            mf << PlayerEspMiss::Global().FormatSummaryLine(
+                PlayerEspMiss::NowMs(), 16)
+               << "\n";
+            EntityDiagnostics::LogRaw(mf.str());
+
             // player_admit_stats is a throttled (2s) verification tap — it must
             // reach the real log (kArcDebugLogPath is NUL by design).
-            std::ofstream f(kArcVerifyPath, std::ios::app);
-            if (f) {
-                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::ostringstream f;
+            const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            f << "{\"sessionId\":\"c190fb\",\"runId\":\"post-fix\","
+              << "\"hypothesisId\":\"P9\",\"location\":\"EntityList.cpp:EntityList\","
+              << "\"message\":\"player_admit_stats\",\"data\":" << pbuf
+              << ",\"timestamp\":" << ts << "}\n";
+            EntityDiagnostics::LogRaw(f.str());
+
+            // ally_probe: the hide_allies decision itself. A teammate drawn as
+            // an enemy has no symptom other than the box, and the field that
+            // decides it is one byte read from one location — so it is reported
+            // with its validity, the branch that classified each ally, and the
+            // team bytes actually seen on candidates.
+            {
+                std::ostringstream ap;
+                const auto allyTs = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
-                f << "{\"sessionId\":\"c190fb\",\"runId\":\"post-fix\","
-                  << "\"hypothesisId\":\"P9\",\"location\":\"EntityList.cpp:EntityList\","
-                  << "\"message\":\"player_admit_stats\",\"data\":" << pbuf
-                  << ",\"timestamp\":" << ts << "}\n";
+                ap << "{\"sessionId\":\"c190fb\",\"runId\":\"ally\","
+                   << "\"hypothesisId\":\"A1\",\"location\":\"EntityList.cpp:EntityList\","
+                   << "\"message\":\"ally_probe\",\"data\":{\"hideAllies\":";
+                ap << (var::hide_allies ? 1 : 0)
+                   << ",\"myTeamId\":" << static_cast<int>(myTeamId)
+                   << ",\"myTeamValid\":" << (myTeamValid ? 1 : 0)
+                   << ",\"mySquadResolved\":" << (mySquadPtr != 0 ? 1 : 0)
+                   << ",\"candidates\":" << dbgPreAdmit
+                   << ",\"teamEvict\":" << dbgTeamEvict
+                   << ",\"allyByTeam\":" << dbgAllyByTeam
+                   << ",\"allyBySquad\":" << dbgAllyBySquad
+                   << ",\"myTeamInvalid\":" << dbgAllyMyTeamInvalid
+                   << ",\"teamsSeen\":[";
+                for (int i = 0; i < teamsSeenCount; ++i) {
+                    if (i)
+                        ap << ',';
+                    ap << "{\"id\":" << static_cast<int>(teamsSeen[i].id)
+                       << ",\"n\":" << teamsSeen[i].n << '}';
+                }
+                ap << "]},\"timestamp\":" << allyTs << "}\n";
+                EntityDiagnostics::LogRaw(ap.str());
             }
         }
     }
@@ -1992,6 +2244,8 @@ void Engine::EntityList()
                 << " fwdMismatch=" << dbgFwdMismatch
                 << " actorTypeAdmit=" << dbgActorTypeAdmit
                 << " gsBot=" << dbgGsBot
+                << " notPioneer=" << dbgNotPioneer
+                << " inRangeMiss=" << dbgInRangeNotAdmitted
                 << " slice=" << dbgAdmitSlice << "/" << kPlayerAdmitSlices
                 << " sliceActors=" << dbgAdmitSliceActors
                 << " prioNew=" << dbgAdmitPrioNew

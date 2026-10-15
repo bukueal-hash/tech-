@@ -66,6 +66,38 @@ inline bool CurrentBotDrawProof(
         && positionAge <= kMaxPosSampleAgeMs;
 }
 
+// How old a SCANNER-sampled position may be and still back a draw. The live
+// sampler (PositionRefreshPass) and RobotList both advance
+// WorldCacheEntry::positionSampleMs, so it is the union freshness of the two
+// sources; only livePositionSampleMs is exclusive to the live sampler. Under bus
+// contention the live sampler can miss a bot for many seconds while RobotList
+// keeps sampling it, and hiding it is what the player sees as "bots don't
+// show". Measured on a live raid: of the in-range refusals (distance < 20 m),
+// 2,036 carried a position age under 1 s while CurrentBotDrawProof refused them
+// because the LIVE stamp alone was stale.
+constexpr uint64_t kMaxScannerPosAgeMs = 3000;
+
+// Draw proof that accepts either sampler. The actor-sighting condition is
+// unchanged and still required, so this cannot resurrect a despawned actor: the
+// caller passes lastActorSeenMs, which only RobotList's current-actor-array walk
+// advances. It only stops one stale stamp from hiding an actor that the other
+// sampler can still see.
+inline bool CurrentBotDrawProofWithScannerFallback(
+    uint64_t actorSeenMs, uint64_t livePositionSampleMs,
+    uint64_t scannerPositionSampleMs, uint64_t nowMs)
+{
+    if (CurrentBotDrawProof(actorSeenMs, livePositionSampleMs, nowMs))
+        return true;
+    if (actorSeenMs == 0 || scannerPositionSampleMs == 0)
+        return false;
+    const uint64_t actorAge = nowMs < actorSeenMs
+        ? 0 : nowMs - actorSeenMs;
+    const uint64_t scannerAge = nowMs < scannerPositionSampleMs
+        ? 0 : nowMs - scannerPositionSampleMs;
+    return actorAge <= kMaxActorSeenAgeMs
+        && scannerAge <= kMaxScannerPosAgeMs;
+}
+
 // A verified bot may temporarily have no display label while the worker
 // retries name resolution. Its identity proof is stronger than an empty
 // display string; retaining it lets paint use the safe "Bot" fallback instead

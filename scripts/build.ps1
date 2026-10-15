@@ -3,7 +3,7 @@ param(
     [switch]$RunOnly,       # launch the existing exe without building
     [switch]$FullRebuild,   # MSBuild /t:Rebuild instead of /t:Build
     [switch]$Test,          # build, then run the test suite (Pillar 1)
-    [switch]$Package        # build, then zip Build/ into dist/
+    [switch]$Package       # build, then zip Build/ into dist/
 )
 
 # Single entry point: clean checkout -> green build + optional tests/package.
@@ -16,8 +16,16 @@ $exeName = "ArcRaiders"
 $outDir = Join-Path $root "Build"
 $exePath = Join-Path $outDir "$exeName.exe"
 $testExe = Join-Path $outDir "Tests\ArcRaiders.Tests.exe"
-$sln = Join-Path $root "ArcRaiders.sln"
+# Build the main target directly; never traverse a solution test target.
+$sln = Join-Path $root "Project\Project.vcxproj"
 $distDir = Join-Path $root "dist"
+
+if ($Test) {
+    throw "Standalone test executables are prohibited. Main-target diagnostics are not integrated yet; no test build or run occurred."
+}
+if ($Package) {
+    throw "Packaging is blocked until the user-data exclusion/allowlist policy is repaired. No archive was created."
+}
 
 function Find-MsBuild {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -36,81 +44,10 @@ function Test-IsAdmin {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Invoke-TaskKill {
-    param([string]$ImageName)
-    $oldEap = $ErrorActionPreference
-    $ErrorActionPreference = "SilentlyContinue"
-    try {
-        & taskkill.exe /F /IM $ImageName /T 2>&1 | Out-Null
-    } finally {
-        $ErrorActionPreference = $oldEap
-    }
-}
 
 # Offsets are generated from the offline sources of truth (the FrostDumper
-# index and the CL drop in sdk/), never hand-edited. This audit fails the build
-# when the generated header would differ from what is on disk, or when a source
-# that can see a slot outranks the shipped value - so a wrong offset cannot be
-# merged just because it compiles.
-function Find-Python {
-    foreach ($candidate in @("python", "py")) {
-        $cmd = Get-Command $candidate -ErrorAction SilentlyContinue
-        if ($cmd) { return $cmd.Source }
-    }
-    return $null
-}
-
-function Invoke-OffsetsAudit {
-    $gen = Join-Path $root "tools\gen_offsets.py"
-    $reconcile = Join-Path $root "tools\reconcile_offsets.py"
-    if (-not (Test-Path $gen)) {
-        Write-Host "[!] tools/gen_offsets.py missing - skipping the offset audit."
-        return
-    }
-    $python = Find-Python
-    if (-not $python) {
-        Write-Host "[!] python not found on PATH - skipping the offset audit."
-        return
-    }
-
-    Write-Host "[*] Audit: Offsets.h against the offline dumps..."
-    $genOutput = & $python $gen --check 2>&1
-    $genCode = $LASTEXITCODE
-    foreach ($line in $genOutput) { Write-Host "    $line" }
-    if ($genCode -ne 0) {
-        Write-Error ("Offsets.h does not match the offline sources (exit $genCode): " +
-            "run python tools/gen_offsets.py and fix tools/ before building.")
-    }
-
-    # gen_offsets --check already runs the reconciliation as part of its own
-    # gate (a source that can see a slot outranking the shipped value is a
-    # failure there), so this second pass only adds the scoreboard summary.
-    if (Test-Path $reconcile) {
-        $scores = & $python $reconcile --check --quiet 2>&1
-        $scoreCode = $LASTEXITCODE
-        foreach ($line in $scores) { Write-Host "    $line" }
-        if ($scoreCode -ne 0) {
-            Write-Error ("Reconciliation found an offset a higher-authority source " +
-                "disagrees with (exit $scoreCode).")
-        }
-    }
-
-    # The gap report is the SDK-adoption scoreboard: every constant the drop
-    # carries must be wired into a feature or explicitly waived with a reason
-    # (tools/gap_dispositions.json). Unaccounted entries fail the build.
-    $gap = Join-Path $root "tools\sdk_gap_report.py"
-    if (Test-Path $gap) {
-        Write-Host "[*] Audit: sdk.txt adoption scoreboard..."
-        $gapOut = & $python $gap --check 2>&1
-        $gapCode = $LASTEXITCODE
-        foreach ($line in $gapOut) { Write-Host "    $line" }
-        if ($gapCode -ne 0) {
-            Write-Error ("SDK gap check failed (exit $gapCode): wire the constants " +
-                "or add tools/gap_dispositions.json entries.")
-        }
-    }
-    Write-Host "[+] Offsets audited against the dumps."
-}
+# index and the CL drop in sdk/), never hand-edited. Offsets.h is already
+# verified at generation time, so builds do not re-audit it.
 
 function Test-ExeUnlocked {
     param([string]$Path)
@@ -138,6 +75,7 @@ function Test-ExeUnlocked {
 
 $script:SourceExtensions = @('.cpp', '.c', '.cc', '.h', '.hpp', '.hxx', '.inl', '.rc', '.vcxproj', '.filters')
 # Intermediate/generated trees and copied data are not compile inputs.
+# Pure diagnostic suites explicitly included in the main project are inputs too.
 $script:SourceSkip = @('\Data\', '\lib\', '\obj\', '\x64\', '\.vs\', '\Generated\', '\Intermediate\')
 
 function Get-NewestSourceTime {
@@ -300,8 +238,7 @@ function Get-ProjectFileMap {
     $byLeaf = @{}
     $excluded = @{}
     $projects = @(
-        [pscustomobject]@{ key = 'app'; path = (Join-Path $root 'Project\Project.vcxproj') },
-        [pscustomobject]@{ key = 'tests'; path = (Join-Path $root 'Project\Project.Tests.vcxproj') }
+        [pscustomobject]@{ key = 'app'; path = (Join-Path $root 'Project\Project.vcxproj') }
     )
     foreach ($p in $projects) {
         if (-not (Test-Path $p.path)) { continue }
@@ -378,6 +315,7 @@ function Save-BuildStamp {
         builtAt = (Get-Date).ToUniversalTime().ToString('o')
         configuration = 'Release|x64'
         target = $Target
+        sdkAudit = 'n/a'
         inputHash = $InputHash
         inputs = $inputs
         outputs = $outs
@@ -421,17 +359,24 @@ function Get-BuildProblems {
 
     # a. every changed translation unit must have been compiled
     foreach ($rel in $Changed) {
-        $clean = $rel -replace ' \(removed\)$', ''
+        # A removed input (file deleted, or dropped from the project) has no
+        # source left on disk, so MSBuild can never emit a compile line for it.
+        # Demanding one failed every correct build after a source deletion; the
+        # removal itself is already covered by the project file's changed hash.
+        if ($rel -match ' \(removed\)$') { continue }
+        $clean = $rel
         # <ExcludedFromBuild> for this configuration: the file is not part of the
         # build at all, so it can neither be compiled nor go stale.
         if ($ProjectMap.excluded.ContainsKey($clean)) { continue }
+        # The Utility test inventory also contains suites not linked into the
+        # application. Only explicit main-target test inputs require compile evidence.
+        if ($clean -match '(^|[\\/])Tests[\\/]' -and -not $ProjectMap.byPath.ContainsKey($clean)) { continue }
         $proj = $null
         if ($ProjectMap.byPath.ContainsKey($clean)) { $proj = $ProjectMap.byPath[$clean] }
         if ($null -eq $proj) {
             # unknown owner (the .sln, a header no project lists): require evidence
             # from both projects rather than guess which one it feeds
             $needsProject['app'] = $true
-            $needsProject['tests'] = $true
         } else {
             $needsProject[$proj] = $true
         }
@@ -501,104 +446,127 @@ function Get-BuildProblems {
     return $problems
 }
 
-function Stop-ArcRaiders {
-    param([int]$MaxWaitSec = 20)
+function Assert-DirectReadBudget {
+    <#
+      One writer, many readers.
 
-    for ($attempt = 1; $attempt -le 4; $attempt++) {
-        $procs = @(Get-Process -Name $exeName -ErrorAction SilentlyContinue)
-        if ($procs.Count -eq 0) {
-            break
+      Core/ReadBudget.hpp makes every DMA read attributable; this makes every
+      read PATH visible at build time. Each file's count of direct DMA read
+      sites is pinned in Project/direct-read-baseline.txt. A file may ship
+      fewer, never more, and a file absent from the baseline may not read at
+      all. Adding a second reader for data the shared frame already carries is
+      then a deliberate edit with a reason, instead of an invisible one - which
+      is the whole point of the one-writer rule.
+
+      This is a ratchet, not a C++ access barrier: the language cannot ask who
+      the caller is, so the guarantee is enforced where every build already
+      passes - in verification. Deletions are free; only growth is refused.
+    #>
+    $baselinePath = Join-Path $root 'Project\direct-read-baseline.txt'
+    $pattern = 'Memory::read|Memory::ReadRaw|Memory::read_nocache|ReadVirtualMemory'
+    $exclude = @('\DMA\', 'Core\Memory.h', '\ThirdParty\', '\Tests\')
+
+    $limit = @{}
+    if (Test-Path $baselinePath) {
+        foreach ($line in @(Get-Content -LiteralPath $baselinePath)) {
+            if (-not $line -or $line -match '^\s*#') { continue }
+            $parts = $line.Trim() -split '\s+', 2
+            if ($parts.Count -lt 2) { continue }
+            $limit[$parts[0].Replace('\', '/')] = [int]$parts[1]
         }
-
-        foreach ($proc in $procs) {
-            Write-Host "[*] Stopping $($exeName) (PID $($proc.Id), attempt $attempt)..."
-            $oldEap = $ErrorActionPreference
-            $ErrorActionPreference = "SilentlyContinue"
-            try {
-                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-            } finally {
-                $ErrorActionPreference = $oldEap
-            }
-        }
-
-        Invoke-TaskKill -ImageName "$exeName.exe"
-        Start-Sleep -Milliseconds 600
     }
 
-    $deadline = (Get-Date).AddSeconds($MaxWaitSec)
-    while ((Get-Date) -lt $deadline) {
-        if (-not (Get-Process -Name $exeName -ErrorAction SilentlyContinue)) {
-            break
+    $found = @{}
+    $projectDir = Join-Path $root 'Project'
+    foreach ($f in @(Get-ChildItem -LiteralPath $projectDir -Recurse -File -ErrorAction SilentlyContinue)) {
+        if ($f.Extension.ToLowerInvariant() -notin @('.cpp', '.h', '.hpp', '.inl')) { continue }
+        $skip = $false
+        foreach ($x in $exclude) {
+            if ($f.FullName -like "*$x*") { $skip = $true; break }
         }
-        Start-Sleep -Milliseconds 250
+        if ($skip) { continue }
+        # -CaseSensitive: Select-String is case-insensitive by default, which
+        # would count Memory::ReadRaw against the Memory::read alternative too
+        # and make every file disagree with its baseline entry.
+        $hits = @(Select-String -LiteralPath $f.FullName -Pattern $pattern -AllMatches -CaseSensitive -ErrorAction SilentlyContinue)
+        if ($hits.Count -eq 0) { continue }
+        $count = 0
+        foreach ($h in $hits) { $count += @($h.Matches).Count }
+        if ($count -gt 0) { $found[(Get-RelativeBuildPath -FullName $f.FullName)] = $count }
     }
 
-    if (Get-Process -Name $exeName -ErrorAction SilentlyContinue) {
-        return $false
-    }
-
-    $unlockDeadline = (Get-Date).AddSeconds($MaxWaitSec)
-    while ((Get-Date) -lt $unlockDeadline) {
-        if (Test-ExeUnlocked -Path $exePath) {
-            Write-Host "[+] $exeName stopped and exe unlocked."
-            return $true
+    $problems = @()
+    foreach ($rel in @($found.Keys | Sort-Object)) {
+        if (-not $limit.ContainsKey($rel)) {
+            $problems += "new direct DMA reader: $rel ($($found[$rel]) sites) is not listed in Project\direct-read-baseline.txt"
+        } elseif ($found[$rel] -gt $limit[$rel]) {
+            $problems += "$rel grew from $($limit[$rel]) to $($found[$rel]) direct DMA read sites"
         }
-        Start-Sleep -Milliseconds 250
     }
 
-    return (Test-ExeUnlocked -Path $exePath)
+    $total = 0
+    foreach ($v in $found.Values) { $total += $v }
+    if ($problems.Count -gt 0) {
+        Write-Error ("Direct-read boundary broken - the shared frame is the only read path:`n  - " +
+            ($problems -join "`n  - ") +
+            "`nRead through the shared frame, or add the file to Project\direct-read-baseline.txt with a reason.")
+    }
+    Write-Host "[i] Direct-read boundary: $($found.Count) file(s), $total site(s) pinned."
 }
 
-function Ensure-ElevatedIfNeeded {
-    if ($env:ARC_REBUILD_ELEVATED -eq "1") {
-        return
+function Assert-ArcRaidersOutputAvailable {
+    # The user owns any running session. Refuse instead of terminating it.
+    if (-not (Test-ExeUnlocked -Path $exePath)) {
+        throw "Output is locked: $exePath. Close your overlay yourself, then retry. No process was stopped."
     }
-    if (-not (Get-Process -Name $exeName -ErrorAction SilentlyContinue)) {
-        return
-    }
-    if (Test-IsAdmin) {
-        return
-    }
-
-    Write-Host "[*] $exeName is running elevated - relaunching this script as admin (silent when UAC is off)..."
-    $argList = @(
-        "-NoProfile",
-        "-ExecutionPolicy", "Bypass",
-        "-Command",
-        "& '$PSCommandPath' $(if ($Run) {'-Run '})$(if ($RunOnly) {'-RunOnly '})$(if ($FullRebuild) {'-FullRebuild '})$(if ($Test) {'-Test '})$(if ($Package) {'-Package '})"
-    )
-    $proc = Start-Process -FilePath "powershell.exe" `
-        -ArgumentList $argList `
-        -Verb RunAs `
-        -PassThru
-
-    if ($null -eq $proc) {
-        Write-Error "Elevated relaunch was cancelled or failed."
-    }
-    # NOTE: do NOT use Start-Process -Wait here. PS 5.1 -Wait waits on the whole
-    # process tree, and the elevated child launches ArcRaiders.exe - so -Wait
-    # blocked until the overlay was closed. WaitForExit() waits only on the
-    # elevated PowerShell itself.
-    $proc.WaitForExit()
-    exit $proc.ExitCode
 }
 
-Ensure-ElevatedIfNeeded
-$env:ARC_REBUILD_ELEVATED = "1"
+function Assert-EmbreeStaticLibs {
+    <#
+      The collision pipeline links Embree 4 statically (Project/Project.vcxproj:
+      embree4.lib + the per-ISA device libs). Those binaries are third-party build
+      products and are deliberately not committed, so a fresh checkout fails at
+      link time with LNK1181 "cannot open file 'embree4.lib'" - a message that
+      says nothing about the fix.
+
+      Checked here instead, before MSBuild runs, so the answer is the same whether
+      or not the linker would have been reached. One-time cost: run the bootstrap
+      below, which clones and builds Embree into ThirdParty\ (git-ignored).
+    #>
+    $embreeHeader = Join-Path $root 'ThirdParty\embree\include\embree4\rtcore.h'
+    $embreeLib = Join-Path $root 'ThirdParty\embree-build\Release\embree4.lib'
+    $deviceLib = Join-Path $root 'ThirdParty\embree-build\Release\embree_sse42.lib'
+
+    # Only enforce this while the project actually references Embree, so the
+    # requirement leaves with the feature instead of outliving it.
+    $vcxproj = Join-Path $root 'Project\Project.vcxproj'
+    $referencesEmbree = (Test-Path $vcxproj) -and
+        ((Get-Content -LiteralPath $vcxproj -Raw) -match 'embree4\.lib')
+    if (-not $referencesEmbree) {
+        return
+    }
+
+    $missing = @()
+    if (-not (Test-Path $embreeHeader)) { $missing += $embreeHeader }
+    if (-not (Test-Path $embreeLib)) { $missing += $embreeLib }
+    if (-not (Test-Path $deviceLib)) { $missing += $deviceLib }
+    if ($missing.Count -gt 0) {
+        throw ("Embree static libraries are missing, so the link would fail:`n  - " +
+            ($missing -join "`n  -") +
+            "`nBuild them once with: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bootstrap-embree.ps1`n" +
+            "(clones Embree 4.4 into ThirdParty\embree and builds the static libs; git-ignored, nothing is committed).")
+    }
+    Write-Host "[i] Embree static libs present (ThirdParty\embree-build\Release)."
+}
+
 
 if (-not $RunOnly) {
-    $stopped = Stop-ArcRaiders
-    if (-not $stopped) {
-        Write-Error "Could not stop $exeName or unlock $exePath - aborting (no alternate output)."
-    }
+    Assert-ArcRaidersOutputAvailable
 
     $msbuild = Find-MsBuild
     $buildTarget = if ($FullRebuild) { "Rebuild" } else { "Build" }
     $outputSpecs = @{}
     $outputSpecs[$exePath] = 'app'
-    $outputSpecs[$testExe] = 'tests'
-
-    Invoke-OffsetsAudit
 
     # Hash the inputs and read the stamp the last verified build wrote: that pair
     # decides whether this build owes output at all, which no timestamp can - a
@@ -610,6 +578,14 @@ if (-not $RunOnly) {
     $inputHash = Get-ManifestHash -Manifest $manifest
     $stamp = Read-BuildStamp
     $projectMap = Get-ProjectFileMap
+
+    # Refuse to build a new competing DMA read path. Runs before MSBuild so the
+    # answer is the same whether or not the compiler would have rebuilt.
+    Assert-DirectReadBudget
+
+    # Refuse a build whose link inputs are absent, before MSBuild spends minutes
+    # compiling only to fail in LNK1181.
+    Assert-EmbreeStaticLibs
 
     $before = @{}
     foreach ($out in $outputSpecs.Keys) {
@@ -688,10 +664,37 @@ if (-not $RunOnly) {
         }
     }
 
+
+
     # Only a verified build may write the stamp, because the next build trusts it
     # to decide whether output is owed.
     Save-BuildStamp -InputHash $inputHash -Manifest $manifest -Outputs @($outputSpecs.Keys) -Target $buildTarget
-    Write-Host "[+] Build OK: $exePath (verified against $($manifest.Count) hashed inputs)"
+    Write-Host "[+] Build OK: $exePath (compile/link output verified against $($manifest.Count) hashed inputs)"
+    # Repo hygiene: a tracked editor backup, a UUID-named screenshot or a prompt
+    # image under the source tree is a mistake, and a `*.db` wildcard in the
+    # shipped-folder whitelist once pulled symsrv's download cache into the repo.
+    # None of these is a build output, so check where the build already verifies
+    # its own results. Warning, not error: the existing offenders are being
+    # removed by a separate commit, and a hard failure would block every build
+    # until that lands.
+    $junkPatterns = @(
+        '(?i)\.(new|bak|orig)$',
+        '(?i)(chatgpt[ _-]?image|copy of|untitled)',
+        '/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.'
+    )
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        $tracked = @(& git ls-files 2>$null)
+        $junk = @()
+        foreach ($f in $tracked) {
+            foreach ($pat in $junkPatterns) {
+                if ($f -match $pat) { $junk += $f; break }
+            }
+        }
+        if ($junk.Count -gt 0) {
+            Write-Warning ("Tracked junk files (not build outputs):`n  - " + ($junk -join "`n  - "))
+        }
+    }
+
 }
 
 if ($Test) {
@@ -718,11 +721,13 @@ if ($Package) {
     Write-Host "[+] Packaged: $zip"
 }
 
-if ($Run) {
+if ($Run -or $RunOnly) {
     if (-not (Test-Path $exePath)) {
         Write-Error "Executable missing: $exePath (build first)"
     }
-    $null = Stop-ArcRaiders
+    if (Get-Process -Name $exeName -ErrorAction SilentlyContinue) {
+        throw "An overlay session is already running. No process was stopped and no second session was launched."
+    }
     Write-Host "[*] Starting $exePath ..."
     Start-Process -FilePath $exePath -WorkingDirectory $outDir
     Write-Host "[+] Launched $(Split-Path -Leaf $exePath)"

@@ -11,6 +11,7 @@ inline const std::unordered_set<std::string> kRobotsList = {
     "Turbine", "Vaporizer", "Tick", "Harvester", "Monolith",
     "Husk", "Husk S", "Husk M", "Husk L",
     "Assessor", "Swarmer", "Standard",
+    "Skulker Enemy", "Bully Enemy",
 };
 
 inline bool IsRobotsListType(const std::string& type)

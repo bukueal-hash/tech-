@@ -69,6 +69,11 @@ static const WorldPropTokenEntry kWorldPropTokens[] = {
     { "weaponcase", WorldItemCategory::WeaponCase, "Weapon Case" },
     { "weapon_case", WorldItemCategory::WeaponCase, "Weapon Case" },
     { "container_weapon", WorldItemCategory::WeaponCase, "Weapon Case" },
+    { "weaponrack", WorldItemCategory::WeaponRack, "Weapon Rack" },
+    { "weaponsrack", WorldItemCategory::WeaponRack, "Weapon Rack" },
+    { "weapon_rack", WorldItemCategory::WeaponRack, "Weapon Rack" },
+    { "weapons_rack", WorldItemCategory::WeaponRack, "Weapon Rack" },
+    { "container_weaponrack", WorldItemCategory::WeaponRack, "Weapon Rack" },
     { "ammobox", WorldItemCategory::Ammo, "Ammo Box" },
     { "ammo_box", WorldItemCategory::Ammo, "Ammo Box" },
     { "container_ammo", WorldItemCategory::Ammo, "Ammo Box" },
@@ -79,6 +84,7 @@ static const WorldPropTokenEntry kWorldPropTokens[] = {
     { "supplycall", WorldItemCategory::SupplyCallStation, "Supply Call Station" },
     { "supply_call", WorldItemCategory::SupplyCallStation, "Supply Call Station" },
     { "firstwaveraidercache", WorldItemCategory::RaiderCache, "Raider Cache" },
+    { "nomadcache", WorldItemCategory::RaiderCache, "Raider Cache" },
     { "raidercache", WorldItemCategory::RaiderCache, "Raider Cache" },
     { "raider_cache", WorldItemCategory::RaiderCache, "Raider Cache" },
     { "bp_raidercache", WorldItemCategory::RaiderCache, "Raider Cache" },
@@ -455,6 +461,7 @@ std::string ResolveSocketContainerDisplayName(const std::string& fname)
         { "drawer", "Drawer" },
         { "safe", "Safe" },
         { "shippingcontainer", "Shipping Container" },
+        { "nomadcache", "Raider Cache" },
         { "raidercache", "Raider Cache" },
         { "burieddetectable", "Buried Loot" },
         { "buried_detectable", "Buried Loot" },
@@ -600,6 +607,7 @@ std::string DirectContainerKeywordLabel(
         // Loot-activity / mission containers
         {"deaddrop", "Dead Drop"},
         {"dead_drop", "Dead Drop"},
+        {"nomadcache", "Raider Cache"},
         {"raidercache", "Raider Cache"},
         {"raider_cache", "Raider Cache"},
         {"firstwaveraidercache", "First Wave Cache"},
@@ -610,6 +618,9 @@ std::string DirectContainerKeywordLabel(
         {"shippingcontainer", "Shipping Container"},
         {"weaponcase", "Weapon Case"},
         {"weapon_case", "Weapon Case"},
+        {"weaponrack", "Weapon Rack"},
+        {"weaponsrack", "Weapon Rack"},
+        {"weapon_rack", "Weapon Rack"},
         {"ammobox", "Ammo Box"},
         {"ammo_box", "Ammo Box"},
         {"medicalbag", "Medical Bag"},
@@ -749,6 +760,12 @@ std::string ResolveContainerDisplayLabel(
         return "Ammo Box";
     if (Contains(d, "weapon case") || Contains(f, "weaponcase") || Contains(f, "weapon_case"))
         return "Weapon Case";
+    // Racks are checked before the generic "rack" words below so a weapon rack is
+    // never labelled as a capacitor rack or a bare "Rack".
+    if (Contains(d, "weapon rack") || Contains(d, "weapons rack")
+        || Contains(f, "weaponrack") || Contains(f, "weaponsrack")
+        || Contains(f, "weapon_rack"))
+        return "Weapon Rack";
     if (Contains(d, "medical bag") || Contains(f, "medicalbag") || Contains(f, "medical_bag"))
         return "Medical Bag";
     if (Contains(d, "grenade tube") || Contains(f, "grenadecontainer") || Contains(f, "grenadetube"))
@@ -846,6 +863,7 @@ const char* WorldItemCategoryLabel(WorldItemCategory cat)
     case WorldItemCategory::RaiderCache: return "Raider Cache";
     case WorldItemCategory::Vehicles: return "Vehicles";
     case WorldItemCategory::WeaponCase: return "Weapon Case";
+    case WorldItemCategory::WeaponRack: return "Weapon Rack";
     case WorldItemCategory::FieldCrate: return "Field Crate";
     case WorldItemCategory::SupplyCallStation: return "Supply Call Station";
     case WorldItemCategory::Corpse: return "Dead Body";
@@ -894,6 +912,7 @@ std::string ContainerCategoryFallbackEspLabel(WorldItemCategory cat)
     case WorldItemCategory::Crate:              return "Crate";
     case WorldItemCategory::FieldCrate:         return "Field Crate";
     case WorldItemCategory::WeaponCase:         return "Weapon Case";
+    case WorldItemCategory::WeaponRack:         return "Weapon Rack";
     case WorldItemCategory::Locker:             return "Locker";
     case WorldItemCategory::Safe:               return "Safe";
     case WorldItemCategory::Trash:              return "Trash Can";
@@ -938,7 +957,7 @@ void InitContainerRangeDefaults()
         WorldItemCategory::Furniture,
         WorldItemCategory::FieldCrate,
         WorldItemCategory::WeaponCase,
-        WorldItemCategory::Industrial,
+        WorldItemCategory::WeaponRack,
         WorldItemCategory::Probe,
         WorldItemCategory::SupplyCallStation,
         WorldItemCategory::Buried,
@@ -987,6 +1006,7 @@ bool WorldCategoryIsContainerProp(WorldItemCategory cat)
     case WorldItemCategory::Probe:
     case WorldItemCategory::Vehicles:
     case WorldItemCategory::WeaponCase:
+    case WorldItemCategory::WeaponRack:
     case WorldItemCategory::FieldCrate:
     case WorldItemCategory::SupplyCallStation:
     case WorldItemCategory::DroppedPickup:
@@ -1243,6 +1263,7 @@ const char* WorldItemCategoryConfigSuffix(WorldItemCategory cat)
     case WorldItemCategory::Probe: return "probe";
     case WorldItemCategory::Vehicles: return "vehicles";
     case WorldItemCategory::WeaponCase: return "weapon_case";
+    case WorldItemCategory::WeaponRack: return "weapon_rack";
     case WorldItemCategory::FieldCrate: return "field_crate";
     case WorldItemCategory::SupplyCallStation: return "supply_station";
     case WorldItemCategory::DroppedPickup: return "dropped";
@@ -1387,6 +1408,9 @@ WorldItemCategory ClassifyWorldActor(const std::string& fnameLower, const std::s
     if (Contains(d, "weapon case") || Contains(f, "weaponcase") || Contains(f, "weapon_case")
         || Contains(f, "container_weapon"))
         return WorldItemCategory::WeaponCase;
+    if (Contains(d, "weapon rack") || Contains(d, "weapons rack") || Contains(f, "weaponrack")
+        || Contains(f, "weaponsrack") || Contains(f, "weapon_rack") || Contains(f, "weapons_rack"))
+        return WorldItemCategory::WeaponRack;
     if (Contains(d, "grenade") || Contains(f, "grenade") || Contains(f, "grenadetube")
         || Contains(f, "grenadecontainer"))
         return WorldItemCategory::Grenade;
@@ -2850,6 +2874,8 @@ uint32_t WorldCategoryLabelColor(WorldItemCategory cat)
         return EspDraw::ColorFromRGBA(var::color_world_vehicles);
     case WorldItemCategory::WeaponCase:
         return EspDraw::ColorFromRGBA(var::color_world_weapon_case);
+    case WorldItemCategory::WeaponRack:
+        return EspDraw::ColorFromRGBA(var::color_world_weapon_rack);
     case WorldItemCategory::FieldCrate:
         return EspDraw::ColorFromRGBA(var::color_world_field_crate);
     case WorldItemCategory::SupplyCallStation:
@@ -2987,6 +3013,8 @@ bool WorldCategoryEnabled(int category)
         return var::show_world_vehicles;
     case WorldItemCategory::WeaponCase:
         return var::show_world_weapon_case;
+    case WorldItemCategory::WeaponRack:
+        return var::show_world_weapon_rack;
     case WorldItemCategory::FieldCrate:
         return var::show_world_field_crate;
     case WorldItemCategory::SupplyCallStation:

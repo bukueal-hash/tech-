@@ -1,9 +1,11 @@
+#include "../Core/BotPosSanity.hpp"
 #include "../Core/Engine.h"
 #include "../Core/FeaturePolicy.hpp"
 #include "../Core/Offsets.h"
 #include "../Core/AgentLog.h"
 #include "../Core/EntityDiagnostics.hpp"
 #include "../Interface/Utils/Variables/index.h"
+#include "../Interface/Utils/UpgradeOptions.hpp"
 #include "WorldScanCommon.h"
 
 #include <algorithm>
@@ -25,6 +27,9 @@ struct PosRefreshKey {
 struct PosRefreshWork {
     PosRefreshKey key{};
     uintptr_t root = 0;
+    // The actor's mesh component, read in the SAME scatter as the root. See
+    // meshBuf below for why the pass needs it.
+    uintptr_t mesh = 0;
     Engine::FVector3d worldBuf{};
     // Second ComponentToWorld candidate (0x310 + Transform::Translation). The
     // pinned offsets slot (0x2D0) is implausible on every bot root; reading both
@@ -32,6 +37,16 @@ struct PosRefreshWork {
     // without a per-root probe round trip.
     Engine::FVector3d worldAltBuf{};
     Vector3 relBuf{};
+    // Mesh ComponentToWorld::Translation. Both buffers above sit on the ROOT, and
+    // Offsets::ComponentToWorld_Alt documents its slot (0x2F0) as zeros on this
+    // build -- so a bot whose root read missed had NO live second source: the
+    // sample was refused as position_implausible, the entry kept its old
+    // position until BotEspExpiry's 3s kill, and the bot left the render frame
+    // as collect_gate. Measured live: 625 refusals, 618 of them the flying bots
+    // (Wasp 192, Snitch 132, Hornet 127, Firefly 85, Tick 82), with samples aged
+    // 17-112s. The mesh CTW is the second source ResolveBotWorldPos already
+    // trusts, so this is the same ladder, read where the 16ms sampler can use it.
+    Engine::FVector3d meshBuf{};
 };
 
 void LogBotPositionDecision(
@@ -39,14 +54,24 @@ void LogBotPositionDecision(
 {
     if (!var::debug_ghost_bots)
         return;
-    static std::unordered_map<uintptr_t, std::pair<const char*, uint64_t>> last;
+    // Keyed per (actor, reason): one slot per actor let two alternating reasons
+    // for the same actor log every pass instead of once a second (same defect as
+    // Esp.cpp LogGhostBotDecision, which this mirrors).
+    uint64_t reasonHash = 1469598103934665603ull;
+    for (const char* p = reason; p && *p; ++p) {
+        reasonHash = (reasonHash ^ static_cast<uint64_t>(
+            static_cast<unsigned char>(*p))) * 1099511628211ull;
+    }
+    static std::unordered_map<uint64_t, uint64_t> last;
     const uint64_t now = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
-    auto& state = last[key];
-    if (state.first == reason && now >= state.second && now - state.second < 1000)
+    const uint64_t throttleKey = (key * 0x9E3779B97F4A7C15ull) ^ reasonHash;
+    const auto throttleIt = last.find(throttleKey);
+    if (throttleIt != last.end() && now >= throttleIt->second
+        && now - throttleIt->second < 1000)
         return;
-    state = { reason, now };
+    last[throttleKey] = now;
     if (last.size() > 4096)
         last.clear();
     const bool posValid = entry && IsPlausibleWorldPos(entry->WorldPos);
@@ -71,13 +96,16 @@ void Engine::PositionRefreshPass()
     std::vector<PosRefreshWork> work;
     work.reserve(256);
 
-    auto queueEntry = [&](PosRefreshKey::CacheKind kind, uintptr_t key, uintptr_t root) {
+    auto queueEntry = [&](PosRefreshKey::CacheKind kind, uintptr_t key, uintptr_t root,
+                          uintptr_t mesh = 0) {
         if (!root || !IsValidPointer(root)) {
             if (kind == PosRefreshKey::CacheKind::Robot)
                 LogBotPositionDecision(key, nullptr, "position_no_root");
             return;
         }
-        work.push_back({ { kind, key }, root, {}, {}, {} });
+        if (mesh == root || !IsValidPointer(mesh))
+            mesh = 0;
+        work.push_back({ { kind, key }, root, mesh, {}, {}, {}, {} });
     };
 
     // Players + bots only. Containers/items are stationary — WorldPos set at admit.
@@ -86,7 +114,7 @@ void Engine::PositionRefreshPass()
         var::robotAimEnabled,
         var::enable_triggerbot};
     if (FeaturePolicy::ShouldRefreshPlayerPositions(
-            var::enableesp, var::show_radar, aimFeatures)) {
+            var::enableesp || UpgradeOptions::warnings, var::show_radar, aimFeatures)) {
         std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
         for (const auto& [key, entry] : playerCache) {
             // Uninitialized first-admission entries must be refreshed even when
@@ -111,7 +139,8 @@ void Engine::PositionRefreshPass()
             // old at the median (843ms p90) with velocity stuck at zero.
             if (!entry.rootComponent)
                 continue;
-            queueEntry(PosRefreshKey::CacheKind::Robot, key, entry.rootComponent);
+            queueEntry(PosRefreshKey::CacheKind::Robot, key, entry.rootComponent,
+                entry.Mesh);
         }
     }
 
@@ -140,6 +169,10 @@ void Engine::PositionRefreshPass()
             item.root + Offsets::ComponentToWorld_Alt + Offsets::Transform_Translation,
             item.worldAltBuf);
         scatter.prepare(item.root + Offsets::RelativeLocation, item.relBuf);
+        // Mesh CTW translation: the only second source that still moves when a
+        // bot's root read misses. Prepared only when the actor has a mesh.
+        if (item.mesh)
+            scatter.prepare(item.mesh + Offsets::ComponentToWorld_Translation, item.meshBuf);
         ++prepared;
     }
     // VMMDLL_Scatter_ExecuteRead reports FALSE for the WHOLE batch when any one
@@ -156,6 +189,8 @@ void Engine::PositionRefreshPass()
     int dbgBotOk = 0;
     int dbgBotFail = 0;
     int dbgBotAlt = 0;
+    int dbgBotJumpRejected = 0;
+    int dbgBotReanchored = 0;
     int dbgPlayerAlt = 0;
     std::vector<uint64_t> dbgBotPrevAges;
     dbgBotPrevAges.reserve(prepared);
@@ -185,9 +220,20 @@ void Engine::PositionRefreshPass()
         }
         lastWorldPos = freshPos;
         lastVelocityUpdate = nowMs;
-    };
+};
 
-    // One unique_lock per cache kind — not per entity.
+// One unique_lock per cache kind — not per entity.
+    // Collect any diagnostic payloads here and emit AFTER releasing the writer
+    // lock so paint / aim / radar readers aren't blocked by a std::to_string
+    // storm or the logger push.
+    struct PendingRefreshFail {
+        uint64_t key;
+        uint64_t root;
+        Vector3 w;
+        Vector3 wa;
+        Vector3 rel;
+    };
+    std::vector<PendingRefreshFail> pendingPlayerFails;
     {
         std::unique_lock<std::shared_mutex> lock(m_playerCacheMutex);
         for (PosRefreshWork& item : work) {
@@ -205,6 +251,17 @@ void Engine::PositionRefreshPass()
                 pos = item.relBuf;
             if (!IsPlausibleWorldPos(pos)) {
                 ++dbgPlayerFail;
+                static auto s_lastPf = std::chrono::steady_clock::time_point{};
+                const auto nowPf = std::chrono::steady_clock::now();
+                if (nowPf - s_lastPf >= std::chrono::seconds(2)) {
+                    s_lastPf = nowPf;
+                    pendingPlayerFails.push_back(PendingRefreshFail{
+                        item.key.key,
+                        item.root,
+                        ToVector3(item.worldBuf),
+                        ToVector3(item.worldAltBuf),
+                        item.relBuf});
+                }
                 continue;
             }
             auto it = playerCache.find(item.key.key);
@@ -226,11 +283,24 @@ void Engine::PositionRefreshPass()
             it->second.Drawing = true;
         }
     }
+    // Lock is released — now safe to build strings and push to the async logger
+    // without blocking paint / aim readers.
+    for (const PendingRefreshFail& pf : pendingPlayerFails) {
+        std::string line = "{\"ev\":\"player_refresh_fail\",\"key\":\""
+            + std::to_string(pf.key)
+            + "\",\"root\":\"" + std::to_string(pf.root) + "\""
+            + ",\"w\":[" + std::to_string(pf.w.x) + "," + std::to_string(pf.w.y) + "," + std::to_string(pf.w.z) + "]"
+            + ",\"wAlt\":[" + std::to_string(pf.wa.x) + "," + std::to_string(pf.wa.y) + "," + std::to_string(pf.wa.z) + "]"
+            + ",\"rel\":[" + std::to_string(pf.rel.x) + "," + std::to_string(pf.rel.y) + "," + std::to_string(pf.rel.z) + "]"
+            + "}\n";
+        EntityDiagnostics::LogRaw(line);
+    }
     {
         std::unique_lock<std::shared_mutex> lock(m_robotCacheMutex);
         for (PosRefreshWork& item : work) {
             if (item.key.kind != PosRefreshKey::CacheKind::Robot)
                 continue;
+            auto it = robotCache.find(item.key.key);
             Vector3 pos = ToVector3(item.worldBuf);
             if (!IsPlausibleWorldPos(pos)) {
                 const Vector3 alt = ToVector3(item.worldAltBuf);
@@ -239,20 +309,89 @@ void Engine::PositionRefreshPass()
                     ++dbgBotAlt;
                 }
             }
-            // Bots: never use RelativeLocation as live WorldPos (freezes remotes).
+            // The two sources below name a DIFFERENT object than the bot's root
+            // (its mesh component), so they are held to a step test: a shared or
+            // freed mesh pointer still reads as a plausible vector, just somewhere
+            // else in the level. Refusing it keeps the failure mode "no new sample"
+            // -- the bot holds its last position -- instead of "box drawn on the
+            // wrong object", which is worse than a missing box. 6,000cm over one
+            // 16ms sample cannot be the same bot.
+            constexpr double kMaxFallbackStepCm = 6000.0;
+            const auto fallbackStepOk = [&](const Vector3& cand) {
+                if (!IsPlausibleWorldPos(cand))
+                    return false;
+                if (it == robotCache.end() || !IsPlausibleWorldPos(it->second.WorldPos))
+                    return true;  // nothing to compare against: first sample
+                const Vector3& prev = it->second.WorldPos;
+                const double dx = cand.x - prev.x;
+                const double dy = cand.y - prev.y;
+                const double dz = cand.z - prev.z;
+                return std::sqrt(dx * dx + dy * dy + dz * dz) <= kMaxFallbackStepCm;
+            };
+            // Mesh CTW before the relative fallback: a mesh component's relative
+            // location is a parent offset, while its CTW is true world space.
+            if (!IsPlausibleWorldPos(pos) && item.mesh
+                && fallbackStepOk(ToVector3(item.meshBuf))) {
+                pos = ToVector3(item.meshBuf);
+                ++dbgBotAlt;
+            }
+            // Last resort: a RootComponent has no parent, so its RelativeLocation
+            // IS its world position -- the same fallback ResolveBotWorldPos applies
+            // for RollBot/Fireball. Guarded on root != mesh: ResolveBotSceneRoot
+            // substitutes the mesh when the root read fails, and a mesh's relative
+            // is a parent offset, so using it there would place the box wrongly
+            // instead of leaving the bot hidden. Only reached when every CTW read
+            // above missed.
+            if (!IsPlausibleWorldPos(pos) && item.root != item.mesh
+                && fallbackStepOk(item.relBuf))
+                pos = item.relBuf;
             if (!IsPlausibleWorldPos(pos)) {
-                auto it = robotCache.find(item.key.key);
                 LogBotPositionDecision(item.key.key,
                     it == robotCache.end() ? nullptr : &it->second,
                     "position_implausible");
                 ++dbgBotFail;
                 continue;
             }
-            auto it = robotCache.find(item.key.key);
             if (it == robotCache.end()) {
                 LogBotPositionDecision(item.key.key, nullptr, "position_cache_miss");
                 ++dbgBotFail;
                 continue;
+            }
+            // Plausibility says the vector is a coordinate at all; it cannot say
+            // it is THIS bot's coordinate, and a poisoned read is usually an
+            // ordinary point somewhere else in the level. The entry's own history
+            // can: a bot cannot cross a kilometre between two samples 16 ms apart.
+            // Refusal means "no new sample" -- the previous position is kept and
+            // no stamp advances, so Core/BotEspExpiry.hpp owns what happens to a
+            // bot that has stopped sampling. See Core/BotPosSanity.hpp for the two
+            // anchors and the re-anchor that stops a poisoned cache from rejecting
+            // every correct read afterwards.
+            {
+                const BotPosSanity::Sample newest{
+                    it->second.WorldPos,
+                    it->second.positionSampleMs,
+                    IsPlausibleWorldPos(it->second.WorldPos)};
+                const BotPosSanity::Sample older{
+                    it->second.prevSampleWorldPos,
+                    it->second.prevSampleMs,
+                    it->second.prevSampleMs != 0
+                        && IsPlausibleWorldPos(it->second.prevSampleWorldPos)};
+                const BotPosSanity::Verdict verdict = BotPosSanity::Judge(
+                    newest, older, pos, nowMs, it->second.posJumpRejects);
+                if (!verdict.accept) {
+                    if (it->second.posJumpRejects < 255)
+                        ++it->second.posJumpRejects;
+                    ++dbgBotJumpRejected;
+                    LogBotPositionDecision(
+                        item.key.key, &it->second, "position_jump_rejected");
+                    continue;
+                }
+                it->second.posJumpRejects = 0;
+                if (verdict.reanchored) {
+                    ++dbgBotReanchored;
+                    LogBotPositionDecision(
+                        item.key.key, &it->second, "position_reanchor");
+                }
             }
             ++dbgBotOk;
             // Age of the sample being replaced: how stale the 16ms sampler found
@@ -323,26 +462,28 @@ void Engine::PositionRefreshPass()
                 ageP50 = dbgBotPrevAges[dbgBotPrevAges.size() / 2];
                 ageMax = dbgBotPrevAges.back();
             }
-            std::ofstream lf(kArcVerifyPath, std::ios::app);
-            if (lf) {
-                lf << "{\"sessionId\":\"c190fb\",\"runId\":\"pos-refresh\","
-                   << "\"location\":\"PositionRefreshPass.cpp\","
-                   << "\"message\":\"pos_refresh\",\"data\":{"
-                   << "\"work\":" << work.size()
-                   << ",\"players\":" << dbgPlayersQueued
-                   << ",\"bots\":" << dbgBotsQueued
-                   << ",\"prepared\":" << prepared
-                   << ",\"execOk\":" << (execOk ? 1 : 0)
-                   << ",\"pOk\":" << dbgPlayerOk
-                   << ",\"pFail\":" << dbgPlayerFail
-                   << ",\"bOk\":" << dbgBotOk
-                   << ",\"bAlt\":" << dbgBotAlt
-                   << ",\"pAlt\":" << dbgPlayerAlt
-                   << ",\"bFail\":" << dbgBotFail
-                   << ",\"bPrevAgeP50\":" << ageP50
-                   << ",\"bPrevAgeMax\":" << ageMax
-                   << "},\"ts\":" << nowProbeMs << "}\n";
-            }
+            
+            std::ostringstream oss;
+            oss << "{\"sessionId\":\"c190fb\",\"runId\":\"pos-refresh\","
+               << "\"location\":\"PositionRefreshPass.cpp\","
+               << "\"message\":\"pos_refresh\",\"data\":{"
+               << "\"work\":" << work.size()
+               << ",\"players\":" << dbgPlayersQueued
+               << ",\"bots\":" << dbgBotsQueued
+               << ",\"prepared\":" << prepared
+               << ",\"execOk\":" << (execOk ? 1 : 0)
+               << ",\"pOk\":" << dbgPlayerOk
+               << ",\"pFail\":" << dbgPlayerFail
+               << ",\"bOk\":" << dbgBotOk
+               << ",\"bAlt\":" << dbgBotAlt
+               << ",\"pAlt\":" << dbgPlayerAlt
+               << ",\"bFail\":" << dbgBotFail
+               << ",\"jRej\":" << dbgBotJumpRejected
+               << ",\"jReanchor\":" << dbgBotReanchored
+               << ",\"bPrevAgeP50\":" << ageP50
+               << ",\"bPrevAgeMax\":" << ageMax
+               << "},\"ts\":" << nowProbeMs << "}\n";
+            EntityDiagnostics::LogRaw(oss.str());
         }
     }
     // #endregion

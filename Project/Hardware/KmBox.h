@@ -2,6 +2,8 @@
 #include <string>
 #include <cstdint>
 
+#include "../Core/FeaturePolicy.hpp"
+
 class KmboxController {
 public:
     KmboxController() = default;
@@ -23,6 +25,7 @@ public:
         bool initialized{ false };
     } kmboxConfig;
 
+    uint64_t lastReadyAttemptMs = 0;
     void InitializeFirst();
     void Initialize();
     /** (Re)open MAKCU/Net if aim needs hardware mouse. Tries MAKCU serial first, then Net. */
@@ -48,6 +51,14 @@ public:
     /** Console summary of type / port or IP / initialized flag. */
     void LogStatus() const;
     std::string GetConfigFilePath() const;
+
+    /** T3.2: true while a press was sent and its release is still outstanding. */
+    bool PressOutstanding() const { return m_pressState.PressOutstanding(); }
+
+private:
+    // T3.2 -- single owner of press/release. The run report reads the outstanding
+    // flag; this machine decides whether a new press may start.
+    FeaturePolicy::PressReleaseState m_pressState;
 };
 
 extern KmboxController g_kmbox;

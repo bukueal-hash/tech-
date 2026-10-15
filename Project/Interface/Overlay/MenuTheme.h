@@ -13,6 +13,12 @@ struct ArcMenuUi {
     ImTextureID logoTexture = 0;
     int logoWidth = 0;
     int logoHeight = 0;
+
+    // Radar map background (D16). Separate SRV from the logo so the two can
+    // never overwrite each other; 0 means no map image was found on disk.
+    ImTextureID mapTexture = 0;
+    int mapWidth = 0;
+    int mapHeight = 0;
 };
 
 ArcMenuUi& ArcMenuTheme();

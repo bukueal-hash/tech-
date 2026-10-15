@@ -8,6 +8,7 @@
 #include <tlhelp32.h>
 
 #include "../DMA/Memory.h"
+#include "ReadBudget.hpp"
 
 #include <atomic>
 
@@ -46,7 +47,11 @@ public:
     {
         if (!m_handle || !buffer || size == 0)
             return false;
-        return g_mem.RequestReadScatter(m_handle, address, buffer, size);
+        if (!g_mem.RequestReadScatter(m_handle, address, buffer, size))
+            return false;
+        ++m_prepared;
+        m_preparedBytes += size;
+        return true;
     }
 
     template <typename T>
@@ -59,14 +64,22 @@ public:
     {
         if (!m_handle)
             return false;
+        const uint64_t entries = m_prepared;
+        const uint64_t bytes = m_preparedBytes;
+        const uint64_t startUs = ReadBudget::NowUs();
         if (!g_mem.ExecuteReadScatter(m_handle))
             return false;
         g_mem.ClearScatterHandle(m_handle);
+        ReadBudget::NoteScatterBatch(entries, bytes, ReadBudget::NowUs() - startUs);
+        m_prepared = 0;
+        m_preparedBytes = 0;
         return true;
     }
 
 private:
     void* m_handle = nullptr;
+    uint64_t m_prepared = 0;
+    uint64_t m_preparedBytes = 0;
 };
 
 inline PersistentScatter g_scatter;
@@ -97,6 +110,7 @@ public:
         if (!g_mem.RequestReadScatter(m_handle, address, buffer, size))
             return false;
         ++m_prepared;
+        m_preparedBytes += size;
         g_dmaScatterPrepares.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
@@ -109,14 +123,20 @@ public:
     bool execute() {
         if (!m_handle)
             return false;
+        const uint64_t entries = m_prepared;
+        const uint64_t bytes = m_preparedBytes;
+        const uint64_t startUs = ReadBudget::NowUs();
         const bool ok = m_cached
             ? g_mem.ExecuteReadScatterCached(m_handle)
             : g_mem.ExecuteReadScatter(m_handle);
+        const uint64_t elapsedUs = ReadBudget::NowUs() - startUs;
         if (ok) {
             g_dmaScatterExecutes.fetch_add(1, std::memory_order_relaxed);
             g_dmaScatterLastBatch.store(m_prepared, std::memory_order_relaxed);
         }
+        ReadBudget::NoteScatterBatch(entries, bytes, elapsedUs);
         m_prepared = 0;
+        m_preparedBytes = 0;
         return ok;
     }
 
@@ -124,6 +144,7 @@ public:
         if (!m_handle)
             return;
         m_prepared = 0;
+        m_preparedBytes = 0;
         if (m_cached)
             g_mem.ClearScatterHandleCached(m_handle);
         else
@@ -136,12 +157,14 @@ public:
             m_handle = nullptr;
         }
         m_prepared = 0;
+        m_preparedBytes = 0;
     }
 
 private:
     void* m_handle = nullptr;
     bool m_cached = false;
     uint64_t m_prepared = 0;
+    uint64_t m_preparedBytes = 0;
 };
 
 class Memory
@@ -249,11 +272,36 @@ public:
         return 0;
     }
 
+    /**
+     * TEB of the attached target, for the per-thread GameInstance TLS anchor
+     * (Core/NameCrypto.hpp). 0 when unattached or no thread map is available.
+     */
+    static uint64_t GetTargetTeb()
+    {
+        if (g_mem.IsInitialized())
+            return PCIMemory::GetTargetTeb();
+        return 0;
+    }
+
+    static std::vector<uint64_t> GetAllTargetTebs()
+    {
+        if (g_mem.IsInitialized())
+            return PCIMemory::GetAllTargetTebs();
+        return {};
+    }
+
     static bool read(const void* address, void* buffer, DWORD64 size)
     {
         if (!g_mem.IsInitialized() || !address || !buffer || !size)
             return false;
-        return g_mem.read(reinterpret_cast<uintptr_t>(address), buffer, static_cast<size_t>(size));
+        // The single pull-read chokepoint: every direct Memory::read<T> in the
+        // tree lands here, which is what makes the ledger's requester/purpose
+        // attribution total instead of a sample of hand-picked call sites.
+        const uint64_t startUs = ReadBudget::NowUs();
+        const bool ok = g_mem.read(
+            reinterpret_cast<uintptr_t>(address), buffer, static_cast<size_t>(size));
+        ReadBudget::NotePull(static_cast<uint64_t>(size), ReadBudget::NowUs() - startUs);
+        return ok;
     }
 
     static bool read(DWORD64 address, void* buffer, DWORD64 size)
@@ -281,7 +329,9 @@ public:
         T buffer{};
         if (!g_mem.IsInitialized())
             return buffer;
+        const uint64_t startUs = ReadBudget::NowUs();
         PCIMemory::ReadVirtualMemoryNoCache(address, &buffer, sizeof(T));
+        ReadBudget::NotePull(sizeof(T), ReadBudget::NowUs() - startUs);
         return buffer;
     }
 

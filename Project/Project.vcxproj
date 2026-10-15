@@ -128,10 +128,10 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>false</GenerateDebugInformation>
       <AdditionalDependencies>d3d11.lib;vmm.lib;leechcore.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(ProjectDir)lib;$(ProjectDir)lib\DMA;$(ArcDmaBinDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(ArcDmaBinDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <PostBuildEvent>
-      <Command>if exist "$(ProjectDir)lib\vmm.dll" copy /Y "$(ProjectDir)lib\vmm.dll" "$(OutDir)"&#x0D;&#x0A;if exist "$(ProjectDir)lib\leechcore.dll" copy /Y "$(ProjectDir)lib\leechcore.dll" "$(OutDir)"&#x0D;&#x0A;xcopy /Y /D "$(ArcDmaBinDir)\*.dll" "$(OutDir)" 2&gt;nul&#x0D;&#x0A;if exist "$(ArcDmaBinDir)\info.db" xcopy /Y /D "$(ArcDmaBinDir)\info.db" "$(OutDir)"&#x0D;&#x0A;xcopy /E /I /Y "$(ProjectDir)Data" "$(OutDir)Data"</Command>
+      <Command>xcopy /Y /D "$(ArcDmaBinDir)\*.dll" "$(OutDir)" 2&gt;nul&#x0D;&#x0A;if exist "$(ArcDmaBinDir)\info.db" xcopy /Y /D "$(ArcDmaBinDir)\info.db" "$(OutDir)"&#x0D;&#x0A;robocopy "$(ProjectDir)Data" "$(OutDir)Data" /E /XF pois.json&#x0D;&#x0A;if errorlevel 8 exit /b 1&#x0D;&#x0A;if not exist "$(OutDir)Data\pois.json" copy /Y "$(ProjectDir)Data\pois.json" "$(OutDir)Data\pois.json"&#x0D;&#x0A;exit /b 0</Command>
       <Message>Copy DMA runtime from Project\x64 to Build\</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
@@ -144,18 +144,22 @@
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>false</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(SolutionDir)Project;$(ProjectDir)lib\include;$(ProjectDir)ThirdParty;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)Project;$(ProjectDir)lib\include;$(ProjectDir)ThirdParty;$(SolutionDir)ThirdParty\embree\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <DebugInformationFormat>None</DebugInformationFormat>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>false</GenerateDebugInformation>
-      <AdditionalDependencies>d3d11.lib;vmm.lib;leechcore.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(ProjectDir)lib;$(ProjectDir)lib\DMA;$(ArcDmaBinDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <!-- Embree 4.4, built static (EMBREE_STATIC_LIB=ON, ISPC/tutorials off,
+           internal tasking) so no new DLL ships next to ArcRaiders.exe. The
+           embree*_<isa>.lib device libraries are part of this build: the BVH
+           entry points are per-ISA, and the API lib alone cannot select one. -->
+      <AdditionalDependencies>d3d11.lib;vmm.lib;leechcore.lib;winmm.lib;embree4.lib;embree_sse42.lib;embree_avx.lib;embree_avx2.lib;lexers.lib;math.lib;simd.lib;sys.lib;tasking.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ArcDmaBinDir);$(SolutionDir)ThirdParty\embree-build\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
     <PostBuildEvent>
-      <Command>if exist "$(ProjectDir)lib\vmm.dll" copy /Y "$(ProjectDir)lib\vmm.dll" "$(OutDir)"&#x0D;&#x0A;if exist "$(ProjectDir)lib\leechcore.dll" copy /Y "$(ProjectDir)lib\leechcore.dll" "$(OutDir)"&#x0D;&#x0A;xcopy /Y /D "$(ArcDmaBinDir)\*.dll" "$(OutDir)" 2&gt;nul&#x0D;&#x0A;if exist "$(ArcDmaBinDir)\info.db" xcopy /Y /D "$(ArcDmaBinDir)\info.db" "$(OutDir)"&#x0D;&#x0A;xcopy /E /I /Y "$(ProjectDir)Data" "$(OutDir)Data"</Command>
+      <Command>xcopy /Y /D "$(ArcDmaBinDir)\*.dll" "$(OutDir)" 2&gt;nul&#x0D;&#x0A;if exist "$(ArcDmaBinDir)\info.db" xcopy /Y /D "$(ArcDmaBinDir)\info.db" "$(OutDir)"&#x0D;&#x0A;robocopy "$(ProjectDir)Data" "$(OutDir)Data" /E /XF pois.json&#x0D;&#x0A;if errorlevel 8 exit /b 1&#x0D;&#x0A;if not exist "$(OutDir)Data\pois.json" copy /Y "$(ProjectDir)Data\pois.json" "$(OutDir)Data\pois.json"&#x0D;&#x0A;exit /b 0</Command>
       <Message>Copy DMA runtime from Project\x64 to Build\</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
@@ -171,16 +175,20 @@
     <ClCompile Include="Functions\PositionRefreshPass.cpp" />
     <ClCompile Include="Interface\Render\RenderQueue.cpp" />
     <ClCompile Include="Functions\WorldScanCommon.cpp" />
+    <ClCompile Include="Functions\CollisionRead.cpp" />
+    <ClCompile Include="Functions\CollisionBvh.cpp" />
+    <ClCompile Include="Functions\CollisionDebug.cpp" />
     <ClCompile Include="Functions\RobotList.cpp" />
     <ClCompile Include="Functions\World.cpp" />
     <ClCompile Include="Functions\BoneList.cpp" />
-    <ClCompile Include="Functions\CollisionMirror.cpp" />
     <ClCompile Include="Functions\Esp.cpp" />
     <ClCompile Include="Functions\Aimbot.cpp" />
+    <ClCompile Include="Functions\AimbotMonitor.cpp" />
     <ClCompile Include="Core\SessionLog.cpp" />
     <ClCompile Include="Core\CrashHandler.cpp" />
     <ClCompile Include="Core\AssetNames.cpp" />
     <ClCompile Include="Core\WorldItemCategory.cpp" />
+
     <ClCompile Include="Functions\Update.cpp" />
     <ClCompile Include="Functions\Utils.cpp" />
     <!-- Hardware -->
@@ -196,12 +204,16 @@
     <ClCompile Include="Input\KeyBind.cpp" />
     <!-- Interface -->
     <ClCompile Include="Interface\Overlay\MenuAssets.cpp" />
+    <ClCompile Include="Interface\Overlay\AimbotDebugPanel.cpp" />
     <ClCompile Include="Interface\Overlay\ImGuiKeybind.cpp" />
     <ClCompile Include="Interface\Overlay\MenuLayout.cpp" />
     <ClCompile Include="Interface\Overlay\MenuSidebar.cpp" />
+    <ClCompile Include="Interface\Overlay\DumperTab.cpp" />
+    <ClCompile Include="Dumper\Dumper.cpp" />
     <ClCompile Include="Interface\OverlayHost.cpp" />
     <ClCompile Include="Interface\Render.cpp" />
     <ClCompile Include="Interface\Utils\AutoConfig.cpp" />
+    <ClCompile Include="Interface\Utils\ColorProfile.cpp" />
     <ClCompile Include="Interface\Utils\Variables\index.cpp" />
     <ClCompile Include="Interface\Utils\Visuals\HealthBarDraw.cpp" />
     <ClCompile Include="Interface\Utils\Visuals\visuals.cpp" />
@@ -228,6 +240,7 @@
     <ClInclude Include="Core\BotAdmitQueue.hpp" />
     <ClInclude Include="Core\BotEspExpiry.hpp" />
     <ClInclude Include="Core\BotMotion.hpp" />
+    <ClInclude Include="Core\BotPosSanity.hpp" />
     <ClInclude Include="Core\Cache.hpp" />
     <ClInclude Include="Core\CrateContents.hpp" />
     <ClInclude Include="Core\LoadoutFormat.hpp" />
@@ -239,10 +252,24 @@
     <ClInclude Include="Core\RaidClock.hpp" />
     <ClInclude Include="Core\ActivityFeed.hpp" />
     <ClInclude Include="Core\RadarProjection.hpp" />
+    <ClInclude Include="Core\VisualState.hpp" />
+
+    <ClInclude Include="Core\PoiParser.hpp" />
+    <ClInclude Include="Core\PoiStore.hpp" />
+    <ClInclude Include="Core\ColorProfiles.hpp" />
+    <ClInclude Include="Interface\Utils\ColorProfile.h" />
     <ClInclude Include="Core\EspFramePolicy.hpp" />
     <ClInclude Include="Core\FeaturePolicy.hpp" />
+    <ClInclude Include="Core\AimCalibration.hpp" />
+    <ClInclude Include="Core\PracticeMode.hpp" />
     <ClInclude Include="Core\EntityDiagnostics.hpp" />
+    <ClInclude Include="Core\CollisionGeom.hpp" />
+    <ClInclude Include="Core\CollisionTess.hpp" />
+    <ClInclude Include="Functions\CollisionRead.h" />
+    <ClInclude Include="Functions\CollisionBvh.h" />
+    <ClInclude Include="Functions\CollisionDebug.h" />
     <ClInclude Include="Core\PlayerEspMissLog.hpp" />
+    <ClInclude Include="Core\RunReport.hpp" />
     <ClInclude Include="Core\BotEspPosition.hpp" />
     <ClInclude Include="Core\Engine.h" />
     <ClInclude Include="Core\Memory.h" />
@@ -269,14 +296,55 @@
     <!-- Interface -->
     <ClInclude Include="Interface\Overlay\ImGuiKeybind.h" />
     <ClInclude Include="Interface\Overlay\Menu.h" />
+    <ClInclude Include="Dumper\Dumper.h" />
     <ClInclude Include="Interface\Overlay\MenuTheme.h" />
     <ClInclude Include="Interface\OverlayHost.h" />
     <ClInclude Include="Interface\Render.h" />
     <ClInclude Include="Interface\Utils\AutoConfig.h" />
     <ClInclude Include="Interface\Utils\Variables\index.h" />
     <ClInclude Include="Interface\Utils\Visuals\visuals.hpp" />
+    <!-- Core (added for solution-explorer completeness) -->
+    <ClInclude Include="Core\ActorType.h" />
+    <ClInclude Include="Core\AgentLog.h" />
+    <ClInclude Include="Core\AimMath.hpp" />
+    <ClInclude Include="Core\BoneMath.hpp" />
+    <ClInclude Include="Core\BotTypes.h" />
+    <ClInclude Include="Core\CrashHandler.h" />
+    <ClInclude Include="Core\EntityFilters.hpp" />
+    <ClInclude Include="Core\IntervalTimer.h" />
+    <ClInclude Include="Core\ItemMetaParser.hpp" />
+    <ClInclude Include="Core\NameCrypto.hpp" />
+    <ClInclude Include="Core\ObjectiveBrief.hpp" />
+    <ClInclude Include="Core\PlayerChain.hpp" />
+    <ClInclude Include="Core\ReadBudget.hpp" />
+    <ClInclude Include="Core\Reflection.hpp" />
+    <ClInclude Include="Core\SessionLog.h" />
+    <ClInclude Include="Core\SteamDecrypt.hpp" />
+    <ClInclude Include="Core\StringUtils.hpp" />
+    <ClInclude Include="Core\WorldItemCategory.h" />
     <!-- Functions -->
-    <ClInclude Include="Functions\CollisionMirror.h" />
+    <ClInclude Include="Functions\AimbotMonitor.hpp" />
+    <ClInclude Include="Functions\EspDraw.h" />
+    <ClInclude Include="Functions\RobotList.h" />
+    <ClInclude Include="Functions\WorldScanCommon.h" />
+    <!-- Interface -->
+    <ClInclude Include="Interface\Overlay\AimbotDebugPanel.hpp" />
+    <ClInclude Include="Interface\Overlay\MenuLayout.h" />
+    <ClInclude Include="Interface\Render\RenderQueue.h" />
+    <ClInclude Include="Interface\Utils\Threads\ScanBudget.h" />
+    <ClInclude Include="Interface\Utils\Threads\SyncedThread.h" />
+    <ClInclude Include="Interface\Utils\UpgradeOptions.hpp" />
+    <ClInclude Include="Interface\Utils\Visuals\Crosshair.hpp" />
+    <ClInclude Include="Interface\Utils\Visuals\CrosshairConfig.hpp" />
+    <ClInclude Include="Interface\Utils\Visuals\SystemHud.hpp" />
+    <ClInclude Include="Interface\Utils\Visuals\ThreatWarnings.hpp" />
+    <!-- Dumper -->
+    <ClInclude Include="Dumper\Driver.h" />
+    <ClInclude Include="Dumper\engine.h" />
+    <ClInclude Include="Dumper\includes.h" />
+    <ClInclude Include="Dumper\structs.h" />
+    <ClInclude Include="resource.h" />
+    <!-- Functions -->
     <!-- ThirdParty (ImGui) -->
     <ClInclude Include="ThirdParty\ImGui\imconfig.h" />
     <ClInclude Include="ThirdParty\ImGui\imgui.h" />

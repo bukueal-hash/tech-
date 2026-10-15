@@ -4,6 +4,11 @@ namespace var {
     /* Esp */
     bool enableesp = true;
     bool box = true;
+    int player_box_style = 3;
+    bool player_box_outline = true;
+    bool player_box_fill = false;
+    float player_box_thickness = 1.f;
+    float player_box_fill_color[4] = { 0.3f, 0.55f, 0.9f, 0.15f };
     // Player data is part of the baseline ESP presentation. These can still
     // be disabled in the menu, but a fresh profile should not look empty.
     bool health = true;
@@ -20,13 +25,6 @@ namespace var {
     float esp_distance = 500.f;
     float esp_color_visible[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     float esp_color_invisible[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
-    bool vis_enabled = false;
-    bool lrts_debug_trace = false;
-    bool lrts_debug_tree = true;
-    bool lrts_debug_burst = false;
-    bool collision_debug_draw = false;
-    bool collision_debug_rays = false;
-    bool collision_vis_enabled = false;
 
     /* Bot ESP */
     bool bot_box = true;
@@ -37,6 +35,7 @@ namespace var {
     float bot_esp_distance = 500.f;
     float bot_color_visible[4] = { 0.25f, 0.55f, 1.0f, 1.0f };
     float bot_color_invisible[4] = { 0.15f, 0.35f, 0.85f, 1.0f };
+    float bot_color_occluded[4] = { 1.0f, 0.55f, 0.1f, 1.0f };
 
     /* Aimbot */
     bool enable_aimbot = false;
@@ -48,7 +47,7 @@ namespace var {
     float humanizer_intensity = 1.0f;   // overall jitter scale (0=off-ish, 2=max)
     float humanizer_react_ms = 220.f;   // base reaction delay (ms)
     float humanizer_overshoot = 0.18f;  // settling overshoot as fraction of error
-    bool randombone = true;
+    bool randombone = false;
     float aimbot_fov = 50.f;
     AimbotPriority aimbot_priority = AimbotPriority::Fov;
     bool show_fov = true;
@@ -61,16 +60,16 @@ namespace var {
     float crosshair_spin_rpm = 20.f;
     float aimbot_distance = 500.f;
     float aim_deadzone_px = 0.f;
-    float smoothness = 3.f;
-    AimAlgorithm aim_algorithm = AimAlgorithm::Accelerated;
+    float smoothness = 2.f;
+    AimAlgorithm aim_algorithm = AimAlgorithm::Linear;
     float aim_sensitivity = 1.0f;
     float aim_hardware_speed = 15.f;
     bool sticky_target_lock = true;
     float aim_sticky_fov_bias_px = 35.f;
     int aim_loss_of_sight_grace_ms = 250;
+    int debug_overlay_key = 0x77; // VK_F8 default; 0 = unbound
     bool aim_loss_of_sight_grace_enabled = true;
     float aim_bullet_speed_cm_s = 80000.f;
-    AimVisMode aim_vis_mode = AimVisMode::Always;
 
     /* Triggerbot */
     bool enable_triggerbot = false;
@@ -103,6 +102,7 @@ namespace var {
     bool show_world_probe = true;
     bool show_world_vehicles = true;
     bool show_world_weapon_case = true;
+    bool show_world_weapon_rack = true;
     bool show_world_field_crate = true;
     bool show_world_supply_station = true;
     bool show_world_keys = true;
@@ -132,6 +132,8 @@ namespace var {
     float color_world_probe[4] = { 1.0f, 165.f / 255.f, 0.0f, 1.0f };
     float color_world_vehicles[4] = { 1.0f, 165.f / 255.f, 0.0f, 1.0f };
     float color_world_weapon_case[4] = { 1.0f, 165.f / 255.f, 0.0f, 1.0f };
+    // Distinct from the case colour so a rack reads differently at a glance.
+    float color_world_weapon_rack[4] = { 0.85f, 0.95f, 0.35f, 1.0f };
     float color_world_field_crate[4] = { 1.0f, 165.f / 255.f, 0.0f, 1.0f };
     float color_world_supply_station[4] = { 1.0f, 165.f / 255.f, 0.0f, 1.0f };
     float color_world_keys[4] = { 1.0f, 215.f / 255.f, 0.0f, 1.0f };
@@ -153,6 +155,9 @@ namespace var {
     bool show_crate_contents = false;
     bool show_stack_counts = false;
     bool grey_looted_containers = false;
+    int state_opened_mode = 2;   // default Grey: matches the old grey_looted behavior
+    int state_dead_mode = 0;     // default Normal: matches the old dead-bot behavior
+    float state_dim_alpha = 0.35f;
     bool show_armor_line = true;
     bool show_player_kit = true;
     bool show_bot_loadout = false;
@@ -165,6 +170,9 @@ namespace var {
     bool show_bot_parts = false;
     bool show_raid_hud = false;
     bool show_activity_feed = false;
+    // Part 6 objectives: on by default so the new panel is visible once the
+    // dashboard is used; nothing renders unless the cached read validates.
+    bool show_objectives = true;
     bool radar_map_mode = false;
     bool radar_underground_dim = false;
     float loot_min_value = 0.f;
@@ -182,6 +190,8 @@ namespace var {
     bool debug_aim_shake = false;
     bool debug_hatch_detect = false;
     bool debug_ghost_bots = false;
+    bool debug_world_trace = false;
+    bool debug_esp_paint = false;
 
 
     /* Camera debug */
@@ -197,4 +207,17 @@ namespace var {
     bool show_radar_special = false;
     bool radar_shape_circle = true;
     bool radar_ally_arrows = true;
+    float radar_dot_scale = 1.0f;
+    bool radar_show_altitude = false;
+    bool radar_compass = true;
+    int radar_focus = 0;
+    bool radar_ghost = true;
+    float radar_ghost_secs = 6.f;
+    bool radar_ghost_suppress_poi = false;
+    bool show_pois = true;
+    bool poi_show_labels = true;
+    int poi_categories = 63;  // bits 0..5 = all six POI categories
+    bool show_search_window = false;
+    int color_profile_slot = -1;
+    
 }

@@ -1,8 +1,11 @@
 #pragma once
 
 #include "Offsets.h"
+#include "ReadBudget.hpp"
 #include "../DMA/Memory.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -92,22 +95,124 @@ inline std::ptrdiff_t ScanActorForTypeOffset(uintptr_t actor)
     return -1;
 }
 
+// ── Per-actor type memo ─────────────────────────────────────────────────────
+// ReadActorTypeId is a single DMA pull read, and it is issued far more often
+// than the value changes: each ring walk reads it once per actor, then every
+// predicate that follows (LooksLikePlayerPawn, IsAnyBotActor, ShouldExclude…)
+// reads the same field again, and the five scanner passes each repeat the whole
+// set every turn. In a 1330-actor raid that is tens of thousands of identical
+// reads of one field, on a bus that can only serve one scanner at a time — the
+// measured cost behind a ~2.4 s scan cycle (perf_spike: EntityList p50 665 ms,
+// RobotList 681 ms, Update 498 ms, on a single shared scan gate).
+//
+// The memo is deliberately narrow:
+//   * only KNOWN type masks are cached. An unknown read is the interesting case
+//     (a spawn still settling, a pointer not yet valid) and always goes to the
+//     bus, so nothing that needs to change can be held back by a cache.
+//   * 1 s TTL, so an address recycled by a later actor is re-read long before
+//     it can be trusted for the rest of a raid.
+//   * per-thread table: the five scanners never contend on it and nothing is
+//     allocated on the scan path.
+//   * direct-mapped (one slot per hash): a collision costs a re-read, never a
+//     probe loop, so the failure mode is "slower", never "wrong".
+//   * cleared whenever the runtime type offset changes, since every cached
+//     value was read at the old offset.
+//
+// Its effect is reported as typeMemo.hits/misses in the scan_cycle record, so
+// the win is measured rather than assumed.
+inline constexpr int64_t kTypeMemoTtlMs = 1000;
+inline constexpr size_t kTypeMemoSlots = 4096; // power of two
+
+// No default member initializers on purpose: a plain aggregate is constant-
+// initialized, so the thread_local table needs no first-use guard check on the
+// hot read path (this runs tens of thousands of times per scan cycle).
+struct TypeMemoEntry {
+    uintptr_t actor;
+    int64_t stampMs;
+    uint32_t typeId;
+};
+
+inline TypeMemoEntry* TypeMemoTable()
+{
+    static thread_local TypeMemoEntry s_table[kTypeMemoSlots];
+    return s_table;
+}
+
+inline std::atomic<uint64_t> g_typeMemoHits{ 0 };
+inline std::atomic<uint64_t> g_typeMemoMisses{ 0 };
+
+inline int64_t TypeMemoNowMs()
+{
+    return static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+/** Drop every cached entry. Callers own the calling thread's table only. */
+inline void ClearActorTypeMemo()
+{
+    TypeMemoEntry* table = TypeMemoTable();
+    for (size_t i = 0; i < kTypeMemoSlots; ++i)
+        table[i].actor = 0;
+}
+
+inline size_t TypeMemoSlot(uintptr_t actor)
+{
+    const uintptr_t mixed = (actor >> 4) ^ (actor >> 20);
+    return static_cast<size_t>(mixed) & (kTypeMemoSlots - 1);
+}
+
+/** Cumulative memo hits/misses, for the scan-cycle record. */
+inline void TypeMemoStats(uint64_t& hits, uint64_t& misses)
+{
+    hits = g_typeMemoHits.load(std::memory_order_relaxed);
+    misses = g_typeMemoMisses.load(std::memory_order_relaxed);
+}
+
 inline uint32_t ReadActorTypeId(uintptr_t actor)
 {
+    // Ledger: actor type id is an identity read; the memo means only misses reach
+    // the bus, so this is a default (a caller's more specific purpose wins).
+    ReadBudget::DefaultPurposeScope purpose(ReadBudget::Purpose::Name);
     if (!actor)
         return 0;
+
+    TypeMemoEntry* table = TypeMemoTable();
+    const size_t slot = TypeMemoSlot(actor);
+    TypeMemoEntry& entry = table[slot];
+    const int64_t nowMs = TypeMemoNowMs();
+    if (entry.actor == actor && entry.stampMs != 0
+        && nowMs - entry.stampMs < kTypeMemoTtlMs) {
+        g_typeMemoHits.fetch_add(1, std::memory_order_relaxed);
+        return entry.typeId;
+    }
+    g_typeMemoMisses.fetch_add(1, std::memory_order_relaxed);
 
     std::ptrdiff_t off = RuntimeActorTypeOffset();
     if (off < 0) {
         off = ScanActorForTypeOffset(actor);
-        if (off >= 0)
+        if (off >= 0) {
+            // Every cached value was read at a different offset.
+            ClearActorTypeMemo();
             RuntimeActorTypeOffset() = off;
+        }
     }
     if (off < 0)
         off = Offsets::ActorTypeId;
 
-    return Memory::read<uint32_t>(actor + off);
+    const uint32_t typeId = Memory::read<uint32_t>(actor + off);
+    // Cache only decisive values: an unknown mask means "ask again", exactly
+    // as it did before the memo existed.
+    if (IsKnownActorTypeMasked(MaskActorTypeId(typeId))) {
+        entry.actor = actor;
+        entry.stampMs = nowMs;
+        entry.typeId = typeId;
+    } else {
+        entry.actor = 0;
+    }
+    return typeId;
 }
+
 
 inline bool IsTargetBotActor(uintptr_t actor)
 {

@@ -6,6 +6,8 @@
 #include "../Interface/Overlay/MenuLayout.h"
 #include "../Interface/Overlay/Menu.h"
 #include "../Interface/Utils/AutoConfig.h"
+#include "../Core/StringUtils.hpp"
+#include "../Core/RunReport.hpp"
 #include "../ThirdParty/ImGui/imgui.h"
 
 #include <Windows.h>
@@ -44,15 +46,14 @@ std::string ExeDirectory()
     return dir;
 }
 
-void TrimInPlace(std::string& s)
+static uint64_t GetNowMs()
 {
-    while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t'))
-        s.pop_back();
-    size_t i = 0;
-    while (i < s.size() && (s[i] == ' ' || s[i] == '\t'))
-        ++i;
-    if (i > 0)
-        s.erase(0, i);
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return u.QuadPart / 10000;
 }
 
 } // namespace
@@ -119,23 +120,32 @@ bool KmboxController::EnsureReady() {
     if (kmboxConfig.initialized)
         return true;
 
+    // Fix slow ticks: Throttle re-initialization attempts to every 500ms.
+    const uint64_t now = GetNowMs();
+    if (lastReadyAttemptMs != 0 && now - lastReadyAttemptMs < 500)
+        return false;
+    lastReadyAttemptMs = now;
+
+    // First attempt: Try the configured port if we have one.
+    if (!kmboxConfig.comPort.empty()) {
+        kmboxConfig.type = "MAKCU";
+        Initialize();
+        if (kmboxConfig.initialized) return true;
+    }
+
+    // Second attempt: Auto-detect MAKCU (slow, scans COM ports).
     const std::string detected = MyMakcu::AutoDetectComPort();
     if (!detected.empty()) {
         kmboxConfig.type = "MAKCU";
         kmboxConfig.comPort = detected;
         Initialize();
-        if (kmboxConfig.initialized) {
-            AutoConfig_MarkDirty();
-            return true;
-        }
+        if (kmboxConfig.initialized) return true;
     }
 
+    // Third attempt: Try Net (KmBox B+ Pro).
     kmboxConfig.type = "Net";
     Initialize();
-    if (kmboxConfig.initialized) {
-        AutoConfig_MarkDirty();
-        return true;
-    }
+    if (kmboxConfig.initialized) return true;
 
     return false;
 }
@@ -373,7 +383,7 @@ bool KmboxController::LoadKmboxConfig() {
 
     std::string line;
     while (std::getline(file, line)) {
-        TrimInPlace(line);
+        StringUtils::TrimInPlace(line);
         if (line.empty() || line[0] == '#' || line[0] == ';')
             continue;
 
@@ -383,8 +393,8 @@ bool KmboxController::LoadKmboxConfig() {
 
         std::string key = line.substr(0, eq);
         std::string val = line.substr(eq + 1);
-        TrimInPlace(key);
-        TrimInPlace(val);
+        StringUtils::TrimInPlace(key);
+        StringUtils::TrimInPlace(val);
 
         if (key == "typeName") {
             // Legacy BPro was never implemented — treat as MAKCU.
@@ -428,6 +438,7 @@ bool KmboxController::LoadKmboxConfig() {
 void KmboxController::Move(int x, int y) {
     if (!kmboxConfig.initialized)
         return;
+    RunReport::NoteInputMoveSubmitted();
     if (kmboxConfig.type == "MAKCU")
         MyMakcu::Move(x, y);
     else if (kmboxConfig.type == "Net")
@@ -439,6 +450,9 @@ void KmboxController::Move(int x, int y) {
 void KmboxController::MoveAim(int x, int y) {
     if (!kmboxConfig.initialized)
         return;
+    // Run report: counted where the command reaches the device, not where it is
+    // decided, so the number is submissions rather than intent.
+    RunReport::NoteInputMoveSubmitted();
     if (kmboxConfig.type == "MAKCU")
         MyMakcu::Move(x, y);
     else if (kmboxConfig.type == "Net")
@@ -480,6 +494,7 @@ void KmboxController::fireTest() {
 void KmboxController::LeftClick() {
     if (!kmboxConfig.initialized)
         return;
+    RunReport::NoteInputPressSubmitted();
     if (kmboxConfig.type == "MAKCU") {
         MyMakcu::LeftClick();
     } else if (kmboxConfig.type == "Net") {
@@ -494,6 +509,13 @@ void KmboxController::LeftClick() {
 void KmboxController::Click(int holdMs) {
     if (!kmboxConfig.initialized)
         return;
+    // T3.2: a click is a press+release, so it must not interleave with an
+    // outstanding release either.
+    if (!m_pressState.BeginPress()) {
+        RunReport::NoteInputRejected();
+        return;
+    }
+    RunReport::NoteInputPressSubmitted();
     if (holdMs < 1)
         holdMs = 1;
     if (kmboxConfig.type == "MAKCU") {
@@ -505,11 +527,21 @@ void KmboxController::Click(int holdMs) {
         Sleep(static_cast<DWORD>(holdMs));
         kmNet_mouse_left(0);
     }
+    // The release went out inside this call, so nothing stays outstanding.
+    m_pressState.BeginRelease();
 }
 
 void KmboxController::HoldStart() {
     if (!kmboxConfig.initialized)
         return;
+    // T3.2: refuse a new press while a release is outstanding. Pressing on top of
+    // an undelivered release is how a button ends up held on the target machine.
+    if (!m_pressState.BeginPress()) {
+        RunReport::NoteInputRejected();
+        return;
+    }
+    RunReport::NoteInputPressSubmitted();
+    RunReport::PressOutstanding().store(true, std::memory_order_relaxed);
     if (kmboxConfig.type == "MAKCU") {
         MyMakcu::MouseDown();
     } else if (kmboxConfig.type == "Net") {
@@ -518,13 +550,33 @@ void KmboxController::HoldStart() {
 }
 
 void KmboxController::HoldEnd() {
-    if (!kmboxConfig.initialized)
+    // T3.2: this is the only release path, and it owns the state. A release with
+    // nothing outstanding is a no-op rather than a stray mouse-up.
+    const int attempts = m_pressState.BeginRelease();
+    if (attempts == 0)
         return;
-    if (kmboxConfig.type == "MAKCU") {
-        MyMakcu::MouseUp();
-    } else if (kmboxConfig.type == "Net") {
-        kmNet_mouse_left(0);
+
+    if (!kmboxConfig.initialized) {
+        // The device cannot take the release. Keep the outstanding flag set: the
+        // button may still be down on the target machine, and clearing the flag
+        // would hide that rather than report it. The run report shows it, and the
+        // next press is refused until a release gets through.
+        m_pressState.NoteReleaseUndeliverable();
+        RunReport::PressOutstanding().store(true, std::memory_order_relaxed);
+        RunReport::NoteInputRejected();
+        return;
     }
+
+    RunReport::NoteInputReleaseSubmitted();
+    // Bounded retry: the device has no ACK, so the best available guarantee is
+    // that the release is issued more than once rather than assumed.
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        if (kmboxConfig.type == "MAKCU")
+            MyMakcu::MouseUp();
+        else if (kmboxConfig.type == "Net")
+            kmNet_mouse_left(0);
+    }
+    RunReport::PressOutstanding().store(false, std::memory_order_relaxed);
 }
 
 KmboxController g_kmbox;

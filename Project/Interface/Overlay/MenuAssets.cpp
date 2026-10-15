@@ -7,9 +7,11 @@
 #include <objbase.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <cwctype>
 #include <random>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -26,13 +28,20 @@ static std::vector<unsigned char> ReadFileBytes(const wchar_t* path)
     FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"rb") != 0 || !f)
         return {};
-    fseek(f, 0, SEEK_END);
-    const long sz = ftell(f);
-    if (sz <= 0) {
+    if (fseek(f, 0, SEEK_END) != 0) {
         fclose(f);
         return {};
     }
-    fseek(f, 0, SEEK_SET);
+    const long sz = ftell(f);
+    constexpr long kMaxFontBytes = 32 * 1024 * 1024;
+    if (sz <= 0 || sz > kMaxFontBytes) {
+        fclose(f);
+        return {};
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return {};
+    }
     std::vector<unsigned char> buf(static_cast<size_t>(sz));
     if (fread(buf.data(), 1, buf.size(), f) != static_cast<size_t>(sz))
         buf.clear();
@@ -46,6 +55,8 @@ static ImFont* LoadFontFromFile(const wchar_t* path, float size, ImGuiIO& io)
     if (data.empty())
         return nullptr;
     void* mem = IM_ALLOC(data.size());
+    if (!mem)
+        return nullptr;
     memcpy(mem, data.data(), data.size());
     ImFontConfig cfg{};
     cfg.FontDataOwnedByAtlas = true;
@@ -64,7 +75,11 @@ static ImFont* LoadFontFirstPath(const wchar_t* const* paths, int count, float s
 static bool CreateTextureFromRgba(ID3D11Device* device, const unsigned char* rgba, int w, int h,
     ID3D11ShaderResourceView** out_srv)
 {
-    if (!device || !rgba || w <= 0 || h <= 0 || !out_srv)
+    if (!out_srv)
+        return false;
+    *out_srv = nullptr;
+    if (!device || !rgba || w <= 0 || h <= 0 || w > 8192 || h > 8192
+        || static_cast<uint64_t>(w) * static_cast<uint64_t>(h) > 16ull * 1024ull * 1024ull)
         return false;
 
     D3D11_TEXTURE2D_DESC desc{};
@@ -95,10 +110,24 @@ static bool CreateTextureFromRgba(ID3D11Device* device, const unsigned char* rgb
     return SUCCEEDED(hr);
 }
 
-static bool LoadLogoTextureWic(ID3D11Device* device, const wchar_t* path, ArcMenuUi& ui)
+// Decodes any WIC image to tightly packed 32-bit RGBA. Shared by the logo and
+// the radar map background (D16) so the two copies of this release ladder can
+// never drift apart.
+static bool DecodeWicToRgba(
+    const wchar_t* path, std::vector<unsigned char>& outPixels, UINT& outW, UINT& outH)
 {
+    WIN32_FILE_ATTRIBUTE_DATA file{};
+    if (!path || !GetFileAttributesExW(path, GetFileExInfoStandard, &file)
+        || (file.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        || file.nFileSizeHigh != 0 || file.nFileSizeLow == 0
+        || file.nFileSizeLow > 64u * 1024u * 1024u)
+        return false;
+
     const HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    const bool coOwned = (coHr == S_OK);
+    // S_FALSE still increments the COM initialization count for this thread.
+    const bool coOwned = SUCCEEDED(coHr);
+    if (FAILED(coHr) && coHr != RPC_E_CHANGED_MODE)
+        return false;
 
     IWICImagingFactory* factory = nullptr;
     HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
@@ -148,8 +177,12 @@ static bool LoadLogoTextureWic(ID3D11Device* device, const wchar_t* path, ArcMen
     }
 
     UINT w = 0, h = 0;
-    converter->GetSize(&w, &h);
-    if (w == 0 || h == 0) {
+    hr = converter->GetSize(&w, &h);
+    // Bound decoded storage to 64 MiB and dimensions to 8192 before UINT
+    // stride/buffer arithmetic or allocation (including compressed-image bombs).
+    const uint64_t pixelCount = static_cast<uint64_t>(w) * h;
+    if (FAILED(hr) || w == 0 || h == 0 || w > 8192 || h > 8192
+        || pixelCount > 16ull * 1024ull * 1024ull) {
         converter->Release();
         frame->Release();
         decoder->Release();
@@ -160,7 +193,17 @@ static bool LoadLogoTextureWic(ID3D11Device* device, const wchar_t* path, ArcMen
 
     const UINT stride = w * 4;
     const UINT bufSize = stride * h;
-    std::vector<unsigned char> pixels(bufSize);
+    std::vector<unsigned char> pixels;
+    try {
+        pixels.resize(bufSize);
+    } catch (const std::bad_alloc&) {
+        converter->Release();
+        frame->Release();
+        decoder->Release();
+        factory->Release();
+        if (coOwned) CoUninitialize();
+        return false;
+    }
     hr = converter->CopyPixels(nullptr, stride, bufSize, pixels.data());
 
     converter->Release();
@@ -172,6 +215,19 @@ static bool LoadLogoTextureWic(ID3D11Device* device, const wchar_t* path, ArcMen
     if (FAILED(hr))
         return false;
 
+    outPixels.swap(pixels);
+    outW = w;
+    outH = h;
+    return true;
+}
+
+static bool LoadLogoTextureWic(ID3D11Device* device, const wchar_t* path, ArcMenuUi& ui)
+{
+    std::vector<unsigned char> pixels;
+    UINT w = 0, h = 0;
+    if (!DecodeWicToRgba(path, pixels, w, h))
+        return false;
+
     ID3D11ShaderResourceView* srv = nullptr;
     if (!CreateTextureFromRgba(device, pixels.data(), static_cast<int>(w), static_cast<int>(h), &srv))
         return false;
@@ -179,6 +235,25 @@ static bool LoadLogoTextureWic(ID3D11Device* device, const wchar_t* path, ArcMen
     ui.logoTexture = reinterpret_cast<ImTextureID>(srv);
     ui.logoWidth = static_cast<int>(w);
     ui.logoHeight = static_cast<int>(h);
+    return true;
+}
+
+// Radar map background (D16): same decoder, its own SRV so it cannot clobber
+// the logo. A missing file is not an error — it just leaves mapTexture at 0.
+static bool LoadMapTextureWic(ID3D11Device* device, const wchar_t* path, ArcMenuUi& ui)
+{
+    std::vector<unsigned char> pixels;
+    UINT w = 0, h = 0;
+    if (!DecodeWicToRgba(path, pixels, w, h))
+        return false;
+
+    ID3D11ShaderResourceView* srv = nullptr;
+    if (!CreateTextureFromRgba(device, pixels.data(), static_cast<int>(w), static_cast<int>(h), &srv))
+        return false;
+
+    ui.mapTexture = reinterpret_cast<ImTextureID>(srv);
+    ui.mapWidth = static_cast<int>(w);
+    ui.mapHeight = static_cast<int>(h);
     return true;
 }
 
@@ -293,6 +368,34 @@ static bool LoadRandomLogo(ID3D11Device* device, ArcMenuUi& ui)
     return false;
 }
 
+// D16: any image named radar_map.* in the usual asset locations. The name is a
+// contract with the user — dropping Build\Data\radar_map.png is all it takes
+// to turn the background on.
+static std::vector<std::wstring> CollectMapImages()
+{
+    std::vector<std::wstring> paths;
+    CollectImagesInDir(GetExecutableDir(), paths);
+    CollectImagesInDir(GetProjectRootFromExe() + L"Build\\Data\\", paths);
+    CollectImagesInDir(GetProjectRootFromExe() + L"Data\\", paths);
+    CollectImagesInDir(GetProjectRootFromExe() + L"Project\\Assets\\", paths);
+
+    std::vector<std::wstring> matches;
+    for (const std::wstring& p : paths) {
+        const size_t slash = p.find_last_of(L"\\/");
+        const std::wstring name = (slash == std::wstring::npos) ? p : p.substr(slash + 1);
+        if (name.size() < 9)
+            continue;
+        std::wstring stem = name.substr(0, 9);
+        std::transform(stem.begin(), stem.end(), stem.begin(), [](wchar_t c) {
+            return static_cast<wchar_t>(towlower(c));
+        });
+        if (stem == L"radar_map")
+            matches.push_back(p);
+    }
+    std::sort(matches.begin(), matches.end());
+    return matches;
+}
+
 } // namespace
 
 ArcMenuUi& ArcMenuTheme()
@@ -330,6 +433,14 @@ void InitArcMenuAssets(ID3D11Device* device)
     g_theme.logoHeight = 0;
     if (device)
         (void)LoadRandomLogo(device, g_theme);
+
+    // Radar map background (D16). Optional by design: with no radar_map.* file
+    // present, mapTexture stays 0 and the radar simply draws no background.
+    if (device) {
+        const std::vector<std::wstring> maps = CollectMapImages();
+        if (!maps.empty())
+            (void)LoadMapTextureWic(device, maps.front().c_str(), g_theme);
+    }
 
     io.Fonts->Build();
 }

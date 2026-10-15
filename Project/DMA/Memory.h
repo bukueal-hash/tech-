@@ -47,6 +47,15 @@ public:
     DWORD GetPidFromName(const char* processName) const;
     std::vector<DWORD> GetPidListFromName(const char* processName) const;
 
+    /**
+     * TEB of the attached target process, from the VMM thread map (lowest TID
+     * first). Needed because the GameInstance is not reachable from the world on
+     * this build: it lives in the per-thread TLS block of the thread that created
+     * it (Core/NameCrypto.hpp, v20261009 reference layout). 0 when unavailable.
+     */
+    static uint64_t GetTargetTeb();
+    static std::vector<uint64_t> GetAllTargetTebs();
+
     template<typename T>
     static T ReadEx(uintptr_t address);
 
@@ -196,13 +205,15 @@ inline void* PCIMemory::GetScatterHandleCached() {
 
 inline bool PCIMemory::RequestReadScatter(void* handle, uintptr_t address, void* buffer, size_t size) {
     if (!handle || !buffer || size == 0) return false;
-    DWORD cbRead = 0;
+    // PrepareEx writes pcbRead during the later ExecuteRead call, not here.
+    // This wrapper exposes no per-read count, so use the API's optional null
+    // output instead of leaving it a pointer to expired stack storage.
     return VMMDLL_Scatter_PrepareEx(
         reinterpret_cast<VMMDLL_SCATTER_HANDLE>(handle),
         address,
         static_cast<DWORD>(size),
         static_cast<PBYTE>(buffer),
-        &cbRead
+        nullptr
     ) == TRUE;
 }
 

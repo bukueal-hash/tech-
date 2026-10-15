@@ -51,6 +51,8 @@ static constexpr uint64_t kHelpUWorldRva = Offsets::UWorld;
 static constexpr uint64_t kHelpPersistentLevel = Offsets::PersistentLevel;
 static constexpr uint64_t kHelpLevelOwningWorld = Offsets::Level_OwningWorld;
 static constexpr uint64_t kHelpActorCluster = Offsets::ActorCluster;
+static constexpr uint64_t kHelpLevelActors = Offsets::AActors;
+static constexpr uint64_t kHelpLevelActorCount = Offsets::ActorsCount;
 static constexpr uint64_t kHelpContainerActors = Offsets::LevelActorContainer_Actors;
 static constexpr uint64_t kHelpContainerActorCount = Offsets::LevelActorContainer_ActorCount;
 static constexpr uint64_t kHelpLevelCollections = Offsets::LevelCollections;
@@ -103,13 +105,25 @@ static bool LevelOwnedByWorld(VMM_HANDLE h, DWORD pid, uint64_t level, uint64_t 
         // accepted the wrong base, which is how every RVA read ended up in
         // heap space (GWorldRaw = garbage, OwningGI = garbage).
         return owning == world;
+    // Fallback when ULevel::OwningWorld does not read: the level's own actor
+    // array. The direct ULevel::Actors TArray is tried first, exactly as
+    // WorldScan::ReadLevelActors does (live-probed data @ Offsets::AActors,
+    // num @ Offsets::ActorsCount), and the dump-sourced
+    // ActorCluster → LevelActorContainer::Actors path stays as the backstop.
+    uint64_t actors = 0;
+    int32_t count = 0;
+    if (ReadU64(h, pid, level + kHelpLevelActors, actors)
+        && actors != 0
+        && !Engine::LooksLikeUtf16Garbage(static_cast<uintptr_t>(actors))
+        && ReadI32(h, pid, level + kHelpLevelActorCount, count)
+        && count > 0 && count <= 10000)
+        return true;
+
     uint64_t cluster = 0;
     if (!ReadU64(h, pid, level + kHelpActorCluster, cluster)
         || Engine::LooksLikeUtf16Garbage(static_cast<uintptr_t>(cluster))
         || cluster < 0x10000)
         return false;
-    uint64_t actors = 0;
-    int32_t count = 0;
     if (!ReadU64(h, pid, cluster + kHelpContainerActors, actors)
         || Engine::LooksLikeUtf16Garbage(static_cast<uintptr_t>(actors)))
         return false;
@@ -564,33 +578,130 @@ std::vector<DWORD> PCIMemory::GetPidListFromName(const char* processName) const 
     return list;
 }
 
+uint64_t PCIMemory::GetTargetTeb()
+{
+    if (!hVMM || !processId)
+        return 0;
+
+    PVMMDLL_MAP_THREAD pThreads = nullptr;
+    if (!VMMDLL_Map_GetThread(hVMM, processId, &pThreads) || !pThreads) {
+        if (pThreads)
+            VMMDLL_MemFree(pThreads);
+        return 0;
+    }
+
+    // Lowest TID first. The GameInstance's TLS block belongs to the thread that
+    // created it — the process's first thread — and the engine's own thread is the
+    // one holding the world, so an arbitrary worker thread would only add noise.
+    uint64_t teb = 0;
+    DWORD bestTid = 0;
+    for (DWORD i = 0; i < pThreads->cMap; ++i) {
+        const VMMDLL_MAP_THREADENTRY& t = pThreads->pMap[i];
+        if (!t.vaTeb)
+            continue;
+        if (!teb || t.dwTID < bestTid) {
+            teb = t.vaTeb;
+            bestTid = t.dwTID;
+        }
+    }
+    VMMDLL_MemFree(pThreads);
+    return teb;
+}
+
+std::vector<uint64_t> PCIMemory::GetAllTargetTebs()
+{
+    std::vector<uint64_t> tebs;
+    if (!hVMM || !processId)
+        return tebs;
+
+    PVMMDLL_MAP_THREAD pThreads = nullptr;
+    if (!VMMDLL_Map_GetThread(hVMM, processId, &pThreads) || !pThreads) {
+        if (pThreads)
+            VMMDLL_MemFree(pThreads);
+        return tebs;
+    }
+
+    tebs.reserve(pThreads->cMap);
+    for (DWORD i = 0; i < pThreads->cMap; ++i) {
+        const VMMDLL_MAP_THREADENTRY& t = pThreads->pMap[i];
+        if (t.vaTeb)
+            tebs.push_back(t.vaTeb);
+    }
+    VMMDLL_MemFree(pThreads);
+    return tebs;
+}
+
 uint64_t DmaMem::FindSignature(const char* signature, uint64_t rangeStart, uint64_t rangeEnd, int pid) {
     if (!signature || !*signature || rangeStart >= rangeEnd)
         return 0;
-    std::vector<uint8_t> buffer(static_cast<size_t>(rangeEnd - rangeStart));
-    DWORD cbRead = 0;
+    // Parse complete whitespace-delimited bytes; '?' and '??' are wildcards.
+    // Reject malformed/oversized patterns before touching target memory.
+    std::vector<int> pattern;
+    const auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    const char* cursor = signature;
+    while (*cursor) {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n')
+            ++cursor;
+        if (!*cursor)
+            break;
+        int byte = -1;
+        if (*cursor == '?') {
+            ++cursor;
+            if (*cursor == '?') ++cursor;
+        } else {
+            const int hi = hex(*cursor++);
+            if (hi < 0 || !*cursor)
+                return 0;
+            const int lo = hex(*cursor++);
+            if (lo < 0)
+                return 0;
+            byte = hi * 16 + lo;
+        }
+        if (*cursor && *cursor != ' ' && *cursor != '\t'
+            && *cursor != '\r' && *cursor != '\n')
+            return 0;
+        pattern.push_back(byte);
+        if (pattern.size() > 256)
+            return 0;
+    }
+    if (pattern.empty() || rangeEnd - rangeStart < pattern.size())
+        return 0;
     auto h = GetVmm();
     if (!h)
         return 0;
-    if (!VMMDLL_MemReadEx(h, static_cast<DWORD>(pid), rangeStart, buffer.data(), static_cast<DWORD>(buffer.size()), &cbRead, 0))
-        return 0;
 
-    const char* pat = signature;
-    uint64_t firstMatch = 0;
-    for (uint64_t i = rangeStart; i < rangeEnd; i++) {
-        const bool match = (*pat == '?') ? true : (buffer[static_cast<size_t>(i - rangeStart)] == static_cast<uint8_t>(strtol(pat, nullptr, 16)));
-        if (match) {
-            if (!firstMatch)
-                firstMatch = i;
-            if (!pat[2])
-                break;
-            pat += (*pat == '?') ? 2 : 3;
-        } else {
-            pat = signature;
-            firstMatch = 0;
+    constexpr size_t kChunkBytes = 64 * 1024;
+    std::vector<uint8_t> buffer(kChunkBytes);
+    for (uint64_t base = rangeStart; base < rangeEnd;) {
+        const uint64_t remaining = rangeEnd - base;
+        const DWORD requested = static_cast<DWORD>(
+            remaining < kChunkBytes ? remaining : kChunkBytes);
+        DWORD cbRead = 0;
+        const bool readOk = VMMDLL_MemReadEx(h, static_cast<DWORD>(pid), base,
+            buffer.data(), requested, &cbRead, 0) != FALSE;
+        // An incomplete read does not prove a contiguous valid prefix when
+        // pages are missing. Fail closed instead of matching zero-filled holes.
+        if (!readOk || cbRead != requested)
+            return 0;
+        for (size_t i = 0; i + pattern.size() <= cbRead; ++i) {
+            size_t matched = 0;
+            while (matched < pattern.size()
+                && (pattern[matched] < 0 || buffer[i + matched] == pattern[matched]))
+                ++matched;
+            if (matched == pattern.size())
+                return base + i;
         }
+        if (remaining <= requested)
+            break;
+        // Overlap permits complete matches spanning a chunk boundary.
+        base += requested - (pattern.size() - 1);
     }
-    return firstMatch;
+    return 0;
 }
 
 bool PCIMemory::FullRefresh()

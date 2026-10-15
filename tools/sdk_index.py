@@ -54,6 +54,16 @@ PROP = re.compile(r"^constexpr uint32_t (\w+)\s*=\s*(0x[0-9a-fA-F]+);\s*//\s*(.*
 META_KEYS = ("Dumper build", "Game build", "Game updated", "Image size",
              "FName pipeline", "PID")
 
+# ArcDumper/Captivate merged-header format (sdk/sdk.txt). One file per line:
+#   // /Script/Engine.Actor                 module + logical name
+#   struct AActor : public UObject          native (U/A) or struct (F/other)
+#       bool bHidden; // 0xd1               member with offset
+#   }; // Size: 0x0                         end of record
+ARC_SCOPED = re.compile(r"^// /Script/([\w./]+)\s*$")
+ARC_DECL = re.compile(r"^(?:struct|class)\s+(\w+)\s*(?::.*)?$")
+ARC_MEMBER = re.compile(r"^\s*(?:static\s+)?([\w:<>,\s\*]+?)\s+(\w+)\s*;\s*//\s*(0x[0-9a-fA-F]+)\s*$")
+ARC_SIZE = re.compile(r"^};\s*//\s*Size:\s*(0x[0-9a-fA-F]+)\s*$")
+
 
 def source_files():
     """Every distinct file in sdk/, realpath-deduped (case-insensitive filesystems
@@ -72,14 +82,20 @@ def source_files():
 
 
 def classify(path):
-    """('reflect'|'drop'|'unknown') from the file's content."""
+    """('reflect'|'arc'|'drop'|'unknown') from the file's content."""
     head = open(path, encoding="utf-8", errors="replace").read()
-    reflect = bool(re.search(r"^// (Class|Struct) [\w.]+", head, re.M))
+    reflect = bool(re.search(r"^// (Class|Struct) (?:/\w+/)?[\w.]+\s*$", head, re.M))
+    arc = bool(re.search(r"^// /Script/[\w./]+\s*$", head, re.M)) and bool(
+        re.search(r"^struct \w+ : public", head, re.M))
     drop = "namespace ArcOffsets" in head or "namespace FName" in head
     if reflect and drop:
         return "both"
     if reflect:
         return "reflect"
+    if arc and drop:
+        return "arcboth"
+    if arc:
+        return "arc"
     if drop:
         return "drop"
     return "unknown"
@@ -134,6 +150,63 @@ def parse_reflect(path):
     return meta, classes, structs
 
 
+def parse_arc(path):
+    """ArcDumper/Captivate merged header -> (meta, classes, structs).
+
+    The `/Script/<Module>.<Name>` comment carries the real engine name (no U/A/F
+    prefix), so keys match the prop: specs' `Module.Name` form. Bucketing is by
+    the native struct name's prefix: `struct U/A...` is a class, everything else
+    (`F...`/plain) is a struct. Blueprint classes (`/AIScript/`, `/Game/`) are
+    skipped - the scoped comment never starts with `// /Script/`, so they never
+    open a record.
+    """
+    meta, classes, structs = {}, {}, {}
+    cur = None
+    for line in open(path, encoding="utf-8", errors="replace"):
+        line = line.rstrip("\n")
+        if line.startswith("// ") and cur is None:
+            text = line[3:].strip()
+            key, _, val = text.partition(":")
+            if key in ("Date",) and val.strip():
+                meta["Game updated"] = val.strip()
+            elif key == "Game base" and val.strip():
+                meta["Image size"] = val.strip()
+        ms = ARC_SCOPED.match(line)
+        if ms:
+            full = ms.group(1)
+            pkg, _, name = full.rpartition(".")
+            cur = {"pkg": pkg, "name": name, "full": full, "struct": None,
+                   "props": {}, "size": None, "inherits": None}
+            continue
+        if cur is None:
+            continue
+        md = ARC_DECL.match(line)
+        if md:
+            if cur["struct"] is None:
+                inherits = line.partition(":")[2].strip()
+                cur["inherits"] = inherits or None
+                cur["struct"] = md.group(1)
+            continue
+        mm = ARC_MEMBER.match(line)
+        if mm:
+            ptype, pname, poff = mm.group(1).strip(), mm.group(2), int(mm.group(3), 16)
+            if not pname.startswith("Pad_"):
+                cur["props"][pname] = {"off": poff, "type": ptype, "mask": None}
+            continue
+        mz = ARC_SIZE.match(line)
+        if mz:
+            cur["size"] = int(mz.group(1), 16)
+            if cur["full"] and cur["struct"]:
+                struct_prefix = (cur["struct"] or "")[:1]
+                if struct_prefix in ("U", "A"):
+                    classes[cur["full"]] = cur
+                else:
+                    structs[cur["full"]] = cur
+            cur = None
+            continue
+    return meta, classes, structs
+
+
 def parse_drop_section():
     """CL drop -> {"constants": {...}, "namespaces": {ns: [name, ...]}}."""
     entries = sdk_drop.parse()
@@ -157,15 +230,12 @@ def sha256(path):
 
 
 def build():
-    old = {}
-    if os.path.exists(OUT):
-        with open(OUT, encoding="utf-8") as fh:
-            old = json.load(fh)
-
-    meta = dict(old.get("meta", {}))
-    classes = old.get("classes", {})
-    structs = old.get("structs", {})
-    drop = old.get("drop")
+    # A new build must never inherit missing types/keys from an old snapshot.
+    # Absent inputs remain absent and downstream gates must report them.
+    meta = {}
+    classes = {}
+    structs = {}
+    drop = None
     sources, carried = [], []
 
     for path in source_files():
@@ -173,8 +243,9 @@ def build():
         rel = os.path.relpath(path, os.path.join(HERE, ".."))
         info = {"path": rel.replace("\\", "/"), "kind": kind,
                 "sha256": sha256(path)[:16], "bytes": os.path.getsize(path)}
-        if kind in ("reflect", "both"):
-            file_meta, new_classes, new_structs = parse_reflect(path)
+        if kind in ("reflect", "both", "arc", "arcboth"):
+            parser = parse_reflect if kind in ("reflect", "both") else parse_arc
+            file_meta, new_classes, new_structs = parser(path)
             meta.update({k: v for k, v in file_meta.items() if k in META_KEYS})
             classes.update(new_classes)
             structs.update(new_structs)
@@ -216,7 +287,9 @@ def build():
 
 
 def kind_missing(sources, want):
-    return not any(s["kind"] in (want, "both") for s in sources)
+    return not any(s["kind"] in (want, "both", "arcboth") or
+                   (want == "reflect" and s["kind"] in ("arc", "arcboth"))
+                   for s in sources)
 
 
 def load():

@@ -6,16 +6,19 @@
 #include "../Core/AssetNames.h"
 #include "../Functions/EspDraw.h"
 #include "../Functions/RobotList.h"
+#include "../Functions/CollisionBvh.h"
 #include "../Hardware/KmBox.h"
 #include "../Input/KeyBind.h"
 #include "../Interface/Utils/Visuals/visuals.hpp"
 #include "../Core/IntervalTimer.h"
 #include "../Interface/Utils/Variables/index.h"
+#include "../Interface/Utils/UpgradeOptions.hpp"
 #include "../ThirdParty/ImGui/imgui.h"
 #include <iostream>
 #include <fstream>
 #include <random>
 #include <chrono>
+#include "AimbotMonitor.hpp"
 #include <cmath>
 #include <algorithm>
 #include <numbers>
@@ -759,10 +762,6 @@ Vector3 Engine::PredictPosition(
     // old, we attenuate it to avoid predicting based on stale movement data
     // (the target may have changed direction since the last refresh).
     Vector3 predicted = targetPos;
-    const float velMag = static_cast<float>(std::sqrt(
-        targetVelocity.x * targetVelocity.x
-        + targetVelocity.y * targetVelocity.y
-        + targetVelocity.z * targetVelocity.z));
 
     for (int i = 0; i < iterations; i++) {
         Vector3 delta = {
@@ -774,14 +773,14 @@ Vector3 Engine::PredictPosition(
         if (distance < 1.0f)
             break;
         const float timeToHit = distance / bulletSpeed;
-        // For distant, fast-moving targets, apply mild velocity attenuation
-        // on the final iteration to prevent overshooting when velocity is stale.
-        const float atten = (i == iterations - 1 && velMag > 200.f && timeToHit > 0.08f)
-            ? 0.85f : 1.0f;
+        // Full intercept lead. The old final-iteration 0.85 attenuation shaved
+        // 15% off the lead for fast/far movers — the systematic "always a little
+        // behind". Velocity staleness is already handled by the age-capped
+        // extrapolation and the auto-lead learner, so no shrink is needed here.
         predicted = {
-            targetPos.x + targetVelocity.x * timeToHit * atten,
-            targetPos.y + targetVelocity.y * timeToHit * atten,
-            targetPos.z + targetVelocity.z * timeToHit * atten
+            targetPos.x + targetVelocity.x * timeToHit,
+            targetPos.y + targetVelocity.y * timeToHit,
+            targetPos.z + targetVelocity.z * timeToHit
         };
     }
     return predicted;
@@ -821,8 +820,14 @@ static bool ComputeVelocityLeadDelta(
     const uint64_t nowMs = NowMs();
     float dtSec =
         (nowMs - static_cast<uint64_t>(lastVelocityUpdate)) * 0.001f;
-    if (dtSec <= 0.f || dtSec > maxDtSec)
+    if (dtSec <= 0.f)
         return false;
+    // Clamp instead of dropping the lead. Velocity samples are often older than
+    // the cap (bot/player samples run 0.4-2s old), and dropping the lead left
+    // moving targets aimed at a stale point, which is what made them outrun aim.
+    // The extrapolation stays bounded by maxDtSec.
+    if (dtSec > maxDtSec)
+        dtSec = maxDtSec;
     const float velMag = VelocityMag(vel);
     if (velMag > 80.f)
         dtSec += 0.055f;
@@ -980,8 +985,6 @@ void Engine::AimAssistPlayer(
     auto consider = [&](uintptr_t key, const PlayerCacheEntry& actor) {
         if (!actor.Drawing) return;
         if (actor.Distance > var::aimbot_distance) return;
-        if (var::aim_vis_mode == AimVisMode::VisibleOnly && !actor.isVisible)
-            return;
 
         Vector3 aimPos{};
         Vector3 worldPos{};
@@ -999,6 +1002,11 @@ void Engine::AimAssistPlayer(
             worldPos, actor.cachedVelocity, actor.lastVelocityUpdate);
 
         Vector3 velocity = actor.cachedVelocity;
+        // The sample the lead extrapolates FROM. Kept so the monitor can report
+        // a real "predicted vs actual" error instead of the placeholder it used
+        // to print, and so a reader can see both ends of the lead.
+        const Vector3 worldPosNoLead = worldPos;
+        const bool leadApplied = var::predict != 0;
 
         if (var::predict)
         {
@@ -1037,6 +1045,12 @@ void Engine::AimAssistPlayer(
         target.distToCenter = distToCenter;
         target.score = totalScore;
         target.isRobot = false;
+        target.distanceM = actor.Distance; // live in the frame/cache entry
+        target.health = actor.health;
+        target.healthMax = actor.maxhealth;
+        target.worldPosNoLead = worldPosNoLead;
+        target.velocityUsed = velocity;
+        target.leadApplied = leadApplied;
 
         targets.push_back(target);
     };
@@ -1067,7 +1081,54 @@ void Engine::AimAssistPlayer(
         consider(key, actor);
 }
 
+// While the ARC part hotkey is held, aim at the cached body part whose
+// projection is closest to the crosshair. Parts far from the bot's live
+// position (frozen mesh drift) are skipped, as in ResolveBotHeadFeetWorld.
+static bool PickRobotPartNearCrosshair(
+    Engine& eng,
+    const Engine::WorldCacheEntry& robot,
+    const Vector3& screenCenter,
+    const Engine::CameraCache& cam,
+    Vector3& outScreenPos,
+    Vector3& outWorldPos,
+    int32_t& outPartID)
+{
+    const Vector3 anchor = IsPlausibleWorldPos(robot.WorldPos)
+        ? robot.WorldPos : robot.CenterWorldPos;
+    if (!IsPlausibleWorldPos(anchor))
+        return false;
+
+    bool found = false;
+    double bestDist2 = DBL_MAX;
+    for (int i = 0; i < robot.BotPartCount; ++i) {
+        const Vector3& part = robot.BotPartPos[i];
+        if (!IsPlausibleWorldPos(part))
+            continue;
+        const double dx = part.x - anchor.x;
+        const double dy = part.y - anchor.y;
+        if ((dx * dx + dy * dy) > (250.0 * 250.0))
+            continue;
+
+        Vector3 screen{};
+        if (!eng.ProjectWorldLocationToScreen(part, screen, cam))
+            continue;
+
+        const double sx = screen.x - screenCenter.x;
+        const double sy = screen.y - screenCenter.y;
+        const double dist2 = sx * sx + sy * sy;
+        if (dist2 < bestDist2) {
+            bestDist2 = dist2;
+            outScreenPos = screen;
+            outWorldPos = part;
+            outPartID = i;
+            found = true;
+        }
+    }
+    return found;
+}
+
 void Engine::AimAssistRobot(
+    float bulletSpeed,
     const Vector3& screenCenter,
     float fovRadius,
     float currentTime,
@@ -1075,35 +1136,91 @@ void Engine::AimAssistRobot(
 {
     (void)currentTime;
 
-    if (!var::robotAimEnabled)
-        return;
+    // No kind gate here: the caller collects ARC targets whenever the aim pass
+    // runs (FeaturePolicy::ShouldCollectRobotTargets). This used to return early
+    // on a separate "robot aim" switch, so the whole pool could be empty while
+    // the aim pass ran — a bot on screen with ESP and no lock.
+
+    // #region agent log — per-gate robot-aim accounting
+    // "Why is this bot not locked" is answered by exactly these counters, so they
+    // go to the trace log rather than std::cout: the console never reaches disk
+    // (the overlay's stdout is not the file a user can read afterwards), which is
+    // why the previous version of this block could not answer the question it
+    // was written for.
+    static uint32_t s_raTotal = 0, s_raNoKey = 0, s_raCachedPlayer = 0,
+        s_raNotDrawing = 0, s_raTooFar = 0, s_raBroken = 0, s_raLabel = 0,
+        s_raEntry = 0, s_raPoint2D = 0, s_raFov = 0, s_raAdmit = 0,
+        s_raFast = 0, s_raFull = 0;
+    {
+        static IntervalTimer robotAimGateTimer(2000);
+        if (robotAimGateTimer.fire()) {
+            std::ostringstream g;
+            g << "{\"total\":" << s_raTotal << ",\"full\":" << s_raFull
+              << ",\"fast\":" << s_raFast << ",\"noKey\":" << s_raNoKey
+              << ",\"cachedPlayer\":" << s_raCachedPlayer
+              << ",\"notDrawing\":" << s_raNotDrawing
+              << ",\"tooFar\":" << s_raTooFar << ",\"broken\":" << s_raBroken
+              << ",\"label\":" << s_raLabel << ",\"entry\":" << s_raEntry
+              << ",\"point2d\":" << s_raPoint2D << ",\"outOfFov\":" << s_raFov
+              << ",\"admitted\":" << s_raAdmit
+              << ",\"aimbotDistanceM\":" << var::aimbot_distance
+              << ",\"aimbotFovDeg\":" << var::aimbot_fov << "}";
+            std::cout << "[robotAimGate] " << g.str() << std::endl;
+            EntityDiagnostics::LogScan("robot_aim_gate", g.str());
+            s_raTotal = s_raNoKey = s_raCachedPlayer = s_raNotDrawing =
+                s_raTooFar = s_raBroken = s_raLabel = s_raEntry = s_raPoint2D =
+                s_raFov = s_raAdmit = s_raFast = s_raFull = 0;
+        }
+    }
+    // #endregion
 
     auto tryAddRobot = [&](uintptr_t key, const WorldCacheEntry& robot) {
-        if (!key || !IsValidPointer(key))
+        ++s_raTotal;
+        if (!key || !IsValidPointer(key)) {
+            ++s_raNoKey;
             return;
-        if (IsCachedPlayer(key))
+        }
+        if (IsCachedPlayer(key)) {
+            ++s_raCachedPlayer;
             return;
-        if (!robot.Drawing)
+        }
+        if (!robot.Drawing) {
+            ++s_raNotDrawing;
             return;
-        if (robot.Distance > var::aimbot_distance)
+        }
+        if (robot.Distance > var::aimbot_distance) {
+            ++s_raTooFar;
             return;
-        if (var::aim_vis_mode == AimVisMode::VisibleOnly && !robot.isVisible)
-            return;
+        }
 
         // Constructable bots (Fireball, Pop, Surveyor) use @0x1210 — not generic @0x1220.
-        if (ReadBotBrokenFlag(key) != 0 && !var::show_dead_bots)
+        // DMA-free: the retain worker owns the broken probe (2 Hz) and
+        // publishes entry.broken. The aim thread must never read the bus per
+        // candidate per tick — this read (plus the label chain below) starved
+        // the pass to ~17 Hz with a full bot pool: the pass that would pick a
+        // newly-entered target up sat behind ~100 queued DMA reads waiting on
+        // the scanner gang — the "2s aim delay on FOV entry".
+        if (robot.broken && !var::show_dead_bots) {
+            ++s_raBroken;
             return;
-
-        std::string fname;
-        if (robot.ActorName.empty()
-            || robot.ActorName == kBotStructAdmissionToken
-            || !IsAcceptedBotEspLabel(*this, robot.ActorName, std::string{})) {
-            fname = GetActorFNameStringCached(key);
-            if (fname.empty())
-                fname = GetActorFNameString(key);
         }
-        if (ResolveBotDrawLabel(key, robot.ActorName, fname).empty())
+
+        // Cached-only identity — the same contract paint already has (see
+        // ResolveBotDrawLabel's allowDma=false): no live DMA on a latency-
+        // critical thread. A flaked decrypt skips the bot for this tick; the
+        // robot worker re-resolves names and the next frame carries it. The old
+        // chain ran the live fname read + the full label fallback (documented
+        // 100-440ms stalls) for every bot on every aim tick.
+        std::string fname;
+        const bool labelSuspect = robot.ActorName.empty()
+            || robot.ActorName == kBotStructAdmissionToken
+            || !IsAcceptedBotEspLabel(*this, robot.ActorName, std::string{});
+        if (labelSuspect)
+            fname = GetActorFNameStringCached(key);
+        if (ResolveBotDrawLabel(key, robot.ActorName, fname, /*allowDma=*/false).empty()) {
+            ++s_raLabel;
             return;
+        }
 
         Vector3 aimPos{};
         Vector3 worldPos{};
@@ -1112,19 +1229,57 @@ void Engine::AimAssistRobot(
 
         WorldCacheEntry resolvedEntry{};
         RobotAimPosSrc posSrc = RobotAimPosSrc::None;
-        if (!ResolveRobotAimEntry(key, robot, g_aimEspFrame, resolvedEntry, posSrc))
+        if (!ResolveRobotAimEntry(key, robot, g_aimEspFrame, resolvedEntry, posSrc)) {
+            ++s_raEntry;
             return;
+        }
 
-        if (!GetRobotAimPoint2D(resolvedEntry, fovRadius, aimPos, worldPos, partID, resistGroup))
+        if (!GetRobotAimPoint2D(resolvedEntry, fovRadius, aimPos, worldPos, partID, resistGroup)) {
+            ++s_raPoint2D;
             return;
+        }
+
+        // Intercept lead, same solver as players. Bot samples are stale and the
+        // velocity extrapolation only ran on the paint path, so aim sat on the
+        // old sample and jumped every time a new one landed (shake, no stick).
+        if (var::predict && bulletSpeed > 0.f) {
+            Vector3 camLocation{};
+            {
+                std::shared_lock<std::shared_mutex> camLock(m_cameraMutex);
+                camLocation = g_Camera.Location;
+            }
+            const Vector3 leadWorld = PredictPosition(
+                worldPos, resolvedEntry.cachedVelocity, camLocation, bulletSpeed, 3);
+            Vector3 leadAim{};
+            if (ProjectWorldLocationToScreen(leadWorld, leadAim, g_aimProjCam)) {
+                worldPos = leadWorld;
+                aimPos = leadAim;
+            }
+        }
+
+        // ARC part hotkey: override the heart point with the nearest body part.
+        if (UpgradeOptions::arcWeakspotKey
+            && KeyBindIsHeld(UpgradeOptions::arcWeakspotKey)) {
+            Vector3 partScreen{};
+            Vector3 partWorld{};
+            int32_t partIdx = -1;
+            if (PickRobotPartNearCrosshair(*this, resolvedEntry, screenCenter, g_aimProjCam,
+                                           partScreen, partWorld, partIdx)) {
+                aimPos = partScreen;
+                worldPos = partWorld;
+                partID = partIdx;
+            }
+        }
 
         const float dx = static_cast<float>(aimPos.x - screenCenter.x);
         const float dy = static_cast<float>(aimPos.y - screenCenter.y);
         const float distToCenter = std::sqrt(dx * dx + dy * dy);
 
         if (!AimStickyBypassFov(key)
-            && distToCenter > EffectiveAimFovForKey(key, fovRadius))
+            && distToCenter > EffectiveAimFovForKey(key, fovRadius)) {
+            ++s_raFov;
             return;
+        }
 
         const float totalScore = ScoreAimTarget(
             distToCenter,
@@ -1146,12 +1301,28 @@ void Engine::AimAssistRobot(
         target.resistGroup = resistGroup;
         target.aimPosSrc = static_cast<uint8_t>(posSrc);
         target.aimWorldAgeMs = RobotWorldAgeMs(resolvedEntry);
+        target.distanceM = robot.Distance; // live in the frame/cache entry
+        target.health = robot.health;
+        target.healthMax = robot.maxhealth;
+        // Bots take their lead from the entry's velocity extrapolation rather
+        // than the player intercept solver, and that path mutates the entry in
+        // place, so there is no pre-lead sample to keep: report the velocity
+        // that moved it and let leadApplied stay false (the helmet points at a
+        // velocity lead, not an intercept solve).
+        target.velocityUsed = robot.cachedVelocity;
+        target.worldPosNoLead = robot.WorldPos;
+        target.leadApplied = false;
 
         targets.push_back(target);
+        ++s_raAdmit;
     };
 
     static int s_robotFullScan = 0;
     const bool wantFull = (g_playerAimLockedKey == 0) || ((++s_robotFullScan % 4) == 0);
+    if (wantFull)
+        ++s_raFull;
+    else
+        ++s_raFast;
     if (!wantFull && g_playerAimLockedKey != 0) {
         g_aimFastPath = 1;
         if (g_aimEspFrame) {
@@ -1268,6 +1439,13 @@ static bool s_inDeadzone = false;
 static AimMath::OscDampState s_oscDampX;
 static AimMath::OscDampState s_oscDampY;
 
+// Creep limiter state (aim-shake fix): sustained sub-threshold ringing
+// (the measured steady 1-2 flips/500ms never trips OscDampState's >=3 gate,
+// so damp stayed 0 all fight).
+static uint64_t s_creepWinMs = 0;
+static int s_creepFlipsX = 0;
+static int s_creepFlipsY = 0;
+
 static void ResetAimMotionState()
 {
     s_filtMx = 0.f;
@@ -1383,6 +1561,19 @@ static float SituationalPullFactor()
 
 float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain = nullptr)
 {
+    // Real inter-tick measurement. s_lastAimTickMs was declared 8ms and
+    // never written — every tick-rate compensation downstream read the
+    // default and could not see the actual 2-4ms cadence under load.
+    static std::chrono::steady_clock::time_point s_aimTickPrev{};
+    const auto aimTickNow = std::chrono::steady_clock::now();
+    if (s_aimTickPrev.time_since_epoch().count() != 0) {
+        const float dtMs = std::chrono::duration<float, std::milli>(
+            aimTickNow - s_aimTickPrev).count();
+        s_lastAimTickMs = s_lastAimTickMs * 0.8f
+            + (dtMs < 1.f ? 1.f : (dtMs > 50.f ? 50.f : dtMs)) * 0.2f;
+    }
+    s_aimTickPrev = aimTickNow;
+
     const float dist = hypotf(dx, dy);
 
     // New lock target → fresh oscillation state AND a fresh randomized pull
@@ -1391,6 +1582,9 @@ float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain =
     if (s_adaptKey != s_aimDbg.locked || s_pullProf.startMs == 0) {
         s_oscDampX = {};
         s_oscDampY = {};
+        s_creepWinMs = 0;
+        s_creepFlipsX = 0;
+        s_creepFlipsY = 0;
         ResetPullProfile();
         // New lock = fresh lead-learning window (don't carry a previous fight's
         // overshoot/trailing bias into the next engagement).
@@ -1417,6 +1611,25 @@ float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain =
         const uint64_t flipNowMs = NowMs();
         s_oscDampX.tick(flipNowMs, xFlip);
         s_oscDampY.tick(flipNowMs, yFlip);
+        // Creep limiter: the damper only engages at >=3 flips/500ms, but the
+        // measured steady shake sits at 1-2 flips/500ms — forever under the
+        // threshold (log damp:[0,0]). Sustained >=4 flips/1.5s still ramps
+        // damp so slow ringing converges instead of shaking all fight.
+        if (s_creepWinMs == 0)
+            s_creepWinMs = flipNowMs;
+        if (xFlip) ++s_creepFlipsX;
+        if (yFlip) ++s_creepFlipsY;
+        if (flipNowMs - s_creepWinMs >= 1500) {
+            if (s_creepFlipsX >= 4)
+                s_oscDampX.damp = (std::min)(AimMath::kOscDampMax,
+                    s_oscDampX.damp + 0.08f);
+            if (s_creepFlipsY >= 4)
+                s_oscDampY.damp = (std::min)(AimMath::kOscDampMax,
+                    s_oscDampY.damp + 0.08f);
+            s_creepFlipsX = 0;
+            s_creepFlipsY = 0;
+            s_creepWinMs = flipNowMs;
+        }
     }
     // Deadzone with hysteresis: once inside, stay inside until error exceeds
     // deadzone + 2 px. Prevents the aim from oscillating in/out at the boundary.
@@ -1473,10 +1686,14 @@ float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain =
         // Only learn while LOCKED, tracking a MOVING target, and we've pulled
         // real mouse (errMag meaningful). Over-lead shows up as loop overshoot;
         // under-lead shows up as residual error that refuses to shrink while
-        // close. Aggregate over a ~450ms window, then nudge s_leadScale slowly
-        // (multiplies the baseline bullet speed). Bounded + per-lock.
+        // close. Aggregate over a short window, then nudge s_leadScale (which
+        // multiplies the baseline bullet speed). Bounded + per-lock.
+        //
+        // Faster settle: the window is 150ms (was 300ms) and the trailing step
+        // is 0.90 (was 0.95), so a shot that keeps landing behind gains lead in
+        // ~2 windows instead of ~5. s_aimDbg.velMag gates on real movement.
         {
-            const bool targetMoving = s_aimDbg.velMag > 80.f;
+            const bool targetMoving = s_aimDbg.velMag > 60.f;
             const float errMag = hypotf(dx, dy);
             const uint64_t nowL = NowMs();
             if (g_kmbox.kmboxConfig.initialized && targetMoving) {
@@ -1488,14 +1705,18 @@ float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain =
                 // small threshold while the target moves → we trail it.
                 if (errMag > 5.f && errMag < 45.f)
                     s_leadErrAcc += errMag, ++s_leadErrN;
-                if (nowL - s_leadWinMs >= 300) {
+                // The monitor measures prediction vs the target's NEXT actual
+                // position: a large miss while moving means the lead overshot,
+                // so it damps lead the same way the loop-overshoot counter does.
+                const float monPredErrorM = AimbotMonitor::CalculatePredictionAccuracy();
+                if (nowL - s_leadWinMs >= 150) {
                     const float avgErr = s_leadErrN > 0 ? s_leadErrAcc / s_leadErrN : 0.f;
-                    if (s_leadOverCount >= 1) {
+                    if (s_leadOverCount >= 1 || monPredErrorM > 0.6f) {
                         // Overshooting the leader → aim too far ahead → less lead.
-                        s_leadScale = (std::clamp)(s_leadScale * 1.05f, 0.5f, 2.0f);
-                    } else if (avgErr > 10.f && s_leadErrN >= 6) {
+                        s_leadScale = (std::clamp)(s_leadScale * 1.08f, 0.40f, 2.50f);
+                    } else if (avgErr > 6.f && s_leadErrN >= 3) {
                         // Stuck off-center on a moving target → trail → more lead.
-                        s_leadScale = (std::clamp)(s_leadScale * 0.95f, 0.5f, 2.0f);
+                        s_leadScale = (std::clamp)(s_leadScale * 0.90f, 0.40f, 2.50f);
                     }
                     s_leadOverCount = 0;
                     s_leadErrAcc = 0.f;
@@ -1547,6 +1768,11 @@ float SendKmAimDelta(float dx, float dy, float pullScale = 1.f, float* outGain =
             closeFrac, s_pullProf.speed, ramp, s_pullProf.sharp, situ);
     }
     s_aimDbg.ppSitu = situ;
+
+    // Tick-rate retime (aim-shake root cause): keep per-second closure
+    // constant regardless of the actual tick rate, so a fast 2-4ms tick
+    // cannot snap past the target and reverse.
+    closeFrac = AimMath::RetimeCloseFrac(closeFrac, s_lastAimTickMs);
 
     // Convert desired screen close → mouse counts via learned scale.
     // Oscillation damping eases the pull per axis while the loop rings.
@@ -1764,8 +1990,9 @@ void Engine::AimAssistence()
         var::enable_aimbot,
         var::robotAimEnabled,
         var::enable_triggerbot};
-    const bool playerAimEnabled = features.playerAim;
-    const bool robotAimEnabled = features.robotAim;
+    // No per-kind flags here on purpose: the pass either runs or it does not, and
+    // the nearest candidate of either kind wins. The old playerAim/robotAim
+    // locals were the two switches that let a drawn target be unselectable.
 
     if (!FeaturePolicy::ShouldRunAimPass(features))
     {
@@ -1779,6 +2006,7 @@ void Engine::AimAssistence()
         return;
     }
 
+    FeaturePolicy::NoteAimPassStage(FeaturePolicy::AimPassStage::Keys);
     const int bindAim = var::aim_hold_key ? var::aim_hold_key : VK_SHIFT;
     const bool aimKeyPressed = KeyBindIsHeld(bindAim);
     const int triggerBind = var::trigger_hold_key ? var::trigger_hold_key : VK_SHIFT;
@@ -1791,6 +2019,7 @@ void Engine::AimAssistence()
     // may acquire and fire on a target, but must never move the pointer.
     const bool sendAimHardware = FeaturePolicy::ShouldSendAimHardware(features)
         && aimKeyPressed;
+    FeaturePolicy::NoteAimPassStage(FeaturePolicy::AimPassStage::Gate);
     if (!sendAimHardware && !triggerActive)
     {
         lockedTarget = 0;
@@ -1860,6 +2089,7 @@ void Engine::AimAssistence()
         return;
     }
 
+    FeaturePolicy::NoteAimPassStage(FeaturePolicy::AimPassStage::World);
     CameraCache aimCam{};
     {
         std::shared_lock<std::shared_mutex> lock(m_cameraMutex);
@@ -1904,6 +2134,7 @@ void Engine::AimAssistence()
     static const EspRenderFrame kInvalidAimFrame{};
     const EspRenderFrame& espFrame = espFrameShared ? *espFrameShared : kInvalidAimFrame;
 
+    FeaturePolicy::NoteAimPassStage(FeaturePolicy::AimPassStage::Frame);
     CameraCache aimProjCam = aimCam;
     // Per-axis drift check: reject ESP frame camera if EITHER axis exceeds the
     // threshold. The old RSS check (sqrt(pitch^2 + yaw^2)) rejected the frame
@@ -1981,8 +2212,9 @@ void Engine::AimAssistence()
         AimAssistPlayer(screenCenter, fovRadius, bulletSpeed, currentTime, allTargets);
 
     if (FeaturePolicy::ShouldCollectRobotTargets(features))
-        AimAssistRobot(screenCenter, fovRadius, currentTime, allTargets);
+        AimAssistRobot(bulletSpeed, screenCenter, fovRadius, currentTime, allTargets);
 
+    FeaturePolicy::NoteAimPassStage(FeaturePolicy::AimPassStage::Collected);
     g_aimEspFrame = nullptr;
     g_aimStickyKey = 0;
     g_aimStickyExtraFovPx = 0.f;
@@ -2029,6 +2261,18 @@ void Engine::AimAssistence()
                     s_graceUntilMs = nowMs + static_cast<uint64_t>(var::aim_loss_of_sight_grace_ms);
                     if (s_graceStampMs == 0)
                         s_graceStampMs = nowMs;
+                }
+                // Hold a LIVE lock through a short candidate dropout (occlusion, Drawing/broken
+                // flap) instead of re-picking another enemy after the grace ends. The
+                // hold only releases if the locked target was last seen dead (health 0)
+                // or has been unseen for kLockHoldMs.
+                constexpr uint64_t kLockHoldMs = 1200;
+                if (!(nowMs <= s_graceUntilMs)
+                    && s_graceTarget.health > 0.f
+                    && s_graceStampMs != 0
+                    && nowMs - s_graceStampMs < kLockHoldMs) {
+                    ReleaseTriggerHold();
+                    return;
                 }
                 if (nowMs <= s_graceUntilMs) {
                     // Lead grace world pos each tick — do not replay frozen screen aimPos.
@@ -2117,6 +2361,13 @@ void Engine::AimAssistence()
 
     if (!bestTarget)
     {
+        // Publish the empty pass too: "0 examined" with a live stamp is a
+        // pass that RAN and found nothing — not the never-published state
+        // (stampMs 0) the panel could not distinguish before.
+        FeaturePolicy::TargetGateCounts none;
+        none.considered = static_cast<uint16_t>((std::min)(
+            allTargets.size(), static_cast<size_t>(0xFFFF)));
+        FeaturePolicy::PublishTargetGateCounts(none, NowMs());
         lockedTarget = 0;
         previousTarget = 0;
         resetHumanizer();
@@ -2127,6 +2378,39 @@ void Engine::AimAssistence()
     }
 
     s_aimDbg.candidates = static_cast<int>(allTargets.size());
+    // ── Visibility (vischeck) ───────────────────────────────────────────────
+    // The collision BVH's own answer for the target this tick selected: cover
+    // between the camera and the aim point means the aim is being pulled at
+    // something the shot cannot reach, so the candidate is refused before any
+    // output is produced. Fail-open by construction -- CollisionBvh::
+    // BlockedForConsumer returns false when no scene is published -- and the
+    // refusal is counted under its own reason, so the panel and the run report
+    // name it instead of showing an unexplained empty tick.
+    bool visBlockedTarget = false;
+    if (UpgradeOptions::visCheckAim && IsPlausibleWorldPos(aimProjCam.Location))
+        visBlockedTarget = CollisionBvh::BlockedForConsumer(
+            aimProjCam.Location, bestTarget->worldPos);
+    {
+        FeaturePolicy::TargetGateCounts gate;
+        gate.considered = static_cast<uint16_t>((std::min)(
+            allTargets.size(), static_cast<size_t>(0xFFFF)));
+        if (visBlockedTarget) {
+            ++gate.byReason[static_cast<size_t>(
+                FeaturePolicy::TargetRejection::Occluded)];
+        } else {
+            gate.admitted = 1;
+            ++gate.byReason[static_cast<size_t>(FeaturePolicy::TargetRejection::None)];
+        }
+        FeaturePolicy::PublishTargetGateCounts(gate, nowMs);
+    }
+    if (visBlockedTarget) {
+        // The lock is deliberately left alone: the target did not go away, it is
+        // behind cover, and var::aim_loss_of_sight_grace_* is what this pass
+        // already uses to sit through a target it cannot currently see. Only the
+        // output is withheld for this tick.
+        ReleaseTriggerHold();
+        return;
+    }
     s_aimDbg.isRobot = bestTarget->isRobot ? 1 : 0;
     s_aimDbg.distPx = bestTarget->distToCenter;
     s_aimDbg.distanceM = bestTarget->distanceM;
@@ -2175,7 +2459,14 @@ void Engine::AimAssistence()
             && bestTarget->entityKey == previousTarget
             && sinceLastSwitch < kTargetSwitchNoBounceSec;
 
+        // A HEALTHY lock gets the anti-flip-flop guards. A lock whose target
+        // VANISHED from the candidate set must NOT: dwell + no-bounce then
+        // delay picking the next target by up to kTargetSwitchDwellSec +
+        // kTargetSwitchNoBounceSec ~= 1.85s — the "aim sits dead for ~2s
+        // when a new target enters FOV" feel after the old one drops.
+        const bool lockedPresent = lockedScoreNow > -FLT_MAX;
         const bool allowSwitch = lockedTarget == 0
+            || !lockedPresent
             || (dwellElapsed && challengerClearlyBetter && !bounceBack);
 
         if (allowSwitch)
@@ -2207,6 +2498,7 @@ void Engine::AimAssistence()
     (void)lockedIsRobot;
 
     s_aimDbg.locked = lockedTarget;
+    FeaturePolicy::NoteAimPassStage(FeaturePolicy::AimPassStage::Selected);
 
     if (!g_kmbox.EnsureReady()) {
         ReleaseTriggerHold();
@@ -2254,6 +2546,23 @@ void Engine::AimAssistence()
     s_aimDbg.distPx = hypotf(
         static_cast<float>(bestTarget->aimPos.x - screenCenter.x),
         static_cast<float>(bestTarget->aimPos.y - screenCenter.y));
+    {
+        // The point the aim path is about to pull toward, with provenance:
+        // a plotted frame/cache sample is Confirmed, anything else is Estimated
+        // (T4.3 — never display an estimate as confirmed).
+        FeaturePolicy::AimPointDebug ap{};
+        ap.confidence = static_cast<uint8_t>(bestTarget->aimPosSrc != 0
+            ? FeaturePolicy::AimPointConfidence::Confirmed
+            : FeaturePolicy::AimPointConfidence::Estimated);
+        ap.validated = bestTarget->aimPosSrc != 0;
+        ap.ageMs = static_cast<float>(bestTarget->aimWorldAgeMs);
+        ap.errorPxX = dx;
+        ap.errorPxY = dy;
+        ap.targetKey = static_cast<uint64_t>(bestTarget->entityKey);
+        ap.isRobot = bestTarget->isRobot;
+        ap.stampMs = nowMs;
+        FeaturePolicy::PublishAimPointDebug(ap);
+    }
     if (targetVelMag > 0.f)
         s_aimDbg.velMag = targetVelMag;
 
@@ -2291,8 +2600,134 @@ void Engine::AimAssistence()
     // Reload / flinch moves the view — skip hardware pull for this tick (keep lock).
     s_dbgSuppress = suppressAimOutput;
     s_dbgShakeDeg = viewShakeDeg;
-    if (sendAimHardware && !suppressAimOutput)
+    if (sendAimHardware && !suppressAimOutput) {
         s_aimDbg.lastGain = SendKmAimDelta(dx, dy, pullScale, &s_aimDbg.lastGain);
+        FeaturePolicy::NoteAimPassStage(FeaturePolicy::AimPassStage::Submitted);
+    }
+
+    // Feed the AimbotDebugPanel telemetry. It was never wired — the panel read
+    // a zeroed thread_local forever ("monitor does nothing while aiming").
+    {
+        using namespace AimbotMonitor;
+        TargetState ts;
+        static char s_telName[48];
+        std::snprintf(s_telName, sizeof(s_telName), "%s 0x%llx",
+            s_aimDbg.isRobot > 0 ? "robot"
+                : (s_aimDbg.isRobot == 0 ? "player" : "target"),
+            static_cast<unsigned long long>(s_aimDbg.locked));
+        ts.targetPtr = s_aimDbg.locked;
+        ts.targetName = s_telName; // stable buffer — worst case garbled text
+        ts.distance = s_aimDbg.distanceM;
+        ts.isVisible = !suppressAimOutput;
+        // The Target block used to print 0.00 m / [0,0,0] for position,
+        // velocity, predicted and error because nothing ever filled them. These
+        // come from the target the aim pass actually used this tick.
+        if (bestTarget) {
+            ts.position = bestTarget->worldPosNoLead;
+            ts.velocity = bestTarget->velocityUsed;
+            ts.predictedPosition = bestTarget->worldPos;
+            ts.health = bestTarget->health;
+            ts.maxHealth = bestTarget->healthMax;
+        }
+        UpdateTargetState(ts);
+        // The monitor's file log existed in code but was never called, so
+        // AimbotTelemetry.log was never created. Cadence-limited: one line per
+        // ~50ms keeps prediction and timing history comparable across runs
+        // without writing on every 4ms tick.
+        {
+            static uint32_t s_telWriteTick = 0;
+            if ((++s_telWriteTick % 12u) == 0u)
+                WriteTelemetryToFile();
+        }
+        AimDeltas ad;
+        ad.yawDelta = s_aimDbg.lastDx;
+        ad.pitchDelta = s_aimDbg.lastDy;
+        ad.smoothingFactor = s_aimDbg.closeFrac;
+        ad.lagCompensation = s_aimDbg.pxPerMouse;
+        ad.jitterAmount = CalculateJitter();
+        // ── Shake trace ────────────────────────────────────────────────
+        // A new lock is a new ringing episode: the previous engagement's
+        // samples describe a target we are no longer aiming at, so the jitter
+        // readout used to lag a real lock change by up to 16 ticks.
+        static uintptr_t s_telLock = 0;
+        static int s_telPrevFlipX = 0, s_telPrevFlipY = 0;
+        static int s_telPrevOver = 0, s_telPrevSw = 0;
+        static int s_telFlipX = 0, s_telFlipY = 0;
+        static int s_telOver = 0, s_telSw = 0;
+        if (s_aimDbg.locked != s_telLock) {
+            s_telLock = s_aimDbg.locked;
+            ResetJitterHistory();
+            s_telFlipX = s_telFlipY = s_telOver = s_telSw = 0;
+            s_telPrevFlipX = s_dbgFlipX;
+            s_telPrevFlipY = s_dbgFlipY;
+            s_telPrevOver = s_dbgOvershoot;
+            s_telPrevSw = s_dbgSwitches;
+        }
+        // The flip/overshoot/switch counters are only cleared inside the
+        // debug_aim_shake print block, so with that flag off they climb
+        // forever. Delta-accumulating makes the per-lock totals mean the same
+        // thing either way, and a counter that jumped backwards (the debug
+        // block cleared it) is treated as a fresh window, not a negative.
+        const auto accumulateCounter = [](int cur, int& prev, int& total) {
+            total += (cur >= prev) ? (cur - prev) : cur;
+            prev = cur;
+        };
+        accumulateCounter(s_dbgFlipX, s_telPrevFlipX, s_telFlipX);
+        accumulateCounter(s_dbgFlipY, s_telPrevFlipY, s_telFlipY);
+        accumulateCounter(s_dbgOvershoot, s_telPrevOver, s_telOver);
+        accumulateCounter(s_dbgSwitches, s_telPrevSw, s_telSw);
+        ad.flipsX = s_telFlipX;
+        ad.flipsY = s_telFlipY;
+        ad.overshootEvents = s_telOver;
+        ad.lockSwitches = s_telSw;
+        ad.dampX = s_oscDampX.damp;
+        ad.dampY = s_oscDampY.damp;
+        ad.tickMs = s_aimDbg.tickMs;
+        ad.pxPerMouse = s_aimDbg.pxPerMouse;
+        ad.closeFrac = s_aimDbg.closeFrac;
+        ad.errorPx = s_aimDbg.distPx;
+        ad.velMag = s_aimDbg.velMag;
+        ad.cmdX = s_aimDbg.cmdX;
+        ad.cmdY = s_aimDbg.cmdY;
+        UpdateAimDeltas(ad);
+
+        // Frame, bone and detection readouts were never fed, so they showed
+        // permanent zeros. Fill them from values this tick already has.
+        {
+            static uint32_t s_monFrameCount = 0;
+            FrameMetrics fm;
+            fm.totalFrameMs = s_aimDbg.tickMs;   // measured inter-tick time
+            fm.frameCount = ++s_monFrameCount;
+            UpdateFrameMetrics(fm);
+        }
+        if (bestTarget) {
+            BoneTracking bone;
+            if (bestTarget->isRobot)
+                bone.boneIndex = static_cast<uint32_t>(
+                    bestTarget->partID < 0 ? 0 : bestTarget->partID);
+            bone.boneWorldPos = bestTarget->worldPos;
+            bone.boneVisible = true;   // projected to screen to reach here
+            bone.boneDistance = bestTarget->distToCenter;
+            bone.distanceToBone = bestTarget->distToCenter;
+            UpdateBoneTracking(bone);
+
+            DetectionMetrics det;
+            det.inFOV = true;   // candidates are FOV-filtered before scoring
+            // The vischeck's own answer instead of the stub this used to be: the
+            // field existed, the panel printed it, and nothing ever computed it
+            // (so "Line of Sight" read BLOCKED forever). raycastValid says whether
+            // there was a scene to ask at all -- reporting an unqueried "clear"
+            // as CLEAR would be the same class of lie in the other direction.
+            det.raycastValid = CollisionBvh::Ready();
+            det.lineOfSightClear = det.raycastValid && !visBlockedTarget;
+            det.behindCover = visBlockedTarget;
+            det.occludedBy = visBlockedTarget ? "geometry" : "none";
+            UpdateDetectionMetrics(det);
+        }
+        AddRotationToHistory(s_aimDbg.lastDy, s_aimDbg.lastDx);
+        SetAimbotState(s_aimDbg.locked != 0
+            ? AimbotState::Tracking : AimbotState::Searching);
+    }
 
     // ============================================
     // TRIGGERBOT

@@ -365,6 +365,26 @@ public:
 
     // Paint-thread safe: try_lock only; on contention returns false and the
     // caller keeps its previous summary.
+    // Run report (Phase 1): totals across OPEN rows keyed by reason -- the same
+    // rows SummaryTryLock summarises, so the report and the HUD line agree.
+    // WORKER THREADS ONLY: this takes the ledger lock. The paint path must use
+    // SummaryTryLock.
+    void ReasonTotals(uint64_t nowMs, std::array<uint32_t, kReasonCount>& out,
+                      size_t& openRows, uint64_t maxAgeMs = 30000) const
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        out.fill(0);
+        openRows = 0;
+        for (const auto& [key, row] : actors_) {
+            (void)key;
+            if (!row.Open(nowMs, maxAgeMs))
+                continue;
+            ++openRows;
+            for (size_t i = 0; i < kReasonCount; ++i)
+                out[i] += row.byReason[i];
+        }
+    }
+
     bool SummaryTryLock(std::string& out, uint64_t nowMs, size_t maxRows,
                         uint64_t maxAgeMs = 30000) const
     {
@@ -512,9 +532,7 @@ private:
             if (!sink) {
                 // Default tap: same verification log as player_admit_stats.
                 sink = [](const std::string& s) {
-                    std::ofstream f(kArcVerifyPath, std::ios::app);
-                    if (f)
-                        f << s << "\n";
+                    EntityDiagnostics::LogRaw(s + "\n");
                 };
                 sink_ = sink;
             }

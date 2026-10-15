@@ -54,6 +54,25 @@ inline float CloseFractionForDist(float dist)
     return closeFrac;
 }
 
+// Retime a per-tick closure to the design tick rate. The aim cadence is
+// 4ms (g_aimCadence.init("aim", 4)) — the OLD "8ms design" assumption was
+// wrong and HALVED every pull ("aim got worse"). f' = 1 - (1-f)^(dt/design)
+// keeps per-second closure constant: a stalled 60ms tick can no longer dump
+// a stale catch-up spike, and a fast 2ms tick closes less per tick. At the
+// normal 4ms tick ratio=1 and closeFrac passes through unchanged.
+inline float RetimeCloseFrac(float closeFrac, float tickMs, float designMs = 4.f)
+{
+    if (tickMs <= 0.f || closeFrac <= 0.f || closeFrac >= 1.f)
+        return closeFrac;
+    float ratio = tickMs / designMs;
+    if (ratio < 0.35f)
+        ratio = 0.35f;
+    if (ratio > 2.0f)
+        ratio = 2.0f;
+    const float f = 1.f - std::pow(1.f - closeFrac, ratio);
+    return f < 0.f ? 0.f : (f > 0.99f ? 0.99f : f);
+}
+
 // Accelerated algorithm: extra pull proportional to (normalized dist)^2,
 // capped at 0.92.
 inline float AcceleratedCloseFrac(float closeFrac, float dist)
@@ -129,14 +148,15 @@ inline float EmaStep(float prev, float sample, float alpha)
     return prev * (1.f - alpha) + sample * alpha;
 }
 
-// Tick-scale for the mouse burst cap: keep a 1x..10x range around 8ms ticks.
+// Tick-scale for the mouse burst cap: 1x..2x around 8ms ticks. A stalled tick
+// (50ms+) used to scale the burst up to 10x and dump one large jump.
 inline float TickScaleFromTickMs(float tickMs)
 {
     float tickScale = tickMs / 8.f;
     if (tickScale < 1.f)
         tickScale = 1.f;
-    if (tickScale > 10.f)
-        tickScale = 10.f;
+    if (tickScale > 2.f)
+        tickScale = 2.f;
     return tickScale;
 }
 

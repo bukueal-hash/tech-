@@ -61,8 +61,8 @@ constexpr uint64_t kSlotClmulK1     = 0x8E9484400ADF26C1ULL;
 constexpr uint64_t kSlotClmulK2     = 0x1ADA36649C975181ULL;
 
 // -- FName pool ------------------------------------------------------------
-constexpr uint64_t kRvaGnamePool        = 0x10987D40ULL;
-constexpr uint64_t kRvaKeystream        = 0x1082B26CULL;
+constexpr uint64_t kRvaGnamePool        = 0x10B779F0ULL; // 2026-10-09 encrypted FName pool
+constexpr uint64_t kRvaKeystream        = 0x10A1425CULL; // 2026-10-09 ARC_RVA_CHARKEY (table data at +0x30)
 constexpr int      kKeystreamBaseIdx    = 0xC;
 constexpr int      kKeystreamCount      = 0x100;
 constexpr uint32_t kShardHashAdd        = 0xD69AD929u;
@@ -110,7 +110,7 @@ constexpr uint64_t kUStructPropertiesSize = 0xD8;
 constexpr uint64_t kUStructMinAlignment = 0x94;
 constexpr uint64_t kFfieldAddConst      = 0x44CB31F912F95FFFULL;
 constexpr uint64_t kFfieldAdd2Const     = 0xBB34B0C01E5AA000ULL;
-constexpr uint32_t kOffsetXorKey        = 0x8DE128DEu;
+constexpr uint32_t kOffsetXorKey        = 0x82D2BA08u; // 2026-10-09: bswap32(stored) ^ key
 
 // -- TEB (Wine/Proton) ------------------------------------------------------
 constexpr uint32_t kTebKeyOff           = 0x1F8;
@@ -146,6 +146,23 @@ constexpr uint32_t kTlsTableStride      = 0x90;
 constexpr uint32_t kTlsVtFnIndexOff     = 0x48;
 constexpr uint32_t kTlsXmmInputOff      = 0x80;
 constexpr uint32_t kTlsMaxSlots         = 0x440;
+
+// -- v20261009 reference GameInstance TLS layout (CL-1424961) ----------------
+// The current build's TEB TLS block geometry, verbatim from the user-verified
+// reference: validity flag at +0xEC0, stage-A blocks from +0xED0 (8 blocks,
+// 0x80 stride), vtable ptr at block+0x00, XMM input at block+0x70. The GI lives
+// in block #2 at vt+0x18; the sibling group at TLS+0x1310 (same stride) is the
+// UWorld group. The CL-1341255 constants above are retired and remain only for
+// the older pipeline.
+constexpr uint32_t kTlsRefValidOff      = 0xEC0;   // TLS+0xEC0 == 1 => TLS base
+constexpr uint32_t kTlsRefStageABase    = 0xED0;   // stage-A block group base
+constexpr uint32_t kTlsRefBlockCount    = 8;
+constexpr uint32_t kTlsRefBlockStride   = 0x80;
+constexpr uint32_t kTlsRefVtOff         = 0x00;    // vtable pointer within a block
+constexpr uint32_t kTlsRefXmmOff        = 0x70;    // XMM input within a block
+constexpr uint32_t kTlsRefGiBlock       = 2;       // GI block index
+constexpr uint32_t kTlsRefGiVtOff       = 0x18;    // GI at vt+0x18
+constexpr uint64_t kTlsRefWorldGroup    = 0x1310;  // sibling group -> UWorld
 
 // -- GameInstanceStaticDecrypt ----------------------------------------------
 constexpr uint32_t kStageArrayRva       = 0x10F35650u;
@@ -324,11 +341,9 @@ inline uint64_t DecodeFFieldName(uint64_t source, uint64_t second)
     return Rol64(source ^ v, 32);
 }
 
-// FProperty offset decode (drop: decode_ffproperty_offset). The drop XORs
-// after the byte-swap (OFFSET_XOR_KEY = 0x8DE128DE); SDK.hpp's folded form
-// bswap32(raw ^ 0xDE28E18D) is algebraically identical because the two keys
-// are byte-reverses of each other. Getting the swap side wrong silently swaps
-// the keys, so Tests/name_crypto_tests.cpp pins both forms.
+// FProperty/member offset decode from the 2026-10-09 live probe:
+// bswap32(stored) ^ 0x82D2BA08. SDK.hpp's folded form uses the byte-reversed
+// key inside the pre-swap XOR.
 inline uint32_t DecodeFfPropertyOffset(uint32_t raw)
 {
     return Bswap32(raw) ^ kOffsetXorKey;
@@ -726,6 +741,49 @@ inline uint64_t TlsSlotValue(uint64_t tlsBase, uint32_t slot, const R& reader)
     if (!IsPlausibleNamePtr(fn))
         return 0;
     return ReadVal<uint64_t>(reader, fn);
+}
+
+// find_tls_base_ref: first TLS block with the v20261009 validity flag (+0xEC0).
+template <typename R>
+inline uint64_t FindTlsBaseRef(uint64_t teb, const R& reader)
+{
+    if (!IsPlausibleNamePtr(teb))
+        return 0;
+    const uint64_t tlsSlots = ReadVal<uint64_t>(reader, teb + kTibTlsSlotsOff);
+    if (!IsPlausibleNamePtr(tlsSlots))
+        return 0;
+    for (uint32_t idx = 0; idx < kTlsMaxSlots; ++idx) {
+        const uint64_t entry =
+            ReadVal<uint64_t>(reader, tlsSlots + static_cast<uint64_t>(idx) * 8);
+        if (!IsPlausibleNamePtr(entry))
+            continue;
+        if (ReadVal<uint8_t>(reader, entry + kTlsRefValidOff) != 1)
+            continue;
+        return entry;
+    }
+    return 0;
+}
+
+// decrypt_game_instance_tls_ref: stage-A block #2, GI at vt+0x18. vt is the
+// block's first field (kTlsRefVtOff == 0), so *(vt + 0x18) is tried first; the
+// literal *(block + 0x18) is the fallback. Caller validates via
+// ValidateGameInstance().
+template <typename R>
+inline uint64_t DecryptGameInstanceTlsRef(uint64_t teb, const R& reader)
+{
+    const uint64_t tlsBase = FindTlsBaseRef(teb, reader);
+    if (!tlsBase)
+        return 0;
+    const uint64_t block = tlsBase + kTlsRefStageABase +
+        static_cast<uint64_t>(kTlsRefGiBlock) * kTlsRefBlockStride;
+    const uint64_t vt = ReadVal<uint64_t>(reader, block + kTlsRefVtOff);
+    if (IsPlausibleNamePtr(vt)) {
+        const uint64_t viaVt = ReadVal<uint64_t>(reader, vt + kTlsRefGiVtOff);
+        if (IsPlausibleNamePtr(viaVt))
+            return viaVt;
+    }
+    const uint64_t literal = ReadVal<uint64_t>(reader, block + kTlsRefGiVtOff);
+    return IsPlausibleNamePtr(literal) ? literal : 0;
 }
 
 // decrypt_game_instance_tls: TLS block pair -> FNV chain -> GameInstance*.

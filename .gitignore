@@ -55,7 +55,9 @@ Desktop.ini
 # these negations override the generic *.exe / *.dll / *.pdb rules above.
 !Build/ArcRaiders.exe
 !Build/*.dll
-!Build/*.db
+# Named, not `*.db`: the wildcard also committed symsrv's download cache next
+# to the runtime database, and would sweep in any future stray .db in Build/.
+!Build/info.db
 !Build/*.ini
 !Build/*.yes
 !Build/Data/
@@ -74,3 +76,18 @@ sdk_vs_project_detailed.txt
 .freebuff/
 .vscode/
 
+# --- Repo hygiene (audit items 72-77) ---
+# Generated .planning data (big SDK indexes; regenerate on demand)
+/.planning/
+# Ad-hoc root reports (HTML) and build/run logs (txt)
+/*.html
+/*.txt
+# Stray editor/backup files
+*.new
+# Local-only test helper for the Python tooling
+tools/tests/
+
+
+# Embree 4 static third-party build (vendored locally, not committed)
+/ThirdParty/embree/
+/ThirdParty/embree-build/

@@ -71,7 +71,7 @@ public:
         return x * v.x + y * v.y + z * v.z;
     }
 
-    inline double Distance(Vector3 v)
+    inline double Distance(Vector3 v) const
     {
         return sqrt(pow(v.x - x, 2) + pow(v.y - y, 2) + pow(v.z - z, 2));
     }

@@ -5,14 +5,34 @@
 #include "../Core/Offsets.h"
 #include "../Core/WorldItemCategory.h"
 #include "../Interface/Utils/Variables/index.h"
+#include "../Interface/Utils/UpgradeOptions.hpp"
 
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
 
+// 2.3b: ContainerList and ItemList run back to back on the same worker thread
+// (EngineThreads.cpp:608/614) and each need the same level + actor-array
+// snapshot. Reuse this thread's last gather inside a short window so the pair
+// pays for one level+actor walk per tick instead of two. The window is below
+// RobotList's 200 ms cadence, so RobotList (its own thread) always re-gathers
+// current actors; only the ContainerList -> ItemList pair shares.
+namespace { constexpr uint64_t kWorldCtxReuseMs = 180; }
+
 bool Engine::GatherWorldScanContext(WorldScanContext& ctx)
 {
+    const uint64_t gatherNowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    static thread_local WorldScanContext s_cachedCtx;
+    static thread_local uint64_t s_cachedMs = 0;
+    if (s_cachedMs != 0 && gatherNowMs - s_cachedMs <= kWorldCtxReuseMs
+        && !s_cachedCtx.currentActors.empty()) {
+        ctx = s_cachedCtx;
+        return true;
+    }
+
     ctx = {};
     {
         std::shared_lock<std::shared_mutex> slock(m_stateMutex);
@@ -43,6 +63,8 @@ bool Engine::GatherWorldScanContext(WorldScanContext& ctx)
         ctx.camera = g_Camera;
     }
 
+    s_cachedCtx = ctx;
+    s_cachedMs = gatherNowMs;
     return true;
 }
 
@@ -52,6 +74,11 @@ void Engine::FinalizeWorldCacheMap(
     int& outDrawing)
 {
     outDrawing = 0;
+    // Container-open probes are DMA reads per entry. Cap them per finalize so a
+    // big cache cannot burn the world-thread budget in one pass; entries that
+    // miss the cap keep their last state and are probed on a later pass.
+    constexpr int kOpenProbesPerFinalize = 12;
+    int openProbeBudget = kOpenProbesPerFinalize;
     // #region agent log
     int distSkip = 0;
     float farDist = 0.f;
@@ -83,6 +110,47 @@ void Engine::FinalizeWorldCacheMap(
 
         auto cat = static_cast<WorldItemCategory>(entry.worldCategory);
 
+        entry.boundsValid = false;
+        if (UpgradeOptions::worldBounds && IsValidPointer(root)) {
+            // Supported subset: root StaticMeshComponent with validated asset
+            // bounds. No guessed dimensions or render-thread memory reads.
+            // GetActorClassFName deliberately rejects component classes for
+            // actor admission, so resolve this component's UClass directly.
+            const uintptr_t rootClassPtr = steam_decrypt::GetActorClassPtr(root);
+            const std::string rootClass = IsValidPointer(rootClassPtr)
+                ? GetActorFNameString(rootClassPtr) : std::string{};
+            if (rootClass.find("StaticMeshComponent") != std::string::npos) {
+                // Ledger: bounds derivation (mesh asset -> ExtendedBounds) is the
+                // static-mesh bounds purpose, not a position read.
+                ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Bounds);
+                const uintptr_t asset = Memory::read_nocache<uintptr_t>(root + Offsets::StaticMesh);
+                if (IsValidPointer(asset)) {
+                    struct AssetBounds { Vector3 origin, extent; double radius; };
+                    const AssetBounds b = Memory::read_nocache<AssetBounds>(asset + Offsets::StaticMesh_ExtendedBounds);
+                    const FTransform t = ReadComponentToWorld(root);
+                    const auto sane = [](const Vector3& v, double limit) {
+                        return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z)
+                            && std::abs(v.x)<limit && std::abs(v.y)<limit && std::abs(v.z)<limit;
+                    };
+                    const double q = t.Rotation.x*t.Rotation.x+t.Rotation.y*t.Rotation.y
+                        +t.Rotation.z*t.Rotation.z+t.Rotation.w*t.Rotation.w;
+                    if (sane(b.origin,100000) && sane(b.extent,100000) && b.extent.x>0 && b.extent.y>0 && b.extent.z>0
+                        && sane(t.Scale3D,100) && std::abs(t.Scale3D.x)>0.001 && std::abs(t.Scale3D.y)>0.001 && std::abs(t.Scale3D.z)>0.001
+                        && sane(t.Translation,1e8) && std::isfinite(q) && q>0.98 && q<1.02) {
+                        entry.boundsValid = true;
+                        for (int i=0;i<8;++i) {
+                            const Vector3 local((b.origin.x+((i&1)?b.extent.x:-b.extent.x))*t.Scale3D.x,
+                                (b.origin.y+((i&2)?b.extent.y:-b.extent.y))*t.Scale3D.y,
+                                (b.origin.z+((i&4)?b.extent.z:-b.extent.z))*t.Scale3D.z);
+                            entry.boundsCorners[i] = t.Rotation.RotateVector(local)+t.Translation;
+                            if (!sane(entry.boundsCorners[i],1e8)) entry.boundsValid = false;
+                        }
+                        entry.boundsSampleMs = SteadyEspNowMs();
+                    }
+                }
+            }
+        }
+
         if (WorldCategoryIsContainerProp(cat)
             && cat != WorldItemCategory::DroppedPickup
             && cat != WorldItemCategory::Harvestable
@@ -111,7 +179,8 @@ void Engine::FinalizeWorldCacheMap(
             }
             const bool needProbe = entry.cachedOpened < 0
                 || (nowMs - entry.openedProbeMs) > ttlMs;
-            if (needProbe) {
+            if (needProbe && openProbeBudget > 0) {
+                --openProbeBudget;
                 const int8_t prevOpened = entry.cachedOpened;
                 entry.cachedOpened = ContainerLootLooksOpened(
                     it->first, entry.ActorName) ? 1 : 0;
@@ -123,6 +192,7 @@ void Engine::FinalizeWorldCacheMap(
                     // EmbarkServerEvents dispatch objects themselves are not
                     // readable over DMA - see Core/ActivityFeed.hpp).
                     if (prevOpened == 0 && entry.cachedOpened == 1) {
+                        ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Name);
                         char who[32] = "someone";
                         const uintptr_t inter = Memory::read_nocache<uintptr_t>(
                             it->first + Offsets::LootInteractionComponent);
@@ -186,7 +256,15 @@ void Engine::FinalizeWorldCacheMap(
         // correct range; only the drop edge is widened.
         const float dropM = entry.Drawing ? maxDrawM * 1.05f : maxDrawM;
 
-        if (entry.Distance > dropM) {
+        // Near-field reveal (mirrors getAllowWorldEntry kNearRevealM): an
+        // entry within touching distance keeps Drawing=true no matter the
+        // cap/category/filter — BUT ShouldDrawWorldEsp gates on entry.Drawing
+        // FIRST, so without this line the frame gate nullified the reveal
+        // ("standing in front of a crate, 2 min, no esp").
+        constexpr float kNearRevealM = 15.f;
+        const bool nearField = entry.Distance <= kNearRevealM;
+
+        if (entry.Distance > dropM && !nearField) {
             entry.Drawing = false;
             // #region agent log
             ++distSkip;
@@ -202,13 +280,13 @@ void Engine::FinalizeWorldCacheMap(
             continue;
         }
 
-        if (!espVisible && !radarVisible) {
+        if (!espVisible && !radarVisible && !nearField) {
             entry.Drawing = false;
             ++it;
             continue;
         }
 
-        if (!PassesLootPickupFilters(filterView)) {
+        if (!PassesLootPickupFilters(filterView) && !nearField) {
             entry.Drawing = false;
             ++it;
             continue;
@@ -257,10 +335,14 @@ void Engine::FinalizeWorldCacheMap(
     {
         thread_local auto s_last = std::chrono::steady_clock::time_point{};
         const auto now = std::chrono::steady_clock::now();
-        if (s_last.time_since_epoch().count() == 0
-            || now - s_last >= std::chrono::seconds(2)) {
+        // Gated: this is the one diagnostic that appended to disk
+        // unconditionally, which is how the trace file grew to tens of MB
+        // during ordinary play. Off unless debug_world_trace is set.
+        if (var::debug_world_trace
+            && (s_last.time_since_epoch().count() == 0
+                || now - s_last >= std::chrono::seconds(2))) {
             s_last = now;
-            std::ofstream f(kArcDebugLogPath, std::ios::app);
+            std::ofstream f(kArcVerifyPath, std::ios::app); // kArcDebugLogPath is NUL (blind); the world-draw reason must reach disk
             if (f) {
                 const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
@@ -268,13 +350,14 @@ void Engine::FinalizeWorldCacheMap(
                 snprintf(farLabelEsc, sizeof(farLabelEsc), "%.48s", farLabel.c_str());
                 char skipLabelEsc[64]{};
                 snprintf(skipLabelEsc, sizeof(skipLabelEsc), "%.48s", skipLabel.c_str());
-                f << "{\"sessionId\":\"c190fb\",\"runId\":\"baseline\",\"hypothesisId\":\"H1\","
+                f << "{"
                   << "\"location\":\"World.cpp:FinalizeWorldCacheMap\",\"message\":\"world_draw_caps\","
                   << "\"data\":{\"cache\":" << cache.size()
                   << ",\"drawing\":" << outDrawing
                   << ",\"distSkip\":" << distSkip
                   << ",\"lootDist\":" << static_cast<int>(var::loot_distance)
                   << ",\"spDist\":" << static_cast<int>(var::container_distance_sp)
+                  << ",\"espDist\":" << static_cast<int>(var::esp_distance)
                   << ",\"radar\":" << static_cast<int>(var::radar_range)
                   << ",\"farDist\":" << static_cast<int>(farDist)
                   << ",\"farCat\":" << farCat

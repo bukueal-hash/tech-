@@ -1,12 +1,17 @@
 #include "../Core/Engine.h"
+#include "../Interface/Utils/UpgradeOptions.hpp"
 #include "../Core/AgentLog.h"
+#include "../Core/StringUtils.hpp"
 #include <cmath>
 #include <immintrin.h>
 #include <cstring>
 #include <cctype>
 #include <algorithm>
 #include <chrono>
+#include <map>
+#include <sstream>
 #include <unordered_set>
+#include <unordered_map>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -20,11 +25,14 @@
 #include "../Core/Cache.hpp"
 #include "../Core/Memory.h"
 #include "../Core/SteamDecrypt.hpp"
+#include "../Core/NameCrypto.hpp"
 #include "../Core/WorldItemCategory.h"
 
 #include "../Interface/OverlayHost.h"
 
 #include <atomic>
+#include <thread>
+#include <type_traits>
 
 namespace {
 
@@ -42,17 +50,70 @@ bool IsPlausibleWorldPosD(const Engine::FVector3d& p)
 
 
 
-/** PCM validation — DefaultFOV alone is the strongest signal.
- *  POV/Location checks are too sensitive to offset errors; a real PCM
- *  always has DefaultFOV in (1,179). */
+// Class identity is independent of the codec-protected controller camera slot.
+bool CameraManagerClass(uintptr_t object)
+{
+    uintptr_t cls = steam_decrypt::GetActorClassPtr(object);
+    std::unordered_set<uintptr_t> seen;
+    for (int depth = 0; cls && depth < 16 && seen.insert(cls).second; ++depth) {
+        if (steam_decrypt::GetActorFNameString(cls) == "PlayerCameraManager")
+            return true;
+        cls = Memory::read<uintptr_t>(cls + Offsets::UStruct_SuperStruct);
+    }
+    return false;
+}
+
+// CL-1426848 dump: APlayerCameraManager::ViewTarget sits at 0x4C0, TViewTarget::POV
+// at +0x10, and MinimalViewInfo carries Location 0x08, Rotation 0x28, FOV 0x48.
+// Read the whole view in one complete nocache transaction; never mix a pawn-eye
+// location or controller rotation with this camera, and never read handle keys.
+bool ReadPlainCamera(uintptr_t pcm, Engine::CameraCache& result)
+{
+    if (!Memory::IsValidPtrFast2(pcm) || (pcm & 7)) return false;
+    // 0x4C covers the last field the gate reads (FOV at POV+0x48) plus one float.
+    uint8_t view[0x4C]{};
+    if (!PCIMemory::ReadVirtualMemoryNoCache(pcm + Offsets::CameraPOVBase, view, sizeof(view)))
+        return false;
+    Engine::FVector3d loc{}, rot{}; float fov = 0;
+    std::memcpy(&loc, view + (Offsets::CameraPOV_Location - Offsets::CameraPOVBase), sizeof(loc));
+    std::memcpy(&rot, view + (Offsets::CameraPOV_Rotation - Offsets::CameraPOVBase), sizeof(rot));
+    std::memcpy(&fov, view + (Offsets::CameraPOV_FOV - Offsets::CameraPOVBase), sizeof(fov));
+    if (!IsPlausibleWorldPosD(loc) || !std::isfinite(fov) || fov <= 1.f || fov >= 179.f
+        || !std::isfinite(rot.x) || !std::isfinite(rot.y) || !std::isfinite(rot.z)
+        || std::fabs(rot.x) > 90.0 || std::fabs(rot.y) > 360.0 || std::fabs(rot.z) > 180.0)
+        return false;
+    result = { Engine::ToVector3(loc), Engine::ToVector3(rot), fov };
+    static std::mutex logMutex;
+    std::lock_guard<std::mutex> logLock(logMutex);
+    static auto lastLog = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastLog >= std::chrono::seconds(2)) {
+        lastLog = now;
+        std::ostringstream f;
+        f << "{\"ev\":\"camera_plain_sample\",\"pcm\":" << pcm << ",\"fov\":" << fov
+          << ",\"loc\":[" << loc.x << "," << loc.y << "," << loc.z
+          << "],\"rot\":[" << rot.x << "," << rot.y << "," << rot.z << "]}\n";
+        EntityDiagnostics::LogRaw(f.str());
+    }
+    return true;
+}
+
 bool PcmLivePovLooksSane(uintptr_t pcm)
 {
-	if (!pcm || !Memory::IsValidPtrFast2(pcm))
-		return false;
+    Engine::CameraCache camera{};
+    return ReadPlainCamera(pcm, camera);
+}
 
-	const float defaultFov =
-		Memory::read_nocache<float>(pcm + Offsets::DefaultFOV);
-	return (defaultFov > 1.f && defaultFov < 179.f);
+/** Complete-read gate: a short or failed DMA read must never become a
+ *  plausible zero value. On failure `value` is left untouched. */
+template <typename T>
+bool ReadComplete(uintptr_t address, T& value)
+{
+    T candidate{};
+    if (!PCIMemory::ReadVirtualMemoryNoCache(address, &candidate, sizeof(T)))
+        return false;
+    value = candidate;
+    return true;
 }
 
 bool IsPlausibleRotation(const Engine::FVector3d& rot)
@@ -225,180 +286,76 @@ bool Engine::ResolvePlayerCameraManagerLadder(
 	uintptr_t actors,
 	bool nocacheFov)
 {
-	auto IsPcmValid = [&](uintptr_t p) {
-		if (!p || !IsValidPointer(p))
-			return false;
-		const float f = nocacheFov
-			? Memory::read_nocache<float>(p + Offsets::DefaultFOV)
-			: Memory::read<float>(p + Offsets::DefaultFOV);
-		if (!(f > 1.0f && f < 179.0f))
-			return false;
-		if (!PcmLivePovLooksSane(p))
-			return false;
-		const uintptr_t owner = Memory::read_nocache<uintptr_t>(p + Offsets::PCOwner);
-		return !pc || !owner || owner == pc;
-	};
-
-	// LP may be 0 — still recover PCM via FName / PCOwner scan.
-	if (pc && !IsPcmValid(pcm))
-		pcm = Memory::read_nocache<uintptr_t>(pc + Offsets::APlayerCameraManager);
-	if (!IsPcmValid(pcm))
-		pcm = GetCameraManagerFromActors();
-	if (!IsPcmValid(pcm) && level && actors) {
-		uintptr_t pcmPc = pc;
-		uintptr_t pcmPawn = pawn;
-		uintptr_t foundPcm = pcm;
-		if (ResolvePcFromLevelCameraManager(level, actors, pcmPc, pcmPawn, foundPcm)) {
-			pcm = foundPcm;
-			pc = pcmPc;
-			pawn = pcmPawn;
-		}
-	}
-	return IsPcmValid(pcm);
+    (void)pc; (void)pawn; (void)actors; (void)nocacheFov;
+    pcm = GetCameraManagerFromActors(0, level, pc);
+    return pcm != 0 && PcmLivePovLooksSane(pcm);
 }
 
 bool Engine::RefreshCameraFromViewTarget()
 {
-	uintptr_t pc = 0;
-	uintptr_t pawn = 0;
-	uintptr_t root = 0;
-	uintptr_t pcm = 0;
-	{
-		std::shared_lock<std::shared_mutex> lock(m_stateMutex);
-		pc = PlayerController;
-		pawn = AcknowledgedPawn;
-		root = RootComponent;
-		pcm = PlayerCameraManager;
-	}
-
-	const uintptr_t pcmStored = pcm;
-	const uintptr_t pcBeforeLadder = pc;
-	uintptr_t level = 0;
-	uintptr_t actors = 0;
-	{
-		std::shared_lock<std::shared_mutex> lock(m_stateMutex);
-		level = PersistentLevel;
-		actors = Actors;
-	}
-	const bool pcmResolved = ResolvePlayerCameraManagerLadder(
-		pc, pawn, pcm, level, actors, /*nocacheFov=*/true);
-	if (pc && (!pcBeforeLadder || pc != pcBeforeLadder)) {
-		std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-		PlayerController = pc;
-		AcknowledgedPawn = pawn;
-	}
-
-	const bool pcmOk = pcmResolved && pcm && IsValidPointer(pcm);
-
-	float povFov = 0.f;
-	float defFov = 0.f;
-	float jsonFov = 0.f;
-	FVector3d povLoc{};
-	FVector3d povRot{};
-
-	if (pcmOk) {
-		const uintptr_t povBase = pcm;
-        povLoc = Memory::read_nocache<FVector3d>(povBase + Offsets::CameraPOV_Location);
-        povRot = Memory::read_nocache<FVector3d>(povBase + Offsets::CameraPOV_Rotation);
-        povFov = Memory::read_nocache<float>(povBase + Offsets::CameraPOV_FOV);
-        defFov = Memory::read_nocache<float>(pcm + Offsets::DefaultFOV);
-		jsonFov = 0.f;
-	}
-
-	Vector3 pawnPos{};
-	uintptr_t rootComp = root;
-	if (pawn && IsValidPointer(pawn)) {
-		const uintptr_t pawnRoot =
-            Memory::read_nocache<uintptr_t>(pawn + Offsets::RootComponent);
-		if (pawnRoot && IsValidPointer(pawnRoot))
-			rootComp = pawnRoot;
-	}
-	if (rootComp && IsValidPointer(rootComp)) {
-		// ComponentToWorld is non-UPROPERTY: probe the working 0x2D0 profile
-		// against the 0x310 alternate instead of trusting one fixed slot.
-		const std::ptrdiff_t ctwOff = Engine::ProbeComponentToWorldOffset(rootComp);
-        const FVector3d pawnWorld = Memory::read_nocache<FVector3d>(
-			rootComp + ctwOff + Offsets::Transform_Translation);
-		pawnPos = ToVector3(pawnWorld);
-		if (!::IsPlausibleWorldPos(pawnPos))
-            pawnPos = Memory::read_nocache<Vector3>(rootComp + Offsets::RelativeLocation);
-		// Reflection-verified fallback: AActor::ReplicatedMovement -> Location.
-		if (!::IsPlausibleWorldPos(pawnPos))
-            pawnPos = Engine::ReadActorReplicatedLocation(pawn);
-	}
-
-	const bool pawnOk = ::IsPlausibleWorldPos(pawnPos);
-
-	Vector3 ctrlRot{};
-	if (pc && IsValidPointer(pc))
-        ctrlRot = Memory::read_nocache<Vector3>(pc + Offsets::ControlRotation);
-
-	CameraProbeSnapshot probe{};
-	CameraCache published{};
-	const bool ok = BuildCameraCacheFromPovReads(
-		pcmOk,
-		povFov,
-		defFov,
-		jsonFov,
-		povLoc,
-		povRot,
-		pawnPos,
-		pawnOk,
-		ctrlRot,
-		pc && IsValidPointer(pc),
-		published,
-		&probe);
-
-	if (pcm && pcm != pcmStored) {
-		std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-		PlayerCameraManager = pcm;
-	}
-
-	{
-		DbgStoreCameraProbe(probe);
-	}
-
-	if (!ok)
-		return false;
-
-	{
-		std::unique_lock<std::shared_mutex> lock(m_cameraMutex);
-		g_Camera = published;
-	}
-
-	return true;
+    const uintptr_t pcm = GetCameraManagerFromActors();
+    CameraCache camera{};
+    if (!pcm || !ReadPlainCamera(pcm, camera)) return false;
+    {
+        std::unique_lock<std::shared_mutex> stateLock(m_stateMutex);
+        PlayerCameraManager = pcm;
+    }
+    {
+        std::unique_lock<std::shared_mutex> cameraLock(m_cameraMutex);
+        g_Camera = camera;
+    }
+    // #region agent log
+    // Transform self-check (worker thread, one sample per 5 s). The local pawn's
+    // own root sits within a few metres of the camera eye, so whichever candidate
+    // translation offset lands nearest the POV is the live one — a stale
+    // ComponentToWorld after a game patch shows up here as "every entity is
+    // kilometres away" instead of as silently wrong boxes. Read-only: never
+    // writes a position, never gates a draw.
+    {
+        static std::mutex probeMutex;
+        static auto lastProbe = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> probeLock(probeMutex);
+        if (now - lastProbe >= std::chrono::seconds(5)) {
+            lastProbe = now;
+            uintptr_t pawn = 0;
+            {
+                std::shared_lock<std::shared_mutex> stateLock(m_stateMutex);
+                pawn = AcknowledgedPawn;
+            }
+            const uintptr_t root = (pawn && IsUsableObjectPtr(pawn))
+                ? Memory::read_nocache<uintptr_t>(pawn + Offsets::RootComponent) : 0;
+            if (root && Memory::IsValidPtrFast2(root)) {
+                static const std::ptrdiff_t kCandidates[] = {
+                    0x2F0, 0x300, 0x310, 0x320, 0x330, 0x340, 0x350 };
+                std::ostringstream f;
+                f << "{\"ev\":\"pawn_transform_probe\",\"root\":" << root
+                  << ",\"cam\":[" << camera.Location.x << "," << camera.Location.y
+                  << "," << camera.Location.z << "]";
+                for (const std::ptrdiff_t off : kCandidates) {
+                    const FVector3d v = Memory::read_nocache<FVector3d>(root + off);
+                    const double dx = v.x - static_cast<double>(camera.Location.x);
+                    const double dy = v.y - static_cast<double>(camera.Location.y);
+                    const double dz = v.z - static_cast<double>(camera.Location.z);
+                    const double dm = std::sqrt(dx * dx + dy * dy + dz * dz) / 100.0;
+                    char key[16];
+                    std::snprintf(key, sizeof(key), "0x%llX",
+                        static_cast<unsigned long long>(off));
+                    f << ",\"" << key << "\":{\"v\":[" << v.x << "," << v.y
+                      << "," << v.z << "],\"dM\":" << dm << "}";
+                }
+                f << "}\n";
+                EntityDiagnostics::LogRaw(f.str());
+            }
+        }
+    }
+    // #endregion
+    return true;
 }
 
 bool Engine::TryBuildCameraFromPcmPov(uintptr_t pcm, CameraCache& outCamera) const
 {
-	if (!pcm || !IsValidPointer(pcm) || !PcmLivePovLooksSane(pcm))
-		return false;
-
-	const uintptr_t povBase = pcm;
-	const FVector3d povLoc =
-		Memory::read_nocache<FVector3d>(povBase + Offsets::CameraPOV_Location);
-	const FVector3d povRot =
-		Memory::read_nocache<FVector3d>(povBase + Offsets::CameraPOV_Rotation);
-	const float povFov =
-		Memory::read_nocache<float>(povBase + Offsets::CameraPOV_FOV);
-	const float defFov =
-		Memory::read_nocache<float>(pcm + Offsets::DefaultFOV);
-
-	Vector3 unusedPawn{};
-	Vector3 unusedCtrl{};
-	return BuildCameraCacheFromPovReads(
-		true,
-		povFov,
-		defFov,
-		0.f,
-		povLoc,
-		povRot,
-		unusedPawn,
-		false,
-		unusedCtrl,
-		false,
-		outCamera,
-		nullptr);
+    return ReadPlainCamera(pcm, outCamera);
 }
 
 // Worker camera refresh (Update thread). RenderEsp also reads POV per-paint via
@@ -436,6 +393,12 @@ bool Engine::ProjectWorldLocationToScreen(
 		g_projViewportW.load(std::memory_order_relaxed));
 	const double overlayH = static_cast<double>(
 		g_projViewportH.load(std::memory_order_relaxed));
+	// T4.5: the FOV axis is a setting, not an assumption. Vertical (the default)
+	// is the reading this projection has always used, so nothing moves unless the
+	// user asks for the horizontal reading that the aim cone already uses.
+	const EngineProjection::FovAxis axis = UpgradeOptions::fovAxisHorizontal
+		? EngineProjection::FovAxis::Horizontal
+		: EngineProjection::FovAxis::Vertical;
 	return EngineProjection::ProjectWorldLocationToScreen(
 		WorldLocation,
 		screen,
@@ -443,7 +406,8 @@ bool Engine::ProjectWorldLocationToScreen(
 		CameraInfo.Rotation,
 		CameraInfo.FOV,
 		overlayW,
-		overlayH);
+		overlayH,
+		axis);
 }
 
 bool Engine::ProjectWorldLocationToScreen(
@@ -503,8 +467,20 @@ static bool ValidatePlayerController(uintptr_t pc, uintptr_t& outPawn, bool requ
         if (!IsUsableObjectPtr(pawn) || !PawnHasWorldPosition(pawn))
             return false;
     } else if (!pcmOk) {
-        if (!IsUsableObjectPtr(pawn) || !Engine::ResolveActorRoot(pawn))
-            return false;
+        // The engine's own local-controller flag is the stronger proof of the two
+        // and the one that does not depend on the camera or on a replicated pawn:
+        // bIsLocalPlayerController (0xDB8, reflected for the APlayerController
+        // this game spawns) is set when the engine creates the controller from a
+        // ULocalPlayer. Requiring the POV check here rejected the *real* local
+        // player on this build, because the manager's POV is not readable at its
+        // SDK offsets — the arc capture records the manager holding an encoded
+        // handle to a heap FCameraCacheEntry instead. The live session showed the
+        // consequence: a controller and its PlayerState resolved while no pawn
+        // had replicated yet, so every GameInstance candidate failed this gate.
+        if (!engine.IsLocalPlayerControllerConfirmed(pc)) {
+            if (!IsUsableObjectPtr(pawn) || !Engine::ResolveActorRoot(pawn))
+                return false;
+        }
     }
 
     outPawn = pawn;
@@ -589,11 +565,9 @@ static bool ValidateGameInstance(uintptr_t gi, uintptr_t* outLocalPlayer = nullp
     uintptr_t lp = 0;
     uintptr_t pc = 0;
 
-    // Help LocalPlayers 0x120; prior CL used 0x130 — try both (do not edit Offsets.h).
-    static const std::ptrdiff_t kLpArrOffs[] = {
-        Offsets::LocalPlayers,
-        static_cast<std::ptrdiff_t>(0x130),
-    };
+    // SDK (Engine.GameInstance::LocalPlayers): reflected array is at 0x108.
+    // Keep 0x120 only as an unverified prior-build fallback; do not prefer it.
+    static const std::ptrdiff_t kLpArrOffs[] = { Offsets::LocalPlayers };
     for (std::ptrdiff_t off : kLpArrOffs) {
         if (TryLocalPlayerChain(gi, off, lp, pc)) {
             if (outLocalPlayer)
@@ -604,26 +578,42 @@ static bool ValidateGameInstance(uintptr_t gi, uintptr_t* outLocalPlayer = nullp
         }
     }
 
-    // The SDK drop does not define a GI->World back-reference field. Do not
-    // validate through the old guessed +0x2F0 slot; the LocalPlayers array and
-    // its LP->PC identity check are the available structural proof.
-    (void)world;
+    (void)world; // No current-build GI->World back-reference is verified.
     for (std::ptrdiff_t off : kLpArrOffs) {
         const GITArrayHdr arr = ReadGIArray(gi, off);
-        if (!IsUsableObjectPtr(arr.Data) || IsModuleSpace(arr.Data))
+        if (!IsUsableObjectPtr(arr.Data) || IsModuleSpace(arr.Data)
+            || arr.Num < 1 || arr.Num > 4 || arr.Max < arr.Num || arr.Max > 4)
             continue;
-        if (arr.Num < 0 || arr.Num > 16)
+        uintptr_t lp = 0, pc = 0, pawn = 0;
+        if (!TryLocalPlayersSlots(arr.Data, arr.Num, lp, pc, pawn, false))
             continue;
-        if (arr.Max < arr.Num || arr.Max > 64)
-            continue;
-        const uintptr_t slot0 = Memory::read<uintptr_t>(arr.Data);
-        if (!IsUsableObjectPtr(slot0) || IsModuleSpace(slot0) || Engine::LooksLikeUtf16Garbage(slot0))
-            continue;
-        if (outLocalPlayer)
-            *outLocalPlayer = slot0;
-        if (outPlayerController)
-            *outPlayerController = 0;
+        if (outLocalPlayer) *outLocalPlayer = lp;
+        if (outPlayerController) *outPlayerController = pc;
         return true;
+    }
+
+    // Menu / pre-spawn: the engine has not created a PlayerController yet, so
+    // every PC gate above fails and the GI is rejected, leaving LocalPlayer at 0.
+    // Accept the reflected LocalPlayers array when a slot is a live ULocalPlayer
+    // whose PlayerController is still null (or is itself a live object).
+    for (std::ptrdiff_t off : kLpArrOffs) {
+        const GITArrayHdr arr = ReadGIArray(gi, off);
+        if (!IsUsableObjectPtr(arr.Data) || IsModuleSpace(arr.Data)
+            || arr.Num < 1 || arr.Num > 4 || arr.Max < arr.Num || arr.Max > 4)
+            continue;
+        for (int i = 0; i < arr.Num; ++i) {
+            const uintptr_t slot =
+                Memory::read<uintptr_t>(arr.Data + static_cast<size_t>(i) * sizeof(uintptr_t));
+            if (!IsUsableObjectPtr(slot) || Engine::LooksLikeUtf16Garbage(slot))
+                continue;
+            const uintptr_t pcField =
+                Memory::read<uintptr_t>(slot + Offsets::LocalPlayer_PlayerController);
+            if (pcField && !IsUsableObjectPtr(pcField))
+                continue;
+            if (outLocalPlayer) *outLocalPlayer = slot;
+            if (outPlayerController) *outPlayerController = pcField;
+            return true;
+        }
     }
 
     return false;
@@ -711,8 +701,8 @@ static uintptr_t GiFromOuterRung(uintptr_t localPlayer, PlayerChain::Rung& which
     return 0;
 }
 
-// CL-1341255: UWorld+0x478 (OwningGameInstance) is SIMD-encrypted — a plain
-// read returns 0. Decrypt: 16B blob @ world+0x478, PSHUFB with the 16-byte
+// Prior-build fallback: older builds stored a SIMD-encrypted GI pointer at
+// UWorld+0x478; decrypt that blob with the legacy PSHUFB pipeline.
 // mask @ base+0xB09C350, XOR qword lanes with keys @ base+0xB06C380/0xB06C390.
 // Validate via the GI's SDK LocalPlayers chain; the drop does not define a
 // GI->World back-reference field.
@@ -764,10 +754,10 @@ static uintptr_t DecryptGameInstancePointer(uintptr_t world)
 static uintptr_t GiOwningSlotRung(uintptr_t world, bool& backRef)
 {
     backRef = false;
-    const uintptr_t plain = Memory::read<uintptr_t>(world + Offsets::OwningGameInstance);
+    const uintptr_t plain = Memory::read_nocache<uintptr_t>(world + Offsets::OwningGameInstance);
     if (!IsUsableObjectPtr(plain))
         return 0;
-    // +0x478 is the SDK's UWorld::OwningGameInstance slot. The drop does not
+    // +0x478 is the SDK's UWorld::OwningGameInstance slot (Engine.World). The drop does not
     // define a GI->World field at +0x2F0, so identity comes from LocalPlayers,
     // not from that stale back-reference guess.
     if (ValidateGameInstance(plain, nullptr, nullptr, world)) {
@@ -777,26 +767,21 @@ static uintptr_t GiOwningSlotRung(uintptr_t world, bool& backRef)
     return 0;
 }
 
-/** Legacy CL-1341255 SIMD-obfuscated slot (data RVAs from the old build). */
+/** DISABLED STUB. Was the legacy CL-1341255 SIMD-obfuscated slot decode; the
+ *  TLS decode it was meant to do is not implemented, so this always returns 0.
+ *  The working TLS rung is GiFromTls in PlayerChain. */
 static uintptr_t GiFromDecryptSlot(uintptr_t world)
 {
-    // The 2026-09-22 drop's static decrypt is the primary source for this hop.
-    // It does not read an invented GI field or a legacy slot: it derives the
-    // result from GameInstanceStaticDecrypt::STAGE_ARRAY_RVA and returns
-    // *(seed_ptr + RESULT_DEREF). Keep the older world-slot decrypt only as a
-    // compatibility fallback for pre-drop targets.
-    const uint64_t base = Memory::getBaseAddress();
-    if (const uintptr_t gi = static_cast<uintptr_t>(GameInstanceLink::DecryptStatic(base));
-        gi && ValidateGameInstance(gi, nullptr, nullptr, world))
-        return gi;
-    return DecryptGameInstancePointer(world);
+    (void)world;
+    return 0;
 }
 
-/** The previous build's slot (0x3B0). */
+/** DISABLED STUB. Previous build's slot (0x3B0); `legacy` is hard-wired to 0,
+ *  so this always returns 0. Kept so the PlayerChain hook table stays intact. */
 static uintptr_t GiFromLegacySlotRung(uintptr_t world)
 {
-    const uintptr_t legacy = Memory::read<uintptr_t>(
-        world + static_cast<std::ptrdiff_t>(0x3B0));
+    const uintptr_t legacy = 0;
+
     if (!legacy || !ValidateGameInstance(legacy, nullptr, nullptr, world))
         return 0;
     return legacy;
@@ -805,6 +790,15 @@ static uintptr_t GiFromLegacySlotRung(uintptr_t world)
 /** Last resort: scan UWorld for a slot whose GI chain validates. */
 static uintptr_t GiFromScanRung(uintptr_t world)
 {
+    // A miss costs ~224 uncached reads plus validation of every usable slot. It
+    // ran on every tick while the GI was unknown, so retry it on a cadence.
+    static constexpr auto kGiScanRetry = std::chrono::milliseconds(1500);
+    static uintptr_t s_missWorld = 0;
+    static std::chrono::steady_clock::time_point s_nextTry{};
+    const auto now = std::chrono::steady_clock::now();
+    if (world == s_missWorld && now < s_nextTry)
+        return 0;
+
     uintptr_t loose = 0;
     for (std::ptrdiff_t off = 0x80; off <= 0x700; off += 0x8) {
         if (off == Offsets::OwningGameInstance || off == 0x3B0)
@@ -815,7 +809,484 @@ static uintptr_t GiFromScanRung(uintptr_t world)
         if (!loose && ValidateGameInstance(gi, nullptr, nullptr, world))
             loose = gi;
     }
-    return loose;
+    if (loose) {
+        s_missWorld = 0;
+        return loose;
+    }
+    s_missWorld = world;
+    s_nextTry = std::chrono::steady_clock::now() + kGiScanRetry;
+    return 0;
+}
+
+// Rate-limited record of the LocalPlayers array a GI candidate presented, so a
+// live raid log shows the real pointer/count instead of only the reject label.
+static void LogLpArrayReject(uintptr_t gi, uintptr_t arrData, int32_t num, int32_t max, const char* reason)
+{
+    static std::chrono::steady_clock::time_point s_nextLog{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now < s_nextLog)
+        return;
+    s_nextLog = now + std::chrono::seconds(2);
+    std::ostringstream f;
+    f << "{\"ev\":\"gi_lp_array_reject\",\"reason\":\"" << reason
+      << "\",\"gi\":" << gi << ",\"arr\":" << arrData
+      << ",\"num\":" << num << ",\"max\":" << max << "}\n";
+    EntityDiagnostics::LogRaw(f.str());
+}
+
+// Names the first check a GameInstance candidate fails, mirroring the gates in
+// ValidateGameInstance, so the TLS rung log says *why* a candidate was rejected.
+static const char* GiRejectReason(uintptr_t gi)
+{
+    if (!gi)
+        return "null";
+    if (!IsUsableObjectPtr(gi))
+        return "not_usable_ptr";
+    if (Engine::LooksLikeUtf16Garbage(gi))
+        return "utf16_garbage";
+    if (IsModuleSpace(gi))
+        return "module_space";
+    const uintptr_t arrData = Memory::read<uintptr_t>(gi + Offsets::LocalPlayers);
+    const int32_t num = Memory::read<int32_t>(gi + Offsets::LocalPlayers + 8);
+    const int32_t max = Memory::read<int32_t>(gi + Offsets::LocalPlayers + 12);
+    if (!IsUsableObjectPtr(arrData) || IsModuleSpace(arrData)) {
+        LogLpArrayReject(gi, arrData, num, max, "lp_array_data_bad");
+        return "lp_array_data_bad";
+    }
+    if (num < 1 || num > 4) {
+        LogLpArrayReject(gi, arrData, num, max, "lp_num_out_of_range");
+        return "lp_num_out_of_range";
+    }
+    if (max < num || max > 4)
+        return "lp_max_out_of_range";
+    bool anySlot = false;
+    for (int i = 0; i < num; ++i) {
+        const uintptr_t slot =
+            Memory::read<uintptr_t>(arrData + static_cast<size_t>(i) * sizeof(uintptr_t));
+        if (IsUsableObjectPtr(slot)) {
+            anySlot = true;
+            break;
+        }
+    }
+    if (!anySlot)
+        return "lp_slots_unusable";
+    return "lp_slots_rejected";
+}
+
+// ── GameInstance rung: the per-thread TLS block ──────────────────────────────
+// There is no GameInstance pointer in UWorld on this build. The arc capture
+// (sdk/arc_decrypt_export.json) swept UWorld +0x8..+0x800 for a plain pointer and
+// for an encoded one and recorded "not found" for both, and the engine sweep
+// (+0x8..+0x2000) found none either — so a GI that is only reachable from the
+// world is exactly the rung that cannot answer here. What does is the TLS group of
+// the thread that created the GameInstance: Core/NameCrypto.hpp carries the
+// v20261009 / CL-1424961 layout (validity flag at +0xEC0, stage-A blocks from
+// +0xED0, 8 x 0x80 stride, GI at block #2 + 0x18 via that block's vtable pointer).
+// Every candidate still has to pass ValidateGameInstance, so a thread whose TLS
+// block belongs to another subsystem, or a build whose layout moved, publishes
+// nothing rather than a plausible-looking number.
+struct GiTlsReader {
+    bool Read(uint64_t addr, void* dst, size_t n) const
+    {
+        return steam_decrypt::MemRead(addr, dst, n);
+    }
+};
+
+// The thread map plus the TLS slot scan cost ~1.1k reads PER THREAD
+// (FindTlsBaseRef walks the whole slot array) across ~170 target threads, so one
+// derivation is seconds of DMA. It used to run inline on the game tick whenever
+// the GameInstance was unknown (hub / pre-pair): one Update then held the shared
+// scan gate for ~7-12s and starved every other scanner — the bot/player blink
+// and the "34s to first ESP". The derivation now runs on a background worker; the
+// rung only reads the published hit and re-proves it with the cheap
+// ValidateGameInstance each tick, so no tick ever blocks on the walk.
+static std::atomic<uintptr_t> g_giTlsHit{ 0 };
+static constexpr uint64_t kTlsRetryMs = 1500;
+
+static uint64_t SteadyMs()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// Worker-only. One full walk of every target thread's TLS block; returns the
+// first GameInstance that validates. Never runs on a game tick, so its seconds
+// of DMA cannot hold the scan gate.
+static bool GiTlsScanOnce(uintptr_t& outGi)
+{
+    outGi = 0;
+    if (!Memory::getProcessID())
+        return false;
+
+    const GiTlsReader reader;
+    // The GameInstance thread is not necessarily the lowest TID, so scan every
+    // thread's TLS block. For each, try the CL-1424961 reference decrypt, then
+    // brute-force the stage-A blocks for a pointer that validates as a GI.
+    const std::vector<uint64_t> tebs = Memory::GetAllTargetTebs();
+    uintptr_t bestTlsBase = 0;
+    int scanned = 0;
+    // One record per thread plus one summary. The logger drops any single line
+    // over 16 KB whole, so one record covering every thread would vanish.
+    auto logSummary = [&](uintptr_t gi) {
+        std::ostringstream s;
+        s << "{\"ev\":\"gi_tls_probe\",\"tebs\":" << tebs.size() << ",\"scanned\":" << scanned
+          << ",\"bestTlsBase\":" << bestTlsBase << ",\"gi\":" << gi << "}\n";
+        EntityDiagnostics::LogRaw(s.str());
+    };
+    for (const uint64_t teb : tebs) {
+        const uintptr_t tlsBase = static_cast<uintptr_t>(
+            namecrypto::FindTlsBaseRef(teb, reader));
+        if (!tlsBase)
+            continue;
+        ++scanned;
+        if (!bestTlsBase)
+            bestTlsBase = tlsBase;
+
+        // Per-thread record: how many candidates were rejected, and by which gate.
+        std::map<std::string, int> rejects;
+        auto check = [&](const char* src, uintptr_t v) -> bool {
+            if (ValidateGameInstance(v, nullptr, nullptr, 0))
+                return true;
+            ++rejects[std::string(src) + ":" + GiRejectReason(v)];
+            return false;
+        };
+        auto probeStageA = [&]() -> uintptr_t {
+            // Brute-force: a plain (or singly-de-referenced) GI pointer anywhere in
+            // the stage-A block group.
+            const uintptr_t stageA = tlsBase + 0xED0;
+            for (int b = 0; b < 8; ++b) {
+                const uintptr_t p = stageA + static_cast<uintptr_t>(b) * 0x80;
+                for (std::ptrdiff_t off = 0; off <= 0x78; off += 8) {
+                    const uintptr_t v = Memory::read_nocache<uintptr_t>(p + off);
+                    if (!IsUsableObjectPtr(v))
+                        continue;
+                    if (check("direct", v))
+                        return v;
+                    const uintptr_t d = Memory::read_nocache<uintptr_t>(v);
+                    if (IsUsableObjectPtr(d) && check("deref", d))
+                        return d;
+                    const uintptr_t d18 = Memory::read_nocache<uintptr_t>(v + 0x18);
+                    if (IsUsableObjectPtr(d18) && check("deref18", d18))
+                        return d18;
+                }
+            }
+            return 0;
+        };
+
+        uint8_t validFlag = 0;
+        reader.Read(tlsBase + 0xEC0, &validFlag, 1);
+
+        uintptr_t found = static_cast<uintptr_t>(
+            namecrypto::DecryptGameInstanceTlsRef(teb, reader));
+        if (!check("ref", found))
+            found = 0;
+        if (!found) {
+            found = static_cast<uintptr_t>(
+                namecrypto::DecryptGameInstanceTls(teb, reader));
+            if (!check("decrypt", found))
+                found = 0;
+        }
+        if (!found)
+            found = probeStageA();
+
+        // One line per thread, so each stays under the logger's per-line cap.
+        std::ostringstream t;
+        t << "{\"ev\":\"gi_tls_thread\",\"teb\":" << teb << ",\"tlsBase\":" << tlsBase
+          << ",\"validFlag\":" << static_cast<int>(validFlag) << ",\"rejects\":{";
+        bool firstReject = true;
+        for (const auto& [key, count] : rejects) {
+            t << (firstReject ? "" : ",") << "\"" << key << "\":" << count;
+            firstReject = false;
+        }
+        t << "}";
+        if (found)
+            t << ",\"gi\":" << found;
+        t << "}\n";
+        EntityDiagnostics::LogRaw(t.str());
+
+        if (found) {
+            outGi = found;
+            logSummary(found);
+            return true;
+        }
+    }
+    logSummary(0);
+    return false;
+}
+
+// Background GameInstance TLS resolver: scans once, publishes the hit, re-proves
+// it cheaply while it holds, and retries the walk after kTlsRetryMs on a miss.
+static void GiTlsWorker()
+{
+    for (;;) {
+        const uintptr_t hit = g_giTlsHit.load(std::memory_order_acquire);
+        if (hit) {
+            if (ValidateGameInstance(hit, nullptr, nullptr, 0)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+            g_giTlsHit.store(0, std::memory_order_release);
+        }
+        uintptr_t found = 0;
+        if (GiTlsScanOnce(found))
+            g_giTlsHit.store(found, std::memory_order_release);
+        else
+            std::this_thread::sleep_for(std::chrono::milliseconds(kTlsRetryMs));
+    }
+}
+
+// The rung is a pure getter now: kick the worker once, then read its published,
+// cheaply re-proved hit. A miss costs one ValidateGameInstance, never the walk.
+static uintptr_t GiFromTlsRung()
+{
+    static std::once_flag s_startOnce;
+    std::call_once(s_startOnce, [] { std::thread(GiTlsWorker).detach(); });
+    const uintptr_t hit = g_giTlsHit.load(std::memory_order_acquire);
+    if (hit && ValidateGameInstance(hit, nullptr, nullptr, 0))
+        return hit;
+    return 0;
+}
+
+// ── GameInstance rung: the GUObjectArray class scan ───────────────────────────
+// No UWorld slot can answer on this build: sdk/arc_decrypt_export.json (runtime
+// capture) swept UWorld +0x8..+0x800 for a plain pointer and for an encoded one
+// and recorded "not found" for both, and the engine sweep (+0x8..+0x2000) found
+// none either — the same reason GiFromScan and the TLS probe are dry here. What
+// the capture *did* resolve the GI through is the object array itself, matched
+// by class (BP_PioneerGameInstance_C). So the deterministic answer to "is there
+// a GameInstance?" is: walk GUObjectArray, keep objects whose *class* name
+// contains "GameInstance", and prove each with its reflected LocalPlayers array
+// (the 0x108 slot is SDK-confirmed). Unlike ValidateGameInstance this proof
+// needs no live controller, so the GI — which exists from engine init, before
+// the match — resolves within seconds of launch. The walk is cursor-based and
+// rate-limited (~82k candidates/s, one chunk at a time), and a hit is re-proved
+// by the class + array check on every tick, so a stale pointer cannot survive a
+// world change. The registry/chunk decode below is the same one the
+// camera-manager fallback (Engine::GetCameraManagerFromActors) proves; it is
+// deliberately self-contained rather than factored, because that walk steps
+// @256 items/500ms and this one needs a ~300x faster cadence to honor the
+// verify panel's 10 s requirement.
+struct GiObjectScanCursor {
+    uint32_t cursor = 0;              // object index since the last decode
+    uintptr_t gi = 0;                 // accepted GameInstance
+    uintptr_t giClass = 0;            // its class ptr (re-proved from, no re-decode)
+    std::unordered_map<uintptr_t, bool> classIsGi;   // class ptr -> match
+    uint32_t classMatches = 0;        // GameInstance-named objects this pass
+    uint32_t arrayRejects = 0;        // ...of which failed the LocalPlayers proof
+    uint32_t readFails = 0;           // failed chunk/item reads this pass
+    uint64_t nextFailLogMs = 0;       // rate limit for read-failure logging
+};
+
+// Memoized class-name filter: the array holds ~642k objects but ~19k distinct
+// classes, so GetActorFNameString (a real name-table walk) runs once per class.
+static uintptr_t GiClassIfMatch(uintptr_t object,
+    std::unordered_map<uintptr_t, bool>& cache)
+{
+    const uintptr_t cls = steam_decrypt::GetActorClassPtr(object);
+    if (!cls)
+        return 0;
+    const auto it = cache.find(cls);
+    if (it != cache.end())
+        return it->second ? cls : 0;
+    const std::string cn = steam_decrypt::GetActorFNameString(cls);
+    const bool match = !cn.empty()
+        && cn.find("GameInstance") != std::string::npos
+        && cn.find("Default__") == std::string::npos
+        && cn.find("Subsystem") == std::string::npos;
+    cache.emplace(cls, match);
+    return match ? cls : 0;
+}
+
+// Cheap identity proof that works before the controller exists: the known-
+// GameInstance class plus a sane reflected LocalPlayers TArray at 0xF8 whose
+// first slots look like LocalPlayer objects (the array exists from engine
+// spawn, so this holds even with no controller yet). It is strictly weaker than
+// ValidateGameInstance (which wants the LP->PC chain and is the gate for every
+// other rung), but it is exactly what engine-spawn-time can provide, and the
+// full chain is re-proved by the normal ladder once the controller is up.
+static bool LooksLikeGameInstanceByClass(uintptr_t gi, uintptr_t giClass)
+{
+    if (!IsUsableObjectPtr(gi) || Engine::LooksLikeUtf16Garbage(gi) || IsModuleSpace(gi))
+        return false;
+    const uintptr_t arrData = Memory::read<uintptr_t>(gi + Offsets::LocalPlayers);
+    const int32_t arrNum = Memory::read<int32_t>(gi + Offsets::LocalPlayers + 8);
+    const int32_t arrMax = Memory::read<int32_t>(gi + Offsets::LocalPlayers + 12);
+    if (!IsUsableObjectPtr(arrData) || IsModuleSpace(arrData)
+        || arrNum < 1 || arrNum > 4 || arrMax < arrNum || arrMax > 4)
+        return false;
+    const int limit = (arrNum > 4) ? 4 : arrNum;
+    for (int i = 0; i < limit; ++i) {
+        const uintptr_t slot =
+            Memory::read<uintptr_t>(arrData + static_cast<size_t>(i) * sizeof(uintptr_t));
+        if (IsUsableObjectPtr(slot) && !Engine::LooksLikeUtf16Garbage(slot))
+            return giClass != 0;
+    }
+    return false;
+}
+
+// Header exits used to be silent, so a scan that never reached its chunk loop
+// looked identical to a scan that ran and found nothing. Rate-limited log.
+static uintptr_t GiObjectScanHeaderFail(const char* stage, uint64_t detail)
+{
+    static uint64_t s_nextLogMs = 0;
+    const uint64_t now = SteadyMs();
+    if (now >= s_nextLogMs) {
+        s_nextLogMs = now + 5000;
+        std::ostringstream f;
+        f << "{\"ev\":\"gi_object_scan_header_fail\",\"stage\":\"" << stage
+          << "\",\"detail\":" << detail << "}\n";
+        EntityDiagnostics::LogRaw(f.str());
+    }
+    return 0;
+}
+
+// Scans one chunk (up to 8192 items) and returns the first accepted
+// GameInstance, or 0. Runs only on the background worker below, so it is not
+// budgeted per tick; the worker owns the cursor exclusively.
+static uintptr_t GiObjectScanStep(GiObjectScanCursor& s)
+{
+    const uint64_t now = SteadyMs();
+
+    const uintptr_t base = Memory::getBaseAddress();
+    uint32_t enc[2]{}, x[2]{}, a[2]{};
+    if (!base)
+        return GiObjectScanHeaderFail("base", 0);
+    // Each read reports its own address so a failing log line names the read.
+    if (!PCIMemory::ReadVirtualMemoryNoCache(base + Offsets::GObjectsRva, enc, sizeof(enc)))
+        return GiObjectScanHeaderFail("gobjects_enc_read", base + Offsets::GObjectsRva);
+    if (!PCIMemory::ReadVirtualMemoryNoCache(base + Offsets::GObjectsKey1Rva, x, sizeof(x)))
+        return GiObjectScanHeaderFail("gobjects_key1_read", base + Offsets::GObjectsKey1Rva);
+    if (!PCIMemory::ReadVirtualMemoryNoCache(base + Offsets::GObjectsKey2Rva, a, sizeof(a)))
+        return GiObjectScanHeaderFail("gobjects_key2_read", base + Offsets::GObjectsKey2Rva);
+    const uintptr_t registry =
+        static_cast<uint64_t>(namecrypto::Rol32(enc[0] ^ x[0], 29) + a[0])
+        | (static_cast<uint64_t>(namecrypto::Rol32(enc[1] ^ x[1], 29) + a[1]) << 32);
+    uint32_t countEnc = 0;
+    uint64_t chunksEnc = 0;
+    if (!Memory::IsValidPtrFast2(registry))
+        return GiObjectScanHeaderFail("registry_ptr", registry);
+    if (!ReadComplete(registry + 0x14, countEnc)
+        || !ReadComplete(registry + 0x20, chunksEnc))
+        return GiObjectScanHeaderFail("registry_read", registry);
+    const uint32_t count = _byteswap_ulong(countEnc ^ 0xA4E88268u);
+    const uintptr_t chunks = _byteswap_uint64(chunksEnc ^ 0x26D0446400000000ULL);
+    if (count < 1 || count > 2000000)
+        return GiObjectScanHeaderFail("count", count);
+    if (!Memory::IsValidPtrFast2(chunks))
+        return GiObjectScanHeaderFail("chunks_ptr", chunks);
+
+    if (s.cursor >= count) {
+        // A full pass finished with no hit: log it so a "GI still red after 10 s"
+        // report can tell "scan never completed" from "scan completed, no match".
+        std::ostringstream f;
+        f << "{\"ev\":\"gi_object_scan_pass\",\"count\":" << count
+          << ",\"classMatches\":" << s.classMatches
+          << ",\"arrayRejects\":" << s.arrayRejects
+          << ",\"readFails\":" << s.readFails << "}\n";
+        EntityDiagnostics::LogRaw(f.str());
+        s.classMatches = 0;
+        s.arrayRejects = 0;
+        s.readFails = 0;
+        s.cursor = 0;
+    }
+    constexpr uint32_t kItemsPerChunk = 0x10000;
+    const uint32_t capacity = kItemsPerChunk - (s.cursor % kItemsPerChunk);
+    const uint32_t n = (std::min)(8192u, (std::min)(count - s.cursor, capacity));
+    uintptr_t chunk = 0;
+    if (!ReadComplete(chunks + (s.cursor / kItemsPerChunk) * 8, chunk)
+        || !Memory::IsValidPtrFast2(chunk)) {
+        ++s.readFails;
+        if (now >= s.nextFailLogMs) {
+            s.nextFailLogMs = now + 5000;
+            std::ostringstream f;
+            f << "{\"ev\":\"gi_object_scan_read_fail\",\"stage\":\"chunk\",\"cursor\":" << s.cursor << "}\n";
+            EntityDiagnostics::LogRaw(f.str());
+        }
+        s.cursor = 0;
+        return 0;
+    }
+    std::vector<uint8_t> items(static_cast<size_t>(n) * 24);
+    if (!PCIMemory::ReadVirtualMemoryNoCache(
+            chunk + static_cast<size_t>(s.cursor % kItemsPerChunk) * 24,
+            items.data(), items.size())) {
+        ++s.readFails;
+        if (now >= s.nextFailLogMs) {
+            s.nextFailLogMs = now + 5000;
+            std::ostringstream f;
+            f << "{\"ev\":\"gi_object_scan_read_fail\",\"stage\":\"items\",\"cursor\":" << s.cursor << "}\n";
+            EntityDiagnostics::LogRaw(f.str());
+        }
+        return 0;
+    }
+    const uint32_t batchBase = s.cursor;
+    s.cursor += n;
+
+    for (uint32_t i = 0; i < n; ++i) {
+        for (const std::ptrdiff_t off : { std::ptrdiff_t{8}, std::ptrdiff_t{0} }) {
+            uintptr_t object = 0;
+            std::memcpy(&object,
+                items.data() + static_cast<size_t>(i) * 24 + off, sizeof(object));
+            if (!IsUsableObjectPtr(object))
+                continue;
+            const uintptr_t cls = GiClassIfMatch(object, s.classIsGi);
+            if (!cls)
+                continue;
+            ++s.classMatches;
+            if (!LooksLikeGameInstanceByClass(object, cls)) {
+                ++s.arrayRejects;
+                continue;
+            }
+            std::ostringstream f;
+            f << "{\"ev\":\"gi_object_scan_hit\",\"gi\":" << object
+              << ",\"cls\":" << cls << ",\"index\":" << (s.cursor - n + i) << "}\n";
+            EntityDiagnostics::LogRaw(f.str());
+            s.gi = object;
+            s.giClass = cls;
+            return object;
+        }
+    }
+    return 0;
+}
+
+// Published result of the background scan. Written only by the worker thread;
+// the game-tick rung just reads it, so a scan never blocks a tick.
+static std::atomic<uintptr_t> g_giObjectScanHit{ 0 };
+
+// Background GameInstance scan: runs chunks back-to-back at DMA speed, yields
+// briefly between chunks, rechecks an accepted GI every 250 ms, and restarts
+// the pass (after a short pause) when it is invalidated or no GI is found.
+static void GiObjectScanWorker()
+{
+    GiObjectScanCursor s;
+    for (;;) {
+        if (s.gi) {
+            if (LooksLikeGameInstanceByClass(s.gi, s.giClass)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                continue;
+            }
+            g_giObjectScanHit.store(0, std::memory_order_release);
+            s = GiObjectScanCursor{};
+        }
+        const uint32_t before = s.cursor;
+        const uintptr_t hit = GiObjectScanStep(s);
+        if (hit) {
+            g_giObjectScanHit.store(hit, std::memory_order_release);
+            continue;
+        }
+        // No progress means a header or chunk read failed: back off so a dead
+        // scan does not hammer DMA. Progress just yields to other threads.
+        if (s.cursor == before || s.cursor == 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        else
+            std::this_thread::yield();
+    }
+}
+
+static uintptr_t GiFromObjectScanRung()
+{
+    static std::once_flag s_startOnce;
+    std::call_once(s_startOnce, [] { std::thread(GiObjectScanWorker).detach(); });
+    return g_giObjectScanHit.load(std::memory_order_acquire);
 }
 
 uintptr_t Engine::ResolveGameStateFromWorld(uintptr_t uworldAddr)
@@ -901,6 +1372,23 @@ uintptr_t Engine::ResolveLocalPlayerFromController(uintptr_t playerController,
     //    plain-pointer scan below could never find it on this build. Decrypt,
     //    then demand the 0xA0 back-pointer as identity proof.
     const uintptr_t decrypted = PlayerLink::FromController(playerController);
+    {
+        // Rate-limited probe: raw PC+0x4B0, decrypted LP, and LP+0xA0 back-ref.
+        static uint64_t s_lpProbeNextMs = 0;
+        const uint64_t probeNow = SteadyMs();
+        if (probeNow >= s_lpProbeNextMs) {
+            s_lpProbeNextMs = probeNow + 5000;
+            const uintptr_t raw = Memory::read<uintptr_t>(playerController + 0x4B0);
+            const uintptr_t back = IsUsableObjectPtr(decrypted)
+                ? Memory::read<uintptr_t>(decrypted + 0xA0) : 0;
+            std::ostringstream f;
+            f << "{\"ev\":\"lp_from_controller\",\"pc\":" << playerController
+              << ",\"raw4B0\":" << raw << ",\"decrypted\":" << decrypted
+              << ",\"backA0\":" << back << ",\"backMatches\":"
+              << ((back == playerController) ? "true" : "false") << "}\n";
+            EntityDiagnostics::LogRaw(f.str());
+        }
+    }
     if (IsUsableObjectPtr(decrypted)) {
         if (lpPointsAtPc(decrypted)) {
             if (outRung)
@@ -955,17 +1443,30 @@ static bool PawnHasWorldPosition(uint64_t pawn)
 }
 
 // Dump-verified identity for a player controller.
-//
-// sdk/SDK.txt (20260922) reflects APlayerController::bIsLocalPlayerController at
-// 0xD64 (byte 0xD64, mask 0x1), and Angelscript.PioneerPlayerController — the
+// sdk/sdk.txt (2026-10-09) reflects APlayerController::bIsLocalPlayerController at
+// 0xDB8 (byte 0xDB8, mask 0x1), and Angelscript.PioneerPlayerController — the
 // class this game actually spawns — inherits it at the same offset. That flag is
 // the engine's own "this controller belongs to a local player" bit, set when the
 // controller is created from a ULocalPlayer, so it identifies the local PC on its
 // own: no pawn, no PlayerCameraManager, no FOV heuristics.
-//
-// The one caveat is that a random object read at +0xD64 can have the bit set by
+//    // The one caveat is that a random object read at +0xDB8 can have the bit set by
+
 // chance, so the caller can require a second field (PlayerState) as a cheap
 // "this really is an AController" proof.
+// The flag byte alone is not proof of a PlayerController: other objects carry the
+// same byte. Require a PlayerController ancestor in the object's class chain.
+static bool ObjectIsPlayerControllerClass(uintptr_t object)
+{
+    uintptr_t cls = steam_decrypt::GetActorClassPtr(object);
+    std::unordered_set<uintptr_t> seen;
+    for (int depth = 0; cls && depth < 16 && seen.insert(cls).second; ++depth) {
+        if (steam_decrypt::GetActorFNameString(cls) == "PlayerController")
+            return true;
+        cls = Memory::read<uintptr_t>(cls + Offsets::UStruct_SuperStruct);
+    }
+    return false;
+}
+
 bool Engine::IsLocalPlayerController(uintptr_t pc)
 {
     if (!pc || !Memory::IsValidPtrFast2(pc))
@@ -973,19 +1474,17 @@ bool Engine::IsLocalPlayerController(uintptr_t pc)
 
     const uint8_t flags = Memory::read<uint8_t>(
         pc + Offsets::PlayerController_bIsLocalPlayerController);
-    return (flags & Offsets::PlayerController_bIsLocalPlayerController_Mask) != 0;
+    if ((flags & Offsets::PlayerController_bIsLocalPlayerController_Mask) == 0)
+        return false;
+    return ObjectIsPlayerControllerClass(pc);
 }
 
 bool Engine::IsLocalPlayerControllerConfirmed(uintptr_t pc)
 {
     if (!IsLocalPlayerController(pc))
         return false;
-
-    // AController::PlayerState (Engine.Controller.PlayerState, 0x3D0) is non-null
-    // on every live controller — a live local PC always has one, so this drops the
-    // chance-coincidence reads without touching the camera slot.
-    const uintptr_t playerState =
-        Memory::read<uintptr_t>(pc + Offsets::AController_PlayerState);
+    const uintptr_t playerState = Memory::read_nocache<uintptr_t>(
+        pc + Offsets::AController_PlayerState);
     return playerState != 0 && Memory::IsValidPtrFast2(playerState);
 }
 
@@ -1130,57 +1629,78 @@ bool Engine::ResolveLocalPlayerChainFromActors(uintptr_t persistentLevel, uintpt
 
     const int scanLimit = (actorCount < 2048) ? actorCount : 2048;
 
-    // Pass 0: dump-verified identity. APlayerController::bIsLocalPlayerController
-    // (0xD64) is the engine's own flag and the 20260922 dump reflects it for the
-    // class this game actually spawns (Angelscript.PioneerPlayerController), so it
-    // outranks every heuristic (camera FOV, name sniffing). PlayerState proves the
-    // actor is an AController; a placed pawn is a bonus, not a requirement, so a
-    // hub/lobby controller with no pawn still resolves.
-    uintptr_t flagPcNoPawn = 0;
-    for (int i = 0; i < scanLimit; ++i) {
+    // Single rotating, time-budgeted sweep with all three identity checks per
+    // actor, in priority order:
+    //   (1) dump-verified bIsLocalPlayerController (0xDB8) — engine's own flag,
+    //       outranks every heuristic; PlayerState proves AController; a pawned
+    //       controller is preferred but a hub/lobby one with no pawn still counts.
+    //   (2) PCM @ PC+0x48 (backup strong path).
+    //   (3) class-name sniff (last resort).
+    // The original ran three independent full ~2k-actor passes on EACH 16ms
+    // Update tick. Every per-actor property read is a DMA round-trip, so while
+    // the controller was unresolvable (party/enter wait, cold cache) one Update
+    // call held the shared scan gate ~9-12s and starved RobotList/EntityList —
+    // the "34s to first bot ESP" and bots/players blinking out. Capping the
+    // sweep by wall time keeps the gate open; the cheap flag check still answers
+    // as soon as the local controller's actor falls inside a window.
+    static int s_cursor = 0;
+    if (s_cursor < 0 || s_cursor >= scanLimit)
+        s_cursor = 0;
+    static uintptr_t s_noPawnPc = 0;
+    const bool constsOk = InitConsts();
+    const uint64_t deadline = SteadyMs() + 40;
+    int i = s_cursor;
+    for (; i < scanLimit; ++i) {
+        if (SteadyMs() >= deadline)
+            break;
         const uint64_t actor = actors[static_cast<size_t>(i)];
-        if (!actor || !Engine::IsValidPointer(actor))
-            continue;
-        if (!Engine::IsLocalPlayerControllerConfirmed(actor))
+        if (!actor || !IsValidPointer(actor))
             continue;
 
-        const uintptr_t pawn = Engine::ReadAcknowledgedPawn(actor);
-        if (pawn && Engine::IsValidPointer(pawn) && PawnHasWorldPosition(pawn)) {
-            outController = actor;
-            outPawn = pawn;
-            return true;
-        }
-        if (!flagPcNoPawn)
-            flagPcNoPawn = actor;
-    }
-    if (flagPcNoPawn) {
-        outController = flagPcNoPawn;
-        const uintptr_t pawn = Engine::ReadAcknowledgedPawn(flagPcNoPawn);
-        outPawn = (pawn && Engine::IsValidPointer(pawn)) ? pawn : 0;
-        return true;
-    }
-
-    // Pass 1: controllers with valid PCM @ PC+0x48 (backup strong path).
-    for (int i = 0; i < scanLimit; ++i) {
-        const uint64_t actor = actors[static_cast<size_t>(i)];
-        if (TryControllerAndPawn(actor, outController, outPawn, true))
-            return true;
-    }
-
-    if (InitConsts()) {
-        for (int i = 0; i < scanLimit; ++i) {
-            const uint64_t actor = actors[static_cast<size_t>(i)];
-            if (!actor || !IsValidPointer(actor))
-                continue;
-
-            const std::string fname = GetActorFNameString(actor);
-            if (fname.find("PioneerPlayerController") == std::string::npos
-                && fname.find("BP_PioneerPlayerController") == std::string::npos)
-                continue;
-
-            if (TryControllerAndPawn(actor, outController, outPawn, true))
+        // (1) dump-verified identity: the engine's own local-controller flag.
+        if (IsLocalPlayerControllerConfirmed(actor)) {
+            const uintptr_t pawn = ReadAcknowledgedPawn(actor);
+            if (pawn && IsValidPointer(pawn) && PawnHasWorldPosition(pawn)) {
+                outController = actor;
+                outPawn = pawn;
+                s_noPawnPc = 0;
+                s_cursor = (i + 1 >= scanLimit) ? 0 : i + 1;
                 return true;
+            }
+            if (!s_noPawnPc)
+                s_noPawnPc = actor;
         }
+
+        // (2) PCM @ PC+0x48.
+        if (TryControllerAndPawn(actor, outController, outPawn, true)) {
+            s_noPawnPc = 0;
+            s_cursor = (i + 1 >= scanLimit) ? 0 : i + 1;
+            return true;
+        }
+
+        // (3) class-name sniff (last resort).
+        if (constsOk) {
+            const std::string fname = GetActorFNameString(actor);
+            if (fname.find("PioneerPlayerController") != std::string::npos
+                || fname.find("BP_PioneerPlayerController") != std::string::npos) {
+                if (TryControllerAndPawn(actor, outController, outPawn, true)) {
+                    s_noPawnPc = 0;
+                    s_cursor = (i + 1 >= scanLimit) ? 0 : i + 1;
+                    return true;
+                }
+            }
+        }
+    }
+    const bool wrapped = (i >= scanLimit);
+    s_cursor = wrapped ? 0 : i;
+    // A no-pawn flagged controller is only reported after a full sweep found no
+    // pawned one, so a mid-array window cannot shadow the real local controller.
+    if (wrapped && s_noPawnPc) {
+        outController = s_noPawnPc;
+        const uintptr_t pawn = ReadAcknowledgedPawn(s_noPawnPc);
+        outPawn = (pawn && IsValidPointer(pawn)) ? pawn : 0;
+        s_noPawnPc = 0;
+        return true;
     }
 
     return false;
@@ -1189,183 +1709,100 @@ bool Engine::ResolveLocalPlayerChainFromActors(uintptr_t persistentLevel, uintpt
 uintptr_t Engine::GetCameraManagerFromActors(uintptr_t worldOverride,
     uintptr_t levelOverride, uintptr_t pcOverride)
 {
-	// Camera discovery is called by Update, the camera worker, and frame building.
-	// Serialize the scan/cache so the static generation-scoped pointer is not
-	// raced by concurrent readers.
-	static std::mutex s_pcmMutex;
-	std::lock_guard<std::mutex> pcmLock(s_pcmMutex);
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    static uint64_t oldGeneration = UINT64_MAX;
+    static uintptr_t cached = 0;
+    static uint32_t cursor = 0;
+    static auto nextScan = std::chrono::steady_clock::time_point{};
+    const uint64_t generation = m_worldGeneration.load(std::memory_order_acquire);
+    if (generation != oldGeneration) {
+        oldGeneration = generation; cached = 0; cursor = 0; nextScan = {};
+    }
+    if (cached && CameraManagerClass(cached) && PcmLivePovLooksSane(cached)) return cached;
+    cached = 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < nextScan) return 0;
+    nextScan = now + std::chrono::milliseconds(500);
+    uintptr_t world = worldOverride, level = levelOverride, pc = pcOverride;
+    {
+        std::shared_lock<std::shared_mutex> stateLock(m_stateMutex);
+        if (!world) world = GWorld;
+        if (!level) level = PersistentLevel;
+        if (!pc) pc = PlayerController;
+    }
+    InitConsts();
+    auto accept = [&](uintptr_t object) {
+        if (!Memory::IsValidPtrFast2(object) || !CameraManagerClass(object)) return false;
+        const std::string name = GetActorFNameString(object);
+        if (name.empty() || name.find("Default__") != std::string::npos) return false;
+        const uintptr_t owner = Memory::read_nocache<uintptr_t>(object + Offsets::PCOwner);
+        std::ostringstream fs;
+        fs << "{\"ev\":\"camera_manager_candidate\",\"pcm\":" << object
+           << ",\"owner\":" << owner << ",\"pc\":" << pc << "}\n";
+        EntityDiagnostics::LogRaw(fs.str());
+        // The reference finds the local PlayerCameraManager by class alone and
+        // reads its plain POV. This is a local client with exactly one camera
+        // manager, and the manager's PCOwner back-ref is codec-protected on this
+        // build (it reads zero), so demanding owner == pc rejected the genuine
+        // manager every tick and left PCM=none. Class + sane POV is enough.
+        if (!PcmLivePovLooksSane(object)) return false;
+        cached = object;
+        return true;
+    };
+    std::vector<uint64_t> actors;
+    WorldScan::CollectLevelActors(world, level, actors);
+    for (uint64_t object : actors) if (accept(static_cast<uintptr_t>(object))) return cached;
 
-	// help/esp.txt: FName PCM over all Levels; LP not required; prefer PCOwner match;
-	// live POV FOV + location sanity (not DefaultFOV-only / FOV-scan).
-	uintptr_t pc = pcOverride;
-	uintptr_t gworld = worldOverride;
-	uintptr_t persistent = levelOverride;
-	if (!pc || !gworld || !persistent) {
-		std::shared_lock<std::shared_mutex> lock(m_stateMutex);
-		if (!pc)
-			pc = PlayerController;
-		if (!gworld)
-			gworld = GWorld;
-		if (!persistent)
-			persistent = PersistentLevel;
-	}
-	uintptr_t pcmDirect = 0;
-	if (pc) {
-		pcmDirect = Memory::read_nocache<uintptr_t>(pc + Offsets::APlayerCameraManager);
-		const uintptr_t owner = pcmDirect
-			? Memory::read_nocache<uintptr_t>(pcmDirect + Offsets::PCOwner)
-			: 0;
-		if (pcmDirect && IsValidPointer(pcmDirect)
-			&& PcmLivePovLooksSane(pcmDirect)
-			&& (!owner || owner == pc))
-			return pcmDirect;
-	}
-
-	// Cache only within one world generation. Pointer validity alone is not
-	// enough: freed actors can leave a numerically valid stale address behind.
-	static uintptr_t s_cachedPcm = 0;
-	static uint64_t s_cachedGeneration = UINT64_MAX;
-	const uint64_t generation = m_worldGeneration.load(std::memory_order_acquire);
-	if (s_cachedGeneration != generation) {
-		s_cachedGeneration = generation;
-		s_cachedPcm = 0;
-	}
-	if (s_cachedPcm && IsValidPointer(s_cachedPcm)
-		&& PcmLivePovLooksSane(s_cachedPcm)) {
-		const uintptr_t owner = Memory::read_nocache<uintptr_t>(
-			s_cachedPcm + Offsets::PCOwner);
-		if (!pc || !owner || owner == pc)
-			return s_cachedPcm;
-		s_cachedPcm = 0;
-	}
-
-	std::vector<uint64_t> actors;
-	WorldScan::CollectLevelActors(gworld, persistent, actors);
-	if (actors.empty()) {
-		const uintptr_t owner = pcmDirect
-			? Memory::read_nocache<uintptr_t>(pcmDirect + Offsets::PCOwner)
-			: 0;
-		return pcmDirect && IsValidPointer(pcmDirect)
-			&& PcmLivePovLooksSane(pcmDirect)
-			&& (!pc || !owner || owner == pc) ? pcmDirect : 0;
-	}
-
-	const bool fnameReady = InitConsts();
-	uintptr_t ownedHit = 0;
-	uintptr_t fnameHit = 0;
-
-	// One-shot diagnostic: log first 10 actor class names + probe PCM offsets on first 5
-	{
-		static bool s_diagDone = false;
-		if (!s_diagDone && fnameReady && !actors.empty()) {
-			s_diagDone = true;
-			std::ofstream diag(kArcDebugLogPath, std::ios::app);
-			int logged = 0;
-			const int limit = (actors.size() < 10) ? (int)actors.size() : 10;
-			for (int idx = 0; idx < limit; ++idx) {
-				const uintptr_t cand = static_cast<uintptr_t>(actors[idx]);
-				if (cand && IsValidPointer(cand)) {
-					std::string cn = GetActorClassFName(cand);
-					std::string fn = GetActorFNameString(cand);
-					diag << "actor_class class=" << cn << " fname=" << fn
-						<< " addr=" << cand << std::endl;
-					++logged;
-				}
-			}
-			int probed = 0;
-			const int probeLimit = (actors.size() < 5) ? (int)actors.size() : 5;
-			for (int idx = 0; idx < probeLimit; ++idx) {
-				const uintptr_t cand = static_cast<uintptr_t>(actors[idx]);
-				if (!cand || !IsValidPointer(cand)) continue;
-				const float fov = Memory::read_nocache<float>(cand + Offsets::CameraPOV_FOV);
-				const float defFov = Memory::read_nocache<float>(cand + Offsets::DefaultFOV);
-				const float fov4C8 = Memory::read_nocache<float>(cand + 0x4C8);
-				const float fovCA0 = Memory::read_nocache<float>(cand + 0xCA0);
-				const uintptr_t pcOwner = Memory::read_nocache<uintptr_t>(cand + Offsets::PCOwner);
-				diag << "pcm_probe addr=" << std::hex << cand << std::dec
-					<< " fov@510=" << fov
-					<< " defFov@3E8=" << defFov
-					<< " fov@4C8=" << fov4C8
-					<< " fov@CA0=" << fovCA0
-					<< " pcOwner@3D0=" << pcOwner
-					<< " class=" << GetActorClassFName(cand)
-					<< std::endl;
-				++probed;
-			}
-		}
-	}
-
-	auto classOrInstanceIsPcm = [&](uintptr_t candidate) -> bool {
-		if (!fnameReady)
-			return false;
-		std::string cn = GetActorClassFName(candidate);
-		if (cn.find("PlayerCameraManager") != std::string::npos
-			|| cn.find("CameraManager") != std::string::npos)
-			return true;
-		const std::string fn = GetActorFNameString(candidate);
-		return fn.find("PlayerCameraManager") != std::string::npos
-			|| fn.find("CameraManager") != std::string::npos;
-	};
-
-	int pcmNameHits = 0;
-	int pcmValidationFails = 0;
-	for (uint64_t a : actors) {
-		const uintptr_t candidate = static_cast<uintptr_t>(a);
-		if (!candidate || !IsValidPointer(candidate))
-			continue;
-		if (!classOrInstanceIsPcm(candidate))
-			continue;
-		++pcmNameHits;
-		if (!PcmLivePovLooksSane(candidate)) {
-			++pcmValidationFails;
-			continue;
-		}
-
-		const uintptr_t owner = Memory::read_nocache<uintptr_t>(
-			candidate + Offsets::PCOwner);
-		if (pc && owner == pc)
-			return candidate;
-		if (owner && Memory::IsValidPtrFast2(owner)) {
-			const uintptr_t pawn = Engine::ReadAcknowledgedPawn(owner);
-			if (pawn && Memory::IsValidPtrFast2(pawn) && PawnHasWorldPosition(pawn)
-				&& !ownedHit)
-				ownedHit = candidate;
-		} else if (!fnameHit) {
-			fnameHit = candidate;
-		}
-	}
-
-	if (ownedHit) {
-		s_cachedPcm = ownedHit;
-		return ownedHit;
-	}
-	if (fnameHit) {
-		s_cachedPcm = fnameHit;
-		return fnameHit;
-	}
-	// Log PCM discovery failure details (one-shot per generation)
-	{
-		static uint64_t s_lastLogGen = UINT64_MAX;
-		if (s_lastLogGen != generation) {
-			s_lastLogGen = generation;
-			std::ofstream diag(kArcDebugLogPath, std::ios::app);
-			diag << "pcm_not_found actors=" << actors.size()
-				<< " nameHits=" << pcmNameHits
-				<< " validationFails=" << pcmValidationFails
-				<< " fnameReady=" << fnameReady
-				<< " pc=" << pc << std::endl;
-		}
-	}
-	if (pcmDirect && IsValidPointer(pcmDirect)
-		&& PcmLivePovLooksSane(pcmDirect)) {
-		const uintptr_t owner = Memory::read_nocache<uintptr_t>(
-			pcmDirect + Offsets::PCOwner);
-		if (!pc || !owner || owner == pc) {
-			s_cachedPcm = pcmDirect;
-			return pcmDirect;
-		}
-	}
-	return 0;
+    // SDK1 CL-1424961 GUObjectArray variant. Unlike the stale generic offsets,
+    // this source specifies ROL29, count+0x14, and the chunk pointer cipher.
+    const uintptr_t base = Memory::getBaseAddress();
+    uint32_t enc[2]{}, x[2]{}, a[2]{};
+    if (!base || !PCIMemory::ReadVirtualMemoryNoCache(base + 0x10E423D0, enc, sizeof(enc))
+        || !PCIMemory::ReadVirtualMemoryNoCache(base + 0xD538AA0, x, sizeof(x))
+        || !PCIMemory::ReadVirtualMemoryNoCache(base + 0xD538AB0, a, sizeof(a))) return 0;
+    const uintptr_t registry = static_cast<uint64_t>(namecrypto::Rol32(enc[0] ^ x[0], 29) + a[0])
+        | (static_cast<uint64_t>(namecrypto::Rol32(enc[1] ^ x[1], 29) + a[1]) << 32);
+    static auto lastAnchorLog = std::chrono::steady_clock::time_point{};
+    if (now - lastAnchorLog >= std::chrono::seconds(5)) {
+        lastAnchorLog = now;
+        std::ostringstream f;
+        f << "{\"ev\":\"camera_registry_anchor\",\"registry\":" << registry
+          << ",\"actors\":" << actors.size() << "}\n";
+        EntityDiagnostics::LogRaw(f.str());
+    }
+    uint32_t countEnc = 0; uint64_t chunksEnc = 0;
+    if (!Memory::IsValidPtrFast2(registry)
+        || !ReadComplete(registry + 0x14, countEnc) || !ReadComplete(registry + 0x20, chunksEnc)) return 0;
+    const uint32_t count = _byteswap_ulong(countEnc ^ 0xA4E88268u);
+    const uintptr_t chunks = _byteswap_uint64(chunksEnc ^ 0x26D0446400000000ULL);
+    static auto lastRegistryLog = std::chrono::steady_clock::time_point{};
+    if (now - lastRegistryLog >= std::chrono::seconds(5)) {
+        lastRegistryLog = now;
+        std::ostringstream f;
+        f << "{\"ev\":\"camera_registry\",\"registry\":" << registry
+          << ",\"count\":" << count << ",\"chunks\":" << chunks << ",\"cursor\":" << cursor << "}\n";
+        EntityDiagnostics::LogRaw(f.str());
+    }
+    if (!count || count > 2000000 || !Memory::IsValidPtrFast2(chunks)) return 0;
+    if (cursor >= count) cursor = 0;
+    const uint32_t n = (std::min)(256u, (std::min)(count - cursor, 65536u - cursor % 65536u));
+    uintptr_t chunk = 0;
+    if (!ReadComplete(chunks + (cursor / 65536u) * 8, chunk) || !Memory::IsValidPtrFast2(chunk)) return 0;
+    std::vector<uint8_t> items(static_cast<size_t>(n) * 24);
+    if (!PCIMemory::ReadVirtualMemoryNoCache(chunk + static_cast<size_t>(cursor % 65536u) * 24,
+            items.data(), items.size())) return 0;
+    cursor += n;
+    for (uint32_t i = 0; i < n; ++i) {
+        // SDK1's preamble and constants disagree about item+0 versus item+8.
+        // Both candidates must pass the same class and local-owner proof.
+        for (size_t off : { size_t(0), size_t(8) }) {
+            uintptr_t object = 0;
+            std::memcpy(&object, items.data() + static_cast<size_t>(i) * 24 + off, sizeof(object));
+            if (accept(object)) return cached;
+        }
+    }
+    return 0;
 }
 
 // SHARED GATE — grep callers before edit
@@ -2193,7 +2630,7 @@ static void AddCrateItemContainerCandidate(
     if (!IsUsableObjectPtr(candidate) || !seen.insert(candidate).second)
         return;
     const std::string cls = engine.GetActorClassFName(candidate);
-    const std::string lower = ToLowerCopy(cls);
+    const std::string lower = StringUtils::ToLowerCopy(cls);
     if (lower.find("itemcontainercomponent") != std::string::npos
         || engine.ResolveOwningActor(candidate, 3) == actor)
         components.push_back(candidate);
@@ -2458,14 +2895,14 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
 
     // Primary: iterate CurrentItemActors TArray @ 0x4B0 (SDK CL-1341255).
     {
-        auto tryItemArray = [&](std::ptrdiff_t arrOff) {
+        auto tryItemArray = [&](std::ptrdiff_t arrOff, size_t stride) {
             const uint64_t data = Memory::read<uint64_t>(invComp + arrOff);
             const int32_t count = Memory::read<int32_t>(invComp + arrOff + 0x8);
             if (!data || count <= 0 || count > 64)
                 return;
             for (int32_t i = 0; i < count; ++i) {
                 const uintptr_t itemActor = Memory::read<uintptr_t>(
-                    static_cast<uintptr_t>(data) + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
+                    static_cast<uintptr_t>(data) + static_cast<uintptr_t>(i) * stride);
                 const uintptr_t resolved = ResolveInventoryPtr(itemActor);
                 if (!resolved)
                     continue;
@@ -2489,9 +2926,10 @@ void Engine::ReadPlayerInventory(uintptr_t pawn, std::string& outWeaponName, int
                 return;
             }
         };
-        tryItemArray(Offsets::CurrentItemActors);
+        // CurrentItemActors is InventoryItemActor[0x20]; local array holds pointers.
+        tryItemArray(Offsets::CurrentItemActors, 0x20);
         if (!IsPlayerWeaponEspLabel(outWeaponName))
-            tryItemArray(Offsets::LocalCurrentItemActors);
+            tryItemArray(Offsets::LocalCurrentItemActors, sizeof(uintptr_t));
     }
 
     // Fallback name: resolve the actually-held weapon actor (replicated slot
@@ -2962,6 +3400,14 @@ int Engine::ReadBotPartHp(uintptr_t actor, float* out, int cap, int& outDestroye
 
 void Engine::RefreshRadarBounds()
 {
+    const uint64_t generation = m_worldGeneration.load(std::memory_order_acquire);
+    {
+        std::unique_lock<std::shared_mutex> lock(m_radarBoundsMutex);
+        if (m_radarBoundsGeneration != generation)
+            m_miniMapActor = 0;
+        m_radarBoundsValid = false; // every failed refresh invalidates calibration
+        m_radarBoundsGeneration = generation;
+    }
     // AWorldPartitionMiniMap is an AInfo in the level: find it via the cached
     // actor array (worker-side only), at most one rescan per 10s while absent.
     if (!m_miniMapActor || !IsValidPointer(m_miniMapActor)) {
@@ -2991,15 +3437,12 @@ void Engine::RefreshRadarBounds()
     if (!m_miniMapActor)
         return;
 
-    // FBox::Min @ +0x00, FBox::Max @ +0x18 as doubles (LWC). The float layout
-    // is tried when the double block reads as garbage.
-    auto readBounds = [&](bool asDouble) {
+    // SDK1 FBox is double-vector based: Min +0x00, Max +0x18.
+    // Do not reinterpret failed double reads as a speculative float schema.
+    auto readBounds = [&] {
         RadarProjection::Bounds b;
         auto readOff = [&](std::ptrdiff_t off) -> double {
-            return asDouble
-                ? Memory::read_nocache<double>(m_miniMapActor + off)
-                : static_cast<double>(
-                    Memory::read_nocache<float>(m_miniMapActor + off));
+            return Memory::read_nocache<double>(m_miniMapActor + off);
         };
         b.minX = readOff(Offsets::MiniMap_WorldBounds);
         b.minY = readOff(Offsets::MiniMap_WorldBounds + 0x8);
@@ -3007,20 +3450,23 @@ void Engine::RefreshRadarBounds()
         b.maxY = readOff(Offsets::MiniMap_WorldBounds + 0x20);
         return b;
     };
-    RadarProjection::Bounds bounds = readBounds(true);
-    if (!RadarProjection::BoundsPlausible(bounds))
-        bounds = readBounds(false);
+    RadarProjection::Bounds bounds = readBounds();
     // WORLD_UNITS_PER_PIXEL calibrates the map scale - a plausible value is
     // the second proof that this really is the minimap block before the radar
     // trusts its bounds.
-    const float unitsPerPixel = Memory::read_nocache<float>(
+    const int32_t unitsPerPixel = Memory::read_nocache<int32_t>(
         m_miniMapActor + Offsets::MiniMap_UnitsPerPixel);
-    if (!(unitsPerPixel > 0.1f && unitsPerPixel < 10000.f))
+    if (!(unitsPerPixel > 0 && unitsPerPixel < 10000))
         return;
     if (!RadarProjection::BoundsPlausible(bounds))
         return;
     std::unique_lock<std::shared_mutex> lock(m_radarBoundsMutex);
+    if (generation != m_worldGeneration.load(std::memory_order_acquire))
+        return;
     m_radarBounds = bounds;
+    m_radarBoundsStampMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
     m_radarBoundsValid = true;
 }
 
@@ -3036,49 +3482,62 @@ void Engine::RefreshRaidDashboard()
         return;
     s_lastMs.store(nowMs, std::memory_order_relaxed);
 
+    const uint64_t generation = m_worldGeneration.load(std::memory_order_acquire);
+    const uintptr_t gs = AGameStateBase;
+    if (!var::show_raid_hud) {
+        std::unique_lock<std::shared_mutex> lock(m_raidHudMutex);
+        m_raidHud = {};
+    }
+    if (!var::show_objectives) {
+        std::unique_lock<std::shared_mutex> lock(m_objectiveMutex);
+        m_objectives = {};
+    }
     if (var::show_radar)
         RefreshRadarBounds();
+    // Objectives live under the same toggle-independent worker tick as the rest
+    // of the dashboard, so the raid HUD staying off does not starve them.
+    if (var::show_objectives)
+        RefreshObjectives(gs, generation, nowMs);
     if (!var::show_raid_hud)
         return;
 
-    const uintptr_t gs = AGameStateBase;
-    if (!IsUsableObjectPtr(gs))
+    if (!IsUsableObjectPtr(gs)) {
+        std::unique_lock<std::shared_mutex> lock(m_raidHudMutex);
+        m_raidHud = {};
         return;
+    }
 
     RaidHudState st;
-    // FStageInfo is inline at game_state + STAGE_INFO per the drop. When that
-    // block reads as a pointer instead, the deref form is tried before the
-    // clock is declared unknown.
-    st.timeLeftS = Memory::read_nocache<double>(
-        gs + Offsets::GameState_StageInfoRef + Offsets::StageInfo_TimeLeftOff);
-    st.graceS = Memory::read_nocache<double>(
-        gs + Offsets::GameState_StageInfoRef + Offsets::StageInfo_GraceTimeOff);
-    if (!RaidClock::ClockPlausible(st.timeLeftS)) {
-        const uintptr_t stagePtr = Memory::read_nocache<uintptr_t>(
-            gs + Offsets::GameState_StageInfoRef);
-        if (IsUsableObjectPtr(stagePtr)) {
-            const double timeLeft = Memory::read_nocache<double>(
-                stagePtr + Offsets::StageInfo_TimeLeftOff);
-            const double grace = Memory::read_nocache<double>(
-                stagePtr + Offsets::StageInfo_GraceTimeOff);
-            if (RaidClock::ClockPlausible(timeLeft)) {
-                st.timeLeftS = timeLeft;
-                st.graceS = grace;
-            }
-        }
-    }
+    st.worldGeneration = generation;
+    // Current SDK StageInfo is inline. Failed reads remain unknown, not zero;
+    // never reinterpret the inline block as a speculative pointer layout.
+    ReadComplete(gs + Offsets::GameState_StageInfoRef + Offsets::StageInfo_TimeLeftOff,
+        st.timeLeftS);
+    ReadComplete(gs + Offsets::GameState_StageInfoRef + Offsets::StageInfo_GraceTimeOff,
+        st.graceS);
     if (!RaidClock::ClockPlausible(st.timeLeftS))
         st.timeLeftS = -1.0;
     if (!(st.graceS >= 0.0 && st.graceS < 3600.0))
         st.graceS = -1.0;
 
-    st.gamePhase =
-        Memory::read_nocache<int32_t>(gs + Offsets::GameState_GamePhase);
-    st.enemyCount =
-        Memory::read_nocache<int32_t>(gs + Offsets::GameState_EnemyCount);
-    st.pickupCount =
-        Memory::read_nocache<int32_t>(gs + Offsets::GameState_PickupCount);
-    if (!(st.gamePhase >= 0 && st.gamePhase <= 16))
+    uint8_t phase = 0;
+    if (ReadComplete(gs + Offsets::GameState_GamePhase, phase))
+        st.gamePhase = phase;
+    ReadComplete(gs + Offsets::GameState_EnemyCount, st.enemyCount);
+    ReadComplete(gs + Offsets::GameState_PickupCount, st.pickupCount);
+    // Map condition removed - was reading garbage (-1254576712)
+    // st.mapConditionKnown = ReadComplete(gs + Offsets::GameState_MapConditionId, st.mapConditionId);
+    st.mapConditionKnown = false;
+    st.mapConditionId = 0;
+    uintptr_t healthInfo = 0;
+    uint8_t healthStatus = 0;
+    if (ReadComplete(gs + Offsets::GameState_ServerHealthInfo, healthInfo)
+        && IsUsableObjectPtr(healthInfo)
+        && GetActorClassFName(healthInfo).find("ServerHealthInfoComponent") != std::string::npos
+        && ReadComplete(healthInfo + Offsets::ServerHealth_CurrentStatus, healthStatus)
+        && healthStatus <= 2)
+        st.serverHealthStatus = healthStatus;
+    if (!(st.gamePhase >= 0 && st.gamePhase <= 4))
         st.gamePhase = -1;
     if (!(st.enemyCount >= 0 && st.enemyCount <= 100000))
         st.enemyCount = -1;
@@ -3086,23 +3545,152 @@ void Engine::RefreshRaidDashboard()
         st.pickupCount = -1;
     st.stampMs = nowMs;
     st.valid =
-        st.timeLeftS >= 0.0 || st.enemyCount >= 0 || st.gamePhase >= 0;
+        st.timeLeftS >= 0.0 || st.enemyCount >= 0 || st.gamePhase >= 0
+        || st.serverHealthStatus >= 0;
     {
         std::unique_lock<std::shared_mutex> lock(m_raidHudMutex);
-        m_raidHud = st;
+        if (generation == m_worldGeneration.load(std::memory_order_acquire))
+            m_raidHud = st;
     }
 }
 
 Engine::RaidHudState Engine::GetRaidHud() const
 {
     std::shared_lock<std::shared_mutex> lock(m_raidHudMutex);
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (m_raidHud.worldGeneration != m_worldGeneration.load(std::memory_order_acquire)
+        || nowMs < m_raidHud.stampMs || nowMs - m_raidHud.stampMs > 2000)
+        return {};
     return m_raidHud;
+}
+
+void Engine::RefreshObjectives(uintptr_t gameState, uint64_t generation, uint64_t nowMs)
+{
+    auto clear = [this]() {
+        std::unique_lock<std::shared_mutex> lock(m_objectiveMutex);
+        m_objectives = {};
+    };
+    if (!IsUsableObjectPtr(gameState)) {
+        clear();
+        return;
+    }
+
+    // Every hop is class-checked: an address that merely looks like an object
+    // must not be published as a live objective component.
+    uintptr_t component = 0;
+    if (!ReadComplete(gameState + Offsets::GameState_MainObjectiveComponent, component)
+        || !IsUsableObjectPtr(component)
+        || GetActorClassFName(component).find("MainObjectiveComponent") == std::string::npos) {
+        clear();
+        return;
+    }
+
+    // MainObjectives is a TArray<MainObjectiveEntry*>; only the first entry is
+    // summarised, and only when the header itself is coherent.
+    uintptr_t entries = 0;
+    int32_t entryCount = 0;
+    if (!ReadComplete(component + Offsets::MainObjective_Entries, entries)
+        || !ReadComplete(component + Offsets::MainObjective_Entries + 0x8, entryCount)
+        || entryCount < 1 || entryCount > 16 || !IsUsableObjectPtr(entries)) {
+        clear();
+        return;
+    }
+
+    uintptr_t entry = 0;
+    if (!ReadComplete(entries, entry) || !IsUsableObjectPtr(entry)) {
+        clear();
+        return;
+    }
+
+    ObjectiveBrief::Brief brief;
+    ReadComplete(entry + Offsets::MainObjectiveEntry_ID, brief.objectiveId);
+    if (brief.objectiveId < 0)
+        brief.objectiveId = -1;
+
+    uint8_t state = 0;
+    if (ReadComplete(entry + Offsets::MainObjectiveEntry_State, state)
+        && ObjectiveBrief::StatePlausible(state))
+        brief.state = state;
+
+    int32_t count = -1;
+    int32_t max = -1;
+    int32_t percent = 0;
+    ReadComplete(
+        entry + Offsets::MainObjectiveEntry_Progress + Offsets::ObjectiveProgress_Count,
+        count);
+    ReadComplete(
+        entry + Offsets::MainObjectiveEntry_Progress + Offsets::ObjectiveProgress_Max,
+        max);
+    ReadComplete(
+        entry + Offsets::MainObjectiveEntry_Progress + Offsets::ObjectiveProgress_bIsPercent,
+        percent);
+    if (ObjectiveBrief::ProgressPlausible(count, max)) {
+        brief.progressCount = count;
+        brief.progressMax = max;
+        brief.isPercent = percent != 0;
+    }
+
+    double seconds = -1.0;
+    if (ReadComplete(
+            entry + Offsets::MainObjectiveEntry_Timer + Offsets::ObjectiveTimer_Seconds,
+            seconds)
+        && seconds >= 0.0 && seconds < 86400.0)
+        brief.timerSeconds = seconds;
+    uint8_t timerType = 0;
+    if (ReadComplete(
+            entry + Offsets::MainObjectiveEntry_Timer + Offsets::ObjectiveTimer_Type,
+            timerType)
+        && ObjectiveBrief::TimerTypePlausible(timerType))
+        brief.timerType = timerType;
+
+    // Task entries: count only. Their FText summaries need a resolved text
+    // table and are deliberately not read as raw bytes.
+    uintptr_t tasks = 0;
+    int32_t taskCount = 0;
+    if (ReadComplete(entry + Offsets::MainObjectiveEntry_Tasks, tasks)
+        && ReadComplete(entry + Offsets::MainObjectiveEntry_Tasks + 0x8, taskCount)
+        && taskCount >= 0 && taskCount <= 64 && IsUsableObjectPtr(tasks))
+        brief.taskCount = taskCount;
+
+    // An entry with no usable field is unknown, not an empty objective.
+    const bool anyKnown = brief.objectiveId >= 0 || brief.state >= 0
+        || brief.progressMax >= 0 || brief.timerSeconds >= 0.0 || brief.taskCount >= 0;
+    if (!anyKnown) {
+        clear();
+        return;
+    }
+
+    brief.valid = true;
+    brief.stampMs = nowMs;
+    brief.worldGeneration = generation;
+    std::unique_lock<std::shared_mutex> lock(m_objectiveMutex);
+    if (generation == m_worldGeneration.load(std::memory_order_acquire))
+        m_objectives = brief;
+}
+
+ObjectiveBrief::Brief Engine::GetObjectives() const
+{
+    std::shared_lock<std::shared_mutex> lock(m_objectiveMutex);
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (m_objectives.worldGeneration != m_worldGeneration.load(std::memory_order_acquire)
+        || nowMs < m_objectives.stampMs || nowMs - m_objectives.stampMs > 2000)
+        return {};
+    return m_objectives;
 }
 
 RadarProjection::Bounds Engine::GetRadarBounds(bool& outValid) const
 {
     std::shared_lock<std::shared_mutex> lock(m_radarBoundsMutex);
-    outValid = m_radarBoundsValid;
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    outValid = m_radarBoundsValid
+        && m_radarBoundsGeneration == m_worldGeneration.load(std::memory_order_acquire)
+        && nowMs >= m_radarBoundsStampMs && nowMs - m_radarBoundsStampMs <= 2000;
     return m_radarBounds;
 }
 
@@ -3112,14 +3700,27 @@ void Engine::PushActivity(uint64_t key, const char* text)
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
     std::unique_lock<std::shared_mutex> lock(m_feedMutex);
+    const uint64_t generation = m_worldGeneration.load(std::memory_order_acquire);
+    if (m_feedGeneration != generation) {
+        m_activityFeed = {};
+        m_feedGeneration = generation;
+    }
     m_activityFeed.Push(nowMs, key, text);
     m_activityFeed.Expire(nowMs, 45000);
 }
 
 ActivityFeed::Feed Engine::GetActivityFeed() const
 {
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
     std::shared_lock<std::shared_mutex> lock(m_feedMutex);
-    return m_activityFeed;
+    if (m_feedGeneration != m_worldGeneration.load(std::memory_order_acquire))
+        return {};
+    ActivityFeed::Feed snapshot = m_activityFeed;
+    // Expire the paint snapshot even when no new scanner event arrives.
+    snapshot.Expire(nowMs, 45000);
+    return snapshot;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -3137,13 +3738,32 @@ uintptr_t Engine::ReadWorldSlot(uint64_t base)
         return 0;
     // Bypass the VMM page cache - a stale GWorld slot blocks raid re-entry until
     // the exe is restarted.
-    const uintptr_t slot = Memory::read_nocache<uintptr_t>(
-        base + static_cast<uint64_t>(Offsets::UWorld));
-    // Preserve the literal slot value for the ladder/overlay even when it is
-    // not a valid UWorld pointer. The next rung owns validation; discarding it
-    // here made the documented intermediary dereference unreachable and lied
-    // about the raw value (GWorldRaw became zero).
-    return slot == UINTPTR_MAX ? 0 : slot;
+    auto rawSlot = [base](std::ptrdiff_t rva) -> uintptr_t {
+        const uintptr_t slot = Memory::read_nocache<uintptr_t>(
+            base + static_cast<uint64_t>(rva));
+        return slot == UINTPTR_MAX ? 0 : slot;
+    };
+    // The global is a double deref ([RVA] -> intermediary -> UWorld), so a slot
+    // counts only when it is itself a world or its inner value is one.
+    auto slotLeadsToWorld = [this](uintptr_t slot) -> bool {
+        if (!slot)
+            return false;
+        if (ResolvePersistentLevel(slot))
+            return true;
+        const uintptr_t inner = WorldSlotInner(slot);
+        return inner != 0 && ResolvePersistentLevel(inner) != 0;
+    };
+    // Primary GWorld global for the current build.
+    const uintptr_t primary = rawSlot(Offsets::UWorld);
+    if (slotLeadsToWorld(primary))
+        return primary;
+    // Fallback: the adjacent build's GWorld global, probed only when the primary
+    // slot leads to no live UWorld. The literal primary value is preserved for
+    // the overlay when neither resolves.
+    const uintptr_t alt = rawSlot(Offsets::UWorld_Alt);
+    if (slotLeadsToWorld(alt))
+        return alt;
+    return primary;
 }
 
 uintptr_t Engine::WorldSlotInner(uintptr_t slot)
@@ -3174,7 +3794,7 @@ uintptr_t Engine::ResolvePersistentLevel(uintptr_t world)
     if (!IsPlausibleObjPtr(world))
         return 0;
 
-    const uintptr_t level = Memory::read<uintptr_t>(world + Offsets::PersistentLevel);
+    const uintptr_t level = Memory::read_nocache<uintptr_t>(world + Offsets::PersistentLevel);
     if (LevelLooksOwnedByWorld(level, world))
         return level;
 
@@ -3248,9 +3868,8 @@ uintptr_t Engine::WorldFromGameStateGlobal(uint64_t base)
 
 static bool IsGoodLocalPlayerPtr(uintptr_t lp)
 {
-    return lp != 0 && lp != UINTPTR_MAX
-        && lp >= 0x1000 && lp < 0x7FFFFFFFFFFF
-        && Memory::IsValidPtrFast2(lp);
+    return Engine::IsUsableObjectPtr(lp)
+        && !Engine::LooksLikeUtf16Garbage(lp);
 }
 
 struct LadderHost {
@@ -3307,6 +3926,7 @@ struct LadderHost {
     {
         return GiOwningSlotRung(world, backRef);
     }
+    uintptr_t GiFromTls() { return GiFromTlsRung(); }
     uintptr_t GiFromOuter(uintptr_t lp, PlayerChain::Rung& which)
     {
         return GiFromOuterRung(lp, which);
@@ -3314,11 +3934,42 @@ struct LadderHost {
     uintptr_t GiFromDecrypt(uintptr_t world) { return GiFromDecryptSlot(world); }
     uintptr_t GiFromLegacySlot(uintptr_t world) { return GiFromLegacySlotRung(world); }
     uintptr_t GiFromScan(uintptr_t world) { return GiFromScanRung(world); }
+    uintptr_t GiFromObjectScan() { return GiFromObjectScanRung(); }
     bool IsGameInstance(uintptr_t gi) { return ValidateGameInstance(gi) != 0; }
 
     // ── Controller ──
-    // Dump-verified cache: bIsLocalPlayerController (SDK 0xD64) keeps the PC
+    // Dump-verified cache: bIsLocalPlayerController (SDK 0xDB8) keeps the PC
     // across hub ticks and pawn-less lobbies, where the pair cache cannot hit.
+    bool CachedPcMatchesLocalPlayer(uintptr_t gi, uintptr_t cachedPc)
+    {
+        if (!IsUsableObjectPtr(gi) || Engine::LooksLikeUtf16Garbage(gi)
+            || IsModuleSpace(gi) || !cachedPc)
+            return true; // No trustworthy current GI: preserve normal fallbacks.
+
+        const uintptr_t data = Memory::read_nocache<uintptr_t>(gi + Offsets::LocalPlayers);
+        const int count = Memory::read_nocache<int>(gi + Offsets::LocalPlayers + 8);
+        if (!IsUsableObjectPtr(data) || count <= 0 || count > 16)
+            return true; // An unreadable/empty array is not evidence of staleness.
+
+        bool foundController = false;
+        const int limit = (count > 4) ? 4 : count;
+        for (int i = 0; i < limit; ++i) {
+            const uintptr_t lp = Memory::read_nocache<uintptr_t>(
+                data + static_cast<size_t>(i) * sizeof(uintptr_t));
+            if (!IsGoodLocalPlayerPtr(lp))
+                continue;
+
+            const uintptr_t currentPc = Memory::read_nocache<uintptr_t>(
+                lp + Offsets::LocalPlayer_PlayerController);
+            if (!IsUsableObjectPtr(currentPc))
+                continue;
+            foundController = true;
+            if (currentPc == cachedPc)
+                return true;
+        }
+        return !foundController;
+    }
+
     bool PcFromCachedFlag(uintptr_t cachedPc, uintptr_t& pc)
     {
         if (!cachedPc || !eng.IsValidPointer(cachedPc)
@@ -3394,7 +4045,7 @@ struct LadderHost {
         if (!level || !actorsArr || count <= 0)
             return false;
         uintptr_t scannedPc = 0, scannedPawn = 0;
-        // IsLocalPlayerController is the dump-reflected flag (0xD64): it accepts
+        // IsLocalPlayerController is the dump-reflected flag (0xDB8): it accepts
         // the controller even when the live-pinned PC+0x4D0 camera slot is
         // garbage on this build.
         // A failed scan is not logged here any more: the ladder's own state says
@@ -3474,8 +4125,11 @@ struct LadderHost {
                 || Memory::read<uintptr_t>(lp + Offsets::LocalPlayer_PlayerController) == pc;
             return lp;
         }
-        if (!pc)
-            return 0;
+        // No controller yet (menu / engine spawn): the object-scan rung proved the
+        // GI by this same reflected array (its LocalPlayers@0x108 slots), so the
+        // first good slot is the real menu local player. This only fills the LP
+        // hop early; the controller/pawn hops below still need a live controller
+        // and stay red until the match, exactly as before.
         const uintptr_t arrData = Memory::read<uintptr_t>(gi + Offsets::LocalPlayers);
         const int arrNum = Memory::read<int>(gi + Offsets::LocalPlayers + 8);
         if (!arrData || !Memory::IsValidPtrFast2(arrData) || arrNum <= 0 || arrNum > 16)
@@ -3486,8 +4140,8 @@ struct LadderHost {
                 Memory::read<uintptr_t>(arrData + static_cast<size_t>(i) * sizeof(uintptr_t));
             if (!IsGoodLocalPlayerPtr(slot))
                 continue;
-            if (Memory::read<uintptr_t>(slot + Offsets::LocalPlayer_PlayerController) == pc) {
-                backRef = true;
+            if (!pc || Memory::read<uintptr_t>(slot + Offsets::LocalPlayer_PlayerController) == pc) {
+                backRef = (pc != 0);
                 return slot;
             }
         }
@@ -3514,8 +4168,10 @@ struct LadderHost {
             { Offsets::Controller_Character, PlayerChain::Rung::PcCharacter },
         };
         for (const Cand& c : kCands) {
-            const uintptr_t pawn = Memory::read<uintptr_t>(pc + c.off);
-            if (pawn && eng.IsValidPointer(pawn)) {
+            if (c.off <= 0)
+                continue;
+            const uintptr_t pawn = Memory::read_nocache<uintptr_t>(pc + c.off);
+            if (Engine::IsUsableObjectPtr(pawn) && Engine::ResolveActorRoot(pawn)) {
                 which = c.rung;
                 return pawn;
             }
@@ -3542,8 +4198,7 @@ struct LadderHost {
     {
         if (!pawn)
             return 0;
-        const uintptr_t root = Memory::read<uintptr_t>(pawn + Offsets::RootComponent);
-        return (root && eng.IsValidPointer(root)) ? root : 0;
+        return Engine::ResolveActorRoot(pawn);
     }
 };
 

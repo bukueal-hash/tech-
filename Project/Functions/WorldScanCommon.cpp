@@ -4,10 +4,10 @@
 #include "../Core/Memory.h"
 #include "../Core/Offsets.h"
 #include "../Core/AgentLog.h"
+#include "../Core/EntityDiagnostics.hpp"
 #include "../Core/WorldItemCategory.h"
 #include "../Interface/Utils/Variables/index.h"
 #include "../Interface/Utils/Threads/SyncedThread.h"
-#include "LrtsVisibility.h"
 
 #include <atomic>
 #include <chrono>
@@ -30,7 +30,7 @@ struct TArrayU64 {
     int32_t Max = 0;
 };
 
-constexpr int32_t kMaxActorsPerLevel = 12000;
+constexpr int32_t kMaxActorsPerLevel = 16384;
 constexpr int32_t kMaxActorsTotal = 16384;
 
 struct CachedActorPtr {
@@ -43,6 +43,8 @@ void AppendLevelActors(
     std::unordered_set<uint64_t>& seen,
     int maxTotal)
 {
+    // Ledger: the actor roster is a world read, not a per-field one.
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::World);
     if (!level || actors.size() >= static_cast<size_t>(maxTotal))
         return;
 
@@ -92,6 +94,12 @@ void CollectAllLevelActors(
 
 std::vector<CachedActorPtr> g_cachedActorPtrs;
 std::chrono::steady_clock::time_point g_actorListTimer{};
+// Short-lived raw actor-list reuse so back-to-back scanner passes share one DMA sweep.
+std::mutex g_ttlMutex;
+uintptr_t g_ttlWorld = 0;
+uintptr_t g_ttlLevel = 0;
+std::vector<uint64_t> g_ttlActors;
+std::chrono::steady_clock::time_point g_ttlTp{};
 int32_t g_lastActorCount = -1;
 int32_t g_lastActorMax = -1;
 std::mutex g_actorCacheMutex;
@@ -126,18 +134,24 @@ bool RefreshActorPointerCache(
 
 bool ReadLevelActors(uintptr_t level, uintptr_t& outData, int32_t& outCount)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::World);
     outData = 0;
     outCount = 0;
     if (!level || !Engine::IsPlausibleObjPtr(level))
         return false;
 
-    // Primary path: Level → ActorCluster (LevelActorContainer*) → Actors
-    const uintptr_t cluster = Memory::read<uintptr_t>(level + Offsets::ActorCluster);
-    if (Engine::IsPlausibleObjPtr(cluster)) {
-        const uintptr_t data = Memory::read<uintptr_t>(
-            cluster + Offsets::LevelActorContainer_Actors);
-        const int32_t count = Memory::read<int32_t>(
-            cluster + Offsets::LevelActorContainer_ActorCount);
+    // Primary path: the level's own Actors TArray — ULevel::Actors, data at
+    // Offsets::AActors (0x108 on the 2026-10-13 build) and the TArray num at
+    // Offsets::ActorsCount (0x110). The field is declared without UPROPERTY, so
+    // no dump can carry it: the current class dump renders 0x0..0x130 of ULevel
+    // as "Pad_0000_0 = uint8_t[0x130]", and reading a reflected header would
+    // report the padding instead. 0x108 is the user live-probed offset for this
+    // build; the earlier 0x110/0x118 pair read the TArray num as if it were the
+    // data pointer (so every actor-list read had to fall through), which is why
+    // the actor count reported 0 with a healthy world and level.
+    {
+        const uintptr_t data = Memory::read<uintptr_t>(level + Offsets::AActors);
+        const int32_t count = Memory::read<int32_t>(level + Offsets::ActorsCount);
         if (Engine::IsPlausibleObjPtr(data) && count > 0 && count <= 12000) {
             outData = data;
             outCount = count;
@@ -145,16 +159,16 @@ bool ReadLevelActors(uintptr_t level, uintptr_t& outData, int32_t& outCount)
         }
     }
 
-    // Fallback: Level → direct Actors TArray. Non-UPROPERTY, so the property
-    // index has no entry for it, but the dumped SDK declares it:
-    //   sdk/CppSDK/SDK/Level_classes.hpp
-    //     class TArray<class AActor*> Actors;  // 0x0110(0x0010)
-    // i.e. data @ 0x110, num @ 0x118 — the old 0x108/0x110 pair read the pad
-    // for the pointer and the pointer's low dword for the count, which is why
-    // every heartbeat logged actors:-1.
-    {
-        const uintptr_t data = Memory::read<uintptr_t>(level + Offsets::AActors);
-        const int32_t count = Memory::read<int32_t>(level + Offsets::ActorsCount);
+    // Fallback: Level → ActorCluster (LevelActorContainer*) → Actors. Dump-backed
+    // (Level.ActorCluster 0x150 -> LevelActorContainer.Actors TArray at 0x90), but
+    // the container is only populated when actor clustering is in use, so it is
+    // the second choice rather than the first.
+    const uintptr_t cluster = Memory::read<uintptr_t>(level + Offsets::ActorCluster);
+    if (Engine::IsPlausibleObjPtr(cluster)) {
+        const uintptr_t data = Memory::read<uintptr_t>(
+            cluster + Offsets::LevelActorContainer_Actors);
+        const int32_t count = Memory::read<int32_t>(
+            cluster + Offsets::LevelActorContainer_ActorCount);
         if (Engine::IsPlausibleObjPtr(data) && count > 0 && count <= 12000) {
             outData = data;
             outCount = count;
@@ -170,6 +184,11 @@ void ClearCachedActorPtrs()
     std::lock_guard<std::mutex> lock(g_actorCacheMutex);
     g_cachedActorPtrs.clear();
     g_actorListTimer = {};
+    {
+        std::lock_guard<std::mutex> ttlLock(g_ttlMutex);
+        g_ttlActors.clear();
+        g_ttlTp = {};
+    }
     g_lastActorCount = -1;
     g_lastActorMax = -1;
 }
@@ -195,7 +214,20 @@ void CollectLevelActors(
     uintptr_t persistentLevel,
     std::vector<uint64_t>& actors)
 {
-    CollectAllLevelActors(uworld, persistentLevel, actors);
+    {
+        std::lock_guard<std::mutex> ttlLock(g_ttlMutex);
+        const auto ttlNow = std::chrono::steady_clock::now();
+        if (uworld == g_ttlWorld && persistentLevel == g_ttlLevel && !g_ttlActors.empty()
+            && ttlNow - g_ttlTp < std::chrono::milliseconds(150)) {
+            actors = g_ttlActors;
+        } else {
+            CollectAllLevelActors(uworld, persistentLevel, actors);
+            g_ttlWorld = uworld;
+            g_ttlLevel = persistentLevel;
+            g_ttlActors = actors;
+            g_ttlTp = ttlNow;
+        }
+    }
 
     // Flaky-read hold: the level actor-array read is a ~12KB DMA transfer per
     // scanner pass. Under bus contention it can come back short or empty —
@@ -255,6 +287,9 @@ void PruneStaleEntries(
 
 bool LooksLikePlayerPawn(uintptr_t actor, uintptr_t localPawn)
 {
+    // Ledger: identity classification — actor type id, then the APlayerState /
+    // mesh pointer chase. These are links, not positions.
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Link);
     if (!actor)
         return false;
     if (localPawn && actor == localPawn)
@@ -285,6 +320,7 @@ bool LooksLikePlayerPawn(uintptr_t actor, uintptr_t localPawn)
 
 bool HasArcEnemyAssetPointer(uintptr_t actor)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Name);
     if (!actor)
         return false;
 
@@ -301,6 +337,7 @@ bool HasArcEnemyAssetPointer(uintptr_t actor)
 // SHARED GATE — grep callers before edit
 bool LooksLikeContainerActor(uintptr_t actor, const std::string& fname)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Name);
     if (!actor)
         return false;
 
@@ -442,6 +479,7 @@ bool LooksLikeContainerActor(uintptr_t actor, const std::string& fname)
 // salvage (Ruined Parachute, Canister, …) and wiped majority floor coverage.
 bool LooksLikeBotPawn(uintptr_t actor, uintptr_t localPawn)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Name);
     if (!actor || (localPawn && actor == localPawn))
         return false;
 
@@ -504,6 +542,7 @@ bool LooksLikeBotPawn(uintptr_t actor, uintptr_t localPawn)
 
 bool ShouldExcludeFromWorldCaches(uintptr_t actor, uintptr_t localPawn)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Name);
     if (!actor)
         return true;
 
@@ -552,6 +591,7 @@ bool ShouldExcludeFromWorldCaches(uintptr_t actor, uintptr_t localPawn)
 
 bool IsHeldEquipmentActor(uintptr_t actor)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Kit);
     if (!actor)
         return false;
 
@@ -609,6 +649,7 @@ namespace {
 /** Name score for held-use ESP only — NEVER used for world-cache exclusion. */
 int ScoreHeldUseActor(uintptr_t actor)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Kit);
     if (!actor || !engine.IsValidPointer(actor))
         return -1;
 
@@ -668,6 +709,7 @@ int ScoreHeldUseActor(uintptr_t actor)
 
 uintptr_t ResolvePreferredHeldItemActor(uintptr_t pawn)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Kit);
     if (!pawn)
         return 0;
 
@@ -773,6 +815,8 @@ void RebuildHeldIndexLocked()
 
 void CollectHeldItemActors(uintptr_t pawn, std::unordered_set<uintptr_t>& out)
 {
+    // Ledger: this is the pre-loop DMA a pass used to spend its only budget on.
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Kit);
     if (!pawn)
         return;
 
@@ -822,6 +866,7 @@ void CollectHeldItemActors(uintptr_t pawn, std::unordered_set<uintptr_t>& out)
 
 bool ScatterReadActorRootPositions(std::vector<CacheRootScatterRow>& rows)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Position);
     if (rows.empty())
         return false;
 
@@ -841,7 +886,12 @@ bool ScatterReadActorRootPositions(std::vector<CacheRootScatterRow>& rows)
     if (!ok || !scatter.execute())
         return false;
 
+    // Serial follow-up reads (root resolve + position) are time-capped. Rows
+    // past the deadline stay unresolved and retry on the next pass.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(25);
     for (CacheRootScatterRow& row : rows) {
+        if (std::chrono::steady_clock::now() > deadline)
+            break;
         uintptr_t root = row.root;
         if (!root || !engine.IsValidPointer(root))
             root = Engine::ResolveLootActorRoot(row.actorKey);
@@ -866,6 +916,7 @@ bool ScatterReadActorRootPositions(std::vector<CacheRootScatterRow>& rows)
 
 void RefreshWorldCacheRetainPositions(std::vector<WorldCacheRetainRow>& rows)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Position);
     if (rows.empty())
         return;
 
@@ -1007,12 +1058,10 @@ void WriteFlickerScoreUnlocked(const FlickerScoreSnapshot& snap)
 {
     // Verify tap: flicker stats are the diagnosis for user-visible blink, so
     // they go to the real log (10 s cadence, counts only — negligible I/O).
-    std::ofstream f(kArcVerifyPath, std::ios::app);
-    if (!f)
-        return;
     const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    f << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker-loop\",\"hypothesisId\":\"F0\","
+    std::ostringstream oss;
+    oss << "{\"sessionId\":\"c190fb\",\"runId\":\"flicker-loop\",\"hypothesisId\":\"F0\","
       << "\"location\":\"WorldScanCommon.cpp\",\"message\":\"flicker_score\","
       << "\"data\":{\"bots\":" << snap.totals[0]
       << ",\"players\":" << snap.totals[1]
@@ -1029,6 +1078,7 @@ void WriteFlickerScoreUnlocked(const FlickerScoreSnapshot& snap)
       << ",\"paintWorld\":" << snap.totals[5]
       << ",\"fixN\":" << kFlickerFixIteration
       << "},\"timestamp\":" << ts << "}\n";
+    EntityDiagnostics::LogRaw(oss.str());
 }
 
 } // namespace
@@ -1119,224 +1169,7 @@ void MaybeFlushFlickerScore()
 
 // #endregion
 
-// ── AggGeom probe (diagnostic only, read-only) ─────────────────────────────
-// Offsets taken from this repo's own SDK dump, not from a forum paste:
-//   UStaticMesh::BodySetup          SDK/Class.cpp:26511   0x1F0
-//   UBodySetup::AggGeom             SDK/Class.cpp:25263   0xB8, size 0x78,
-//                                   INLINE struct — never dereference it
-//   FKAggregateGeom TArray order    SDK/Struct.cpp:12248-12254
 namespace {
-
-constexpr uintptr_t kUStaticMesh_BodySetup = 0x1F0;
-constexpr uintptr_t kUBodySetup_AggGeom = 0xB8;
-constexpr int32_t kAggGeomMaxElems = 4096;
-constexpr int kAggGeomArrays = 7;
-constexpr int kAggGeomNameSamples = 64;
-
-/** FName text is normally [A-Za-z0-9_], but never trust it into raw JSON. */
-std::string JsonSafeName(const std::string& in)
-{
-    std::string out;
-    out.reserve(in.size());
-    for (unsigned char c : in) {
-        if (c < 0x20 || c > 0x7E || c == '"' || c == '\\')
-            continue;
-        out.push_back(static_cast<char>(c));
-        if (out.size() >= 96)
-            break;
-    }
-    return out;
-}
-
-std::mutex g_aggProbeMu;
-AggGeomProbeResult g_aggProbe;
-std::atomic<bool> g_aggProbeRunning{ false };
-ManagedJob g_aggProbeJob;
-
-/**
- * Read the 7 inline TArray headers.
- *
- * All 7 come out of one 0x70 struct read, so a single garbage header means the
- * block is not an FKAggregateGeom at all. Reject the whole BodySetup instead of
- * trusting whichever slots happened to look sane — otherwise a junk header that
- * lands inside the sanity window (e.g. Num == Max == 0x1000) gets counted as
- * real collision.
- */
-bool ReadAggGeomHeaders(
-    uintptr_t bodySetup,
-    int32_t outCounts[kAggGeomArrays],
-    uint8_t outRaw[0x70])
-{
-    if (!Memory::ReadRaw(bodySetup + kUBodySetup_AggGeom, outRaw, 0x70))
-        return false;
-
-    for (int i = 0; i < kAggGeomArrays; ++i) {
-        uintptr_t data = 0;
-        int32_t num = 0;
-        int32_t max = 0;
-        memcpy(&data, outRaw + i * 0x10, sizeof(data));
-        memcpy(&num, outRaw + i * 0x10 + 0x8, sizeof(num));
-        memcpy(&max, outRaw + i * 0x10 + 0xC, sizeof(max));
-
-        outCounts[i] = 0;
-        if (!data && !num && !max)
-            continue;  // genuinely empty slot
-
-        if (num < 0 || max < 0 || num > max || max >= kAggGeomMaxElems
-            || !Memory::IsValidPtrFast2(data))
-            return false;
-
-        outCounts[i] = num;
-    }
-    return true;
-}
-
-void RunAggGeomProbeJob()
-{
-    AggGeomProbeResult r;
-    r.ran = true;
-
-    const Engine::EngineStateSnapshot snap = engine.GetStateSnapshot();
-    if (!snap.gWorld || !snap.persistentLevel) {
-        r.note = "no gWorld/persistentLevel — not in raid";
-        std::lock_guard<std::mutex> lock(g_aggProbeMu);
-        g_aggProbe = r;
-        return;
-    }
-
-    std::vector<uint64_t> actors;
-    CollectLevelActors(snap.gWorld, snap.persistentLevel, actors);
-    r.actorsWalked = static_cast<int>(actors.size());
-
-    std::unordered_set<uintptr_t> seenBodySetups;
-    int nameSamplesLogged = 0;
-
-    for (uint64_t a : actors) {
-        const uintptr_t actor = static_cast<uintptr_t>(a);
-        if (!actor)
-            continue;
-
-        const uintptr_t root = Memory::read<uintptr_t>(actor + Offsets::RootComponent);
-        if (!Engine::IsPlausibleObjPtr(root))
-            continue;
-        ++r.rootsValid;
-
-        // No component-class filter here: neither engine.GetActorClassFName nor
-        // steam_decrypt::GetActorClassFName resolves a name for root components
-        // on this build, so filtering on it zeroed out the entire walk. The
-        // whole-block validation in ReadAggGeomHeaders is what rejects chains
-        // followed off a non-StaticMeshComponent root.
-        uintptr_t staticMesh = Memory::read<uintptr_t>(root + Offsets::StaticMesh);
-        bool legacy = false;
-        if (!Engine::IsPlausibleObjPtr(staticMesh)) {
-            staticMesh = Memory::read<uintptr_t>(root + Offsets::StaticMeshLegacy);
-            legacy = true;
-        }
-        if (!Engine::IsPlausibleObjPtr(staticMesh))
-            continue;
-        if (legacy)
-            ++r.meshFromLegacy;
-        else
-            ++r.meshFromPrimary;
-
-        const uintptr_t bodySetup =
-            Memory::read<uintptr_t>(staticMesh + kUStaticMesh_BodySetup);
-        if (!Engine::IsPlausibleObjPtr(bodySetup))
-            continue;
-        ++r.bodySetupsValid;
-
-        // Many actors share one UStaticMesh, so one UBodySetup. Read each once.
-        if (!seenBodySetups.insert(bodySetup).second)
-            continue;
-        ++r.bodySetupsUnique;
-
-        int32_t counts[kAggGeomArrays] = {};
-        uint8_t raw[0x70] = {};
-        if (!ReadAggGeomHeaders(bodySetup, counts, raw)) {
-            ++r.headersRejected;
-            continue;
-        }
-
-        r.sphereElems += counts[0];
-        r.boxElems += counts[1];
-        r.sphylElems += counts[2];
-        r.convexElems += counts[3];
-        r.taperedCapsuleElems += counts[4];
-        r.levelSetElems += counts[5];
-        r.skinnedLevelSetElems += counts[6];
-
-        int total = 0;
-        for (int i = 0; i < kAggGeomArrays; ++i)
-            total += counts[i];
-        if (total <= 0)
-            continue;
-        ++r.bodySetupsNonEmpty;
-
-        // Name what the geometry actually belongs to. The UStaticMesh asset
-        // FName is the decisive one: SM_Wall_* / SM_Floor_* means this covers
-        // world structure, prop-only names mean AggGeom can't back a vis check.
-        if (nameSamplesLogged < kAggGeomNameSamples) {
-            ++nameSamplesLogged;
-
-            std::string meshName = engine.GetActorFNameStringCached(staticMesh);
-            if (meshName.empty())
-                meshName = engine.GetActorFNameString(staticMesh);
-            std::string actorName = engine.GetActorFNameStringCached(actor);
-            if (actorName.empty())
-                actorName = engine.GetActorFNameString(actor);
-
-            std::ofstream f(kArcVerifyPath, std::ios::app);
-            if (f) {
-                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                f << "{\"location\":\"WorldScanCommon.cpp\","
-                  << "\"message\":\"agggeom_sample\","
-                  << "\"timestamp\":" << ts
-                  << ",\"mesh\":\"" << JsonSafeName(meshName) << "\""
-                  << ",\"actor\":\"" << JsonSafeName(actorName) << "\""
-                  << ",\"bodySetup\":\"0x" << std::hex << bodySetup << std::dec << "\""
-                  << ",\"sphere\":" << counts[0]
-                  << ",\"box\":" << counts[1]
-                  << ",\"sphyl\":" << counts[2]
-                  << ",\"convex\":" << counts[3]
-                  << ",\"tapered\":" << counts[4]
-                  << ",\"levelSet\":" << counts[5]
-                  << ",\"skinnedLevelSet\":" << counts[6]
-                  << "}\n";
-            }
-        }
-    }
-
-    {
-        std::ofstream f(kArcVerifyPath, std::ios::app);
-        if (f) {
-            const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            f << "{\"location\":\"WorldScanCommon.cpp\","
-              << "\"message\":\"agggeom_probe\","
-              << "\"timestamp\":" << ts
-              << ",\"actorsWalked\":" << r.actorsWalked
-              << ",\"rootsValid\":" << r.rootsValid
-              << ",\"meshPrimary\":" << r.meshFromPrimary
-              << ",\"meshLegacy\":" << r.meshFromLegacy
-              << ",\"bodySetupsValid\":" << r.bodySetupsValid
-              << ",\"bodySetupsUnique\":" << r.bodySetupsUnique
-              << ",\"bodySetupsNonEmpty\":" << r.bodySetupsNonEmpty
-              << ",\"headersRejected\":" << r.headersRejected
-              << ",\"sphere\":" << r.sphereElems
-              << ",\"box\":" << r.boxElems
-              << ",\"sphyl\":" << r.sphylElems
-              << ",\"convex\":" << r.convexElems
-              << ",\"tapered\":" << r.taperedCapsuleElems
-              << ",\"levelSet\":" << r.levelSetElems
-              << ",\"skinnedLevelSet\":" << r.skinnedLevelSetElems
-              << "}\n";
-        }
-    }
-
-    std::lock_guard<std::mutex> lock(g_aggProbeMu);
-    g_aggProbe = r;
-}
 
 // ── UWorld clock-field probe ────────────────────────────────────────────────
 
@@ -1397,7 +1230,7 @@ void RunTimeSecondsProbeJob()
     const double lo = r.elapsed * 0.80;
     const double hi = r.elapsed * 1.20;
 
-    std::ofstream f(kArcVerifyPath, std::ios::app);
+    std::ostringstream f;
     const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 
@@ -1421,18 +1254,16 @@ void RunTimeSecondsProbeJob()
         }
         ++r.hits;
 
-        if (f) {
-            f << "{\"location\":\"WorldScanCommon.cpp\","
-              << "\"message\":\"worldclock_candidate\","
-              << "\"timestamp\":" << ts
-              << ",\"offset\":\"0x" << std::hex << off << std::dec << "\""
-              << ",\"type\":\"" << (isFloat ? "float" : "double") << "\""
-              << ",\"first\":" << v1
-              << ",\"second\":" << v2
-              << ",\"delta\":" << delta
-              << ",\"elapsed\":" << r.elapsed
-              << "}\n";
-        }
+        f << "{\"location\":\"WorldScanCommon.cpp\","
+          << "\"message\":\"worldclock_candidate\","
+          << "\"timestamp\":" << ts
+          << ",\"offset\":\"0x" << std::hex << off << std::dec << "\""
+          << ",\"type\":\"" << (isFloat ? "float" : "double") << "\""
+          << ",\"first\":" << v1
+          << ",\"second\":" << v2
+          << ",\"delta\":" << delta
+          << ",\"elapsed\":" << r.elapsed
+          << "}\n";
     };
 
     for (uint32_t off = 0; off + 8 <= kClockScanSize; off += 8) {
@@ -1455,167 +1286,22 @@ void RunTimeSecondsProbeJob()
             : "no advancing float or double in UWorld+0x000..0x2000";
     }
 
-    if (f) {
-        f << "{\"location\":\"WorldScanCommon.cpp\","
-          << "\"message\":\"worldclock_summary\","
-          << "\"timestamp\":" << ts
-          << ",\"gWorld\":\"0x" << std::hex << snap.gWorld << std::dec << "\""
-          << ",\"hits\":" << r.hits
-          << ",\"firstOffset\":\"0x" << std::hex << r.firstOffset << std::dec << "\""
-          << ",\"bytesChanged\":" << r.bytesChanged
-          << ",\"elapsed\":" << r.elapsed
-          << "}\n";
-    }
+    f << "{\"location\":\"WorldScanCommon.cpp\","
+      << "\"message\":\"worldclock_summary\","
+      << "\"timestamp\":" << ts
+      << ",\"gWorld\":\"0x" << std::hex << snap.gWorld << std::dec << "\""
+      << ",\"hits\":" << r.hits
+      << ",\"firstOffset\":\"0x" << std::hex << r.firstOffset << std::dec << "\""
+      << ",\"bytesChanged\":" << r.bytesChanged
+      << ",\"elapsed\":" << r.elapsed
+      << "}\n";
+    EntityDiagnostics::LogRaw(f.str());
 
     std::lock_guard<std::mutex> lock(g_clockProbeMu);
     g_clockProbe = r;
 }
 
-// ── Mesh render-tick probe ──────────────────────────────────────────────────
-
-constexpr uint32_t kTickScanSize = 0x1000;
-constexpr int kTickSamples = 200;
-constexpr int kTickIntervalMs = 10;
-
-std::mutex g_tickProbeMu;
-TickProbeResult g_tickProbe;
-std::atomic<bool> g_tickProbeRunning{ false };
-ManagedJob g_tickProbeJob;
-
-void RunTickProbeJob()
-{
-    TickProbeResult r;
-    r.ran = true;
-
-    uint64_t mesh = 0;
-    {
-        std::lock_guard<std::mutex> lock(LrtsVis::g_session.mu);
-        mesh = LrtsVis::g_session.lastMesh;
-    }
-    if (!mesh) {
-        r.note = "no mesh seen yet - enable LRTS in a raid first";
-        std::lock_guard<std::mutex> lock(g_tickProbeMu);
-        g_tickProbe = r;
-        return;
-    }
-    r.mesh = mesh;
-
-    const uint32_t slots = kTickScanSize / 4;
-    std::vector<uint32_t> prev(slots), cur(slots);
-    std::vector<int> changes(slots, 0);
-
-    if (!PCIMemory::ReadVirtualMemoryNoCache(mesh, prev.data(), kTickScanSize)) {
-        r.note = "initial mesh read failed";
-        std::lock_guard<std::mutex> lock(g_tickProbeMu);
-        g_tickProbe = r;
-        return;
-    }
-
-    for (int s = 0; s < kTickSamples; ++s) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(kTickIntervalMs));
-        if (!PCIMemory::ReadVirtualMemoryNoCache(mesh, cur.data(), kTickScanSize))
-            continue;
-        ++r.samples;
-        for (uint32_t i = 0; i < slots; ++i) {
-            if (cur[i] != prev[i]) {
-                ++changes[i];
-                prev[i] = cur[i];
-            }
-        }
-    }
-
-    for (uint32_t i = 0; i < slots; ++i) {
-        if (changes[i] <= 0)
-            continue;
-        ++r.slotsChanged;
-        // Keep the busiest slots. A per-frame timestamp changes far more often
-        // than positions or animation state, so it rises to the top.
-        for (int k = 0; k < TickProbeResult::kTop; ++k) {
-            if (changes[i] > r.topCount[k]) {
-                for (int j = TickProbeResult::kTop - 1; j > k; --j) {
-                    r.topCount[j] = r.topCount[j - 1];
-                    r.topOffset[j] = r.topOffset[j - 1];
-                }
-                r.topCount[k] = changes[i];
-                r.topOffset[k] = i * 4;
-                break;
-            }
-        }
-    }
-
-    if (r.slotsChanged == 0)
-        r.note = "nothing changed - mesh may be dead or reads failing";
-
-    {
-        std::ofstream f(kArcVerifyPath, std::ios::app);
-        if (f) {
-            const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            for (uint32_t i = 0; i < slots; ++i) {
-                if (changes[i] <= 0)
-                    continue;
-                f << "{\"location\":\"WorldScanCommon.cpp\","
-                  << "\"message\":\"tick_slot\","
-                  << "\"timestamp\":" << ts
-                  << ",\"mesh\":\"0x" << std::hex << mesh << std::dec << "\""
-                  << ",\"offset\":\"0x" << std::hex << (i * 4) << std::dec << "\""
-                  << ",\"changes\":" << changes[i]
-                  << ",\"samples\":" << r.samples
-                  << "}\n";
-            }
-        }
-    }
-
-    std::lock_guard<std::mutex> lock(g_tickProbeMu);
-    g_tickProbe = r;
-}
-
 } // namespace
-
-void StartTickProbe()
-{
-    bool expected = false;
-    if (!g_tickProbeRunning.compare_exchange_strong(expected, true))
-        return;
-
-    {
-        std::lock_guard<std::mutex> lock(g_tickProbeMu);
-        g_tickProbe = TickProbeResult{};
-        g_tickProbe.running = true;
-    }
-
-    const bool started = g_tickProbeJob.start([]() {
-        try {
-            RunTickProbeJob();
-        } catch (const std::exception& ex) {
-            std::lock_guard<std::mutex> lock(g_tickProbeMu);
-            g_tickProbe.ran = true;
-            g_tickProbe.note = ex.what();
-        } catch (...) {
-            std::lock_guard<std::mutex> lock(g_tickProbeMu);
-            g_tickProbe.ran = true;
-            g_tickProbe.note = "probe threw";
-        }
-        {
-            std::lock_guard<std::mutex> lock(g_tickProbeMu);
-            g_tickProbe.running = false;
-        }
-        g_tickProbeRunning.store(false);
-    });
-    if (!started) {
-        std::lock_guard<std::mutex> lock(g_tickProbeMu);
-        g_tickProbe.running = false;
-        g_tickProbe.ran = true;
-        g_tickProbe.note = "job already running";
-        g_tickProbeRunning.store(false);
-    }
-}
-
-TickProbeResult GetTickProbeResult()
-{
-    std::lock_guard<std::mutex> lock(g_tickProbeMu);
-    return g_tickProbe;
-}
 
 void StartTimeSecondsProbe()
 {
@@ -1662,59 +1348,10 @@ TimeSecondsProbeResult GetTimeSecondsProbeResult()
     return g_clockProbe;
 }
 
-void StartAggGeomProbe()
-{
-    bool expected = false;
-    if (!g_aggProbeRunning.compare_exchange_strong(expected, true))
-        return;
-
-    {
-        std::lock_guard<std::mutex> lock(g_aggProbeMu);
-        g_aggProbe = AggGeomProbeResult{};
-        g_aggProbe.running = true;
-    }
-
-    const bool started = g_aggProbeJob.start([]() {
-        try {
-            RunAggGeomProbeJob();
-        } catch (const std::exception& ex) {
-            std::lock_guard<std::mutex> lock(g_aggProbeMu);
-            g_aggProbe.ran = true;
-            g_aggProbe.note = ex.what();
-        } catch (...) {
-            std::lock_guard<std::mutex> lock(g_aggProbeMu);
-            g_aggProbe.ran = true;
-            g_aggProbe.note = "probe threw";
-        }
-        {
-            std::lock_guard<std::mutex> lock(g_aggProbeMu);
-            g_aggProbe.running = false;
-        }
-        g_aggProbeRunning.store(false);
-    });
-    if (!started) {
-        std::lock_guard<std::mutex> lock(g_aggProbeMu);
-        g_aggProbe.running = false;
-        g_aggProbe.ran = true;
-        g_aggProbe.note = "job already running";
-        g_aggProbeRunning.store(false);
-    }
-}
-
-AggGeomProbeResult GetAggGeomProbeResult()
-{
-    std::lock_guard<std::mutex> lock(g_aggProbeMu);
-    return g_aggProbe;
-}
-
 void StopBackgroundJobs()
 {
-    g_tickProbeJob.stop();
     g_clockProbeJob.stop();
-    g_aggProbeJob.stop();
-    g_tickProbeRunning.store(false, std::memory_order_release);
     g_clockProbeRunning.store(false, std::memory_order_release);
-    g_aggProbeRunning.store(false, std::memory_order_release);
 }
 
 } // namespace WorldScan

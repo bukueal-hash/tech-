@@ -1,4 +1,5 @@
 #include "../Core/Engine.h"
+#include "../Interface/Utils/AutoConfig.h"
 #include "../Core/FeaturePolicy.hpp"
 #include "../Core/AgentLog.h"
 #include "../Core/ActorType.h"
@@ -6,19 +7,29 @@
 #include "../Core/BotEspExpiry.hpp"
 #include "../Core/BotEspPosition.hpp"
 #include "../Core/EntityDiagnostics.hpp"
+#include "../Core/PracticeMode.hpp"
 #include "../Core/PlayerEspMissLog.hpp"
+#include "../Core/RunReport.hpp"
 #include "../Core/AssetNames.h"
 #include "../Core/Memory.h"
 #include "../Core/WorldItemCategory.h"
+#include "../Core/EntityFilters.hpp"
+#include "../Core/VisualState.hpp"
+#include "../Core/PoiStore.hpp"
 #include "../Functions/WorldScanCommon.h"
 #include "../Functions/RobotList.h"
-#include "../Functions/CollisionMirror.h"
 #include "../Interface/Utils/Variables/index.h"
+#include "../Interface/Utils/UpgradeOptions.hpp"
 #include "../Interface/Utils/Visuals/visuals.hpp"
+#include "../Interface/Utils/Visuals/Crosshair.hpp"
+#include "../Interface/Utils/Visuals/ThreatWarnings.hpp"
+#include "../Interface/Overlay/MenuTheme.h"
 #include "EspDraw.h"
 #include "../Interface/Render/RenderQueue.h"
 
 #include "../ThirdParty/ImGui/imgui.h"
+#include "CollisionDebug.h"
+#include "CollisionBvh.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -50,22 +61,38 @@ WorldEspDebugStats g_worldEspDbg{};
 
 static void LogGhostBotDecision(
     uintptr_t actorKey, const Engine::WorldCacheEntry& entry,
-    const char* reason, float distanceM = -1.f)
+    const char* reason, float distanceM = -1.f,
+    float camDepthCm = std::nanf(""), float screenX = std::nanf(""),
+    float screenY = std::nanf(""))
 {
     if (!var::debug_ghost_bots)
         return;
 
-    // The paint path can evaluate a bot many times per second. Keep one
-    // decision per actor/reason per second so the log remains useful instead
-    // of flooding the asynchronous diagnostic queue.
-    static std::unordered_map<uintptr_t, std::pair<const char*, uint64_t>> last;
+    // The paint path can evaluate a bot many times per second, so keep one
+    // decision per (actor, reason) per second: the log stays useful and the
+    // bounded asynchronous queue (kMaxQueuedLines) is not flooded. Keyed per
+    // (actor, reason), not per actor — this path alternates reasons for
+    // the same actor inside one frame: ShouldDrawRobotEsp logs the draw reason,
+    // then the collect loop logs "collect_gate" for the same key. With one
+    // (reason, time) slot per actor the two alternating reasons each cleared the
+    // other's throttle, so 9 unreachable actors produced 5,405 lines and ate the
+    // bounded diagnostic queue (kMaxQueuedLines) that real records need.
+    uint64_t reasonHash = 1469598103934665603ull;
+    for (const char* p = reason; p && *p; ++p) {
+        reasonHash = (reasonHash ^ static_cast<uint64_t>(
+            static_cast<unsigned char>(*p))) * 1099511628211ull;
+    }
+    static std::unordered_map<uint64_t, uint64_t> last;
     const uint64_t now = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
-    auto& state = last[actorKey];
-    if (state.first == reason && now >= state.second && now - state.second < 1000)
+    const uint64_t throttleKey =
+        (actorKey * 0x9E3779B97F4A7C15ull) ^ reasonHash;
+    const auto throttleIt = last.find(throttleKey);
+    if (throttleIt != last.end() && now >= throttleIt->second
+        && now - throttleIt->second < 1000)
         return;
-    state = { reason, now };
+    last[throttleKey] = now;
     if (last.size() > 4096)
         last.clear();
 
@@ -75,7 +102,8 @@ static void LogGhostBotDecision(
     EntityDiagnostics::LogBotDecision(
         actorKey, entry.ActorName, reason, entry.Drawing,
         entry.botIdentityProven, entry.IsBreaked, positionValid, age,
-        distanceM >= 0.f ? distanceM : entry.Distance);
+        distanceM >= 0.f ? distanceM : entry.Distance,
+        camDepthCm, screenX, screenY);
 }
 
 static const char* EspFrameResultName(int result)
@@ -174,7 +202,7 @@ static void RenderEspFrameHealthFallback(
 }
 
 // Clean, human-readable category label for a container. Never empty, never a
-// raw fname or number — used whenever a specific name can't be resolved so a
+// raw fname or number â€” used whenever a specific name can't be resolved so a
 // container is ALWAYS labeled rather than drawn blank.
 static std::string ContainerCategoryFallbackLabel(WorldItemCategory cat)
 {
@@ -236,16 +264,19 @@ inline float EffectiveRadarRangeM()
     return var::radar_range > 0.f ? var::radar_range : 100.f;
 }
 
-inline float PlayerCollectMaxM()
+// One profile: the robot pool is needed whenever the aim pass can target ARC —
+// not only while a separate robot-aim switch is on. Same predicate the aim path
+// itself uses, so the frame it reads is always being collected when it runs.
+inline bool ArcPoolNeeded()
 {
-    if (var::enableesp)
-        return var::esp_distance;
-    return 0.f;
+    const FeaturePolicy::AimFeatures f{
+        var::enable_aimbot, var::robotAimEnabled, var::enable_triggerbot };
+    return FeaturePolicy::ShouldCollectRobotTargets(f);
 }
 
 inline float BotCollectMaxM()
 {
-    if (var::showRobots || var::robotAimEnabled)
+    if (var::showRobots || ArcPoolNeeded())
         return var::bot_esp_distance;
     return 0.f;
 }
@@ -366,6 +397,10 @@ static bool CameraOkForEsp(const Engine::CameraCache& cam)
 }
 
 static int g_camLeadSkips = 0;  // ghost-guard skips, surfaced in [debugCam]
+// Source-recovery hold-offs: paints where g_Cam was ok again but the
+// hysteresis kept FRAME (needs two consecutive ok paints to switch back).
+// Surfaced on the GHOST TRACER header so a flickering g_Cam is visible.
+static int g_camHoldOffs = 0;
 
 // Points that failed with the paint camera and were re-projected with
 // g_Camera instead - two cameras placing entities inside one paint.
@@ -384,10 +419,15 @@ static bool ResolveLiveRenderCamera(
     static bool s_prevOk = false;
     static auto s_prevTp = std::chrono::steady_clock::time_point{};
 
-    auto applyRotExtrap = [&](Engine::CameraCache& cam) {
+    auto applyRotExtrap = [&](Engine::CameraCache& cam, bool allowLead) {
         const auto now = std::chrono::steady_clock::now();
         const Engine::CameraCache raw = cam;
-        if (s_prevOk) {
+        // A source SWITCH must not measure the disagreement between the two
+        // cameras as if it were a rotation rate — that is exactly the bogus
+        // cross-source lead that made entities step on every SRCFLIP.
+        if (outDbg && !allowLead)
+            outDbg->leadSkipped = true;
+        if (s_prevOk && allowLead) {
             const float dtSec = std::chrono::duration<float>(now - s_prevTp).count();
             if (dtSec > 0.0005f && dtSec < 0.05f) {
                 const float dyaw = static_cast<float>(
@@ -433,25 +473,49 @@ static bool ResolveLiveRenderCamera(
         s_prevTp = now;
     };
 
+    // Source pick with hysteresis (SRCFLIP storm fix): g_Cam is preferred,
+    // but RETURNING to g_Cam from FRAME requires it ok on TWO consecutive
+    // paints. The old instant adopt oscillated the source whenever g_Cam
+    // flickered ok/bad — each flip carried a cross-source rotation delta
+    // through the extrapolator and teleported every entity (the CAMZIG /
+    // ENTZIG / red-border spam on the GHOST TRACER).
+    static int s_gCamOkStreak = 0;
+    static bool s_servingFrame = false;
+    const bool frameOk = frame.valid && CameraOkForEsp(frame.camera);
+    bool useGCam = false;
     {
         std::shared_lock<std::shared_mutex> lock(engine.m_cameraMutex);
-        if (CameraOkForEsp(engine.g_Camera)) {
+        const bool gCamOk = CameraOkForEsp(engine.g_Camera);
+        s_gCamOkStreak = gCamOk ? (std::min)(s_gCamOkStreak + 1, 4) : 0;
+        if (gCamOk && (!s_servingFrame || s_gCamOkStreak >= 2)) {
             outCam = engine.g_Camera;
-            // #region agent log
-            if (outDbg)
-                outDbg->src = "g_Cam";
-            // #endregion
-            applyRotExtrap(outCam);
-            return true;
+            useGCam = true;
+        } else if (gCamOk && frameOk) {
+            ++g_camHoldOffs; // recovery not yet confirmed — stay on FRAME
+        } else if (gCamOk) {
+            // Recovery unconfirmed but FRAME is unusable: only viable source.
+            outCam = engine.g_Camera;
+            useGCam = true;
         }
     }
-    if (frame.valid && CameraOkForEsp(frame.camera)) {
-        outCam = frame.camera;
+    if (useGCam) {
+        const bool allowLead = !s_servingFrame; // already on g_Cam
+        // #region agent log
+        if (outDbg)
+            outDbg->src = "g_Cam";
+        // #endregion
+        s_servingFrame = false;
+        applyRotExtrap(outCam, allowLead);
+        return true;
+    }
+    if (frameOk) {
+        const bool allowLead = s_servingFrame; // already on FRAME
         // #region agent log
         if (outDbg)
             outDbg->src = "FRAME";
         // #endregion
-        applyRotExtrap(outCam);
+        s_servingFrame = true;
+        applyRotExtrap(outCam, allowLead);
         return true;
     }
     return false;
@@ -474,7 +538,7 @@ static bool ProjectWorldEspPoint(
 // GHOST1 (Fix #10): the Fix #6/#7 sticky-screen holds repainted labels at
 // their LAST screen coordinates when WorldToScreen failed. If the projection
 // failed because the object left the view (camera rotated past it), that
-// stale coordinate is a random mid-screen spot — a phantom "Locker" flash
+// stale coordinate is a random mid-screen spot â€” a phantom "Locker" flash
 // with nothing there. Only allow the hold while the camera still faces the
 // object's world position; otherwise skip the draw entirely.
 static bool WorldPointRoughlyInView(
@@ -499,18 +563,33 @@ static bool WorldPointRoughlyInView(
     return dot >= std::cos(halfCone * kDeg2Rad);
 }
 
-static ImU32 PlayerEspColor(const Engine::PlayerCacheEntry& actor)
+static ImU32 PlayerEspColor(bool visible)
 {
-    const float* c = actor.isVisible ? var::esp_color_visible : var::esp_color_invisible;
+    const float* c = visible ? var::esp_color_visible : var::esp_color_invisible;
     return EspDraw::ColorFromRGBA(c);
 }
 
-static ImU32 BotEspColor(bool visible, bool isBreaked = false)
+static ImU32 BotEspColor(bool visible, bool isBreaked = false, bool occluded = false)
 {
     const float* c = isBreaked
         ? var::color_dead_bots
-        : (visible ? var::bot_color_visible : var::bot_color_invisible);
-    return EspDraw::ColorFromRGBA(c);
+        : (occluded ? var::bot_color_occluded
+            : (visible ? var::bot_color_visible : var::bot_color_invisible));
+    ImU32 out = EspDraw::ColorFromRGBA(c);
+    // Dead styling follows the same policy the radar uses. Hide is handled
+    // by the show_dead_bots gates upstream, not here.
+    const VisualState::Decision d = VisualState::ForDead(
+        isBreaked, static_cast<VisualState::Mode>(var::state_dead_mode),
+        var::state_dim_alpha);
+    if (d.grey)
+        out = (out & 0xFF000000u) | VisualState::kGreyRgb;
+    if (d.alphaMul < 1.f)
+        out = (out & 0x00FFFFFFu)
+            | (static_cast<ImU32>(
+                   static_cast<float>((out >> IM_COL32_A_SHIFT) & 0xFFu)
+                   * d.alphaMul)
+               << IM_COL32_A_SHIFT);
+    return out;
 }
 
 static ImVec2 LabelTextSize(const char* text, float distanceM)
@@ -565,7 +644,7 @@ static void DrawWeaponLabel(
     if (active == stowed0) stowed0.clear();
     if (active == stowed1) stowed1.clear();
 
-    // Active weapon — centered on head X.
+    // Active weapon â€” centered on head X.
     if (!active.empty()) {
         std::string weaponLabel = active;
         if (active != "Unarmed") {
@@ -609,6 +688,41 @@ static ImU32 SquadColor(uint8_t idx)
     }
 }
 
+// Platform logo mark, drawn from primitives so it needs no font glyph and no
+// image asset: the Xbox nexus (green disc, white X) for a console identity and
+// the Steam valve (dark disc, light ring + piston) for a validated SteamID64.
+static void DrawPlatformMark(ImDrawList* drawList, bool steam, const ImVec2& c, float d)
+{
+    const float r = d * 0.5f;
+    const float th = (std::max)(1.4f, r * 0.20f);
+    if (steam) {
+        drawList->AddCircleFilled(c, r, IM_COL32(27, 40, 56, 235), 20);
+        drawList->AddCircle(c, r * 0.74f, IM_COL32(200, 232, 255, 255), 20, th);
+        const ImVec2 hub(c.x - r * 0.30f, c.y + r * 0.30f);
+        drawList->AddCircleFilled(hub, r * 0.30f, IM_COL32(200, 232, 255, 255), 12);
+        drawList->AddLine(hub, ImVec2(c.x + r * 0.34f, c.y - r * 0.34f),
+            IM_COL32(200, 232, 255, 255), th * 1.4f);
+    } else {
+        drawList->AddCircleFilled(c, r, IM_COL32(16, 124, 16, 235), 20);
+        const float a = r * 0.56f;
+        drawList->AddLine(ImVec2(c.x - a, c.y - a), ImVec2(c.x + a, c.y + a),
+            IM_COL32(255, 255, 255, 255), th * 1.2f);
+        drawList->AddLine(ImVec2(c.x - a, c.y + a), ImVec2(c.x + a, c.y - a),
+            IM_COL32(255, 255, 255, 255), th * 1.2f);
+    }
+}
+
+// Platform badge: the Steam logo for a validated SteamID, the Xbox logo
+// otherwise. (x, y) is the left edge and the baseline the mark is centred on.
+static float DrawPlatformBadge(ImDrawList* drawList, const Engine::PlayerCacheEntry& actor, float x, float y)
+{
+    const bool steam = SquadRoster::PlausibleSteamId(actor.steamId64);
+    const float d = (std::max)(10.f, UpgradeOptions::badgeSize);
+    const ImVec2 c(x + d * 0.5f, y - d * 0.5f);
+    DrawPlatformMark(drawList, steam, c, d);
+    return d + 6.f;
+}
+
 static float StackPlayerLabels(
     ImDrawList* drawList,
     const Engine::PlayerCacheEntry& actor,
@@ -617,6 +731,7 @@ static float StackPlayerLabels(
     double camYawDeg,
     const Visuals::EspDrawScale& scale)
 {
+    bool platformBadgeInline = false;
     // 1. Group Name, Squad, and Distance onto a single clear line closest to the player's head.
     if (var::names || var::show_distance || var::show_squad_idx) {
         std::string topText;
@@ -640,6 +755,13 @@ static float StackPlayerLabels(
         }
 
         if (!topText.empty()) {
+            if (UpgradeOptions::platformBadges) {
+                // Badge sits on the name's line, just right of the text.
+                const float nameW = ImGui::GetFont()->CalcTextSizeA(
+                    Visuals::LabelTextPx(actor.Distance), FLT_MAX, 0.f, topText.c_str()).x;
+                DrawPlatformBadge(drawList, actor, headX + nameW * 0.5f + 4.f, labelStackY);
+                platformBadgeInline = true;
+            }
             ImU32 textColor = IM_COL32(255, 255, 255, 255);
             if (var::show_squad_idx && !actor.isAlly && actor.squadIdx > 0) {
                 textColor = SquadColor(actor.squadIdx);
@@ -654,6 +776,33 @@ static float StackPlayerLabels(
                 textColor,
                 actor.Distance);
             labelStackY -= LabelTextHeight(topText.c_str(), actor.Distance) + 4.f;
+        }
+    }
+
+    if (UpgradeOptions::platformBadges && !platformBadgeInline) {
+        // Fallback when the name line is empty: stack the logo above the label.
+        // Unknown identity is shown with the Xbox mark.
+        const bool steam = SquadRoster::PlausibleSteamId(actor.steamId64);
+        const float d = (std::max)(10.f, UpgradeOptions::badgeSize);
+        const ImVec2 c(headX, labelStackY - d * 0.5f);
+        DrawPlatformMark(drawList, steam, c, d);
+        labelStackY -= d + 7.f;
+    }
+    if (UpgradeOptions::playerStates) {
+        const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        const char* state = nullptr;
+        if (actor.isDbno && UpgradeOptions::stateDowned) state = "Downed";
+        else if (!actor.isDbno && actor.lastVelocityUpdate && now >= actor.lastVelocityUpdate && now-actor.lastVelocityUpdate <= 500) {
+            const double speed = std::hypot(actor.cachedVelocity.x, actor.cachedVelocity.y);
+            if (std::isfinite(speed)) {
+                if (speed > 20.0 && UpgradeOptions::stateWalking) state = "Walking / moving";
+                else if (speed <= 20.0 && UpgradeOptions::stateIdle) state = "Idle";
+            }
+        }
+        if (state) {
+            EspDraw::DrawLabelEsp(drawList, ImVec2(headX,labelStackY), state, IM_COL32(180,215,235,220), actor.Distance);
+            labelStackY -= LabelTextHeight(state,actor.Distance)+3.f;
         }
     }
 
@@ -781,10 +930,20 @@ static float StackPlayerLabels(
         labelStackY -= 14.f;
     }
 
-    return labelStackY;
+    return labelStackY;}
+} // namespace
+
+// Shared with EntityList admission (Engine.h): one range for admit + frame cull.
+float PlayerCollectMaxM()
+{
+    float range = var::enableesp ? var::esp_distance : 0.f;
+    if (var::enable_aimbot || var::enable_triggerbot) range = (std::max)(range,var::aimbot_distance);
+    if (UpgradeOptions::warnings) range = (std::max)(range,UpgradeOptions::warningRange);
+    if (var::show_radar) range = (std::max)(range,var::radar_range);
+    return range;
 }
 
-} // namespace
+
 
 static void RenderPlayerEspFromFrame(
     const std::vector<Engine::EspFramePlayer>& players,
@@ -818,11 +977,15 @@ static void DrawPlayerSkeletonFromCache(
     const float thickness = (std::max)(2.0f, scale.lineThickness * 1.5f);
     const ImU32 outlineColor = IM_COL32(0, 0, 0, 200);
 
+
+
     for (const auto& [boneA, boneB] : eng.SkeletonLinksArcRaiders) {
         ImVec2 a{};
         ImVec2 b{};
         if (!EspDraw::TrySkeletonSegmentScreen(eng, frameCam, actor, boneA, boneB, a, b))
             continue;
+
+
 
         // Draw outline line underneath
         drawList->AddLine(a, b, outlineColor, thickness + 2.f);
@@ -846,7 +1009,15 @@ bool Engine::ShouldDrawPlayerEsp(const PlayerCacheEntry& entry) const
     }
     if (entry.isAlly && var::hide_allies)
         return false;
-    // HealthInfo@PS+0x530 is wrong on PioneerPS; health may read 0 — still draw.
+    // Bots never reach the ESP cache via admission; this is the draw-side
+    // backstop (same bit test as EntityList.cpp PlayerStateIsBot).
+    if (entry.actorState && Memory::IsValidPtrFast2(entry.actorState)) {
+        ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Name);
+        const uint8_t flags = Memory::read<uint8_t>(entry.actorState + Offsets::PS_BotStateByte);
+        if (flags & Offsets::PS_BotStateBotMask)
+            return false;
+    }
+    // HealthInfo@PS+0x530 is wrong on PioneerPS; health may read 0 â€” still draw.
     // Do not use the stale scanner distance as a hard render gate; the frame
     // collector recomputes current distance after the camera sample.
     if (entry.Distance < 0.f)
@@ -870,24 +1041,37 @@ bool Engine::ShouldDrawRobotEsp(uintptr_t actorKey, const WorldCacheEntry& entry
     const uint64_t nowMs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
-    const bool currentDrawProof = BotEspExpiry::CurrentBotDrawProof(
-        entry.lastActorSeenMs, entry.livePositionSampleMs, nowMs);
+    // Either sampler may prove the position: livePositionSampleMs is the
+    // high-frequency root sampler, positionSampleMs is the union of that and
+    // RobotList's own scene read. Requiring the live stamp alone hid in-range
+    // bots whose live sample was starved but whose scanner sample was under a
+    // second old (measured: 2,036 in-range refusals per session).
+    const bool currentDrawProof = BotEspExpiry::CurrentBotDrawProofWithScannerFallback(
+        entry.lastActorSeenMs, entry.livePositionSampleMs,
+        entry.positionSampleMs, nowMs);
     Vector3 selectedPosition{};
     const bool hasDrawablePosition = BotEspPosition::Select(
         entry.WorldPos, entry.CenterWorldPos,
         [](const Vector3& p) { return IsPlausibleWorldPos(p); },
         selectedPosition);
+    const bool actorSeenRecently = entry.lastActorSeenMs != 0
+        && (nowMs < entry.lastActorSeenMs
+            || nowMs - entry.lastActorSeenMs
+                <= BotEspExpiry::kMaxActorSeenAgeMs);
     if (!currentDrawProof) {
-        const bool actorSeenRecently = entry.lastActorSeenMs != 0
-            && (nowMs < entry.lastActorSeenMs
-                || nowMs - entry.lastActorSeenMs
-                    <= BotEspExpiry::kMaxActorSeenAgeMs);
-        LogGhostBotDecision(actorKey, entry,
-            !actorSeenRecently ? "actor_not_current" : "no_live_position");
-        return false;
+        // 3.1: a starved live sample must not blink a bot out while the actor is
+        // still in the current actor array and admission left a plausible cached
+        // position. Draw from that cached position (the paint path re-derives the
+        // distance and interpolates every frame) instead of hiding — this is the
+        // "bots blink / some never show at all" report.
+        if (!(actorSeenRecently && hasDrawablePosition)) {
+            LogGhostBotDecision(actorKey, entry,
+                !actorSeenRecently ? "actor_not_current" : "no_live_position");
+            return false;
+        }
     }
     if (!entry.Drawing && !(entry.botIdentityProven && hasDrawablePosition)) {
-        if (var::showRobots || var::robotAimEnabled)
+        if (var::showRobots || ArcPoolNeeded())
             return false;
         if (!var::show_radar)
             return false;
@@ -907,14 +1091,19 @@ bool Engine::ShouldDrawRobotEsp(uintptr_t actorKey, const WorldCacheEntry& entry
     // The robot scanner's distance is also stale for fast/flying targets. Keep
     // admission independent of it; CollectEspRenderFrame recomputes the
     // distance from the frame camera before the paint path applies range.
-    if (entry.IsBreaked && !var::show_dead_bots)
+    if (entry.IsBreaked && var::DeadBotsHidden())
         return false;
     // Ghost-box kill (BotEspExpiry): a proven bot whose position sample is
     // frozen is a corpse husk or a despawned actor ("ghost bots, nothing
     // there"). Normal samples are <= ~2.1s old even under DMA load, so a 3s
     // stale sample means the sampler stopped updating that entry.
+    //
+    // 3.1: only while the actor is NOT still in the current actor array. A frozen
+    // sample on an actor that is still present is a starved sampler, not a
+    // corpse — hiding it (every frame the sample stayed stale) was the blink.
     {
-        if (!BotEspExpiry::PosSampleFresh(
+        if (!actorSeenRecently
+            && !BotEspExpiry::PosSampleFresh(
                 entry.positionSampleMs, entry.admittedMs, nowMs)) {
             LogGhostBotDecision(actorKey, entry, "stale_sample");
             return false;
@@ -954,7 +1143,7 @@ bool Engine::ShouldDrawWorldEsp(const WorldCacheEntry& entry) const
 //
 // FExtractionInfo { double startedTs; double time; } is ambiguous by design:
 // the drop calls +0x8 "duration in seconds", but the game's own marker widget
-// ticks a live remaining. Let the data decide — sample twice:
+// ticks a live remaining. Let the data decide â€” sample twice:
 //   decreasing at local rate -> live remaining (use directly)
 //   constant                -> duration (subtract elapsed since the observed
 //                              startedTs transition / first sight)
@@ -968,8 +1157,27 @@ struct ExtractTimerState {
 std::unordered_map<uintptr_t, ExtractTimerState> s_extractTimerState;
 } // namespace
 
+// One line per ESP vischeck ray: which bot, its distance, and whether the wall
+// test blocked it. Capped so a raid cannot flood the diagnostics file, and
+// enough to match the hidden bots on screen against the rays that hid them.
+static void LogVisRay(uintptr_t key, float distM, bool blocked)
+{
+    constexpr int kVisRayLogCap = 600;
+    static std::atomic<int> s_logged{ 0 };
+    if (s_logged.fetch_add(1, std::memory_order_relaxed) >= kVisRayLogCap)
+        return;
+    char rec[256];
+    std::snprintf(rec, sizeof(rec),
+        "{\"location\":\"Esp.cpp:LogVisRay\",\"message\":\"vis_ray\",\"timestamp\":%llu,"
+        "\"key\":\"0x%llx\",\"distM\":%.1f,\"blocked\":%d}\n",
+        static_cast<unsigned long long>(EntityDiagnostics::NowMs()),
+        static_cast<unsigned long long>(key), static_cast<double>(distM), blocked ? 1 : 0);
+    EntityDiagnostics::LogRaw(rec);
+}
+
 static void RefreshExtractionTimer(Engine::WorldCacheEntry& e)
 {
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::World);
     const uintptr_t actor = e.APawn; // hatch entries stash the actor key here
     if (!actor)
         return;
@@ -1002,14 +1210,14 @@ static void RefreshExtractionTimer(Engine::WorldCacheEntry& e)
         const bool ticking =
             dtS > 0.0 && drop >= dtS * 0.25 && drop <= dtS * 4.0 + 1.0;
         if (!ticking) {
-            // Constant field: duration semantics — anchor elapsed on the
+            // Constant field: duration semantics â€” anchor elapsed on the
             // observed start (a startedTs transition means it just began).
             if (st.startObsMs == 0 || startedTs != st.lastStartedTs)
                 st.startObsMs = nowMs;
             remain = timeField - static_cast<double>(nowMs - st.startObsMs) / 1000.0;
         }
     } else {
-        st.startObsMs = nowMs; // first sight — anchor for duration mode
+        st.startObsMs = nowMs; // first sight â€” anchor for duration mode
     }
 
     st.prevField = timeField;
@@ -1023,6 +1231,8 @@ static void RefreshExtractionTimer(Engine::WorldCacheEntry& e)
 bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
 {
     out = {};
+    // Phase 1 run report: whole-pass timing (two clock reads, no allocation).
+    const auto reportCollectStart = std::chrono::steady_clock::now();
     out.frameSeq = m_espFrameSeq.fetch_add(1, std::memory_order_relaxed) + 1;
     out.worldGeneration = m_worldGeneration.load(std::memory_order_acquire);
     m_espFrameDiagnostics.lastCollectStartMs.store(
@@ -1040,13 +1250,25 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         return false;
     }
 
+    const auto reportDiscoveryStart = std::chrono::steady_clock::now();
+    // Split the collect into "our own work" against "waiting for a scanner". This
+    // pass runs on an ungated thread while the gated scanners can hold a cache
+    // mutex for seconds; measured together they are one anonymous 200ms collect,
+    // and every fix aimed at the wrong half is wasted. Reported per frame as
+    // frame.boneMilliseconds and frame.cacheWaitMilliseconds.
+    double reportCacheWaitMs = 0.0;
+    double reportBoneMs = 0.0;
+
     const FeaturePolicy::AimFeatures frameAimFeatures{
         var::enable_aimbot,
         var::robotAimEnabled,
         var::enable_triggerbot};
-    if (var::enableesp || var::show_radar
+    if (var::enableesp || var::show_radar || UpgradeOptions::warnings
         || FeaturePolicy::ShouldRunAimPass(frameAimFeatures)) {
+        const auto tPlayerLock = std::chrono::steady_clock::now();
         std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
+        reportCacheWaitMs += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - tPlayerLock).count();
         out.players.reserve(playerCache.size());
         const uint64_t missNowMs = PlayerEspMiss::NowMs();
         int frameNotDrawing = 0;
@@ -1067,7 +1289,7 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
                 ++framePosition;
             bool include = false;
             bool espSelected = false;
-            if (var::enableesp || var::show_radar) {
+            if (var::enableesp || var::show_radar || UpgradeOptions::warnings) {
                 if (ShouldDrawPlayerEsp(entry)) {
                     include = true;
                     espSelected = true;
@@ -1080,7 +1302,7 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
                     include = true;
             }
             if ((var::enableesp || var::show_radar) && !espSelected) {
-                // Per-player miss reason (first failing gate wins) — the
+                // Per-player miss reason (first failing gate wins) â€” the
                 // PlayerEspMissLog answer to "which player is missing and why".
                 // An aimbot-only collect still counts as an ESP miss; with ESP
                 // fully off nothing is "missing", so no notes are recorded.
@@ -1111,6 +1333,12 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             framePlayer.entry = entry;
             out.players.push_back(std::move(framePlayer));
         }
+        // When these copies were taken. Everything inside them (position sample,
+        // velocity, flags) is as of this instant; the frame is not complete until
+        // collectStampMs, and a consumer may read it hundreds of ms later. A
+        // reader measuring a copy's stamp against its own clock would charge the
+        // copy for all of that latency, which is why the capture stamp is kept.
+        out.playersCopyStampMs = SteadyNowMs();
         SetPlayerFrameResult(out.players.size(), frameNotDrawing,
             frameNotInitialized, frameAlly, frameDistance, framePosition);
     }
@@ -1118,11 +1346,17 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
     if (AnyWorldEspEnabled() || var::show_radar || var::enableesp) { // near-field reveal: collect world frames while ESP is on
         size_t worldReserve = 0;
         {
+            const auto tContReserve = std::chrono::steady_clock::now();
             std::shared_lock<std::shared_mutex> lock(m_containerCacheMutex);
+            reportCacheWaitMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - tContReserve).count();
             worldReserve += containerCache.size();
         }
         {
+            const auto tItemReserve = std::chrono::steady_clock::now();
             std::shared_lock<std::shared_mutex> lock(m_itemCacheMutex);
+            reportCacheWaitMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - tItemReserve).count();
             worldReserve += itemCache.size();
         }
         out.world.reserve(worldReserve);
@@ -1154,17 +1388,26 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         };
 
         {
+            const auto tItemAppend = std::chrono::steady_clock::now();
             std::shared_lock<std::shared_mutex> lock(m_itemCacheMutex);
+            reportCacheWaitMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - tItemAppend).count();
             appendWorld(itemCache);
         }
         {
+            const auto tContAppend = std::chrono::steady_clock::now();
             std::shared_lock<std::shared_mutex> lock(m_containerCacheMutex);
+            reportCacheWaitMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - tContAppend).count();
             appendWorld(containerCache);
         }
     }
 
-    if (var::showRobots || var::robotAimEnabled || var::show_radar) {
+    if (var::showRobots || ArcPoolNeeded() || var::show_radar) {
+        const auto tRobotLock = std::chrono::steady_clock::now();
         std::shared_lock<std::shared_mutex> lock(m_robotCacheMutex);
+        reportCacheWaitMs += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - tRobotLock).count();
         out.robots.reserve(robotCache.size());
         for (const auto& [key, entry] : robotCache) {
             if (!ShouldDrawRobotEsp(key, entry)) {
@@ -1177,7 +1420,12 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             frameRobot.entry = entry;
             out.robots.push_back(std::move(frameRobot));
         }
+        out.robotsCopyStampMs = SteadyNowMs();
     }
+
+    // Discovery phase: turning the entity caches into this frame's entries.
+    const double reportDiscoveryMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - reportDiscoveryStart).count();
 
     uintptr_t pc = 0;
     uintptr_t pawn = 0;
@@ -1192,6 +1440,7 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
 
     uintptr_t rootComp = root;
     if (pawn && IsValidPointer(pawn)) {
+        ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Link);
         const uintptr_t pawnRoot =
             Memory::read<uintptr_t>(pawn + Offsets::RootComponent);
         if (pawnRoot && IsValidPointer(pawnRoot))
@@ -1202,8 +1451,8 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
     // PositionRefreshPass (~20ms) already NOCACHE-scatters Drawing roots into the
     // caches we just copied. A second ~280-actor NOCACHE scatter + serial
     // ResolveLootActorRoot/ReadSceneWorldPos fallbacks co-timed with hitch_pos
-    // as ~200–1400ms hitch_frame storms every ~10s (VMM TLB expiry).
-    // Camera POV scatter only — keep entry.WorldPos from PositionRefreshPass.
+    // as ~200â€“1400ms hitch_frame storms every ~10s (VMM TLB expiry).
+    // Camera POV scatter only â€” keep entry.WorldPos from PositionRefreshPass.
     float povFov = 0.f;
     float defFov = 0.f;
     const float jsonFov = 0.f;
@@ -1212,6 +1461,7 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
     FVector3d pawnWorld{};
     Vector3 ctrlRot{};
 
+    const auto reportReadStart = std::chrono::steady_clock::now();
     if (pcmOk && povBase) {
         g_scatter.prepare(povBase + Offsets::CameraPOV_Location, povLoc);
         g_scatter.prepare(povBase + Offsets::CameraPOV_Rotation, povRot);
@@ -1220,7 +1470,7 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
     }
     if (rootComp && IsValidPointer(rootComp)) {
         // ComponentToWorld has two candidate slots on this build (live-pinned
-        // 0x310, derived fallback 0x2D0) — the probe keeps the pawn scatter on the
+        // 0x310, derived fallback 0x2D0) â€” the probe keeps the pawn scatter on the
         // slot that actually holds a plausible world position, and the read is the
         // FTransform translation inside that block.
         g_scatter.prepare(
@@ -1232,11 +1482,17 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         g_scatter.prepare(pc + Offsets::ControlRotation, ctrlRot);
 
     const bool scatterOk = g_scatter.execute();
+    // Read phase: the DMA read batch of this frame build (prepare + execute).
+    const double reportReadMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - reportReadStart).count();
     if (!scatterOk) {
         // The cache snapshots above are still useful. If the live camera is
         // valid, publish them instead of dropping bots and loot for one failed
         // camera scatter batch.
+        const auto tCamScatter = std::chrono::steady_clock::now();
         std::shared_lock<std::shared_mutex> lock(m_cameraMutex);
+        reportCacheWaitMs += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - tCamScatter).count();
         if (!CameraOkForEsp(g_Camera)) {
             RecordEspFrameFailure(EspFrameResult::ScatterExecuteFailed);
             return false;
@@ -1245,8 +1501,10 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
     }
 
     Vector3 pawnPos = Engine::ToVector3(pawnWorld);
-    if (!IsPlausibleWorldPos(pawnPos) && rootComp && IsValidPointer(rootComp))
+    if (!IsPlausibleWorldPos(pawnPos) && rootComp && IsValidPointer(rootComp)) {
+        ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Position);
         pawnPos = Memory::read<Vector3>(rootComp + Offsets::RelativeLocation);
+    }
 
     const bool pawnOk = IsPlausibleWorldPos(pawnPos);
     if (scatterOk && !BuildCameraCacheFromPovReads(
@@ -1265,7 +1523,10 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         // Entity snapshots are already collected. If the dedicated camera
         // worker has a valid live camera, keep publishing the frame rather
         // than throwing away bots and loot for one failed camera build.
+        const auto tCamBuild = std::chrono::steady_clock::now();
         std::shared_lock<std::shared_mutex> lock(m_cameraMutex);
+        reportCacheWaitMs += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - tCamBuild).count();
         if (!CameraOkForEsp(g_Camera)) {
             RecordEspFrameFailure(EspFrameResult::CameraFailed);
             return false;
@@ -1301,7 +1562,7 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             continue;
         extrapolateEntry(e.WorldPos, e.cachedVelocity, e.lastVelocityUpdate);
         // Extrapolate skeleton bones too so they stay on target with the
-        // ESP box — without this the skeleton lags one DMA cycle behind.
+        // ESP box â€” without this the skeleton lags one DMA cycle behind.
         for (auto& wb : e.boneData.bonesWorldDouble)
             extrapolateEntry(wb, e.cachedVelocity, e.lastVelocityUpdate);
     }
@@ -1363,7 +1624,7 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
                         item.entry.Distance > playerMaxM * 1.05f;
                     if (culled) {
                         // Selected earlier, then dropped by the fresh-camera
-                        // range gate — the most confusing miss, so name it.
+                        // range gate â€” the most confusing miss, so name it.
                         PlayerEspMiss::Global().Note(item.actorKey,
                             item.entry.ActorName, item.entry.Distance,
                             PlayerEspMiss::Reason::FrameRangeCull);
@@ -1382,10 +1643,10 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
             }),
         out.robots.end());
 
-    if (var::skeleton || var::silhouette || var::box || var::enable_aimbot) {
+    if (var::skeleton || var::silhouette || var::box || var::show_head_dot || var::enable_aimbot || var::enable_triggerbot) {
         const float boneMaxM =
             var::esp_distance > 0.f ? var::esp_distance : var::kMaxDistanceSliderM;
-        const float aimBoneMaxM = var::enable_aimbot && var::aimbot_distance > 0.f
+        const float aimBoneMaxM = (var::enable_aimbot || var::enable_triggerbot) && var::aimbot_distance > 0.f
             ? var::aimbot_distance
             : boneMaxM;
         const float readMaxM = (std::max)(boneMaxM, aimBoneMaxM);
@@ -1410,6 +1671,7 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
         if (boneIndices.size() > kMaxEspFrameBoneReads)
             boneIndices.resize(kMaxEspFrameBoneReads);
 
+        const auto boneStart = std::chrono::steady_clock::now();
         for (size_t idx : boneIndices) {
             Engine::PlayerCacheEntry& entry = out.players[idx].entry;
             const uintptr_t liveMesh = GetActorBoneMesh(entry.APawn);
@@ -1417,6 +1679,11 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
                 entry.actorMesh = liveMesh;
             GetBones(entry);
         }
+        // The skeleton refresh is the only part of the collect that scales with
+        // the number of nearby players (kMaxEspFrameBoneReads), so it is timed
+        // apart from the cache snapshot it depends on.
+        reportBoneMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - boneStart).count();
     }
 
     out.collectStampMs = SteadyNowMs();
@@ -1424,13 +1691,112 @@ bool Engine::CollectEspRenderFrame(EspRenderFrame& out)
     RecordEspFramePublished(out);
 
     // #region agent log
-    // Flush only — world Drawing transitions are owned by FinalizeWorldCacheMap
+    // Flush only â€” world Drawing transitions are owned by FinalizeWorldCacheMap
     // (World.cpp). CollectEspRenderFrame is the render collect path checkpoint.
     WorldScan::MaybeFlushFlickerScore();
     // Paint-stall diagnostic drain: worker thread only, never the paint path.
     // Writes paint_stall NDJSON (max/avg iteration + spike list) to the log.
     PaintStallFlushToLog();
+    // Debug-flag-gated ESP paint profile (frame time + per-lock try/miss/wait).
+    // Worker thread only, like the stall flush above.
+    if (var::debug_esp_paint)
+        EspPaintProfileFlushToLog();
     // #endregion
+
+    // Phase 1 run report: one immutable sample per published frame, built here
+    // and handed to the writer thread. No file I/O and no lock that paint holds
+    // -- the two engine locks are try_lock only, so a contended read is recorded
+    // as "not observable" rather than as an invented value.
+    {
+        RunReport::FrameSample sample{};
+        sample.frameSeq = out.frameSeq;
+        sample.worldGeneration = out.worldGeneration;
+        sample.collectStampMs = out.collectStampMs;
+        sample.collectMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - reportCollectStart).count();
+        sample.readMs = reportReadMs;
+        sample.discoveryMs = reportDiscoveryMs;
+        sample.boneMs = reportBoneMs;
+        sample.cacheWaitMs = reportCacheWaitMs;
+        sample.cameraValid = CameraOkForEsp(out.camera);
+        sample.camFov = out.camera.FOV;
+        sample.playerCount = static_cast<uint32_t>(out.players.size());
+        sample.robotCount = static_cast<uint32_t>(out.robots.size());
+        sample.worldCount = static_cast<uint32_t>(out.world.size());
+        sample.drawCount = sample.playerCount + sample.robotCount
+            + sample.worldCount;
+
+        {
+            std::shared_lock<std::shared_mutex> lock(
+                m_playerDiagMutex, std::try_to_lock);
+            if (lock.owns_lock()) {
+                const PlayerPipelineStats& pd = m_playerDiag;
+                sample.playerDiagValid = true;
+                sample.playerInitialized = pd.initialized;
+                sample.playerUninitialized = pd.uninitialized;
+                sample.playerDrawing = pd.drawing;
+                sample.frameSelected = pd.frameSelected;
+                sample.frameNotDrawing = pd.frameNotDrawing;
+                sample.frameNotInitialized = pd.frameNotInitialized;
+                sample.frameAlly = pd.frameAlly;
+                sample.frameDistance = pd.frameDistance;
+                sample.framePosition = pd.framePosition;
+            }
+        }
+        {
+            std::shared_lock<std::shared_mutex> lock(m_stateMutex, std::try_to_lock);
+            if (lock.owns_lock())
+                sample.actorCount = ActorsCount;
+        }
+        {
+            std::array<uint32_t, RunReport::kReasonCount> totals{};
+            size_t openRows = 0;
+            PlayerEspMiss::Global().ReasonTotals(
+                PlayerEspMiss::NowMs(), totals, openRows);
+            sample.missOpen = static_cast<int32_t>(openRows);
+            sample.missByReason = totals;
+        }
+        sample.lastResult = m_espFrameDiagnostics.lastResult.load(
+            std::memory_order_acquire);
+        sample.consecutiveFailures = m_espFrameDiagnostics.consecutiveFailures
+            .load(std::memory_order_acquire);
+        sample.lastFailureMs = m_espFrameDiagnostics.lastFailureMs.load(
+            std::memory_order_acquire);
+        DmaScatterStats_Get(sample.dmaScatterExecutes,
+            sample.dmaScatterPrepares, sample.dmaScatterLastBatch);
+        // T4.1: the calibration in force on this frame, read through the same
+        // accessor the aim path uses (UpgradeOptions::CalibrationProfile), so the
+        // report cannot describe a calibration the aim path is not using.
+        {
+            // One shared profile: the ARC columns mirror the same values.
+            const AimCalibration::Profile playerCal =
+                UpgradeOptions::CalibrationProfile();
+            const AimCalibration::Profile arcCal = playerCal;
+            sample.calPlayerX = playerCal.countsPerPixel.x;
+            sample.calPlayerY = playerCal.countsPerPixel.y;
+            sample.calPlayerCurve = playerCal.curve;
+            sample.calPlayerCap = playerCal.maxCountsPerTick;
+            sample.calPlayerCapDeferred = !AimCalibration::CapUsable(playerCal)
+                || !(playerCal.maxCountsPerTick > 0.f);
+            sample.calArcX = arcCal.countsPerPixel.x;
+            sample.calArcY = arcCal.countsPerPixel.y;
+            sample.calArcCurve = arcCal.curve;
+            sample.calArcCap = arcCal.maxCountsPerTick;
+            sample.calArcCapDeferred = !AimCalibration::CapUsable(arcCal)
+                || !(arcCal.maxCountsPerTick > 0.f);
+            sample.calibrationRefused =
+                static_cast<uint32_t>(UpgradeOptions::calibrationRejections);
+            const char* refusedKey = UpgradeOptions::lastCalibrationRejection.key;
+            size_t n = 0;
+            while (refusedKey && refusedKey[n]
+                && n + 1 < sizeof(sample.calibrationRefusedKey)) {
+                sample.calibrationRefusedKey[n] = refusedKey[n];
+                ++n;
+            }
+            sample.calibrationRefusedKey[n] = '\0';
+        }
+        RunReport::Publish(sample);
+    }
 
     return true;
 }
@@ -1448,7 +1814,7 @@ static void DrawPlayerEspList(
 
     const float silhouetteMaxM = var::EffectiveSilhouetteMaxM();
 
-    // Screen-space EMA smoothing — keyed on actor key, cleared each frame.
+    // Screen-space EMA smoothing â€” keyed on actor key, cleared each frame.
     // Smooths the projected head/feet so the box glides instead of snapping.
     struct SmoothedPos {
         ImVec2 head{};
@@ -1457,14 +1823,30 @@ static void DrawPlayerEspList(
         int misses = 0;  // consecutive frames this actor was not drawn
     };
     static std::unordered_map<uintptr_t, SmoothedPos> s_smooth;
-    // Raised from 0.6 — the skeleton/silhouette draw the raw unsmoothed bones,
+    // Raised from 0.6 â€” the skeleton/silhouette draw the raw unsmoothed bones,
     // so a laggier box could visibly drift off-target during fast movement.
     static constexpr float kSmoothAlpha = 0.85f;   // 0=no smooth, 1=instant.
     // A single missed frame (DMA hiccup, one-frame proj/pick fail) must not
-    // erase the smoothed position — that makes the box jump on re-entry.
+    // erase the smoothed position â€” that makes the box jump on re-entry.
     // Keep the state across short gaps and only prune after a real absence.
     static constexpr int kSmoothMaxMisses = 15;  // ~0.25s at 60fps
     std::unordered_set<uintptr_t> seenThisFrame;
+    // 3.3: draw-range hysteresis. Collection uses PlayerCollectMaxM() (a
+    // superset of esp_distance for aim/radar/warnings) while the box/name/dot
+    // cap is var::esp_distance. A hard cut at the cap popped the box on/off as
+    // the distance jittered across it. Hold an already-drawn actor on a 1.10x
+    // drop edge (mirrors the loot 1.05x and robot 1.15x drop bands).
+    static std::unordered_map<uintptr_t, uint64_t> s_playerRangeHold;
+    static constexpr float kPlayerRangeDropFactor = 1.10f;
+    static constexpr uint64_t kPlayerRangeHoldMs = 750;
+    const uint64_t rangeNowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    const float playerDrawMaxM = var::esp_distance;
+    // Same cover check the bots get, with its own per-frame budget so players
+    // cannot starve the bot queries (and vice versa).
+    constexpr int kPlayerVisQueriesPerFrame = 32;
+    int playerVisQueriesThisFrame = 0;
 
     for (const Engine::PlayerCacheEntry* actor : actors) {
         if (!actor->APawn || !engine.IsValidPointer(actor->APawn))
@@ -1480,7 +1862,12 @@ static void DrawPlayerEspList(
             // #endregion
             continue;
         }
-        if (actor->Distance < 2.f)
+        const auto rangeHoldIt = s_playerRangeHold.find(actor->APawn);
+        const bool rangeHeld = rangeHoldIt != s_playerRangeHold.end()
+            && rangeNowMs - rangeHoldIt->second <= kPlayerRangeHoldMs;
+        const float playerDrawCapM =
+            rangeHeld ? playerDrawMaxM * kPlayerRangeDropFactor : playerDrawMaxM;
+        if (actor->Distance < 2.f || actor->Distance > playerDrawCapM)
             continue;
         if (!IsPlausibleWorldPos(actor->WorldPos)) {
             // #region agent log
@@ -1490,7 +1877,7 @@ static void DrawPlayerEspList(
             continue;
         }
 
-        // Frame-synced WorldPos (scatter + velocity) — no per-paint live DMA.
+        // Frame-synced WorldPos (scatter + velocity) â€” no per-paint live DMA.
         const Engine::PlayerCacheEntry& live = *actor;
 
         Vector3 headWorld{};
@@ -1502,11 +1889,25 @@ static void DrawPlayerEspList(
             // #endregion
             continue;
         }
+        // Collision debug (visibility work): the shapes recorded for this player
+        // and the vischeck ray to its head. Drawing only, reading nothing, so the
+        // paint path stays DMA-free. The actor key is what resolves: a player's
+        // root component is its capsule, and nothing was ever cached under it.
+        if (UpgradeOptions::collisionDebugShapes || UpgradeOptions::collisionDebugRays) {
+            const Vector3 dbgEye = frameCam.Location;
+            if (UpgradeOptions::collisionDebugShapes)
+                CollisionDebug::DrawShapeOutlines(drawList, engine, frameCam, dbgEye,
+                    live.rootComponent, actor->APawn);
+            if (UpgradeOptions::collisionDebugRays)
+                CollisionDebug::DrawRay(drawList, engine, frameCam, dbgEye, headWorld,
+                    "player", /*entity=*/true);
+        }
+
         // Player hop debug: log first 3 players every 2s
         ImVec2 head{};
         ImVec2 feet{};
         if (!EspDraw::WorldToScreenBox(engine, frameCam, headWorld, feetWorld, head, feet)) {
-            // PROJ2 (Fix #13): looking away is not flicker — only count when
+            // PROJ2 (Fix #13): looking away is not flicker â€” only count when
             // the player is still roughly in the camera cone.
             if (WorldPointRoughlyInView(frameCam, headWorld)) {
                 // #region agent log
@@ -1521,8 +1922,9 @@ static void DrawPlayerEspList(
             continue;
         }
 
-        // ── EMA smoothing ──────────────────────────────────────────────
+        // â”€â”€ EMA smoothing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         seenThisFrame.insert(actor->APawn);
+        s_playerRangeHold[actor->APawn] = rangeNowMs;
         auto it = s_smooth.find(actor->APawn);
         if (it != s_smooth.end() && it->second.valid) {
             SmoothedPos& prev = it->second;
@@ -1532,20 +1934,47 @@ static void DrawPlayerEspList(
             feet.y = prev.feet.y + (feet.y - prev.feet.y) * kSmoothAlpha;
         }
         s_smooth[actor->APawn] = { head, feet, true };
-        // ───────────────────────────────────────────────────────────────
+        // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         // #region agent log
         WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintPlayer,
             actor->APawn, true, WorldScan::FlickerCause::Other);
         // #endregion
 
-        const ImU32 color = PlayerEspColor(*actor);
+        // Cover, as a colour: a player the BVH says is behind a wall takes the
+        // not-visible colour even when the game's isVisible flag is set. Fails
+        // open (BlockedForConsumer is false with no scene published).
+        bool occludedPlayer = false;
+        if (playerVisQueriesThisFrame < kPlayerVisQueriesPerFrame) {
+            ++playerVisQueriesThisFrame;
+            occludedPlayer = CollisionBvh::BlockedForConsumer(frameCam.Location, headWorld);
+        }
+        const ImU32 color = PlayerEspColor(actor->isVisible && !occludedPlayer);
         const float boxH = feet.y - head.y;
         if (boxH < 2.f)
             continue;
 
         const Visuals::EspDrawScale scale =
             Visuals::ComputeEspScaleFromBox(boxH, live.Distance);
+
+        if (var::show_head_dot) {
+            // Use the cached head bone when available; the box-top fallback
+            // is not the anatomical head and must not be presented as one.
+            const size_t headIndex = static_cast<size_t>(UniBone::Head);
+            const uint64_t headNow = Engine::SteadyEspNowMs();
+            if (live.boneData.valid.test(headIndex) && live.boneData.readStampMs
+                && headNow>=live.boneData.readStampMs && headNow-live.boneData.readStampMs<=500) {
+                Vector3 headScreen{};
+                if (engine.ProjectWorldLocationToScreen(live.boneData.bonesWorldDouble[headIndex], headScreen, frameCam)
+                    && std::isfinite(headScreen.x) && std::isfinite(headScreen.y)) {
+                    const float radius = std::isfinite(var::head_dot_radius_px)
+                        ? std::clamp(var::head_dot_radius_px, 1.f, 10.f) : 3.f;
+                    const ImVec2 center(static_cast<float>(headScreen.x), static_cast<float>(headScreen.y));
+                    drawList->AddCircleFilled(center, radius + 1.f, IM_COL32(0, 0, 0, 180), 16);
+                    drawList->AddCircleFilled(center, radius, EspDraw::ColorFromRGBA(var::head_dot_color), 16);
+                }
+            }
+        }
 
         const bool wantSilhouette =
             var::silhouette && live.Distance <= silhouetteMaxM;
@@ -1628,7 +2057,7 @@ static void DrawPlayerEspList(
                         ImVec2(pS.x + 10.f, pS.y - 8.f),
                         IM_COL32(255, 255, 120, 255), dbgBuf);
 
-                    // Console + file line — closest drawn player, 500ms cadence.
+                    // Console + file line â€” closest drawn player, 500ms cadence.
                     // File copy lands in debug-c190fb.log so the probe is
                     // readable outside the exe console.
                     static uint64_t s_skelLastPrintMs = 0;
@@ -1652,19 +2081,18 @@ static void DrawPlayerEspList(
                     if (nowMsDbg - s_skelLastPrintMs >= 500 && s_skelLine[0]) {
                         std::cout << s_skelLine << std::endl;
                         {
-                            std::ofstream lf(kArcVerifyPath, std::ios::app);
-                            if (lf) {
-                                lf << "{\"location\":\"Esp.cpp\"," 
-                                   << "\"message\":\"skel_lag\"," 
-                                   << "\"data\":{\"key\":" << s_skelVals.key
-                                   << ",\"ageMs\":" << s_skelVals.ageMs
-                                   << ",\"extAgeMs\":" << s_skelVals.extAgeMs
-                                   << ",\"dWcm\":" << s_skelVals.dW
-                                   << ",\"dSpx\":" << s_skelVals.dPx
-                                   << ",\"speed\":" << s_skelVals.speed
-                                   << ",\"dist\":" << s_skelVals.dist
-                                   << "},\"ts\":" << nowMsDbg << "}\n";
-                            }
+                            std::ostringstream oss;
+                            oss << "{\"location\":\"Esp.cpp\"," 
+                               << "\"message\":\"skel_lag\"," 
+                               << "\"data\":{\"key\":" << s_skelVals.key
+                               << ",\"ageMs\":" << s_skelVals.ageMs
+                               << ",\"extAgeMs\":" << s_skelVals.extAgeMs
+                               << ",\"dWcm\":" << s_skelVals.dW
+                               << ",\"dSpx\":" << s_skelVals.dPx
+                               << ",\"speed\":" << s_skelVals.speed
+                               << ",\"dist\":" << s_skelVals.dist
+                               << "},\"ts\":" << nowMsDbg << "}\n";
+                            EntityDiagnostics::LogRaw(oss.str());
                         }
                         s_skelLastPrintMs = nowMsDbg;
                         s_skelLine[0] = 0;
@@ -1677,7 +2105,7 @@ static void DrawPlayerEspList(
         if (var::box) {
             const Vector3 screenTop{ head.x, head.y, 0.0 };
             const Vector3 screenBottom{ feet.x, feet.y, 0.0 };
-            Visuals::Box(screenTop, screenBottom, actor->isVisible, color, 0, scale);
+            Visuals::Box(screenTop, screenBottom, actor->isVisible, color, -1, scale);
         }
 
         float labelStackY = head.y;
@@ -1697,7 +2125,7 @@ static void DrawPlayerEspList(
 
         if (var::names || var::show_weapon || var::show_distance || var::show_squad_idx
             || var::show_armor_line || var::show_dbno_badge
-            || var::show_steam_ids || var::show_look_arrows)
+            || var::show_steam_ids || var::show_look_arrows || UpgradeOptions::platformBadges || UpgradeOptions::playerStates)
             StackPlayerLabels(
                 drawList, live, head.x, labelStackY, frameCam.Rotation.y, scale);
 
@@ -1706,7 +2134,7 @@ static void DrawPlayerEspList(
     }
 
     // Prune actors that disappeared this frame so stale smoothed positions
-    // don't carry over and cause a ghost slide on re-entry — but only after
+    // don't carry over and cause a ghost slide on re-entry â€” but only after
     // kSmoothMaxMisses consecutive misses. One-frame flickers (DMA hiccups,
     // brief proj/pos fails) must keep the state so the box glides back instead
     // of snapping.
@@ -1720,6 +2148,12 @@ static void DrawPlayerEspList(
             it->second.misses = 0;
             ++it;
         }
+    }
+    for (auto it = s_playerRangeHold.begin(); it != s_playerRangeHold.end(); ) {
+        if (rangeNowMs - it->second > kPlayerRangeHoldMs)
+            it = s_playerRangeHold.erase(it);
+        else
+            ++it;
     }
 }
 
@@ -1756,9 +2190,9 @@ static void RenderPlayerEspFromFrame(
     }
 
     // Paint-gap velocity continuation: extrapolation ran at COLLECT time with
-    // its own clamp, but paint happens 40-90ms later — during that gap the
+    // its own clamp, but paint happens 40-90ms later â€” during that gap the
     // skeleton/world entries freeze while the game moves on. Continue the
-    // same cached velocity over the collect→present delta (pure math, no DMA).
+    // same cached velocity over the collectâ†’present delta (pure math, no DMA).
     // Clamp bounds worst-case drift if paint stalls.
     if (collectStampMs != 0) {
         const uint64_t paintNowMs = static_cast<uint64_t>(
@@ -1812,7 +2246,7 @@ static void RenderRobotEspFromFrame(
     if (!drawList)
         return;
 
-    const Engine::EngineStateSnapshot stateSnap = engine.GetStateSnapshot();
+    const Engine::EngineStateSnapshot stateSnap = engine.GetStateSnapshot(/*allowStale=*/true);
     const Vector3 distRef = engine.ResolveDistanceReference(
         frameCam, stateSnap.acknowledgedPawn);
 
@@ -1827,6 +2261,11 @@ static void RenderRobotEspFromFrame(
         int label = 0;
         int offscreen = 0;
         int painted = 0;
+        // Visibility work, counted separately from the geometric funnel: a bot
+        // behind cover is not a projection miss, and conflating the two is how
+        // "the box vanished" would read as a camera problem.
+        int occluded = 0;
+        int visBudgetHit = 0;
         const char* closestReason = "none";
         uintptr_t closestKey = 0;
         float closestDistance = -1.f;
@@ -1834,9 +2273,17 @@ static void RenderRobotEspFromFrame(
         bool closestProven = false;
         uint64_t closestSampleAgeMs = 0;
     } funnel;
+    // Per-frame cap on vischeck queries in the paint path. Each query is
+    // microseconds against the published BVH, but an uncapped loop over a full bot
+    // cache inside a frame is exactly the kind of unprofiled cost this path has
+    // been burned by before, so it is bounded and the overflow is counted.
+    constexpr int kVisQueriesPerFrame = 96;
+    int visQueriesThisFrame = 0;
     const auto noteSkip = [&](const char* reason, uintptr_t key,
-                              const Engine::WorldCacheEntry& robot, float distance) {
-        LogGhostBotDecision(key, robot, reason, distance);
+                              const Engine::WorldCacheEntry& robot, float distance,
+                              float camDepthCm = std::nanf(""), float sx = std::nanf(""),
+                              float sy = std::nanf("")) {
+        LogGhostBotDecision(key, robot, reason, distance, camDepthCm, sx, sy);
         if (distance >= 0.f && (funnel.closestDistance < 0.f
             || distance < funnel.closestDistance)) {
             funnel.closestReason = reason;
@@ -1854,7 +2301,7 @@ static void RenderRobotEspFromFrame(
 
     // #region agent log
     // Bots that vanish from the render frame entirely (collect drop) blink
-    // without ever hitting a paint skip branch — diff the frame's key set.
+    // without ever hitting a paint skip branch â€” diff the frame's key set.
     {
         static std::unordered_set<uintptr_t> s_prevPaintBotKeys;
         std::unordered_set<uintptr_t> cur;
@@ -1884,7 +2331,7 @@ static void RenderRobotEspFromFrame(
             noteSkip("playerVeto", key, robot, -1.f);
             continue;
         }
-        if (robot.IsBreaked && !var::show_dead_bots) {
+        if (robot.IsBreaked && var::DeadBotsHidden()) {
             ++funnel.dead;
             noteSkip("dead", key, robot, -1.f);
             continue;
@@ -2006,6 +2453,18 @@ static void RenderRobotEspFromFrame(
             continue;
         }
 
+        // Collision debug: same two overlays for bots, with the ray aimed at the
+        // head the aim gate would use rather than the scene-root position.
+        if (UpgradeOptions::collisionDebugShapes || UpgradeOptions::collisionDebugRays) {
+            const Vector3 dbgEye = frameCam.Location;
+            if (UpgradeOptions::collisionDebugShapes)
+                CollisionDebug::DrawShapeOutlines(drawList, engine, frameCam, dbgEye,
+                    drawEntry.rootComponent, drawEntry.APawn);
+            if (UpgradeOptions::collisionDebugRays)
+                CollisionDebug::DrawRay(drawList, engine, frameCam, dbgEye, headWorld,
+                    "bot", /*entity=*/true);
+        }
+
         ImVec2 head{};
         ImVec2 feet{};
         // Paint does no DMA: a WorldToScreenBox miss is deterministic geometry
@@ -2037,7 +2496,31 @@ static void RenderRobotEspFromFrame(
             }
             if (!recovered) {
                 ++funnel.projection;
-                noteSkip("projection", key, robot, distM);
+                // Split the projection miss by cause. Behind the camera (camera-space
+                // depth < 1) and outside the viewport both looked like one
+                // "projection" reason before. Uses the same centre point the
+                // box fallback projects.
+                const Vector3 projCenter{
+                    (headWorld.x + feetWorld.x) * 0.5,
+                    (headWorld.y + feetWorld.y) * 0.5,
+                    (headWorld.z + feetWorld.z) * 0.5};
+                Vector3 projAxisX{};
+                Vector3 projAxisY{};
+                Vector3 projAxisZ{};
+                EngineProjection::RotationGetAxes(
+                    frameCam.Rotation, projAxisX, projAxisY, projAxisZ);
+                const Vector3 projDelta = projCenter - frameCam.Location;
+                const float projDepthCm = static_cast<float>(
+                    projDelta.x * projAxisX.x + projDelta.y * projAxisX.y
+                    + projDelta.z * projAxisX.z);
+                // The screen point is written before the bounds check, so an
+                // off-screen point keeps its coordinates. A point behind the
+                // camera returns early and leaves them at zero.
+                Vector3 projScreen{};
+                engine.ProjectWorldLocationToScreen(projCenter, projScreen, frameCam);
+                noteSkip(projDepthCm < 1.f ? "projection_behind" : "projection_offscreen",
+                    key, robot, distM, projDepthCm,
+                    static_cast<float>(projScreen.x), static_cast<float>(projScreen.y));
                 if (WorldPointRoughlyInView(frameCam, headWorld)) {
                     // #region agent log
                     WorldScan::NoteFlickerDrawing(WorldScan::FlickerChannel::PaintBot,
@@ -2048,7 +2531,7 @@ static void RenderRobotEspFromFrame(
             }
         }
 
-        // ── Bot skeleton/position lag probe + light smoothing ──────────
+        // â”€â”€ Bot skeleton/position lag probe + light smoothing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         {
             struct BotSmooth { ImVec2 head{}; ImVec2 feet{}; bool valid = false; };
             static std::unordered_map<uintptr_t, BotSmooth> s_botSmooth;
@@ -2171,32 +2654,47 @@ static void RenderRobotEspFromFrame(
                             renderState.leadMs, stepCm, stepDtMs };
                     }
                     if (nowDbg - s_lastBotProbeLog >= 500) {
-                        std::ofstream lf(kArcVerifyPath, std::ios::app);
-                        if (lf) {
-                            lf << "{\"location\":\"Esp.cpp\",\"message\":\"bot_skel_lag\","
-                               << "\"data\":{\"key\":" << best.key
-                               << ",\"sampleAgeMs\":" << best.sampleAge
-                               << ",\"velocityAgeMs\":" << best.velocityAge
-                               << ",\"dWorldCm\":" << best.dWorld
-                               << ",\"dScreenPx\":" << best.dScreen
-                               << ",\"speed\":" << best.speed
-                               << ",\"dist\":" << best.dist
-                               << ",\"intervalMs\":" << best.intervalMs
-                               << ",\"delayMs\":" << best.delayMs
-                               << ",\"leadMs\":" << best.leadMs
-                               << ",\"stepCm\":" << best.stepCm
-                               << ",\"stepDtMs\":" << best.stepDtMs
-                               << "},\"ts\":" << nowDbg << "}\n";
-                        }
+                        std::ostringstream lf;
+                        lf << "{\"location\":\"Esp.cpp\",\"message\":\"bot_skel_lag\","
+                           << "\"data\":{\"key\":" << best.key
+                           << ",\"sampleAgeMs\":" << best.sampleAge
+                           << ",\"velocityAgeMs\":" << best.velocityAge
+                           << ",\"dWorldCm\":" << best.dWorld
+                           << ",\"dScreenPx\":" << best.dScreen
+                           << ",\"speed\":" << best.speed
+                           << ",\"dist\":" << best.dist
+                           << ",\"intervalMs\":" << best.intervalMs
+                           << ",\"delayMs\":" << best.delayMs
+                           << ",\"leadMs\":" << best.leadMs
+                           << ",\"stepCm\":" << best.stepCm
+                           << ",\"stepDtMs\":" << best.stepDtMs
+                           << "},\"ts\":" << nowDbg << "}\n";
+                        EntityDiagnostics::LogRaw(lf.str());
                         s_lastBotProbeLog = nowDbg;
                         s_bestBotDist = -1.f;
                     }
                 }
             }
         }
-        // ───────────────────────────────────────────────────────────────
+        // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-        const ImU32 color_base = BotEspColor(robot.isVisible, robot.IsBreaked);
+        // Cover, as a colour rather than a skip: a bot the BVH says is behind cover
+        // keeps its box and takes the not-visible colour. The ray targets the same
+        // head anchor the ESP draws toward. It fails open -- BlockedForConsumer
+        // answers false with no scene published, so nothing changes colour until
+        // the collision probe has built one.
+        bool occludedHere = false;
+        if (visQueriesThisFrame < kVisQueriesPerFrame) {
+            ++visQueriesThisFrame;
+            occludedHere = CollisionBvh::BlockedForConsumer(frameCam.Location, headWorld);
+            LogVisRay(key, distM, occludedHere);
+            if (occludedHere)
+                ++funnel.occluded;
+        } else {
+            ++funnel.visBudgetHit;
+        }
+        const ImU32 color_base = BotEspColor(robot.isVisible && !occludedHere, robot.IsBreaked,
+            robot.isVisible && occludedHere);
         const ImU32 color = color_base;
         const float boxH = feet.y - head.y;
         const Visuals::EspDrawScale scale =
@@ -2228,10 +2726,12 @@ static void RenderRobotEspFromFrame(
             }
             botLabel = "Bot";
         }
+        if (!EntityFilters::Arc(botLabel))
+            continue;
         if (!EspDraw::IsEspBoxOnScreen(head, feet)) {
             ++funnel.offscreen;
             noteSkip("offscreen", key, robot, distM);
-            // Looking away is not flicker — leave the track as-is so return
+            // Looking away is not flicker â€” leave the track as-is so return
             // to screen does not count as an on->off->on blink.
             continue;
         }
@@ -2244,7 +2744,7 @@ static void RenderRobotEspFromFrame(
         // #endregion
 
         // #region agent log
-        // bot_appear (verify log): the end-to-end discovery funnel — first
+        // bot_appear (verify log): the end-to-end discovery funnel â€” first
         // seen (pending-lane insert) -> admitted (cache) -> FIRST PAINTED
         // (past every draw gate, on screen). appearMs = seen->painted,
         // admitMs = seen->cached, paintMs = cached->painted. Keyed by
@@ -2269,23 +2769,22 @@ static void RenderRobotEspFromFrame(
                     (robot.admittedMs && nowMs >= robot.admittedMs)
                         ? static_cast<long long>(nowMs - robot.admittedMs)
                         : -1;
-                std::ofstream f(kArcVerifyPath, std::ios::app);
-                if (f) {
-                    char labelEsc[48]{};
-                    snprintf(labelEsc, sizeof(labelEsc), "%.40s", botLabel.c_str());
-                    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    f << "{\"sessionId\":\"c190fb\",\"runId\":\"appear\","
-                      << "\"location\":\"Esp.cpp:paintBot\",\"message\":\"bot_appear\","
-                      << "\"data\":{\"key\":" << key
-                      << ",\"name\":\"" << labelEsc
-                      << "\",\"appearMs\":" << appearMs
-                      << ",\"admitMs\":" << admitMs
-                      << ",\"paintMs\":" << paintMs
-                      << ",\"dist\":" << distM
-                      << ",\"fallback\":" << (botLabel == "Bot" ? 1 : 0)
-                      << "},\"timestamp\":" << ts << "}\n";
-                }
+                std::ostringstream f;
+                char labelEsc[48]{};
+                snprintf(labelEsc, sizeof(labelEsc), "%.40s", botLabel.c_str());
+                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                f << "{\"sessionId\":\"c190fb\",\"runId\":\"appear\","
+                  << "\"location\":\"Esp.cpp:paintBot\",\"message\":\"bot_appear\","
+                  << "\"data\":{\"key\":" << key
+                  << ",\"name\":\"" << labelEsc
+                  << "\",\"appearMs\":" << appearMs
+                  << ",\"admitMs\":" << admitMs
+                  << ",\"paintMs\":" << paintMs
+                  << ",\"dist\":" << distM
+                  << ",\"fallback\":" << (botLabel == "Bot" ? 1 : 0)
+                  << "},\"timestamp\":" << ts << "}\n";
+                EntityDiagnostics::LogRaw(f.str());
             }
         }
         // #endregion
@@ -2474,27 +2973,28 @@ static void RenderRobotEspFromFrame(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
         if (nowMs - s_lastFunnelLogMs >= 1000) {
             s_lastFunnelLogMs = nowMs;
-            std::ofstream f(kArcVerifyPath, std::ios::app);
-            if (f) {
-                f << "{\"location\":\"Esp.cpp:paintBot\",\"message\":\"bot_paint_funnel\","
-                  << "\"data\":{\"input\":" << funnel.input
-                  << ",\"invalid\":" << funnel.invalid
-                  << ",\"playerVeto\":" << funnel.playerVeto
-                  << ",\"dead\":" << funnel.dead
-                  << ",\"position\":" << funnel.position
-                  << ",\"distance\":" << funnel.distance
-                  << ",\"projection\":" << funnel.projection
-                  << ",\"label\":" << funnel.label
-                  << ",\"offscreen\":" << funnel.offscreen
-                  << ",\"painted\":" << funnel.painted
-                  << ",\"closestReason\":\"" << funnel.closestReason
-                  << "\",\"closestKey\":" << funnel.closestKey
-                  << ",\"closestDist\":" << funnel.closestDistance
-                  << ",\"closestDrawing\":" << (funnel.closestDrawing ? 1 : 0)
-                  << ",\"closestProven\":" << (funnel.closestProven ? 1 : 0)
-                  << ",\"closestAgeMs\":" << funnel.closestSampleAgeMs
-                  << "},\"ts\":" << nowMs << "}\n";
-            }
+            std::ostringstream f;
+            f << "{\"location\":\"Esp.cpp:paintBot\",\"message\":\"bot_paint_funnel\","
+              << "\"data\":{\"input\":" << funnel.input
+              << ",\"invalid\":" << funnel.invalid
+              << ",\"playerVeto\":" << funnel.playerVeto
+              << ",\"dead\":" << funnel.dead
+              << ",\"position\":" << funnel.position
+              << ",\"distance\":" << funnel.distance
+              << ",\"projection\":" << funnel.projection
+              << ",\"label\":" << funnel.label
+              << ",\"offscreen\":" << funnel.offscreen
+              << ",\"painted\":" << funnel.painted
+              << ",\"occluded\":" << funnel.occluded
+              << ",\"visBudgetHit\":" << funnel.visBudgetHit
+              << ",\"closestReason\":\"" << funnel.closestReason
+              << "\",\"closestKey\":" << funnel.closestKey
+              << ",\"closestDist\":" << funnel.closestDistance
+              << ",\"closestDrawing\":" << (funnel.closestDrawing ? 1 : 0)
+              << ",\"closestProven\":" << (funnel.closestProven ? 1 : 0)
+              << ",\"closestAgeMs\":" << funnel.closestSampleAgeMs
+              << "},\"ts\":" << nowMs << "}\n";
+            EntityDiagnostics::LogRaw(f.str());
         }
     }
 }
@@ -2725,6 +3225,29 @@ static void GhostTracePaint(
         if (entJumps > 0)
             ++s_entZigs;
         s_flashUntil = now + std::chrono::milliseconds(400);
+
+        // Persist every event: the on-screen ring dies with the process, and
+        // post-session diagnosis needs the actual src/dyaw rows from disk
+        // (Logger::Push is an async queue — no file I/O on the paint thread).
+        for (char& c : ev.worst) {
+            if (c == '"' || c == '\\')
+                c = '_';
+        }
+        char jl[640];
+        std::snprintf(jl, sizeof(jl),
+            "{\"timestampMs\":%llu,\"kind\":\"%s\",\"src\":\"%s\","
+            "\"paint\":%llu,\"dyaw\":%.2f,\"dpitch\":%.2f,\"dloc\":%.1f,"
+            "\"dtMs\":%.1f,\"frameSeq\":%llu,\"frameAgeMs\":%d,"
+            "\"entJumps\":%d,\"mixedCam\":%d,\"worst\":\"%s\","
+            "\"from\":[%.0f,%.0f],\"to\":[%.0f,%.0f]}",
+            static_cast<unsigned long long>(nowMs),
+            ev.kind, ev.src,
+            static_cast<unsigned long long>(ev.paint),
+            ev.dyaw, ev.dpitch, ev.dloc, ev.dtMs,
+            static_cast<unsigned long long>(ev.frameSeq),
+            ev.frameAgeMs, ev.entJumps, ev.mixedCam,
+            ev.worst, ev.x0, ev.y0, ev.x1, ev.y1);
+        EntityDiagnostics::LogRaw(jl);
     }
 
     s_cam2 = s_cam1;
@@ -2760,11 +3283,12 @@ static void GhostTracePaint(
     ry += 16.f;
 
     std::snprintf(line, sizeof(line),
-        "camzig %llu | srcflip %llu | entzig %llu | mixedCam %d",
+        "camzig %llu | srcflip %llu | entzig %llu | mixedCam %d | holdoff %d",
         static_cast<unsigned long long>(s_camZigs),
         static_cast<unsigned long long>(s_srcFlips),
         static_cast<unsigned long long>(s_entZigs),
-        mixedCam);
+        mixedCam,
+        g_camHoldOffs);
     dl->AddText(font, fs, ImVec2(px + 8.f, ry), IM_COL32(200, 220, 255, 255), line);
     ry += 16.f;
 
@@ -2860,127 +3384,81 @@ static void GhostTracePaint(
 }
 // #endregion
 
-// #region collision debug (Stage 2): wireframe blocks + LOS rays
-namespace {
-
-struct TriDrawCtx {
-    Engine::CameraCache cam{};
-    float radius = 2000.f;
-    int visited = 0;
-    int queued = 0;
-};
-
-void DrawCollisionTriCb(const CollisionMirror::Tri& t, void* rawCtx)
-{
-    auto* ctx = static_cast<TriDrawCtx*>(rawCtx);
-    ++ctx->visited;
-    Vector3 a, b, c;
-    if (!engine.ProjectWorldLocationToScreen(t.p0, a, ctx->cam))
-        return;
-    if (!engine.ProjectWorldLocationToScreen(t.p1, b, ctx->cam))
-        return;
-    if (!engine.ProjectWorldLocationToScreen(t.p2, c, ctx->cam))
-        return;
-    const ImU32 col = IM_COL32(140, 150, 170, 110);
-    g_renderQueue.addLine(ImVec2((float)a.x, (float)a.y), ImVec2((float)b.x, (float)b.y), col, 1.f);
-    g_renderQueue.addLine(ImVec2((float)b.x, (float)b.y), ImVec2((float)c.x, (float)c.y), col, 1.f);
-    g_renderQueue.addLine(ImVec2((float)c.x, (float)c.y), ImVec2((float)a.x, (float)a.y), col, 1.f);
-    ++ctx->queued;
-}
-
-void DrawCollisionDebug(
-    const Engine::EspRenderFrame& frame,
-    const Engine::CameraCache& renderCam)
-{
-    // Blocks: wireframe of the published KD-tree triangles near the camera.
-    // try_lock inside ForEachTriNear — if a rebuild is mid-swap, skip the
-    // frame (never block paint).
-    if (var::collision_debug_draw) {
-        TriDrawCtx ctx{ renderCam, 2000.f };
-        const size_t visited =
-            CollisionMirror::ForEachTriNear(
-                renderCam.Location, ctx.radius,
-                &DrawCollisionTriCb, &ctx);
-        {
-            static std::chrono::steady_clock::time_point sLastDbgDraw{};
-            const auto nowD = std::chrono::steady_clock::now();
-            if (nowD - sLastDbgDraw > std::chrono::seconds(1)) {
-                sLastDbgDraw = nowD;
-                const auto dts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                std::ofstream f(kArcVerifyPath, std::ios::app);
-                if (f) {
-                    f << "{\"sessionId\":\"c190fb\",\"location\":\"Esp.cpp\","
-                      << "\"message\":\"collision_draw\","
-                      << "\"data\":{\"ready\":" << (CollisionMirror::IsReady() ? 1 : 0)
-                      << ",\"tris\":" << CollisionMirror::TriangleCount()
-                      << ",\"near\":" << visited
-                      << ",\"queued\":" << ctx.queued
-                      << ",\"camX\":" << static_cast<long long>(renderCam.Location.x)
-                      << ",\"camY\":" << static_cast<long long>(renderCam.Location.y)
-                      << ",\"camZ\":" << static_cast<long long>(renderCam.Location.z)
-                      << "}" << ",\"timestamp\":" << dts << "}\n";
-                }
-            }
-        }
-    }
-
-    if (!var::collision_debug_rays)
-        return;
-
-    // Rays: camera → each bot's world position, green if clear, red if blocked.
-    for (const auto& r : frame.robots) {
-        const Vector3& target = r.entry.WorldPos;
-        if (target.x == 0.0 && target.y == 0.0 && target.z == 0.0)
-            continue;
-        Vector3 fromScr, toScr;
-        if (!engine.ProjectWorldLocationToScreen(renderCam.Location, fromScr, renderCam))
-            continue;
-        if (!engine.ProjectWorldLocationToScreen(target, toScr, renderCam))
-            continue;
-        const CollisionMirror::RayHit hit =
-            CollisionMirror::QueryRay(renderCam.Location, target);
-        const ImU32 col = hit.visible
-            ? IM_COL32(60, 220, 90, 200)
-            : IM_COL32(230, 70, 70, 220);
-        g_renderQueue.addLine(
-            ImVec2((float)fromScr.x, (float)fromScr.y),
-            ImVec2((float)toScr.x, (float)toScr.y),
-            col, 1.5f);
-    }
-}
-
-} // namespace
-// #endregion
 
 void Engine::RenderEsp()
 {
     const bool drawPlayers = var::enableesp;
-    const bool drawBots = FeaturePolicy::ShouldRenderRobotEsp(var::showRobots);
-    const bool drawWorld = AnyWorldEspEnabled();
-    const bool drawCollDbg = var::collision_debug_draw || var::collision_debug_rays;
-    if (!drawPlayers && !drawBots && !drawWorld && !var::show_radar && !drawCollDbg)
+    const bool drawBots = FeaturePolicy::ShouldRenderRobotEsp(var::showRobots)
+        && (!UpgradeOptions::combatActive || UpgradeOptions::combatShowArcs);
+    const bool drawWorld = AnyWorldEspEnabled() && !UpgradeOptions::combatActive;
+    if (!drawPlayers && !drawBots && !drawWorld && !var::show_radar
+        && !UpgradeOptions::warnings)
         return;
 
     SetProjectionViewport(
         ImGui::GetIO().DisplaySize.x,
         ImGui::GetIO().DisplaySize.y);
 
+    // Debug-only paint counters (var::debug_esp_paint). Off by default; when
+    // on, prints frame time and frames that missed the frame-mutex try_lock
+    // (the lock-wait counter) once every 5 s to the console.
+    struct PaintProbe {
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        bool lockMiss = false;
+        ~PaintProbe() {
+            if (!var::debug_esp_paint) return;
+            static int s_frames = 0;
+            static int s_miss = 0;
+            static float s_sumMs = 0.f;
+            static float s_maxMs = 0.f;
+            static auto s_last = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            const float ms = std::chrono::duration<float, std::milli>(now - t0).count();
+            // Frame-time counter. Cheap relaxed atomics, drained by the
+            // debug-flag-gated EspPaintProfileFlushToLog (never from paint).
+            EspPaintFrameNote(ms);
+            ++s_frames;
+            s_sumMs += ms;
+            if (ms > s_maxMs) s_maxMs = ms;
+            if (lockMiss) ++s_miss;
+            if (now - s_last >= std::chrono::seconds(5)) {
+                std::cout << "[esp-paint] frames=" << s_frames
+                          << " avgMs=" << (s_frames ? s_sumMs / s_frames : 0.f)
+                          << " maxMs=" << s_maxMs
+                          << " lockWaitMiss=" << s_miss << std::endl;
+                s_frames = 0;
+                s_miss = 0;
+                s_sumMs = 0.f;
+                s_maxMs = 0.f;
+                s_last = now;
+            }
+        }
+    } paintProbe;
+
     // Never block paint on m_espFrameMutex. Keep only a current, fresh frame;
     // the atomic retained pointer is reset by ClearEspCaches on world changes.
     std::shared_ptr<const EspRenderFrame> paintFrame;
     {
+        const auto tFrameLock = std::chrono::steady_clock::now();
         std::shared_lock<std::shared_mutex> lock(m_espFrameMutex, std::try_to_lock);
-        if (lock.owns_lock()) {
+        const bool frameLockOk = lock.owns_lock();
+        EspPaintLockNote(0, frameLockOk,
+            std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - tFrameLock).count());
+        if (frameLockOk) {
             if (m_espFrameShared && IsCurrentFreshEspFrame(*m_espFrameShared))
                 m_espPaintFrame.store(m_espFrameShared);
             // Do not clear the retained snapshot merely because the newest
             // worker snapshot is briefly stale. The next successful publish
             // replaces it; ClearEspCaches still clears it on world changes.
+        } else {
+            paintProbe.lockMiss = true;
         }
         paintFrame = m_espPaintFrame.load();
     }
+
     if (!paintFrame || !IsCurrentFreshEspFrame(*paintFrame)) {
+        ThreatWarnings::Clear();
         RenderEspFrameHealthFallback(paintFrame.get(), nullptr);
         return;
     }
@@ -3000,6 +3478,7 @@ void Engine::RenderEsp()
     Engine::CameraCache renderCam{};
     RenderCamDebug camDbg{};
     if (!ResolveLiveRenderCamera(frame, renderCam, &camDbg)) {
+        ThreatWarnings::Clear();
         RenderEspFrameHealthFallback(&frame, &camDbg);
         return;
     }
@@ -3007,11 +3486,29 @@ void Engine::RenderEsp()
     PaintSubPhaseNote(0, msT(tR0, nowT()));  // cam
     // #endregion
 
+    ThreatWarnings::Draw(frame, renderCam);
     g_renderQueue.newFrame();
 
-    // Draw order: items first (bottom), then players, bots last (top) — so
+    // Draw order: items first (bottom), then players, bots last (top) â€” so
     // bot ESP is the most visible layer and items never cover enemies. ImGui
     // renders later commands on top, so this call order IS the z-stack.
+    // Collision debug overlays reset their counters once per paint pass, before
+    // any sub-renderer can draw into them. Outside the drawWorld branch on
+    // purpose: the counters must describe the pass even when world ESP is off
+    // and only players or bots are painting their shapes and rays.
+    if (UpgradeOptions::collisionDebugShapes || UpgradeOptions::collisionDebugRays
+        || UpgradeOptions::collisionDebugSceneDecoded || UpgradeOptions::collisionDebugSceneBoxes)
+        CollisionDebug::BeginFrame();
+
+    // The scene wireframe is world-global, so it is drawn once per pass here and
+    // not from the per-entity sub-renderers (which would redraw the whole level
+    // once per target). Before the ESP queues, so the geometry sits underneath
+    // the boxes and rays it is explaining.
+    if (UpgradeOptions::collisionDebugSceneDecoded || UpgradeOptions::collisionDebugSceneBoxes) {
+        if (ImDrawList* sceneList = ImGui::GetForegroundDrawList())
+            CollisionDebug::DrawSceneWireframe(sceneList, engine, renderCam, renderCam.Location);
+    }
+
     if (drawWorld) {
         // Same live POV as players/bots. Using frame.camera here lagged behind
         // g_Camera during stick rotation and drove paintWorld projFail spikes.
@@ -3020,6 +3517,33 @@ void Engine::RenderEsp()
         // #region agent log
         PaintSubPhaseNote(1, msT(tW0, nowT()));  // world
         // #endregion
+    }
+
+    if (drawPlayers && UpgradeOptions::offscreen) {
+        const ImVec2 ds = ImGui::GetIO().DisplaySize;
+        const float inset = (std::min)(UpgradeOptions::arrowInset, (std::min)(ds.x,ds.y)*0.35f);
+        const double yaw = renderCam.Rotation.y*3.141592653589793/180.0;
+        const uint64_t now = Engine::SteadyEspNowMs();
+        for (const auto& item : frame.players) {
+            const auto& p = item.entry;
+            if (!p.Drawing || p.isAlly || p.bIsDead || p.Distance>var::esp_distance
+                || !p.positionSampleMs || now<p.positionSampleMs || now-p.positionSampleMs>500) continue;
+            Vector3 screen{};
+            if (engine.ProjectWorldLocationToScreen(p.WorldPos,screen,renderCam)
+                && screen.x>=0 && screen.y>=0 && screen.x<ds.x && screen.y<ds.y) continue;
+            const double dx=p.WorldPos.x-renderCam.Location.x, dy=p.WorldPos.y-renderCam.Location.y;
+            const double forward=dx*std::cos(yaw)+dy*std::sin(yaw), right=-dx*std::sin(yaw)+dy*std::cos(yaw);
+            const double len=std::hypot(forward,right);
+            if (!std::isfinite(len) || len<1.0) continue;
+            const float ux=static_cast<float>(right/len), uy=static_cast<float>(-forward/len);
+            const float rx=(std::max)(1.f,ds.x*0.5f-inset), ry=(std::max)(1.f,ds.y*0.5f-inset);
+            const float t=1.f/(std::max)(std::abs(ux)/rx,std::abs(uy)/ry);
+            const ImVec2 tip(ds.x*0.5f+ux*t,ds.y*0.5f+uy*t);
+            const float size=UpgradeOptions::arrowSize;
+            const ImVec2 left(tip.x-ux*size-uy*size*0.5f,tip.y-uy*size+ux*size*0.5f);
+            const ImVec2 rightPoint(tip.x-ux*size+uy*size*0.5f,tip.y-uy*size-ux*size*0.5f);
+            ImGui::GetForegroundDrawList()->AddTriangleFilled(tip,left,rightPoint,EspDraw::ColorFromRGBA(UpgradeOptions::arrowColor));
+        }
     }
     if (drawPlayers) {
         const auto tP0 = nowT();
@@ -3032,14 +3556,6 @@ void Engine::RenderEsp()
         RenderRobotEspFromFrame(frame.robots, renderCam, frame.collectStampMs);
         // #region agent log
         PaintSubPhaseNote(3, msT(tB0, nowT()));  // bot
-        // #endregion
-    }
-
-    if (drawCollDbg) {
-        const auto tC0 = nowT();
-        DrawCollisionDebug(frame, renderCam);
-        // #region agent log
-        PaintSubPhaseNote(4, msT(tC0, nowT()));  // collision debug
         // #endregion
     }
 
@@ -3127,6 +3643,8 @@ static void RenderWorldEspFromFrame(
 
     for (const Engine::EspFrameWorld& item : world) {
         const Engine::WorldCacheEntry& entry = item.entry;
+        if (UpgradeOptions::combatActive || !EntityFilters::World(entry.worldCategory, entry.ActorName, entry.ItemDisplayName))
+            continue;
         if (!engine.getAllowWorldEntry(entry)) {
             ++dbg.skipAllow;
             continue;
@@ -3236,7 +3754,7 @@ static void RenderWorldEspFromFrame(
             // #endregion
             continue;
         }
-        // Quest items get the star prefix (UTF-8 U+2605) — the only label in
+        // Quest items get the star prefix (UTF-8 U+2605) â€” the only label in
         // the app with one. Escaped as raw bytes to survive MSVC codepages.
         if (cat == WorldItemCategory::QuestItem)
             label = "\xE2\x98\x85 " + label;
@@ -3311,12 +3829,61 @@ static void RenderWorldEspFromFrame(
             color = (color & 0x00FFFFFFu) | (fadedA << IM_COL32_A_SHIFT);
         }
 
-        // Looted crates: grey + "(Looted)" tag instead of a whole trip to an
-        // empty box. RGB replaced, the distance-fade alpha is kept.
-        const bool lootedGrey =
-            var::grey_looted_containers && 0 < entry.cachedOpened;
+        // Looted crates: one shared policy with the radar, so the label and
+        // the blip can never disagree about an emptied container.
+        const VisualState::Decision openSt = VisualState::ForOpened(
+            entry.cachedOpened,
+            static_cast<VisualState::Mode>(var::state_opened_mode),
+            var::state_dim_alpha);
+        if (openSt.hide)
+            continue;
+        const bool lootedGrey = openSt.grey;
         if (lootedGrey)
-            color = (color & 0xFF000000u) | (IM_COL32(140, 140, 140, 255) & 0x00FFFFFFu);
+            color = (color & 0xFF000000u) | VisualState::kGreyRgb;
+        if (openSt.alphaMul < 1.f)
+            color = (color & 0x00FFFFFFu)
+                | (static_cast<ImU32>(
+                       static_cast<float>((color >> IM_COL32_A_SHIFT) & 0xFFu)
+                       * openSt.alphaMul)
+                   << IM_COL32_A_SHIFT);
+
+        if (UpgradeOptions::worldBounds && entry.boundsValid && entry.boundsSampleMs) {
+            const uint64_t now = Engine::SteadyEspNowMs();
+            if (now>=entry.boundsSampleMs && now-entry.boundsSampleMs<=2000) {
+                ImVec2 points[8]; bool valid=true;
+                for (int i=0;i<8;++i) {
+                    Vector3 s{};
+                    if (!ProjectWorldEspPoint(entry.boundsCorners[i],frameCam,s)
+                        || !std::isfinite(s.x) || !std::isfinite(s.y)) { valid=false; break; }
+                    points[i]=ImVec2(static_cast<float>(s.x),static_cast<float>(s.y));
+                }
+                if (valid) for (int i=0;i<8;++i) for (int bit : {1,2,4})
+                    if (!(i&bit)) drawList->AddLine(points[i],points[i|bit],color,1.f);
+            }
+        }
+
+        // Collision debug (visibility work): draw the decoded shapes for this
+        // entry's component and trace the vischeck ray from the frame camera to
+        // it. Both are bounded (radius + per-frame budgets) and drawing only -
+        // no reads here, so the paint path stays DMA-free.
+        if (UpgradeOptions::collisionDebugShapes || UpgradeOptions::collisionDebugRays) {
+            const Vector3 dbgEye = frameCam.Location;
+            if (UpgradeOptions::collisionDebugShapes)
+                CollisionDebug::DrawShapeOutlines(drawList, engine, frameCam, dbgEye,
+                    entry.rootComponent, entry.APawn);
+            if (UpgradeOptions::collisionDebugRays) {
+                Vector3 dbgTarget = entry.WorldPos;
+                if (entry.hasBotHeadWorldPos)
+                    dbgTarget = entry.BotHeadWorldPos;
+                else if (std::isfinite(entry.CenterWorldPos.x)
+                    && std::isfinite(entry.CenterWorldPos.y)
+                    && std::isfinite(entry.CenterWorldPos.z)
+                    && !(entry.CenterWorldPos.x == 0.0 && entry.CenterWorldPos.y == 0.0
+                        && entry.CenterWorldPos.z == 0.0))
+                    dbgTarget = entry.CenterWorldPos;
+                CollisionDebug::DrawRay(drawList, engine, frameCam, dbgEye, dbgTarget, nullptr);
+            }
+        }
 
         // Extraction hatches: append the replicated SDK state to the label.
         std::string drawLabel = label;
@@ -3399,20 +3966,19 @@ static void RenderWorldEspFromFrame(
 
     g_worldEspDbg = dbg;
     // File-log the ghost-guard skips (throttled 5s) so leadSkip is verifiable
-    // in the debug log — [debugCam] only prints with the debug overlay on.
+    // in the debug log â€” [debugCam] only prints with the debug overlay on.
     if (g_camLeadSkips > 0) {
         static std::chrono::steady_clock::time_point s_lastLeadLog{};
         const auto nowLl = std::chrono::steady_clock::now();
         if (nowLl - s_lastLeadLog >= std::chrono::seconds(5)) {
             s_lastLeadLog = nowLl;
-            std::ofstream lf(kArcVerifyPath, std::ios::app);
-            if (lf) {
-                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                lf << "{\"location\":\"Esp.cpp\",\"message\":\"cam_lead_skip\","
-                   << "\"data\":{\"skips\":" << g_camLeadSkips
-                   << "},\"ts\":" << ts << "}\n";
-            }
+            std::ostringstream lf;
+            const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            lf << "{\"location\":\"Esp.cpp\",\"message\":\"cam_lead_skip\","
+               << "\"data\":{\"skips\":" << g_camLeadSkips
+               << "},\"ts\":" << ts << "}\n";
+            EntityDiagnostics::LogRaw(lf.str());
             g_camLeadSkips = 0;
         }
     }
@@ -3424,8 +3990,7 @@ void Engine::RenderFovCircle()
         var::enable_aimbot,
         var::robotAimEnabled,
         var::enable_triggerbot};
-    if (!FeaturePolicy::ShouldRenderFov(var::show_fov, features)
-        || var::aimbot_fov <= 0.f)
+    if (!FeaturePolicy::ShouldRenderFov(var::show_fov, features))
         return;
 
     float gameFov = 90.f;
@@ -3433,172 +3998,121 @@ void Engine::RenderFovCircle()
         std::shared_lock<std::shared_mutex> lock(m_cameraMutex);
         gameFov = g_Camera.FOV;
     }
-    Visuals::FovCircle(var::aimbot_fov, gameFov);
+    // One cone for one profile: the FOV ring IS the target cone for players and
+    // ARC alike (the aim applies var::aimbot_fov to both), so there is no second
+    // ARC ring to draw.
+    if (var::enable_aimbot || var::enable_triggerbot)
+        Visuals::FovCircle(var::aimbot_fov, gameFov);
 }
 
-namespace {
-
-constexpr float kCrosshairPi = 3.14159265358979323846f;
-
-ImVec2 CrosshairRotateOffset(float x, float y, float cosA, float sinA)
+// T4.4: practice / calibration reference mode. The object set is fixed and named
+// in Core/PracticeMode.hpp, and this function draws exactly that set -- nothing
+// else is drawn and no ESP path depends on it, so "normal ESP output is
+// untouched" is a property of the code, not a promise.
+void Engine::RenderPracticeReference()
 {
-    return ImVec2(x * cosA - y * sinA, x * sinA + y * cosA);
-}
-
-void CrosshairDrawRotatedLine(
-    ImDrawList* drawList,
-    const ImVec2& center,
-    float x1,
-    float y1,
-    float x2,
-    float y2,
-    float cosA,
-    float sinA,
-    ImU32 color,
-    float thickness)
-{
-    if (!drawList)
-        return;
-    const ImVec2 o1 = CrosshairRotateOffset(x1, y1, cosA, sinA);
-    const ImVec2 o2 = CrosshairRotateOffset(x2, y2, cosA, sinA);
-    drawList->AddLine(
-        ImVec2(center.x + o1.x, center.y + o1.y),
-        ImVec2(center.x + o2.x, center.y + o2.y),
-        color,
-        thickness);
-}
-
-void CrosshairDrawPlus(
-    ImDrawList* drawList,
-    const ImVec2& center,
-    float size,
-    float gap,
-    float thickness,
-    ImU32 color,
-    float angleRad)
-{
-    const float cosA = std::cos(angleRad);
-    const float sinA = std::sin(angleRad);
-    const float g = (std::max)(0.f, gap);
-    CrosshairDrawRotatedLine(drawList, center, -size, 0.f, -g, 0.f, cosA, sinA, color, thickness);
-    CrosshairDrawRotatedLine(drawList, center, g, 0.f, size, 0.f, cosA, sinA, color, thickness);
-    CrosshairDrawRotatedLine(drawList, center, 0.f, -size, 0.f, -g, cosA, sinA, color, thickness);
-    CrosshairDrawRotatedLine(drawList, center, 0.f, g, 0.f, size, cosA, sinA, color, thickness);
-}
-
-void CrosshairDrawCenterDot(
-    ImDrawList* drawList,
-    const ImVec2& center,
-    float radius,
-    ImU32 color)
-{
-    if (!drawList || radius <= 0.f)
-        return;
-    drawList->AddCircleFilled(center, radius, color);
-}
-
-void CrosshairDrawInvertedT(
-    ImDrawList* drawList,
-    const ImVec2& center,
-    float size,
-    float thickness,
-    ImU32 color,
-    float angleRad)
-{
-    const float cosA = std::cos(angleRad);
-    const float sinA = std::sin(angleRad);
-    const float barY = -size * 0.5f;
-    CrosshairDrawRotatedLine(drawList, center, -size, barY, size, barY, cosA, sinA, color, thickness);
-    CrosshairDrawRotatedLine(drawList, center, 0.f, barY, 0.f, size, cosA, sinA, color, thickness);
-}
-
-void CrosshairDrawTriangle(
-    ImDrawList* drawList,
-    const ImVec2& center,
-    float size,
-    float thickness,
-    ImU32 color,
-    float angleRad)
-{
-    if (!drawList)
-        return;
-    constexpr float kTwoPi = kCrosshairPi * 2.f;
-    constexpr float kThird = kTwoPi / 3.f;
-    ImVec2 pts[3]{};
-    for (int i = 0; i < 3; ++i) {
-        const float a = angleRad - kCrosshairPi * 0.5f + static_cast<float>(i) * kThird;
-        pts[i] = ImVec2(
-            center.x + std::cos(a) * size,
-            center.y + std::sin(a) * size);
-    }
-    for (int i = 0; i < 3; ++i)
-        drawList->AddLine(pts[i], pts[(i + 1) % 3], color, thickness);
-}
-
-} // namespace
-
-void Engine::RenderOverlayCrosshair()
-{
-    if (!var::show_crosshair)
+    if (!var::practice_mode)
         return;
 
-    ImDrawList* drawList = ImGui::GetForegroundDrawList();
-    if (!drawList)
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    if (!dl)
         return;
 
     const ImVec2 disp = ImGui::GetIO().DisplaySize;
-    if (disp.x <= 0.f || disp.y <= 0.f)
+    if (disp.x < 8.f || disp.y < 8.f)
         return;
+    const ImVec2 centre(disp.x * 0.5f, disp.y * 0.5f);
 
-    const ImVec2 center(disp.x * 0.5f, disp.y * 0.5f);
-    const ImU32 color = EspDraw::ColorFromRGBA(var::crosshair_color);
-    const float size = (std::max)(1.f, var::crosshair_size);
-    const float thickness = (std::max)(0.5f, var::crosshair_thickness);
-    const float gap = (std::max)(0.f, var::crosshair_gap);
-    const float spinRadPerSec =
-        var::crosshair_spin_rpm * (kCrosshairPi * 2.f / 60.f);
-    const float angleRad = static_cast<float>(ImGui::GetTime()) * spinRadPerSec;
+    // centre_cross: the reference the aim error is measured from.
+    const ImU32 crossCol = IM_COL32(120, 220, 255, 200);
+    dl->AddLine(ImVec2(centre.x - 14.f, centre.y),
+                ImVec2(centre.x + 14.f, centre.y), crossCol, 1.f);
+    dl->AddLine(ImVec2(centre.x, centre.y - 14.f),
+                ImVec2(centre.x, centre.y + 14.f), crossCol, 1.f);
 
-    switch (var::crosshair_style) {
-    case 0: // Classic
-        CrosshairDrawPlus(drawList, center, size, gap, thickness, color, 0.f);
-        CrosshairDrawCenterDot(drawList, center, thickness * 0.5f + 0.5f, color);
-        break;
-    case 1: // Dot
-        CrosshairDrawCenterDot(drawList, center, size * 0.5f, color);
-        break;
-    case 2: // Tight
-        CrosshairDrawPlus(drawList, center, size * 0.65f, 0.f, thickness, color, 0.f);
-        break;
-    case 3: // Circle
-        drawList->AddCircle(center, size, color, 0, thickness);
-        CrosshairDrawPlus(drawList, center, size * 0.35f, 0.f, thickness, color, 0.f);
-        break;
-    case 4: // T static
-        CrosshairDrawInvertedT(drawList, center, size, thickness, color, 0.f);
-        break;
-    case 5: // T spin
-        CrosshairDrawInvertedT(drawList, center, size, thickness, color, angleRad);
-        break;
-    case 6: // Cross spin
-        CrosshairDrawPlus(drawList, center, size, gap, thickness, color, angleRad);
-        break;
-    case 7: // Tri spin
-        CrosshairDrawTriangle(drawList, center, size, thickness, color, angleRad);
-        break;
-    default:
-        CrosshairDrawPlus(drawList, center, size, gap, thickness, color, 0.f);
-        CrosshairDrawCenterDot(drawList, center, thickness * 0.5f + 0.5f, color);
-        break;
+    // axis_ruler: tick marks every 5 degrees, placed with the SAME conversion the
+    // world projection uses for the configured FOV axis. A ruler tick and a
+    // projected point at the same angle must therefore land on the same pixel,
+    // which is the T4.5 check a user can perform by eye.
+    float gameFov = 90.f;
+    {
+        std::shared_lock<std::shared_mutex> lock(m_cameraMutex);
+        gameFov = g_Camera.FOV;
     }
+    if (gameFov > 1.f && gameFov < 179.f) {
+        const EngineProjection::FovAxis axis = UpgradeOptions::fovAxisHorizontal
+            ? EngineProjection::FovAxis::Horizontal
+            : EngineProjection::FovAxis::Vertical;
+        constexpr double kPiR = 3.14159265358979323846;
+        const double halfTan = std::tan(static_cast<double>(gameFov) * kPiR / 360.0);
+        const double pxPerTan = EngineProjection::AxisScalePx(
+            halfTan, axis, static_cast<double>(disp.x), static_cast<double>(disp.y));
+        if (pxPerTan > 0.0) {
+            const ImU32 rulerCol = IM_COL32(210, 200, 120, 170);
+            for (int deg = 5; deg <= 80; deg += 5) {
+                const double px = pxPerTan * std::tan(deg * kPiR / 180.0);
+                if (!std::isfinite(px))
+                    continue;
+                const float r = static_cast<float>(px);
+                const float half = (deg % 10 == 0) ? 8.f : 4.f;
+                // Right and up only: the mirror ticks carry the same angle twice.
+                if (r < disp.x * 1.2f) {
+                    dl->AddLine(ImVec2(centre.x + r, centre.y - half),
+                                ImVec2(centre.x + r, centre.y + half), rulerCol, 1.f);
+                    if (deg % 10 == 0) {
+                        const std::string label = std::to_string(deg);
+                        dl->AddText(ImVec2(centre.x + r + 2.f, centre.y + 6.f),
+                                    rulerCol, label.c_str());
+                    }
+                }
+                if (r < disp.y * 1.2f) {
+                    dl->AddLine(ImVec2(centre.x - half, centre.y - r),
+                                ImVec2(centre.x + half, centre.y - r), rulerCol, 1.f);
+                }
+            }
+        }
+    }
+
+    // fov_ring: the same circles the FOV display draws, so the cone the
+    // outside_fov candidate test applies is visible while calibrating.
+    if (var::enable_aimbot || var::enable_triggerbot)
+        Visuals::FovCircle(var::aimbot_fov, gameFov, IM_COL32(255, 255, 255, 200));
+
+    // counts_probe: the counts the last tick actually commanded beside the error
+    // they were computed from. This is the number T4.1's counts-per-pixel is
+    // validated against, so it is shown raw rather than rounded for the eye.
+    const FeaturePolicy::AimPointDebug point = FeaturePolicy::CurrentAimPointDebug();
+    const float probeY = (disp.y * 0.5f) + 40.f;
+    const float pxPerCountX = (std::abs(point.errorPxX) > 0.5f && std::abs(point.cmdX) > 0.001f)
+        ? std::abs(point.errorPxX) / std::abs(point.cmdX) : 0.f;
+    const float pxPerCountY = (std::abs(point.errorPxY) > 0.5f && std::abs(point.cmdY) > 0.001f)
+        ? std::abs(point.errorPxY) / std::abs(point.cmdY) : 0.f;
+    char probe[224];
+    std::snprintf(probe, sizeof(probe),
+        "counts_probe  err %.1f,%.1f px -> cmd %.2f,%.2f counts   (%.2f / %.2f px per count)",
+        point.errorPxX, point.errorPxY, point.cmdX, point.cmdY, pxPerCountX, pxPerCountY);
+    dl->AddText(ImVec2(centre.x + 20.f, probeY), IM_COL32(230, 230, 230, 220), probe);
+    dl->AddText(ImVec2(12.f, disp.y - 28.f), IM_COL32(170, 170, 170, 200),
+        ("practice objects: " + PracticeMode::ObjectListLine()).c_str());
+}
+
+void Engine::RenderOverlayCrosshair()
+{
+    const ImVec2 disp = ImGui::GetIO().DisplaySize;
+    if (disp.x > 0.f && disp.y > 0.f)
+        ArcCrosshair::Draw(ImGui::GetForegroundDrawList(), ImVec2(disp.x * 0.5f, disp.y * 0.5f));
 }
 
 void Engine::RenderRaidHud()
 {
-    if (!var::show_raid_hud)
+    // Raid state and the objective brief are independent features sharing one
+    // panel; each renders only from its own validated cache.
+    if (!var::show_raid_hud && !var::show_objectives)
         return;
-    const RaidHudState st = GetRaidHud();
-    if (!st.valid)
+    const RaidHudState st = var::show_raid_hud ? GetRaidHud() : RaidHudState{};
+    const ObjectiveBrief::Brief obj =
+        var::show_objectives ? GetObjectives() : ObjectiveBrief::Brief{};
+    if (!st.valid && !obj.valid)
         return;
     const uint64_t nowMs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -3637,6 +4151,29 @@ void Engine::RenderRaidHud()
     if (st.pickupCount >= 0) {
         ImGui::SameLine();
         ImGui::Text("| Loot %d", st.pickupCount);
+    }
+    if (st.valid) {
+        // Map condition display removed - feature was reading garbage
+        // if (st.mapConditionKnown)
+        //     ImGui::Text("Map condition ID: %lld (name unresolved)",
+        //         static_cast<long long>(st.mapConditionId));
+        ImGui::Text("Server health (client status): %s",
+            RaidClock::ServerHealthText(st.serverHealthStatus));
+    }
+    if (obj.valid) {
+        const std::string line = ObjectiveBrief::SummaryLine(obj);
+        if (!line.empty())
+            ImGui::TextUnformatted(line.c_str());
+        if (obj.timerSeconds >= 0.0) {
+            ImGui::SameLine();
+            ImGui::Text("| Objective timer %s (%s)",
+                RaidClock::FormatClock(obj.timerSeconds).c_str(),
+                ObjectiveBrief::TimerTypeText(obj.timerType).c_str());
+        }
+        if (obj.taskCount >= 0)
+            ImGui::Text("Tasks: %d", obj.taskCount);
+        // Titles/summaries are FText and cannot be decoded without a resolved
+        // text table, so they are omitted rather than shown as raw bytes.
     }
     ImGui::End();
 }
@@ -3688,16 +4225,7 @@ void Engine::RenderRadar(bool interactive)
         return;
     const EspRenderFrame& frame = *frameShared;
 
-    Engine::CameraCache frameCam{};
-    {
-        std::shared_lock<std::shared_mutex> lock(m_cameraMutex);
-        frameCam = g_Camera;
-    }
-    if (frame.valid) {
-        Engine::CameraCache liveCam{};
-        if (ResolveLiveRenderCamera(frame, liveCam))
-            frameCam = liveCam;
-    }
+    const Engine::CameraCache frameCam = frame.camera;
     if (!IsPlausibleWorldPos(frameCam.Location))
         return;
 
@@ -3734,11 +4262,14 @@ void Engine::RenderRadar(bool interactive)
                 var::radar_pos_y_norm + delta.y / screenH, 0.05f, 0.95f);
             cx = screenW * var::radar_pos_x_norm;
             cy = screenH * var::radar_pos_y_norm;
+            AutoConfig_MarkDirty();
         }
         ImGui::End();
         ImGui::PopStyleVar();
     }
 
+    const ImVec2 radarMin(cx - radarPx, cy - radarPx);
+    const ImVec2 radarSz(radarPx * 2.f, radarPx * 2.f);
     const ImU32 bgCol = IM_COL32(16, 16, 22, 190);
     const ImU32 borderCol = IM_COL32(80, 80, 100, 220);
     if (var::radar_shape_circle) {
@@ -3757,11 +4288,92 @@ void Engine::RenderRadar(bool interactive)
             0,
             1.5f);
     }
-    drawList->AddCircleFilled(ImVec2(cx, cy), 3.f, IM_COL32(255, 255, 255, 220), 12);
-
     // Map mode (feature #11): whole-map fit when the minimap bounds resolved.
+    // Declared here rather than next to projectBlip so the D16 background can
+    // draw between it and the compass.
     bool mapBoundsOk = false;
     const RadarProjection::Bounds mapBounds = GetRadarBounds(mapBoundsOk);
+
+    // D16 terrain background. Only meaningful when Map mode has resolved bounds,
+    // because that is the one projection where world XY maps linearly onto the
+    // radar rect â€” and the image must cover exactly the minimap bounds for the
+    // blips to sit on the right terrain.
+    if (false && var::radar_map_mode && mapBoundsOk) {
+        const ImTextureID mapTex = ArcMenuTheme().mapTexture;
+        if (mapTex) {
+            if (var::radar_shape_circle) {
+                // AddImage is rectangular, so slice the circle into horizontal
+                // bands whose width follows the radius to mask it properly.
+                constexpr int kStrips = 96;
+                for (int i = 0; i < kStrips; ++i) {
+                    const float t0 = -1.f + 2.f * static_cast<float>(i) / kStrips;
+                    const float t1 = -1.f + 2.f * static_cast<float>(i + 1) / kStrips;
+                    const float tc = 0.5f * (t0 + t1);
+                    const float halfW = std::sqrt((std::max)(0.f, 1.f - tc * tc));
+                    if (halfW <= 0.002f)
+                        continue;
+                    drawList->AddImage(
+                        mapTex,
+                        ImVec2(cx - halfW * radarPx, cy + t0 * radarPx),
+                        ImVec2(cx + halfW * radarPx, cy + t1 * radarPx),
+                        ImVec2(0.5f - halfW * 0.5f, 0.5f + t0 * 0.5f),
+                        ImVec2(0.5f + halfW * 0.5f, 0.5f + t1 * 0.5f));
+                }
+            } else {
+                drawList->AddImage(
+                    mapTex,
+                    ImVec2(cx - radarPx, cy - radarPx),
+                    ImVec2(cx + radarPx, cy + radarPx));
+            }
+        }
+    }
+
+
+    // Compass (B5): N/E/S/W on the edge. Map mode is already north-up so the
+    // rose is fixed there; the rotating radar swings it with the camera yaw.
+    if (var::radar_compass) {
+        struct Dir { float wx, wy; const char* label; };
+        static const Dir kDirs[] = {
+            { 0.f, 1.f, "N" }, { 1.f, 0.f, "E" },
+            { 0.f, -1.f, "S" }, { -1.f, 0.f, "W" },
+        };
+        const float edge = (std::max)(radarPx - 1.f, 1.f);
+        
+        // Smaller font size for compass labels (was using full ImGui font size)
+        const float fs = ImGui::GetFontSize() * 0.55f;  // 55% of normal size
+        const float lw = fs * 0.6f;
+        
+        for (const Dir& d : kDirs) {
+            // World direction -> radar-local unit vector, same basis as projectBlip.
+            float ux, uy;
+            if (var::radar_map_mode) {
+                ux = d.wx;
+                uy = -d.wy;
+            } else {
+                const float fwd = d.wx * cosYaw + d.wy * sinYaw;
+                const float rgt = -d.wx * sinYaw + d.wy * cosYaw;
+                ux = rgt;
+                uy = -fwd;
+            }
+            const bool isNorth = d.label[0] == 'N';
+            const ImU32 col = isNorth
+                ? IM_COL32(255, 210, 90, 235)
+                : IM_COL32(150, 150, 170, 190);
+            const float tickLen = isNorth ? 9.f : 6.f;
+            drawList->AddLine(
+                ImVec2(cx + ux * (edge - tickLen), cy + uy * (edge - tickLen)),
+                ImVec2(cx + ux * edge, cy + uy * edge),
+                col, isNorth ? 2.f : 1.f);
+            
+            // Position label OUTSIDE the radar circle (was inside at edge-tickLen-fs)
+            const float labelR = edge + fs * 0.8f;  // Outside edge by small margin
+            drawList->AddText(
+                ImGui::GetFont(), fs,
+                ImVec2(cx + ux * labelR - lw * 0.5f,
+                       cy + uy * labelR - fs * 0.5f),
+                col, d.label);
+        }
+    }
 
     auto projectBlip = [&](const Vector3& worldPos, float& outX, float& outY) -> bool {
         if (!IsPlausibleWorldPos(worldPos))
@@ -3769,8 +4381,10 @@ void Engine::RenderRadar(bool interactive)
 
         if (var::radar_map_mode) {
             float mx = 0.f, my = 0.f;
-            if (mapBoundsOk && RadarProjection::MapFitted(
-                    worldPos.x, worldPos.y, mapBounds, radarPx, mx, my)) {
+            if (mapBoundsOk) {
+                if (!RadarProjection::MapFitted(
+                        worldPos.x, worldPos.y, mapBounds, radarPx, mx, my))
+                    return false; // never mix fitted and fallback points
                 outX = cx + mx;
                 outY = cy + my;
                 return true;
@@ -3820,18 +4434,26 @@ void Engine::RenderRadar(bool interactive)
         return true;
     };
 
+    auto markerFits = [&](float x, float y, float margin = 0.f) {
+        const float limit = (std::max)(radarPx - margin, 0.f);
+        const float dx = x - cx, dy = y - cy;
+        return var::radar_shape_circle ? dx * dx + dy * dy <= limit * limit
+            : std::fabs(dx) <= limit && std::fabs(dy) <= limit;
+    };
+    float selfX{}, selfY{};
+    if (projectBlip(frameCam.Location, selfX, selfY) && markerFits(selfX, selfY, 3.f))
+        drawList->AddCircleFilled(ImVec2(selfX, selfY), 3.f, IM_COL32(255, 255, 255, 220), 12);
+
     auto drawBlip = [&](float x, float y, ImU32 color, float distanceM,
                         float baseRadius = 3.5f, bool hollow = false) {
-        const float dx = x - cx;
-        const float dy = y - cy;
-        const float clipR = (std::max)(radarPx - 1.f, 1.f);
-        if (dx * dx + dy * dy > clipR * clipR)
-            return;
-
+        // Blip size (B6): scale the value AND both clamp bounds â€” clamping a
+        // scaled value against unscaled bounds inverts the range below ~1.0x.
         const float radius = std::clamp(
-            baseRadius * Visuals::EspDistanceScale(distanceM),
-            1.8f,
-            baseRadius * 1.12f);
+            baseRadius * var::radar_dot_scale * Visuals::EspDistanceScale(distanceM),
+            1.8f * var::radar_dot_scale,
+            baseRadius * 1.12f * var::radar_dot_scale);
+        if (!markerFits(x, y, radius))
+            return;
         // Underground-floor blips draw hollow + thinner (feature #11).
         if (hollow)
             drawList->AddCircle(ImVec2(x, y), radius, color, 12, 1.5f);
@@ -3843,6 +4465,56 @@ void Engine::RenderRadar(bool interactive)
         return EspDraw::ColorFromRGBA(rgba);
     };
 
+    // Altitude (B2): metres above/below you, drawn as text beside player and bot
+    // blips. Text rather than a hover tooltip deliberately â€” the overlay sets
+    // WS_EX_TRANSPARENT in-raid, so the mouse never reaches a blip to hover it.
+    auto drawAlt = [&](float x, float y, double worldZ) {
+        const double dzM = (worldZ - frameCam.Location.z) / 100.0;
+        if (std::fabs(dzM) < 0.5f)
+            return;
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%+.0fm", dzM);
+        const ImU32 col = dzM > 0.f
+            ? IM_COL32(150, 235, 255, 215)
+            : IM_COL32(255, 190, 140, 215);
+        const float fs2 = ImGui::GetFontSize() * 0.65f;  // 65% smaller for altitude labels
+        drawList->AddText(
+            ImGui::GetFont(), fs2,
+            ImVec2(x + 6.f, y - fs2 * 0.5f), col, buf);
+    };
+
+    // Ghost mode (C2). A player or bot that leaves the pipeline entirely (DMA
+    // stall, cache eviction) used to blink out with no explanation. Remember
+    // where it last drew and, until the ghost budget runs out, keep it on the
+    // radar as a fading ring with an age label. Keyed by the same uintptr the
+    // caches use. ghostSeen marks everything still PRESENT this frame â€” only
+    // entries that actually vanished become ghosts, so a bot hidden by focus or
+    // by the dead-bot rule does not reappear as one.
+    struct GhostEntry {
+        Vector3 pos{};
+        bool isBot = false;
+        std::chrono::steady_clock::time_point seen{};
+        std::string botLabel;
+
+    };
+    static std::unordered_map<uintptr_t, GhostEntry> ghostMap;
+    static std::unordered_set<uintptr_t> ghostSeen;
+    static uint64_t ghostGeneration = UINT64_MAX;
+    if (ghostGeneration != frame.worldGeneration || !var::radar_ghost) {
+        ghostMap.clear();
+        ghostGeneration = frame.worldGeneration;
+    }
+    ghostSeen.clear();
+    const auto ghostNow = std::chrono::steady_clock::now();
+    const float ghostLimitSec = std::clamp(var::radar_ghost_secs, 1.f, 30.f);
+
+    auto rememberGhost = [&](uintptr_t key, const Vector3& pos, bool isBot, const std::string& botLabel = std::string{}) {
+        if (!var::radar_ghost)
+            return;
+        ghostSeen.insert(key);
+        ghostMap[key] = GhostEntry{ pos, isBot, ghostNow, botLabel };
+    };
+
     // Radar must never block the paint thread: the player scanner holds
     // m_playerCacheMutex exclusively during DMA-backed scans, and a blocking
     // shared_lock here stalled Present for 26-600ms on a ~20s cadence (user:
@@ -3850,16 +4522,18 @@ void Engine::RenderRadar(bool interactive)
     // frame if the scanner is mid-scan - the radar is auxiliary, one skipped
     // radar frame is invisible.
     {
-        std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex, std::defer_lock);
-        if (!lock.try_lock())
-            return;
-        for (const auto& [key, actor] : playerCache) {
-            (void)key;
+        for (const EspFramePlayer& player : frame.players) {
+            const uintptr_t key = player.actorKey;
+            const PlayerCacheEntry& actor = player.entry;
+            ghostSeen.insert(key);
+            if (var::radar_focus != var::kRadarFocusAll
+                && var::radar_focus != var::kRadarFocusPlayers)
+                continue;
             if (!ShouldDrawPlayerEsp(actor))
                 continue;
             if (actor.isAlly && var::hide_allies)
                 continue;
-            if (actor.Distance > rangeM)
+            if (!(var::radar_map_mode && mapBoundsOk) && actor.Distance > rangeM)
                 continue;
             if (!IsPlausibleWorldPos(actor.WorldPos))
                 continue;
@@ -3871,11 +4545,17 @@ void Engine::RenderRadar(bool interactive)
             const ImU32 color = actor.isVisible
                 ? pickerColor(var::esp_color_visible)
                 : pickerColor(var::esp_color_invisible);
+            if (var::radar_show_altitude)
+                drawAlt(rx, ry, actor.WorldPos.z);
             if (actor.isAlly && var::radar_ally_arrows) {
                 const float playerYawRad = static_cast<float>(
                     engine.DegToRad(static_cast<double>(actor.facingYaw)));
-                const float relAngle = playerYawRad - yawRad;
-                const float arrowLen = 8.f;
+                const float relAngle = var::radar_map_mode
+                    ? static_cast<float>(M_PI) / 2.f - playerYawRad
+                    : playerYawRad - yawRad;
+                const float arrowLen = 8.f * var::radar_dot_scale;
+                if (!markerFits(rx, ry, arrowLen))
+                    continue;
                 const float baseSpread = 2.3f;
                 float tipX = rx + sinf(relAngle) * arrowLen;
                 float tipY = ry - cosf(relAngle) * arrowLen;
@@ -3891,6 +4571,7 @@ void Engine::RenderRadar(bool interactive)
                         && RadarProjection::IsUnderground(
                             actor.WorldPos.z - frameCam.Location.z));
             }
+            rememberGhost(key, actor.WorldPos, false);
         }
     }
 
@@ -3901,9 +4582,18 @@ void Engine::RenderRadar(bool interactive)
         const WorldCacheEntry& robot = item.entry;
         if (!item.actorKey || !engine.IsValidPointer(item.actorKey))
             continue;
-        if (robot.IsBreaked && !var::show_dead_bots)
+        ghostSeen.insert(item.actorKey);
+        std::string botLabel = ResolveBotDrawLabel(item.actorKey, robot.ActorName, robot.ActorName, /*allowDma=*/false);
+        if (botLabel.empty() && !robot.ItemDisplayName.empty())
+            botLabel = ResolveBotDrawLabel(item.actorKey, robot.ItemDisplayName, robot.ActorName, /*allowDma=*/false);
+        if (!EntityFilters::Arc(botLabel) || (UpgradeOptions::combatActive && !UpgradeOptions::combatShowArcs))
             continue;
-        if (robot.Distance > rangeM)
+        if (var::radar_focus != var::kRadarFocusAll
+            && var::radar_focus != var::kRadarFocusBots)
+            continue;
+        if (robot.IsBreaked && var::DeadBotsHidden())
+            continue;
+        if (!(var::radar_map_mode && mapBoundsOk) && robot.Distance > rangeM)
             continue;
         if (!IsPlausibleWorldPos(robot.WorldPos))
             continue;
@@ -3912,15 +4602,32 @@ void Engine::RenderRadar(bool interactive)
         if (!projectBlip(robot.WorldPos, rx, ry))
             continue;
 
-        const ImU32 color = robot.IsBreaked
+        ImU32 color = robot.IsBreaked
             ? pickerColor(var::color_dead_bots)
             : (robot.isVisible
                 ? pickerColor(var::bot_color_visible)
                 : pickerColor(var::bot_color_invisible));
+        const VisualState::Decision deadSt = VisualState::ForDead(
+            robot.IsBreaked,
+            static_cast<VisualState::Mode>(var::state_dead_mode),
+            var::state_dim_alpha);
+        if (deadSt.hide)
+            continue;
+        if (deadSt.grey)
+            color = (color & 0xFF000000u) | VisualState::kGreyRgb;
+        if (deadSt.alphaMul < 1.f)
+            color = (color & 0x00FFFFFFu)
+                | (static_cast<ImU32>(
+                       static_cast<float>((color >> IM_COL32_A_SHIFT) & 0xFFu)
+                       * deadSt.alphaMul)
+                   << IM_COL32_A_SHIFT);
         drawBlip(rx, ry, color, robot.Distance, 3.5f,
             var::radar_underground_dim
                 && RadarProjection::IsUnderground(
                     robot.WorldPos.z - frameCam.Location.z));
+        if (var::radar_show_altitude)
+            drawAlt(rx, ry, robot.WorldPos.z);
+        rememberGhost(item.actorKey, robot.WorldPos, true, botLabel);
     }
 
     // Quest items: always shown as a gold star (never filtered by loot
@@ -3928,7 +4635,9 @@ void Engine::RenderRadar(bool interactive)
     auto drawStar = [&](float scx, float scy, float distM, ImU32 color) {
         ImVec2 c(scx, scy);
         const float R = std::clamp(
-            4.0f * Visuals::EspDistanceScale(distM), 3.2f, 4.6f);
+            4.0f * Visuals::EspDistanceScale(distM), 3.2f, 4.6f) * var::radar_dot_scale;
+        if (!markerFits(scx, scy, R))
+            return;
         const float r = R * 0.42f;
         ImVec2 pts[10];
         for (int i = 0; i < 10; ++i) {
@@ -3942,6 +4651,13 @@ void Engine::RenderRadar(bool interactive)
 
     for (const EspFrameWorld& item : frame.world) {
         const WorldCacheEntry& entry = item.entry;
+        if (UpgradeOptions::combatActive || !EntityFilters::World(entry.worldCategory, entry.ActorName, entry.ItemDisplayName))
+            continue;
+        // Focus gate is a plain continue so no brace nesting changes here â€”
+        // loot is never ghosted, so it needs no ghostSeen entry.
+        if (var::radar_focus != var::kRadarFocusAll
+            && var::radar_focus != var::kRadarFocusLoot)
+            continue;
         if (!IsPlausibleWorldPos(entry.WorldPos))
             continue;
 
@@ -3968,12 +4684,401 @@ void Engine::RenderRadar(bool interactive)
             continue;
 
         const bool isPickup = LootItemLooksLikePickup(filterView);
-        const ImU32 color = isPickup
+        ImU32 color = isPickup
             ? WorldLootLabelColor(cat, entry.lootRarityTier, true)
             : WorldCategoryLabelColor(cat);
+
+        // Looted containers must be styled here exactly as they are on the
+        // ESP pass. This check was missing, so an emptied crate drew bright
+        // on the radar while the label beside it read "(Looted)".
+        const VisualState::Decision openSt = VisualState::ForOpened(
+            entry.cachedOpened,
+            static_cast<VisualState::Mode>(var::state_opened_mode),
+            var::state_dim_alpha);
+        if (openSt.hide)
+            continue;
+        if (openSt.grey)
+            color = (color & 0xFF000000u) | VisualState::kGreyRgb;
+        if (openSt.alphaMul < 1.f)
+            color = (color & 0x00FFFFFFu)
+                | (static_cast<ImU32>(
+                       static_cast<float>((color >> IM_COL32_A_SHIFT) & 0xFFu)
+                       * openSt.alphaMul)
+                   << IM_COL32_A_SHIFT);
+
         drawBlip(rx, ry, color, entry.Distance, isPickup ? 3.f : 2.5f,
             var::radar_underground_dim
                 && RadarProjection::IsUnderground(
                     entry.WorldPos.z - frameCam.Location.z));
     }
+
+    // D17 points of interest: user-defined named markers from Data\pois.json.
+    // Drawn after the regular blips so they stay readable in a crowd, and
+    // gated by Focus the same way world items are. projectBlip gives both the
+    // whole-map fit and the rotating range view for free.
+    if (var::show_pois && !UpgradeOptions::combatActive
+        && (var::radar_focus == var::kRadarFocusAll
+            || var::radar_focus == var::kRadarFocusLoot)) {
+        PoiStore::EnsureLoaded();
+        const std::vector<PoiParser::Poi>& pois = PoiStore::Items();
+        if (!pois.empty()) {
+            // One colour per category, keyed to PoiParser::kCategoryNames.
+            constexpr ImU32 kPoiColors[PoiParser::kCategoryCount] = {
+                IM_COL32(90, 230, 120, 255),    // exfil  - green
+                IM_COL32(110, 170, 255, 255),   // spawn  - blue
+                IM_COL32(255, 90, 90, 255),     // hot    - red
+                IM_COL32(255, 215, 90, 255),    // vendor - yellow
+                IM_COL32(215, 130, 255, 255),   // quest  - purple
+                IM_COL32(210, 210, 220, 255),   // custom - grey
+            };
+            const float poiFs = ImGui::GetFontSize();
+            for (const PoiParser::Poi& p : pois) {
+                const int cat = PoiParser::CategoryIndex(p.category);
+                if ((var::poi_categories & (1 << cat)) == 0)
+                    continue;
+                
+                const ImU32 col = kPoiColors[cat];
+                
+                // Draw boundary polygon if present (3+ points)
+                if (p.HasBoundary()) {
+                    std::vector<ImVec2> boundaryScreen;
+                    boundaryScreen.reserve(p.boundary.size());
+                    bool allVisible = true;
+                    for (const auto& pt : p.boundary) {
+                        float bx = 0.f, by = 0.f;
+                        if (projectBlip(Vector3(pt.x, pt.y, p.z), bx, by)) {
+                            boundaryScreen.push_back(ImVec2(bx, by));
+                        } else {
+                            allVisible = false;
+                            break;
+                        }
+                    }
+                    if (allVisible && boundaryScreen.size() >= 3) {
+                        // Draw filled polygon with transparency
+                        ImU32 fillCol = (col & 0x00FFFFFF) | (40 << 24);  // Low alpha fill
+                        drawList->AddConvexPolyFilled(boundaryScreen.data(), 
+                            static_cast<int>(boundaryScreen.size()), fillCol);
+                        // Draw outline
+                        drawList->AddPolyline(boundaryScreen.data(), 
+                            static_cast<int>(boundaryScreen.size()), col, 
+                            ImDrawFlags_Closed, 2.f);
+                        
+                        // Draw label at center
+                        if (var::poi_show_labels) {
+                            float mx = 0.f, my = 0.f;
+                            if (projectBlip(Vector3(p.x, p.y, p.z), mx, my)) {
+                                drawList->AddText(
+                                    ImGui::GetFont(), poiFs,
+                                    ImVec2(mx - poiFs * 2.f, my - poiFs * 0.5f),
+                                    IM_COL32(245, 245, 245, 235), p.name.c_str());
+                            }
+                        }
+                    }
+                    continue;  // Skip diamond marker if boundary exists
+                }
+                
+                // Draw point marker (diamond) if no boundary
+                float mx = 0.f, my = 0.f;
+                if (!projectBlip(Vector3(p.x, p.y, p.z), mx, my))
+                    continue;
+                // Diamond, so a POI can never be mistaken for an entity blip.
+                const float r = 5.5f * var::radar_dot_scale;
+                if (!markerFits(mx, my, r))
+                    continue;
+                const ImVec2 pts[4] = {
+                    ImVec2(mx, my - r), ImVec2(mx + r, my),
+                    ImVec2(mx, my + r), ImVec2(mx - r, my),
+                };
+                drawList->AddConvexPolyFilled(pts, 4, col);
+                drawList->AddPolyline(pts, 4, IM_COL32(0, 0, 0, 220), ImDrawFlags_Closed, 1.f);
+                if (var::poi_show_labels) {
+                    drawList->AddText(
+                        ImGui::GetFont(), poiFs,
+                        ImVec2(mx + r + 3.f, my - poiFs * 0.5f),
+                        IM_COL32(245, 245, 245, 235), p.name.c_str());
+                }
+            }
+        }
+    }
+
+    // Draw and expire ghosts. An entry still present this frame is retained â€” it
+    // was either refreshed by rememberGhost or is deliberately not drawn (focus,
+    // dead-bot rule, out of range) and must not linger as a ghost. Everything
+    // else fades out over the ghost budget.
+    if (var::radar_ghost && !ghostMap.empty()) {
+        for (auto it = ghostMap.begin(); it != ghostMap.end(); ) {
+            const GhostEntry& g = it->second;
+            if (ghostSeen.count(it->first) != 0) {
+                ++it; // retain observations; present-but-filtered is not a ghost
+                continue;
+            }
+            if (g.isBot && (!EntityFilters::Arc(g.botLabel)
+                || (UpgradeOptions::combatActive && !UpgradeOptions::combatShowArcs))) {
+                it = ghostMap.erase(it);
+                continue;
+            }
+            
+            // POI boundary suppression: skip ghosts inside any POI boundary zone
+            if (var::radar_ghost_suppress_poi) {
+                PoiStore::EnsureLoaded();
+                const auto& pois = PoiStore::Items();
+                bool insideBoundary = false;
+                for (const auto& poi : pois) {
+                    if (poi.ContainsPoint(g.pos.x, g.pos.y)) {
+                        insideBoundary = true;
+                        break;
+                    }
+                }
+                if (insideBoundary) {
+                    ++it;
+                    continue;
+                }
+            }
+            
+            const float age =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    ghostNow - g.seen).count() / 1000.f;
+            if (age > ghostLimitSec) {
+                it = ghostMap.erase(it);
+                continue;
+            }
+            const bool focusOk = var::radar_focus == var::kRadarFocusAll
+                || (g.isBot && var::radar_focus == var::kRadarFocusBots)
+                || (!g.isBot && var::radar_focus == var::kRadarFocusPlayers);
+            if (focusOk) {
+                float gx = 0.f, gy = 0.f;
+                if (projectBlip(g.pos, gx, gy)) {
+                    const float fade = 1.f - age / ghostLimitSec;
+                    const int a = static_cast<int>(60.f + 150.f * fade);
+                    const ImU32 col = IM_COL32(215, 215, 230, a);
+                    const float rr = (std::max)(4.f * var::radar_dot_scale, 3.f);
+                    if (!markerFits(gx, gy, rr)) {
+                        ++it;
+                        continue;
+                    }
+                    drawList->AddCircle(ImVec2(gx, gy), rr, col, 12, 1.5f);
+                    char gbuf[16];
+                    std::snprintf(gbuf, sizeof(gbuf), "%.0fs", age);
+                    const float gfs = ImGui::GetFontSize();
+                    drawList->AddText(
+                        ImGui::GetFont(), gfs,
+                        ImVec2(gx + rr + 3.f, gy - gfs * 0.5f), col, gbuf);
+                }
+            }
+            ++it;
+        }
+    }
+    
+    // Status line: show when ghost suppression is active
+    if (var::radar_ghost_suppress_poi) {
+        PoiStore::EnsureLoaded();
+        const std::vector<PoiParser::Poi>& pois = PoiStore::Items();
+        int boundaryCount = 0;
+        for (const auto& poi : pois) {
+            if (!poi.boundary.empty()) {
+                ++boundaryCount;
+            }
+        }
+        if (boundaryCount > 0) {
+            const float statusY = radarMin.y + radarSz.y - ImGui::GetFontSize() - 4.f;
+            char statusBuf[64];
+            std::snprintf(statusBuf, sizeof(statusBuf), 
+                "Ghost suppression: %d zone%s", boundaryCount, boundaryCount == 1 ? "" : "s");
+            const ImU32 statusCol = IM_COL32(180, 200, 255, 200);
+            drawList->AddText(
+                ImVec2(radarMin.x + 8.f, statusY), statusCol, statusBuf);
+        }
+    }
+}
+
+void Engine::RenderSearch()
+{
+    // Toggle search window with '/' key
+    if (ImGui::IsKeyPressed(ImGuiKey_Slash) && !ImGui::GetIO().WantTextInput) {
+        var::show_search_window = !var::show_search_window;
+    }
+    
+    if (!var::show_search_window)
+        return;
+    
+    // Close with ESC
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        var::show_search_window = false;
+        return;
+    }
+    
+    // Get frame data
+    std::shared_ptr<const EspRenderFrame> frameShared;
+    {
+        std::shared_lock<std::shared_mutex> lock(m_espFrameMutex, std::try_to_lock);
+        if (lock.owns_lock())
+            frameShared = m_espFrameShared;
+    }
+    if (!frameShared || !IsCurrentFreshEspFrame(*frameShared))
+        return;
+    const EspRenderFrame& frame = *frameShared;
+    
+    const Vector3 camPos = frame.camera.Location;
+    
+    // Search window
+    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.3f), 
+        ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(600.f, 400.f), ImGuiCond_FirstUseEver);
+    
+    if (ImGui::Begin("Unified Search", &var::show_search_window, ImGuiWindowFlags_NoCollapse)) {
+        // Search input
+        static char searchBuf[256] = "";
+        ImGui::SetNextItemWidth(-1.f);
+        const bool focusInput = ImGui::IsWindowAppearing();
+        if (ImGui::InputText("##search", searchBuf, sizeof(searchBuf), 
+            ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_EscapeClearsAll)) {
+            // Input changed
+        }
+        if (focusInput) {
+            ImGui::SetKeyboardFocusHere(-1);  // Focus the input
+        }
+        
+        const std::string query = [&]() {
+            std::string q = searchBuf;
+            std::transform(q.begin(), q.end(), q.begin(), 
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return q;
+        }();
+        
+        ImGui::Separator();
+        
+        struct SearchResult {
+            std::string name;
+            std::string category;
+            float distance;
+            Vector3 pos;
+            ImU32 color;
+        };
+        std::vector<SearchResult> results;
+        
+        // Search POIs
+        if (var::show_pois) {
+            PoiStore::EnsureLoaded();
+            const std::vector<PoiParser::Poi>& pois = PoiStore::Items();
+            constexpr ImU32 kPoiColors[PoiParser::kCategoryCount] = {
+                IM_COL32(90, 230, 120, 255),    // exfil
+                IM_COL32(110, 170, 255, 255),   // spawn
+                IM_COL32(255, 90, 90, 255),     // hot
+                IM_COL32(255, 215, 90, 255),    // vendor
+                IM_COL32(215, 130, 255, 255),   // quest
+                IM_COL32(210, 210, 220, 255),   // custom
+            };
+            for (const auto& poi : pois) {
+                const int cat = PoiParser::CategoryIndex(poi.category);
+                if ((var::poi_categories & (1 << cat)) == 0)
+                    continue;
+                std::string lowerName = poi.name;
+                std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (query.empty() || lowerName.find(query) != std::string::npos) {
+                    const Vector3 poiPos(poi.x, poi.y, poi.z);
+                    const float dist = static_cast<float>(poiPos.Distance(camPos)) / 100.f;  // cm to m
+                    results.push_back({
+                        poi.name,
+                        std::string("POI: ") + poi.category,
+                        dist,
+                        poiPos,
+                        kPoiColors[cat]
+                    });
+                }
+            }
+        }
+        
+        // Search Players
+        for (const auto& player : frame.players) {
+            const PlayerCacheEntry& actor = player.entry;
+            if (!ShouldDrawPlayerEsp(actor))
+                continue;
+            if (actor.isAlly && var::hide_allies)
+                continue;
+            std::string lowerName = actor.ActorName;
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (query.empty() || lowerName.find(query) != std::string::npos) {
+                const float dist = actor.Distance;
+                results.push_back({
+                    actor.ActorName,
+                    actor.isAlly ? "Player (Ally)" : "Player (Enemy)",
+                    dist,
+                    actor.WorldPos,
+                    actor.isAlly ? IM_COL32(100, 255, 100, 255) : IM_COL32(255, 100, 100, 255)
+                });
+            }
+        }
+        
+        // Search Bots
+        for (const auto& bot : frame.robots) {
+            const std::string botLabel = bot.entry.ActorName;
+            if (botLabel.empty() || !EntityFilters::Arc(botLabel.c_str()))
+                continue;
+            if (bot.entry.IsBreaked && var::DeadBotsHidden())
+                continue;
+            std::string lowerName = botLabel;
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (query.empty() || lowerName.find(query) != std::string::npos) {
+                const float dist = bot.entry.Distance;
+                results.push_back({
+                    botLabel,
+                    bot.entry.IsBreaked ? "Bot (Dead)" : "Bot",
+                    dist,
+                    bot.entry.WorldPos,
+                    bot.entry.IsBreaked ? IM_COL32(120, 120, 120, 255) : IM_COL32(255, 180, 80, 255)
+                });
+            }
+        }
+        
+        // Search Containers
+        for (const auto& item : frame.world) {
+            const WorldCacheEntry& entry = item.entry;
+            if (!EntityFilters::World(entry.worldCategory, entry.ActorName, entry.ItemDisplayName))
+                continue;
+            const std::string label = ResolveWorldDrawLabel(
+                entry.worldCategory, entry.ActorName, entry.ItemDisplayName);
+            if (label.empty())
+                continue;
+            std::string lowerName = label;
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (query.empty() || lowerName.find(query) != std::string::npos) {
+                const float dist = entry.Distance;
+                results.push_back({
+                    label,
+                    "Container",
+                    dist,
+                    entry.WorldPos,
+                    IM_COL32(200, 200, 80, 255)
+                });
+            }
+        }
+        
+        // Sort by distance
+        std::sort(results.begin(), results.end(), 
+            [](const SearchResult& a, const SearchResult& b) { return a.distance < b.distance; });
+        
+        // Display results
+        ImGui::Text("%zu result%s", results.size(), results.size() == 1 ? "" : "s");
+        ImGui::Separator();
+        
+        if (ImGui::BeginChild("##results", ImVec2(0, 0), false)) {
+            for (const auto& result : results) {
+                ImGui::PushStyleColor(ImGuiCol_Text, result.color);
+                ImGui::Selectable(
+                    (result.name + " ##" + std::to_string(result.pos.x)).c_str(), false,
+                    0, ImVec2(0, 0));
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+                ImGui::TextDisabled("%.0fm", result.distance);
+                ImGui::SameLine();
+                ImGui::TextDisabled("- %s", result.category.c_str());
+            }
+        }
+        ImGui::EndChild();
+    }
+    ImGui::End();
 }

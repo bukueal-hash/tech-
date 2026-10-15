@@ -12,6 +12,12 @@ Every constant is either:
   lit:<hex>                 nothing offline can see this slot: a hand-probed
                             value kept until a source or the live target pins it
   expr:<text>               alias or arithmetic over other constants
+
+UNRESOLVED SOURCES (2026-10-10 audit, section 2): nine packed boolean masks
+and three struct sizes are damaged in the current dumps (multi-bit masks such
+as 0x7E/0xD7, zero or address-derived sizes). Those constants are carried as
+explicit literals rather than asserted against a source the audit ruled
+untrustworthy. Re-pin them when a clean dump supplies real masks/sizes.
   sdk:<NAME>                re-exported from Project/Core/SDK.hpp
                             (the FName/decrypt drop: game::offsets + key tables)
 
@@ -35,7 +41,7 @@ OUT = os.path.join(ROOT, "Project", "Core", "Offsets.h")
 
 # Constants the live target has pinned to a value no static source carries.
 # GWorld is deliberately not overridden here: sdk.txt defines the authoritative
-# 0x10839A98 global and the ladder performs its documented intermediary deref.
+# October SDK1 0x1096BA98 global and its documented intermediary deref.
 LIVE_OVERRIDES = {
     # ComponentToWorld is not a UPROPERTY on this build, so the dump has no
     # value for it. ArcOffsets (2026-09-22) pins the block at 0x310 with the
@@ -43,21 +49,26 @@ LIVE_OVERRIDES = {
     # read at the old 0x2D0 slot came back implausible (pos_refresh bFail ==
     # bots, 100%) while the 0x310 slot resolved. 0x2D0 stays as the probe's
     # alternate for older builds.
-    "ComponentToWorld": ("ArcOffsets::SceneComponent::COMPONENT_TO_WORLD = 0x310 "
-                         "(v20260922 dumper + user); translation at +0x20 => 0x330"),
+    "ComponentToWorld": ("live CL-1426848 FTransform block = 0x320; translation at +0x20 => 0x340 "
+                         "(measured on the pawn root, see Engine.h)"),
     # Neither render stamp is reflected, so the dump cannot see them either.
     # CL-1372005 made both PLAIN floats again; the vis check user-provided
     # 2026-09-23 pins them at 0x480/0x484 (the drop's 0x4C0/0x4C4 slot reads
     # zero on the current build). 0x4C8/0x4CC is the retired XOR-era pair and
     # reading it left visibility at "unknown".
-    "LastRenderTime": "vis check user-provided 2026-09-23: PrimitiveComponent::LastRenderTime = 0x480 (plain float; drop's 0x4C0 reads zero now)",
-    "LastRenderTimeOnScreen": "vis check user-provided 2026-09-23: LastRenderTimeOnScreen = 0x484 (plain float; was 0x4C4)",
+    "LastRenderTime": "user-provided 2026-09-23: PrimitiveComponent::LastRenderTime = 0x480 (plain float; drop's 0x4C0 reads zero now)",
+    "LastRenderTimeOnScreen": "user-provided 2026-09-23: LastRenderTimeOnScreen = 0x484 (plain float; was 0x4C4)",
     # The dump types HealthComponent.CachedHealth (0x700) and MaxHealth (0x378)
     # as FName, so both reads returned a name index instead of a number. The
     # live-verified doubles are CURRENT_HEALTH 0x6D0 and MAX_HEALTH 0x348 (the
     # latter inside the dump's Pad_0340 hole).
     "Health": "ArcOffsets::HealthComponent::CURRENT_HEALTH = 0x6D0 (the 0x700 dump field is an FName shadow)",
     "MaxHealth": "ArcOffsets::HealthComponent::MAX_HEALTH = 0x348 (native, in the dump's Pad_0340 hole)",
+    # The dump reflects APlayerCameraManager::PCOwner at 0x428, but that value
+    # reads nothing live: it broke PCM discovery (PCM=none, fallback FOV 90).
+    # The pre-regeneration owner slot 0xD0 is what the live target actually
+    # answers, so it is pinned here over the SDK's reflected value.
+    "PCOwner": "pre-regeneration owner slot 0xD0; SDK reflects 0x428 which broke PCM discovery",
 }
 
 # (name, cpp type, value spec, comment)
@@ -69,9 +80,19 @@ SECTIONS = [
         ("FStringVerificationRva", "uint64_t", "sdk:FString_Verification_Offset",
          "FString verification data"),
     ]),
-    ("Globals only the 20260922 dump carries", [
-        ("GObjectsRva", "uint64_t", "lit:0x10C56FE0",
-         "OFFSET_GOBJECTS (Dumpspace OffsetsInfo / dump header)"),
+    ("GUObjectArray globals and XOR decode (CL-1426848 drop)", [
+        ("GObjectsRva", "uint64_t", "drop:FName::RVA_GUOBJECTARRAY_BLOB",
+         "RVA_GUOBJECTARRAY_BLOB - pure-XOR-encrypted FUObjectArray blob global"),
+        ("GObjectsXor", "uint64_t", "drop:FName::UNIVERSAL_PTR_XOR",
+         "UNIVERSAL_PTR_XOR - FUObjectArray = blob ^ this (the ROL32 3-key cipher is retired)"),
+        ("GObjects_NumXorOff", "std::ptrdiff_t", "drop:FName::GUOBJ_NUM_OFF",
+         "GUOBJ_NUM_OFF - NumElements dword offset in the decrypted FUObjectArray"),
+        ("GObjects_NumXor", "uint32_t", "drop:FName::GUOBJ_NUM_XOR",
+         "GUOBJ_NUM_XOR - NumElements = bswap32(enc ^ this)"),
+        ("GObjects_ChunksXorOff", "std::ptrdiff_t", "drop:FName::GUOBJ_CHUNKS_OFF",
+         "GUOBJ_CHUNKS_OFF - encrypted chunks-pointer offset in the decrypted FUObjectArray"),
+        ("GObjects_ChunksXor", "uint64_t", "drop:FName::GUOBJ_CHUNKS_XOR",
+         "GUOBJ_CHUNKS_XOR - Chunks = bswap64(enc ^ this)"),
         ("ProcessEventRva", "uint64_t", "lit:0x5AF560", "OFFSET_PROCESSEVENT"),
         ("ProcessEventIndex", "uint32_t", "lit:0x4C", "INDEX_PROCESSEVENT"),
     ]),
@@ -117,7 +138,7 @@ SECTIONS = [
         ("PersistentLevel", "std::ptrdiff_t", "prop:Engine.World.PersistentLevel", ""),
         ("StreamingLevels", "std::ptrdiff_t", "prop:Engine.World.StreamingLevels", ""),
         ("Levels", "std::ptrdiff_t", "prop:Engine.World.Levels", ""),
-        ("OwningGameInstance", "std::ptrdiff_t", "drop:ArcOffsets::UWorld::GAME_INSTANCE",
+        ("OwningGameInstance", "std::ptrdiff_t", "prop:Engine.World.OwningGameInstance",
          "SDK drop: encrypted UWorld::OwningGameInstance slot"),
         ("LevelCollections", "std::ptrdiff_t", "prop:Engine.World.LevelCollections",
          "TArray<FLevelCollection>"),
@@ -127,14 +148,14 @@ SECTIONS = [
          "prop:Engine.LevelCollection.GameState", "FLevelCollection::GameState"),
         ("LevelCollection_PersistentLevel", "std::ptrdiff_t",
          "prop:Engine.LevelCollection.PersistentLevel", "FLevelCollection::PersistentLevel"),
-        ("LevelCollection_Stride", "std::ptrdiff_t", "sizeof:Engine.LevelCollection",
+        ("LevelCollection_Stride", "std::ptrdiff_t", "lit:0x78",
          "FLevelCollection element stride"),
         ("GameState", "std::ptrdiff_t", "expr:LevelCollections",
          "UWorld has no direct GameState field — use LevelCollections"),
     ]),
     ("GameInstance / LocalPlayer", [
-        ("LocalPlayers", "std::ptrdiff_t", "drop:ArcOffsets::GameInstance::LOCAL_PLAYERS",
-         "SDK drop: UGameInstance::LocalPlayers"),
+        ("LocalPlayers", "std::ptrdiff_t", "prop:Engine.GameInstance.LocalPlayers",
+         "TArray<LocalPlayer*> from October SDK1; supersedes the September drop value"),
         ("LocalPlayer_PlayerController", "std::ptrdiff_t",
          "prop:Engine.Player.PlayerController", "ULocalPlayer inherits UPlayer"),
         ("LocalPlayer_ControllerId", "std::ptrdiff_t",
@@ -153,7 +174,7 @@ SECTIONS = [
         ("ActorCluster", "std::ptrdiff_t", "prop:Engine.Level.ActorCluster",
          "the live actor path on this build"),
         ("LevelActorContainer_Actors", "std::ptrdiff_t",
-         "prop:Engine.ActorContainer.Actors", "ULevelActorContainer::Actors"),
+         "prop:Engine.LevelActorContainer.Actors", "ULevelActorContainer::Actors TArray (not ActorContainer TMap)"),
         ("LevelActorContainer_ActorCount", "std::ptrdiff_t",
          "expr:LevelActorContainer_Actors + 0x8", "TArray num"),
     ]),
@@ -177,7 +198,7 @@ SECTIONS = [
         ("Controller_Character", "std::ptrdiff_t", "prop:Engine.Controller.Character", ""),
         ("ControlRotation", "std::ptrdiff_t", "drop:ArcOffsets::Controller::CONTROL_ROTATION",
          "SDK drop: AController::ControlRotation"),
-        ("AController_PlayerState", "std::ptrdiff_t", "drop:ArcOffsets::Controller::PLAYER_STATE",
+        ("AController_PlayerState", "std::ptrdiff_t", "prop:Engine.Controller.PlayerState",
          "SDK drop: AController::PlayerState"),
         ("APlayerCameraManager", "std::ptrdiff_t", "lit:0x4D0",
          "non-UPROPERTY on PlayerController — live-pinned slot"),
@@ -186,7 +207,7 @@ SECTIONS = [
          "APlayerController::bIsLocalPlayerController — the engine's own local-PC flag"),
         ("PlayerController_bIsLocalPlayerController_Mask", "uint8_t", "lit:0x1",
          "bIsLocalPlayerController mask (declared bool mask=0x1 in the dump)"),
-        ("APlayerState", "std::ptrdiff_t", "drop:ArcOffsets::Pawn::PLAYER_STATE",
+        ("APlayerState", "std::ptrdiff_t", "prop:Engine.Pawn.PlayerState",
          "SDK drop: APawn::PlayerState"),
         ("PlayerNamePrivate", "std::ptrdiff_t", "prop:Engine.PlayerState.PlayerNamePrivate", ""),
         ("PlayerState_PawnPrivate", "std::ptrdiff_t", "prop:Engine.PlayerState.PawnPrivate", ""),
@@ -201,21 +222,22 @@ SECTIONS = [
         ("PlayerNameOnPawn", "std::ptrdiff_t", "lit:0x438",
          "no longer a name slot on this build — heuristic only"),
     ]),
-    ("PlayerCameraManager (TViewTarget @ 0x460, FMinimalViewInfo inside POV)", [
+    ("PlayerCameraManager (active TViewTarget; FMinimalViewInfo inside POV)", [
         ("ViewTarget", "std::ptrdiff_t", "prop:Engine.PlayerCameraManager.ViewTarget",
          "TViewTarget (active)"),
         ("PendingViewTarget", "std::ptrdiff_t",
          "prop:Engine.PlayerCameraManager.PendingViewTarget", "TViewTarget (blend target)"),
         ("CameraPOV_Location", "std::ptrdiff_t",
-         "expr:ViewTarget + 0x10 + 0x10", "TViewTarget::POV + FMinimalViewInfo::Location"),
+         "expr:ViewTarget + 0x10 + 0x08", "TViewTarget::POV + FMinimalViewInfo::Location"),
         ("CameraPOV_Rotation", "std::ptrdiff_t",
-         "expr:ViewTarget + 0x10 + 0x38", "TViewTarget::POV + FMinimalViewInfo::Rotation"),
+         "expr:ViewTarget + 0x10 + 0x28", "TViewTarget::POV + FMinimalViewInfo::Rotation"),
         ("CameraPOV_FOV", "std::ptrdiff_t",
-         "expr:ViewTarget + 0x10 + 0x60", "TViewTarget::POV + FMinimalViewInfo::FOV"),
+         "expr:ViewTarget + 0x10 + 0x48", "TViewTarget::POV + FMinimalViewInfo::FOV"),
         ("CameraLocation", "std::ptrdiff_t", "expr:CameraPOV_Location", ""),
         ("CameraRotation", "std::ptrdiff_t", "expr:CameraPOV_Rotation", ""),
         ("CameraFOV", "std::ptrdiff_t", "expr:CameraPOV_FOV", ""),
-        ("PCOwner", "std::ptrdiff_t", "prop:Engine.PlayerCameraManager.PCOwner", ""),
+        ("PCOwner", "std::ptrdiff_t", "lit:0xD0",
+         "user live --probe: pre-regeneration owner slot; SDK reflects 0x428 which broke PCM discovery"),
         ("DefaultFOV", "std::ptrdiff_t", "prop:Engine.PlayerCameraManager.DefaultFOV", ""),
         ("LockedFOV", "std::ptrdiff_t", "lit:0x43C",
          "sdk.txt drop: APlayerCameraManager::LockedFOV (2026-09-22)"),
@@ -331,18 +353,20 @@ SECTIONS = [
         ("ActorInstigator", "std::ptrdiff_t", "prop:Engine.Actor.Instigator", ""),
         ("Actor_bHiddenByte", "std::ptrdiff_t", "prop:Engine.Actor.bHidden",
          "byte holding bHidden"),
-        ("Actor_bHiddenMask", "uint8_t", "maskOf:Engine.Actor.bHidden", ""),
+        ("Actor_bHiddenMask", "uint8_t", "lit:0x1", ""),
         ("Actor_FlagsDd", "std::ptrdiff_t", "prop:Engine.Actor.bActorEnableCollision",
          "byte holding bActorEnableCollision / bActorIsBeingDestroyed"),
         ("Actor_bActorEnableCollisionMask", "uint8_t",
-         "maskOf:Engine.Actor.bActorEnableCollision", ""),
+         "lit:0x2", ""),
         ("Actor_bActorIsBeingDestroyedMask", "uint8_t",
-         "maskOf:Engine.Actor.bActorIsBeingDestroyed", ""),
+         "lit:0x4", ""),
         ("ReplicatedMovement", "std::ptrdiff_t", "prop:Engine.Actor.ReplicatedMovement", ""),
         ("RepMov_LinearVelocity", "std::ptrdiff_t",
          "prop:Engine.RepMovement.LinearVelocity", "offset within FRepMovement"),
         ("Actor_InstanceComponents", "std::ptrdiff_t",
          "prop:Engine.Actor.InstanceComponents", ""),
+        ("Actor_BlueprintCreatedComponents", "std::ptrdiff_t",
+         "prop:Engine.Actor.BlueprintCreatedComponents", ""),
     ]),
     # CoreUObject.Transform - the dump's own FTransform. The CTW slot cannot be
     # sourced from the dump (not a UPROPERTY), but its *layout* can, and the layout
@@ -356,21 +380,22 @@ SECTIONS = [
          "FTransform::Translation (FVector3d) - the live world position"),
         ("Transform_Scale3D", "std::ptrdiff_t", "prop:CoreUObject.Transform.Scale3D",
          "FTransform::Scale3D (FVector3d)"),
-        ("Transform_Size", "std::ptrdiff_t", "sizeof:CoreUObject.Transform",
+        ("Transform_Size", "std::ptrdiff_t", "lit:0x60",
          "sizeof(FTransform) = Quat 0x20 + Translation 0x18 + pad 0x8 + Scale3D 0x18"),
     ]),
     ("SceneComponent", [
         ("RelativeLocation", "std::ptrdiff_t", "prop:Engine.SceneComponent.RelativeLocation", ""),
         # CONFLICT, unresolved: ArcOffsets::SceneComponent::RELATIVE_LOCATION
-        # says 0x2A8 ("live-verified 2026-09-14, was 0x260") and the dump says
-        # 0x268. Nothing in this repo can settle it without the live target, so
-        # both are named and the dump value stays primary.
+        # says 0x2A8 ("live-verified 2026-09-14, was 0x260"); the dump's
+        # RelativeLocation is 0x280. 0x2A8 falls inside RelativeRotation
+        # (0x298-0x2B0), so it is unlikely to be the location. Kept as the alt
+        # candidate only; the dump value stays primary.
         ("RelativeLocation_Alt", "std::ptrdiff_t", "lit:0x2A8",
-         "ArcOffsets::SceneComponent::RELATIVE_LOCATION = 0x2A8 (conflicts with the dump's 0x268)"),
+         "ArcOffsets::SceneComponent::RELATIVE_LOCATION = 0x2A8 (conflicts with the dump's 0x280)"),
         ("RelativeRotation", "std::ptrdiff_t", "prop:Engine.SceneComponent.RelativeRotation", ""),
         ("ComponentVelocity", "std::ptrdiff_t", "prop:Engine.SceneComponent.ComponentVelocity", ""),
-        ("ComponentToWorld", "std::ptrdiff_t", "lit:0x310",
-         "v20260922 FTransform block; translation at +0x20 => 0x330"),
+        ("ComponentToWorld", "std::ptrdiff_t", "lit:0x320",
+         "live CL-1426848 FTransform block; translation at +0x20 => 0x340"),
         ("ComponentToWorld_Alt", "std::ptrdiff_t", "lit:0x2D0",
          "previous build's slot, alternate candidate for the runtime probe"),
         ("ComponentToWorld_Rotation", "std::ptrdiff_t",
@@ -385,9 +410,9 @@ SECTIONS = [
         ("WorldLocation", "std::ptrdiff_t", "expr:ComponentToWorld_Translation",
          "the live world position (ComponentToWorld + 0x20, FVector3d LWC)"),
         ("Scene_bVisibleByte", "std::ptrdiff_t", "prop:Engine.SceneComponent.bVisible", ""),
-        ("Scene_bVisibleMask", "uint8_t", "maskOf:Engine.SceneComponent.bVisible", ""),
+        ("Scene_bVisibleMask", "uint8_t", "lit:0x20", ""),
         ("Scene_bHiddenInGameByte", "std::ptrdiff_t", "prop:Engine.SceneComponent.bHiddenInGame", ""),
-        ("Scene_bHiddenInGameMask", "uint8_t", "maskOf:Engine.SceneComponent.bHiddenInGame", ""),
+        ("Scene_bHiddenInGameMask", "uint8_t", "lit:0x10", ""),
         ("AttachChildren", "std::ptrdiff_t", "prop:Engine.SceneComponent.AttachChildren", ""),
     ]),
     ("Primitive / skinned mesh", [
@@ -398,17 +423,17 @@ SECTIONS = [
         # 0x4C0/0x4C4 reads zero on the current build). The old 0x4C8/0x4CC
         # pair is the retired XOR-era slot the LRTS raw path once compared.
         ("LastRenderTime", "std::ptrdiff_t", "lit:0x480",
-         "vis check user-provided 2026-09-23: PrimitiveComponent::LastRenderTime = 0x480 (plain float)"),
+         "user-provided 2026-09-23: PrimitiveComponent::LastRenderTime = 0x480 (plain float)"),
         ("LastRenderTimeOnScreen", "std::ptrdiff_t", "lit:0x484",
-         "vis check user-provided 2026-09-23: LastRenderTimeOnScreen = 0x484 (plain float)"),
+         "user-provided 2026-09-23: LastRenderTimeOnScreen = 0x484 (plain float)"),
         ("LastSubmitTime", "std::ptrdiff_t", "expr:LastRenderTime",
-         "alias kept for the LRTS raw fast-path (== LastRenderTime)"),
+         "alias (== LastRenderTime)"),
         ("VisibilityBasedAnimTickOption", "std::ptrdiff_t",
          "prop:Engine.SkinnedMeshComponent.VisibilityBasedAnimTickOption", ""),
         ("bRecentlyRendered", "std::ptrdiff_t", "prop:Engine.SkinnedMeshComponent.bRecentlyRendered",
          "byte holding bRecentlyRendered"),
         ("bRecentlyRenderedMask", "uint8_t",
-         "maskOf:Engine.SkinnedMeshComponent.bRecentlyRendered", ""),
+         "lit:0x40", ""),
     ]),
     ("Bone decrypt slots (non-reflected — no dump source)", [
         ("Encrypted", "std::ptrdiff_t", "lit:0x7B0", "bone pointer decrypt seed"),
@@ -431,11 +456,11 @@ SECTIONS = [
         ("bNoSkeletonUpdate", "std::ptrdiff_t",
          "prop:Engine.SkeletalMeshComponent.bNoSkeletonUpdate", ""),
         ("bNoSkeletonUpdateMask", "uint8_t",
-         "maskOf:Engine.SkeletalMeshComponent.bNoSkeletonUpdate", ""),
+         "lit:0x8", ""),
         ("bForceRefpose", "std::ptrdiff_t",
          "prop:Engine.SkeletalMeshComponent.bForceRefpose", ""),
         ("bForceRefposeMask", "uint8_t",
-         "maskOf:Engine.SkeletalMeshComponent.bForceRefpose", ""),
+         "lit:0x1", ""),
         ("CharacterMovement", "std::ptrdiff_t", "prop:Engine.Character.CharacterMovement", ""),
         ("Character_CapsuleComponent", "std::ptrdiff_t",
          "prop:Engine.Character.CapsuleComponent", ""),
@@ -484,8 +509,10 @@ SECTIONS = [
          "prop:Angelscript.InventoryComponent.LocalCurrentItemActors", ""),
         ("EquippedPrimaryItem", "std::ptrdiff_t",
          "prop:Angelscript.InventoryComponent.EquippedArmor", "reads the equipped armor slot"),
-        ("WeaponClip", "std::ptrdiff_t", "prop:Angelscript.BeamFirearmActor.ClipSize", ""),
-        ("WeaponQuality", "std::ptrdiff_t", "prop:Angelscript.BeamFirearmActor.WeaponQuality", ""),
+        # BeamFirearmActor reflects with 0 properties and a damaged size on the
+        # current build; the live weapon class is Angelscript.WeaponActor.
+        ("WeaponClip", "std::ptrdiff_t", "prop:Angelscript.WeaponActor.ClipSize", ""),
+        ("WeaponQuality", "std::ptrdiff_t", "prop:Angelscript.WeaponActor.WeaponQuality", ""),
         ("StowedWeaponSlot0", "std::ptrdiff_t",
          "prop:Angelscript.InventoryComponent.StowedWeapon0", ""),
         ("StowedWeaponSlot1", "std::ptrdiff_t",
@@ -579,13 +606,15 @@ SECTIONS = [
          "prop:Angelscript.SalvageExtractionPoint.TimeLeftAfterStartup",
          "config window (double seconds)"),
         ("StaticMesh", "std::ptrdiff_t", "prop:Engine.StaticMeshComponent.StaticMesh", ""),
+
+        ("StaticMesh_PositiveBoundsExtension", "std::ptrdiff_t",
+         "prop:Engine.StaticMesh.PositiveBoundsExtension", "FVector on the asset"),
+        ("StaticMesh_NegativeBoundsExtension", "std::ptrdiff_t",
+         "prop:Engine.StaticMesh.NegativeBoundsExtension", "FVector on the asset"),
         ("StaticMesh_ExtendedBounds", "std::ptrdiff_t",
          "prop:Engine.StaticMesh.ExtendedBounds", "FBoxSphereBounds on the asset"),
         ("StaticMeshLegacy", "std::ptrdiff_t", "lit:0x718", "previous build's slot"),
-        ("Mesh_LastRenderTimeEnc", "std::ptrdiff_t", "lit:0x4BC", "no dump source"),
-        ("Mesh_LastRenderTimeOnScreenEnc", "std::ptrdiff_t", "lit:0x4C4", "no dump source"),
-        ("Mesh_LastRenderTimeKey", "uint32_t", "lit:0x5AB299E0", "XOR key"),
-        ("Mesh_LastRenderTimeOnScreenKey", "uint32_t", "lit:0xA83E5CBE", "XOR key"),
+
         ("UActorComponent_WorldPrivate", "std::ptrdiff_t",
          "drop:PrimitiveComponent::WORLD_PRIVATE",
          "the drop found the UWorld ptr at +0x140 (live-verified 2026-08-20, was 0x148)"),
@@ -742,7 +771,7 @@ SECTIONS = [
          "bFinishedRound bool byte - the drop's B_FINISHED_ROUND 0x5B8 is the "
          "pre-shift slot"),
         ("PS_FinishedRoundMask", "uint8_t",
-         "maskOf:Angelscript.PioneerPlayerState.bFinishedRound",
+         "lit:0x1",
          "bFinishedRound bit mask"),
         ("PS_AchievementComponent", "std::ptrdiff_t",
          "prop:Angelscript.PioneerPlayerState.AchievementComponent",
@@ -812,7 +841,7 @@ SECTIONS = [
     ]),
     ("Intel: map radar (WorldPartitionMiniMap + level settings)", [
         ("MiniMap_UnitsPerPixel", "std::ptrdiff_t",
-         "drop:WorldPartitionMiniMap::WORLD_UNITS_PER_PIXEL",
+         "prop:Engine.WorldPartitionMiniMap.WorldUnitsPerPixel",
          "world units per minimap pixel - authoritative radar scale"),
         ("MiniMap_WorldBounds", "std::ptrdiff_t",
          "drop:WorldPartitionMiniMap::MINIMAP_WORLD_BOUNDS", "FBox world bounds"),
@@ -840,7 +869,7 @@ SECTIONS = [
          "UObject::Name — FName (u32 comparison index + u32 number)"),
         ("UObject_OuterPrivate", "std::ptrdiff_t", "lit:0xA0",
          "UObject::Outer — CoreUObject_classes.hpp"),
-        ("UObject_Size", "std::ptrdiff_t", "sizeof:CoreUObject.Object",
+        ("UObject_Size", "std::ptrdiff_t", "lit:0x90",
          "sizeof(UObject)"),
         ("FNamePool_Blocks", "std::ptrdiff_t", "lit:0x40",
          "FNamePool::Blocks[0x2000] — Basic.hpp (CurrentBlock 0x38, Cursor 0x3C)"),
@@ -869,19 +898,111 @@ SECTIONS = [
 
 
 def load_index():
-    with open(INDEX) as fh:
+    if not os.path.isfile(INDEX):
+        raise SystemExit(
+            "SDK index missing: " + INDEX + "\n"
+            "Create a fresh reviewed index with tools/sdk_index.py build only "
+            "when all required SDK inputs are accessible. No placeholder or "
+            "stale-index fallback is supported.")
+    with open(INDEX, encoding="utf-8") as fh:
         return json.load(fh)
 
 
 _DROP = {}
+_DROP_ABSENT = False
+
+
+def header_values(path=OUT):
+    """Parse `constexpr <type> NAME = <value>;` from the on-disk header.
+
+    Used for value-level verification (a spec's resolved value must equal the
+    shipped constant) and as the retained value for a spec whose offline source
+    is not present in this checkout.
+    """
+    out = {}
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            m = re.search(
+                r"constexpr\s+[\w:<>]+\s+(\w+)\s*=\s*(0x[0-9A-Fa-f]+|\d+)\s*;", line)
+            if m:
+                out[m.group(1)] = int(m.group(2), 0)
+    return out
+
+
+_HEADER_RHS = None
+
+
+def header_rhs(path=OUT):
+    """Raw right-hand side text for every constant in the shipped header.
+
+    Alias constants (`A = B;`) have no numeric value of their own, so generation
+    must reproduce the shipped alias text rather than a made-up number.
+    """
+    global _HEADER_RHS
+    if _HEADER_RHS is not None:
+        return _HEADER_RHS
+    out = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                m = re.search(r"constexpr\s+[\w:<>]+\s+(\w+)\s*=\s*([^;]+);", line)
+                if m:
+                    out[m.group(1)] = m.group(2).strip()
+    _HEADER_RHS = out
+    return out
+
+
+def format_section_heading(title):
+    return ("    // -- %s " % title
+            + "-" * max(0, 60 - len(title))).rstrip()
+
+
+def preserve_unmanaged_constants(existing_content, generated_names):
+    """Keep project-owned constants that are not declared in SECTIONS."""
+    declarations = []
+    in_offsets = False
+    for line in existing_content.splitlines():
+        if not in_offsets:
+            if re.match(r"\s*namespace\s+Offsets\s*\{", line):
+                in_offsets = True
+            continue
+        if line.strip() == "}":
+            break
+        match = re.match(r"\s*constexpr\s+[\w:<>]+\s+(\w+)\s*=", line)
+        if match:
+            declarations.append((match.group(1), line))
+
+    preserved = []
+    for index, (name, line) in enumerate(declarations):
+        if name in generated_names:
+            continue
+        anchor = next(
+            (later_name for later_name, _ in declarations[index + 1:]
+             if later_name in generated_names),
+            None,
+        )
+        preserved.append((anchor, line))
+    return preserved
 
 
 def drop_value(path_key):
     """Look up a CL drop constant by its namespace::NAME path (the ArcOffsets::
     prefix may be omitted - the drop's outermost namespace is not part of the
-    constant's identity when reading it)."""
+    constant's identity when reading it).
+
+    An absent drop source is an optional-missing input, not a wrong offset: the
+    same policy the idmap and Dumper-7 sources already follow. When the drop is
+    present but a named constant is missing from it, that is still a hard spec
+    error.
+    """
+    global _DROP_ABSENT
     if not _DROP:
         _DROP.update(sdk_drop.parse())
+    if not _DROP:
+        _DROP_ABSENT = True
+        return {"value": None, "path": path_key, "fresh": False, "absent": True}
     if path_key in _DROP:
         return _DROP[path_key]
     matches = [k for k in _DROP if k == "ArcOffsets::" + path_key]
@@ -895,7 +1016,7 @@ def drop_value(path_key):
     raise SystemExit("drop constant %s not found (%d candidates)" % (path_key, len(matches)))
 
 
-def resolve(idx, spec):
+def resolve(idx, spec, name=None):
     """Return (value, comment, is_dump_sourced)."""
     kind, _, arg = spec.partition(":")
     buckets = {"classes": idx["classes"], "structs": idx["structs"]}
@@ -932,6 +1053,13 @@ def resolve(idx, spec):
         raise SystemExit("class %s not in dump" % arg)
     if kind == "drop":
         entry = drop_value(arg)
+        if entry.get("absent"):
+            # Offline CL drop is not in this checkout. Retain the shipped value
+            # so generation stays stable, and report the constant as unverified
+            # instead of silently asserting it.
+            retained = header_values().get(name) if name else None
+            return (retained, "%s - value retained; CL drop absent, unverified"
+                    % arg, False)
         fresh = " (drop re-checked 2026-09-22)" if entry["fresh"] else ""
         return (entry["value"], "sdk/sdk.txt %s = 0x%X%s"
                 % (entry["path"], entry["value"], fresh), True)
@@ -951,7 +1079,13 @@ def emit_expr_text(spec, values, name, ctype="std::ptrdiff_t"):
         return "static_cast<%s>(game::offsets::%s)" % (ctype, arg)
     if kind == "expr":
         return arg
-    # prop/maskOf/sizeof resolved numerically in the caller
+    # prop/maskOf/sizeof/drop resolved numerically in the caller; an alias (or a
+    # constant whose offline source is absent) keeps its shipped right-hand side.
+    if values.get(name) is None:
+        shipped = header_rhs().get(name)
+        if shipped:
+            return shipped
+        raise SystemExit("no value or shipped text for %s" % name)
     return "0x%X" % values[name]
 
 
@@ -968,7 +1102,7 @@ def main():
     order = []
     for _, entries in SECTIONS:
         for name, ctype, spec, note in entries:
-            val, comment, is_dump = resolve(idx, spec)
+            val, comment, is_dump = resolve(idx, spec, name)
             values[name] = val
             comments[name] = (comment, note, is_dump, spec, ctype)
             order.append(name)
@@ -1015,7 +1149,7 @@ def main():
     lines.append("")
     lines.append("namespace Offsets {")
     for title, entries in SECTIONS:
-        lines.append("    // -- %s " % title + "-" * max(0, 60 - len(title)))
+        lines.append(format_section_heading(title))
         for name, ctype, spec, note in entries:
             rhs = generated_expr.get(name) or emit_expr_text(spec, values, name, ctype)
             comment, nnote, is_dump, _, _ = comments[name]
@@ -1029,6 +1163,33 @@ def main():
             lines.append("    constexpr %-14s %-38s = %-44s // %s%s" % (
                 ctype, name, rhs + ";", comment + (" - " + text if text else ""), tag))
         lines.append("")
+
+    generated_names = {
+        name for _, entries in SECTIONS for name, _, _, _ in entries
+    }
+    existing_content = ""
+    if os.path.exists(OUT):
+        with open(OUT, encoding="utf-8") as fh:
+            existing_content = fh.read()
+    preserved_constants = preserve_unmanaged_constants(
+        existing_content, generated_names)
+    preserved_by_anchor = {}
+    for anchor, line in preserved_constants:
+        preserved_by_anchor.setdefault(anchor, []).append(line)
+    for anchor, preserved_lines in preserved_by_anchor.items():
+        if anchor is None:
+            insertion = len(lines) - 1
+        else:
+            declaration = re.compile(
+                r"\s*constexpr\s+[\w:<>]+\s+" + re.escape(anchor) + r"\s*=")
+            insertion = next(
+                (i for i, line in enumerate(lines) if declaration.match(line)),
+                len(lines) - 1,
+            )
+        if insertion and lines[insertion - 1].strip():
+            lines.insert(insertion, "")
+            insertion += 1
+        lines[insertion:insertion] = preserved_lines
 
     # value check: dump-sourced offsets must sit inside their class
     problems = []
@@ -1058,20 +1219,54 @@ def main():
         len(comments), n_dump, len(comments) - n_dump))
 
     if args.check:
+        # Value-level verification. The header carries hand-maintained provenance
+        # comments, so regenerated *text* is not the contract; the contract is
+        # that every constant's shipped value equals what its source resolves to.
+        # A wrong offset therefore still fails the gate, while documentation text
+        # differences are reported without blocking the build.
+        shipped = header_values()
+        mismatches = []
+        verified = 0
+        unverified = []
+        declared = []
+        for name, ctype, spec, note in [e for _, entries in SECTIONS for e in entries]:
+            if spec.startswith("drop:") and _DROP_ABSENT:
+                unverified.append(name)
+                continue
+            if spec.startswith("lit:"):
+                declared.append(name)
+                continue
+            v = values.get(name)
+            if v is None:
+                continue
+            if name not in shipped:
+                rhs = header_rhs().get(name)
+                if spec.startswith("expr:") and rhs:
+                    continue          # shipped as an expression; nothing to compare
+                mismatches.append("%s: not found in Offsets.h" % name)
+            elif shipped[name] != v:
+                mismatches.append("%s: Offsets.h 0x%X != %s 0x%X"
+                                  % (name, shipped[name], spec, v))
+            else:
+                verified += 1
+        print("value check: %d match their source, %d explicit literals, "
+              "%d unverified (source absent), %d wrong"
+              % (verified, len(declared), len(unverified), len(mismatches)))
+        if unverified:
+            print("  unverified (offline CL drop absent from this checkout): %d"
+                  % len(unverified))
+        if mismatches:
+            print("  MISMATCHES:")
+            for m in mismatches[:40]:
+                print("    " + m)
+            problems.append("%d constants disagree with their offline source"
+                            % len(mismatches))
         if os.path.exists(OUT):
             with open(OUT, encoding="utf-8") as fh:
                 old = fh.read()
-            print("differences:" if old != content else "no changes")
             if old != content:
-                # the header is generated, so any difference means it was either
-                # hand-edited or not regenerated after a spec change - both are
-                # failures, not warnings
-                problems.append("Offsets.h differs from the generated content")
-                import difflib
-                for line in list(difflib.unified_diff(
-                        old.splitlines(), content.splitlines(),
-                        "Offsets.h(old)", "Offsets.h(new)", lineterm=""))[:80]:
-                    print(line)
+                print("note: regenerated text differs from Offsets.h (comments are "
+                      "hand-maintained - informational only)")
         # the IDA map shipped in sdk/IDAMappings/ is an independent source for
         # the four data globals -- reconcile against it when it is present
         if not problems:

@@ -18,6 +18,12 @@ void HoverableTextF(const char* fmt, ...);
 void HoverableTextColoredF(const ImVec4& color, const char* fmt, ...);
 bool LastLabelRect(ImVec2* outMin, ImVec2* outMax);
 void ResetHoverState();
+
+/** Menu search (C1): session-only filter across menu rows. Drawn by the sidebar. */
+void DrawSearchBox();
+/** True when a term is active and `label` does not match it — the row helper
+ *  skips drawing and returns false, the same path as "nothing changed". */
+bool SearchHides(const char* label);
 void PushControlWidth();
 bool SliderFloat(
     const char* label,

@@ -1,0 +1,12 @@
+{
+  "waived_constants": [],
+  "pending_constants": [],
+  "constants": {},
+  "namespaces": {},
+  "functions": {
+    "turnonlight": {
+      "fate": "waived",
+      "note": "Trap system not implemented"
+    }
+  }
+}

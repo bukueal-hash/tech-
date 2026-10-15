@@ -53,6 +53,15 @@ void ClearItemScannerStaticState();
 void ClearContainerScannerStaticState();
 void ClearRobotScannerStaticState();
 
+/**
+ * One-shot, in-process proof of the bot admission lane's first-probe ordering
+ * (Core/BotAdmitQueue.hpp): the tests project has no compile targets and
+ * scripts/build.ps1 -Test refuses by policy, so the decision table is executed
+ * inside the shipping exe instead. Called from the overlay loop; logs its own
+ * pass/fail record and runs at most once per process.
+ */
+void EnsureFirstProbeSelfTestRan();
+
 void PruneStaleEntries(
     std::unordered_map<uintptr_t, Engine::WorldCacheEntry>& cache,
     const std::unordered_set<uint64_t>& currentSet);
@@ -114,39 +123,6 @@ void RefreshWorldCacheRetainPositions(std::vector<WorldCacheRetainRow>& rows);
  */
 void DedupeWorldCacheByRoot(std::unordered_map<uintptr_t, Engine::WorldCacheEntry>& cache);
 
-/**
- * One-shot read-only simple-collision probe. Walks every level actor's static
- * mesh to UBodySetup and reads the FKAggregateGeom TArray headers that live
- * INLINE at UBodySetup+0xB8. Diagnostic only — no ESP or visibility consumer.
- */
-struct AggGeomProbeResult {
-    bool ran = false;
-    bool running = false;
-    int actorsWalked = 0;
-    int rootsValid = 0;
-    int meshFromPrimary = 0;   // StaticMeshComponent + Offsets::StaticMesh
-    int meshFromLegacy = 0;    // StaticMeshComponent + Offsets::StaticMeshLegacy
-    int bodySetupsValid = 0;
-    int bodySetupsUnique = 0;
-    int bodySetupsNonEmpty = 0;
-    /** BodySetups whose 0x70 block held a garbage header — misread, not "empty". */
-    int headersRejected = 0;
-    int sphereElems = 0;
-    int boxElems = 0;
-    int sphylElems = 0;
-    int convexElems = 0;
-    int taperedCapsuleElems = 0;
-    int levelSetElems = 0;
-    int skinnedLevelSetElems = 0;
-    std::string note;
-};
-
-/** Kick the probe on an owned, joinable job. No-op while one is already running. */
-void StartAggGeomProbe();
-
-/** Snapshot of the last (or in-flight) probe run. */
-AggGeomProbeResult GetAggGeomProbeResult();
-
 /** Stop and join all diagnostic probe jobs before engine teardown. */
 void StopBackgroundJobs();
 
@@ -175,32 +151,6 @@ void StartTimeSecondsProbe();
 
 /** Snapshot of the last (or in-flight) probe run. */
 TimeSecondsProbeResult GetTimeSecondsProbeResult();
-
-/**
- * One-shot read-only probe that finds render-timestamp fields on a mesh
- * component WITHOUT decrypting anything. A render time ticks every frame while
- * the mesh is on screen and freezes when it is not, so the change rate alone
- * identifies the field — no XOR key and no hardcoded offset required.
- * Run it once with the target visible and once with it behind cover; the slot
- * that is busy in the first run and still in the second is the one we want.
- */
-struct TickProbeResult {
-    bool ran = false;
-    bool running = false;
-    uint64_t mesh = 0;
-    int samples = 0;
-    int slotsChanged = 0;   // dwords that moved at least once
-    static constexpr int kTop = 6;
-    uint32_t topOffset[kTop]{};
-    int topCount[kTop]{};
-    std::string note;
-};
-
-/** Kick the probe on an owned, joinable job. Takes ~2s. No-op while running. */
-void StartTickProbe();
-
-/** Snapshot of the last (or in-flight) probe run. */
-TickProbeResult GetTickProbeResult();
 
 /** EMA blend for aim/ESP velocity; zeros if |newVel| >= 3000 cm/s. */
 inline void BlendCachedVelocity(Vector3& cachedVelocity, const Vector3& newVel)

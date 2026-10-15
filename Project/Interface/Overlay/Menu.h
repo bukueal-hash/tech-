@@ -18,10 +18,12 @@ void DrawArcEspTab();
 void DrawArcRadarTab();
 void DrawArcAimbotTab();
 void DrawArcSettingsTab();
+    void DrawArcDumperTab();
 void DrawArcHelpTab();
 void DrawArcDebugContent();
 void DrawArcTriggerbotContent();
 void DrawArcLootContent();
+void DrawArcCollisionContent();
 }
 
 void ArcMenuAddVerticalSpacing(float spacing);
