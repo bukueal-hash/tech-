@@ -727,6 +727,17 @@ inline uint16_t keyTable[256]{};
 // v20261009 reference keystream: u16[256] loaded from KEYTABLE at RefKeyTableRva.
 inline uint16_t refKeyTable[RefKeyStreamCount]{};
 inline bool refReady = false;     // reference keystream loaded
+// Alt tier (pasted GNames decoder): separate pool, key table, selector and
+// string keystream. Consulted only after the reference tier.
+constexpr uint64_t AltPoolRva         = 0x10EB1180ULL;
+constexpr uint64_t AltKeyTableRva     = 0x10D4B25CULL;
+constexpr uint32_t AltChunkOffsetMask = 0x1FFF00u;
+constexpr uint32_t AltKeystreamCount  = 256u;
+constexpr uint32_t AltKeystreamBase   = 88u;
+constexpr uint32_t AltStringKeyBias   = 0x1312u;
+constexpr uint32_t AltStringKeyStep   = 0x35u;
+inline uint16_t altKeyTable[AltKeystreamCount]{};
+inline bool altReady = false;
 inline bool ready = false;        // FName pool reachable (SDK plain layout)
 inline bool keyTableReady = false; // SDK-drop key table loaded (slot path only)
 inline bool legacyReady = false;  // legacy keystream loaded
@@ -760,6 +771,8 @@ inline void Reset() {
 	keyTableReady = false;
 	legacyReady = false;
 	refReady = false;
+	altReady = false;
+	std::memset(altKeyTable, 0, sizeof(altKeyTable));
 }
 
 // SDK init: load the FName key table (game::offsets::KEYTABLE). The legacy
@@ -810,6 +823,21 @@ inline bool Init(uint64_t moduleBase)
 			refReady = RefNz >= 8;
 			if (!refReady)
 				std::memset(refKeyTable, 0, sizeof(refKeyTable));
+		}
+	}
+
+	// Alt keystream: u16[256] at AltKeyTableRva (pasted GNames decoder).
+	{
+		uint8_t AltBuf[AltKeystreamCount * 2]{};
+		if (steam_decrypt::MemRead(moduleBase + AltKeyTableRva, AltBuf, sizeof(AltBuf))) {
+			int AltNz = 0;
+			for (uint32_t I = 0; I < AltKeystreamCount; ++I) {
+				std::memcpy(&altKeyTable[I], AltBuf + I * 2, 2);
+				AltNz += (altKeyTable[I] != 0);
+			}
+			altReady = AltNz >= 8;
+			if (!altReady)
+				std::memset(altKeyTable, 0, sizeof(altKeyTable));
 		}
 	}
 
@@ -1468,6 +1496,55 @@ inline bool DecryptPlayerNameKeystream(std::vector<uint16_t>& buffer, int charCo
 	return true;
 }
 
+// ── Alt tier: pasted GNames decoder ──────────────────────────────────────────
+// Name selector (FNV32 over obj+0x10, already ^2 for the name slot).
+inline uint32_t AltSlotSelector(uint64_t ObjBase) {
+	const uint64_t Seed = ObjBase + RefSlotSeedOff;
+	const uint32_t Lo = static_cast<uint32_t>(Seed);
+	const uint32_t Hi = static_cast<uint32_t>(Seed >> 32);
+	uint32_t H = HashPrime32 * (Lo >> 3) + RefSlotHashAdd;
+	H = HashPrime32 * RotateLeft32(H, 26) + Hi + RefSlotHashAdd;
+	H = HashPrime32 * (H >> 3) + RefSlotHashAdd;
+	H = HashPrime32 * (H >> 6) + RefSlotHashAdd;
+	return ((H ^ (H >> 16)) & 3u) ^ RefSlotNameXor;
+}
+
+// Name slot CI: same unified descriptor decode as the reference tier.
+inline uint64_t AltReadCompIndex(uint64_t ObjBase) {
+	return RotateLeft64(RefDecodeSlotValue(ObjBase, AltSlotSelector(ObjBase)), 32);
+}
+
+// Shard index from the chunk seed (chunk + 0x10); idx2 is idx1 + 1.
+inline uint32_t AltShardIndex(uint64_t Seed) {
+	const uint32_t Lo = static_cast<uint32_t>(Seed);
+	const uint32_t Hi = static_cast<uint32_t>(Seed >> 32);
+	uint32_t H = HashPrime32 * RotateLeft32(Lo, 28) + RefShardHashAdd;
+	H = HashPrime32 * RotateLeft32(H, 26) + Hi + RefShardHashAdd;
+	H = HashPrime32 * (H >> 4) + RefShardHashAdd;
+	H = HashPrime32 * (H >> 6) + RefShardHashAdd;
+	return (H ^ (H >> 16)) & 7u;
+}
+
+// CI -> FNameEntry* through the alt pool (blocks at chunk + 0x20).
+inline uint64_t ResolveNamePointerAlt(uint64_t moduleBase, int32_t CompIndex) {
+	if (CompIndex < 0 || !moduleBase || !altReady)
+		return 0;
+
+	const uint32_t Ci = static_cast<uint32_t>(CompIndex);
+	const uint64_t Chunk = moduleBase + AltPoolRva + ((Ci >> 8) & AltChunkOffsetMask);
+	const uint32_t Bidx1 = AltShardIndex(Chunk + 0x10ULL);
+	const uint32_t Bidx2 = (Bidx1 + 1u) & 7u;
+	const uint64_t First = RefDecodeBlock(Chunk + 0x20ULL + 32ULL * Bidx1);
+	const uint64_t Second = RefDecodeBlock(Chunk + 0x20ULL + 32ULL * Bidx2);
+	if (!First && !Second)
+		return 0;
+
+	uint64_t Mixed = FnvPrime * RotateLeft64(First, RefFnvRol1) + RefFnvAdd;
+	Mixed = FnvPrime * RotateLeft64(Mixed, RefFnvRol2) + RefFnvAdd;
+	const uint64_t EntryPtr = First + (Second ^ Mixed) + 2ULL * static_cast<uint16_t>(Ci);
+	return steam_decrypt::ValidPtr(EntryPtr) ? EntryPtr : 0;
+}
+
 inline uint64_t ResolveNamePointer(uint64_t moduleBase, int32_t CompIndex) {
 	if (const uint64_t Entry = ResolveNamePointerRef(moduleBase, CompIndex))
 		return Entry;
@@ -1669,6 +1746,64 @@ inline std::string DecodeStringLegacy(uint64_t NameEntryPtr) {
 	return Out;
 }
 
+// Alt string decode: wide = bit15, len = ((hdr>>3)&0x3FC)|((hdr>>13)&3). The key
+// is (chars + 0x1312) stepped by 0x35; narrow XORs (ks >> 3), wide XORs the word.
+inline std::string DecodeStringAlt(uint64_t NameEntryPtr) {
+	if (!NameEntryPtr || !altReady)
+		return {};
+
+	const uint16_t Header = steam_decrypt::MemReadVal<uint16_t>(NameEntryPtr);
+	if (!Header)
+		return {};
+	const bool IsWide = (Header & 0x8000u) != 0;
+	const uint32_t Length = ((static_cast<uint32_t>(Header) >> 3) & 0x3FCu) |
+		((static_cast<uint32_t>(Header) >> 13) & 0x3u);
+	if (Length == 0 || Length > RefMaxNameLen)
+		return {};
+
+	const uint32_t Chars = IsWide ? (Length >> 1) : Length;
+	if (Chars == 0)
+		return {};
+	const uint32_t Key = Chars + AltStringKeyBias;
+	auto KsSlot = [](uint32_t K) -> uint16_t {
+		return altKeyTable[(K & 0x3Fu) + AltKeystreamBase];
+	};
+
+	std::string Out;
+	Out.reserve(Chars);
+	if (!IsWide) {
+		std::vector<uint8_t> Buf(static_cast<size_t>(Chars));
+		if (!steam_decrypt::MemRead(NameEntryPtr + 2, Buf.data(), Buf.size()))
+			return {};
+		for (uint32_t I = 0; I < Chars; ++I) {
+			const uint8_t B = static_cast<uint8_t>(
+				Buf[I] ^ (KsSlot(Key + I * AltStringKeyStep) >> 3));
+			if (B == 0)
+				break;
+			Out.push_back(B >= 32 && B <= 126 ? static_cast<char>(B) : '?');
+		}
+		return Out;
+	}
+
+	std::vector<uint16_t> Raw(static_cast<size_t>(Chars));
+	if (!steam_decrypt::MemRead(NameEntryPtr + 2, Raw.data(), Raw.size() * sizeof(uint16_t)))
+		return {};
+	for (uint32_t I = 0; I < Chars; ++I) {
+		const uint16_t C = static_cast<uint16_t>(Raw[I] ^ KsSlot(Key + I * AltStringKeyStep));
+		if (C == 0)
+			break;
+		Out.push_back(C >= 32 && C <= 126 ? static_cast<char>(C) : '?');
+	}
+	return Out;
+}
+
+// Alt name text: resolve through the alt pool and keep it only if it passes the
+// entry-text gate.
+inline std::string ResolveNameTextAlt(uint64_t moduleBase, int32_t CompIndex) {
+	const std::string Str = DecodeStringAlt(ResolveNamePointerAlt(moduleBase, CompIndex));
+	return LooksLikeNameEntry(Str) ? Str : std::string{};
+}
+
 // Entry-pointer decode, in order: the SDK's plain pool (this build's real
 // layout, sdk/CppSDK/SDK/Basic.hpp), then the retired SDK-drop slot pipeline,
 // then the v20260818 keystream. Every candidate must pass the entry-text gate,
@@ -1817,6 +1952,14 @@ inline uint64_t FindFNameSlot(uint64_t ObjBase)
 			return Ref;
 	}
 
+	// Alt tier (pasted GNames decoder): own selector family, pool and key table.
+	// Gated on altReady so it stays inert unless its keystream is present.
+	if (GNames::altReady) {
+		if (const uint64_t Alt = GNames::AltReadCompIndex(ObjBase);
+			(Alt & 0xFFFFFFFFULL) > 1 && (Alt & 0xFFFFFFFFULL) < 0x2000000ULL)
+			return Alt;
+	}
+
 	// SDK layout (sdk/CppSDK/SDK/CoreUObject_classes.hpp) first: UObject::Name is
 	// a plain FName at +0x98 and its low dword is the comparison index.
 	const uint64_t Plain = MemReadVal<uint64_t>(ObjBase + Offsets::UObject_NamePrivate);
@@ -1861,9 +2004,9 @@ inline std::string CachedNameString(int32_t comp_index, uint64_t game_base)
 	if (!InitFNameState(game_base))
 		return {};
 	uint64_t Ptr = ResolveNamePtr(comp_index, game_base);
-	if (!Ptr)
-		return {};
-	std::string Str = DecryptNameString(Ptr);
+	std::string Str = Ptr ? DecryptNameString(Ptr) : std::string{};
+	if (Str.empty() || !IsPlausibleFNameText(Str))
+		Str = GNames::ResolveNameTextAlt(game_base, comp_index);
 	if (Str.empty() || !IsPlausibleFNameText(Str))
 		return {};
 	{

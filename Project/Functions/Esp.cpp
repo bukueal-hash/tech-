@@ -569,12 +569,11 @@ static ImU32 PlayerEspColor(bool visible)
     return EspDraw::ColorFromRGBA(c);
 }
 
-static ImU32 BotEspColor(bool visible, bool isBreaked = false, bool occluded = false)
+static ImU32 BotEspColor(bool visible, bool isBreaked = false)
 {
     const float* c = isBreaked
         ? var::color_dead_bots
-        : (occluded ? var::bot_color_occluded
-            : (visible ? var::bot_color_visible : var::bot_color_invisible));
+        : (visible ? var::bot_color_visible : var::bot_color_invisible);
     ImU32 out = EspDraw::ColorFromRGBA(c);
     // Dead styling follows the same policy the radar uses. Hide is handled
     // by the show_dead_bots gates upstream, not here.
@@ -744,8 +743,6 @@ static float StackPlayerLabels(
         
         if (var::names) {
             topText += actor.ActorName.empty() ? "Raider" : actor.ActorName;
-        } else if (topText.empty() && var::show_distance) {
-            topText = "Player";
         }
         
         if (var::show_distance) {
@@ -1898,9 +1895,23 @@ static void DrawPlayerEspList(
             if (UpgradeOptions::collisionDebugShapes)
                 CollisionDebug::DrawShapeOutlines(drawList, engine, frameCam, dbgEye,
                     live.rootComponent, actor->APawn);
-            if (UpgradeOptions::collisionDebugRays)
-                CollisionDebug::DrawRay(drawList, engine, frameCam, dbgEye, headWorld,
-                    "player", /*entity=*/true);
+            if (UpgradeOptions::collisionDebugRays) {
+                // Per-bone vischeck: one ray from the crosshair to every cached
+                // bone, in the player's own visible/not-visible colours, so a
+                // target half behind cover shows which body parts are shootable.
+                // Drawing only: the query is a CPU BVH traversal, no reads.
+                const uint32_t visColor = EspDraw::ColorFromRGBA(var::esp_color_visible);
+                const uint32_t hidColor = EspDraw::ColorFromRGBA(var::esp_color_invisible);
+                for (size_t bi = 0; bi < static_cast<size_t>(UniBone::Count); ++bi) {
+                    if (!live.boneData.valid.test(bi))
+                        continue;
+                    const Vector3& boneWorld = live.boneData.bonesWorldDouble[bi];
+                    if (!IsPlausibleWorldPos(boneWorld))
+                        continue;
+                    CollisionDebug::DrawBoneRay(drawList, engine, frameCam, boneWorld,
+                        visColor, hidColor);
+                }
+            }
         }
 
         // Player hop debug: log first 3 players every 2s
@@ -1947,7 +1958,8 @@ static void DrawPlayerEspList(
         bool occludedPlayer = false;
         if (playerVisQueriesThisFrame < kPlayerVisQueriesPerFrame) {
             ++playerVisQueriesThisFrame;
-            occludedPlayer = CollisionBvh::BlockedForConsumer(frameCam.Location, headWorld);
+            occludedPlayer = CollisionBvh::BlockedForConsumer(frameCam.Location, headWorld,
+                static_cast<double>(UpgradeOptions::visCheckClearanceCm));
         }
         const ImU32 color = PlayerEspColor(actor->isVisible && !occludedPlayer);
         const float boxH = feet.y - head.y;
@@ -2279,6 +2291,11 @@ static void RenderRobotEspFromFrame(
     // been burned by before, so it is bounded and the overflow is counted.
     constexpr int kVisQueriesPerFrame = 96;
     int visQueriesThisFrame = 0;
+    // Last cover result per bot. Bots past the per-frame cap reuse it, so a bot
+    // does not flip colour just because the cap fell on it this frame.
+    static std::unordered_map<uintptr_t, bool> s_botOccludedMemo;
+    if (s_botOccludedMemo.size() > 8192)
+        s_botOccludedMemo.clear();
     const auto noteSkip = [&](const char* reason, uintptr_t key,
                               const Engine::WorldCacheEntry& robot, float distance,
                               float camDepthCm = std::nanf(""), float sx = std::nanf(""),
@@ -2462,7 +2479,7 @@ static void RenderRobotEspFromFrame(
                     drawEntry.rootComponent, drawEntry.APawn);
             if (UpgradeOptions::collisionDebugRays)
                 CollisionDebug::DrawRay(drawList, engine, frameCam, dbgEye, headWorld,
-                    "bot", /*entity=*/true);
+                    nullptr, /*entity=*/true);
         }
 
         ImVec2 head{};
@@ -2686,15 +2703,18 @@ static void RenderRobotEspFromFrame(
         bool occludedHere = false;
         if (visQueriesThisFrame < kVisQueriesPerFrame) {
             ++visQueriesThisFrame;
-            occludedHere = CollisionBvh::BlockedForConsumer(frameCam.Location, headWorld);
+            occludedHere = CollisionBvh::BlockedForConsumer(frameCam.Location, headWorld,
+                static_cast<double>(UpgradeOptions::visCheckClearanceCm));
+            s_botOccludedMemo[key] = occludedHere;
             LogVisRay(key, distM, occludedHere);
             if (occludedHere)
                 ++funnel.occluded;
         } else {
             ++funnel.visBudgetHit;
+            const auto memo = s_botOccludedMemo.find(key);
+            occludedHere = memo != s_botOccludedMemo.end() && memo->second;
         }
-        const ImU32 color_base = BotEspColor(robot.isVisible && !occludedHere, robot.IsBreaked,
-            robot.isVisible && occludedHere);
+        const ImU32 color_base = BotEspColor(robot.isVisible && !occludedHere, robot.IsBreaked);
         const ImU32 color = color_base;
         const float boxH = feet.y - head.y;
         const Visuals::EspDrawScale scale =
@@ -2706,6 +2726,7 @@ static void RenderRobotEspFromFrame(
         // so a flaky fname (Constructable token) skips this bot instead of running the
         // DMA label chain inside Present (the ~20s 100-440ms ghost-copy stall).
         const std::string& fname = robot.ActorName;
+        bool botNameHidden = false;
         std::string botLabel = ResolveBotDrawLabel(key, robot.ActorName, fname, /*allowDma=*/false);
         if (botLabel.empty() && !robot.ItemDisplayName.empty())
             botLabel = ResolveBotDrawLabel(key, robot.ItemDisplayName, fname, /*allowDma=*/false);
@@ -2725,6 +2746,7 @@ static void RenderRobotEspFromFrame(
                 continue;
             }
             botLabel = "Bot";
+            botNameHidden = true;
         }
         if (!EntityFilters::Arc(botLabel))
             continue;
@@ -2797,6 +2819,8 @@ static void RenderRobotEspFromFrame(
                 robot.health, robot.maxhealth,
                 0.f, 0.f, scale, drawList);
         }
+        // Bot heart and bot box share the bot palette so changing either
+        // bot colour moves both together.
         if (var::showRobots && var::bot_heart)
             DrawBotHeartIfEnabled(drawList, head, feet, boxH, scale, color);
 
@@ -2806,13 +2830,13 @@ static void RenderRobotEspFromFrame(
             Visuals::Box(screenTop, screenBottom, robot.isVisible, color, 0, scale);
         }
 
-        if (var::bot_names && !botLabel.empty()) {
+        if (var::bot_names && !botLabel.empty() && !botNameHidden) {
             Visuals::Names(
                 botLabel,
                 head.x,
                 botLabelY,
                 scale,
-                ImColor(255, 255, 255, 255));
+                ImColor(color));
         }
 
         // Best-effort loadout line (weapon + armor tier) for bots that carry an
@@ -2831,7 +2855,7 @@ static void RenderRobotEspFromFrame(
             }
             if (!loadoutLine.empty()) {
                 float loadoutY = botLabelY;
-                if (var::bot_names && !botLabel.empty() && ImGui::GetFont()) {
+                if (var::bot_names && !botLabel.empty() && !botNameHidden && ImGui::GetFont()) {
                     loadoutY -= ImGui::GetFont()->CalcTextSizeA(
                         Visuals::LabelTextPx(distM), FLT_MAX, 0.f, botLabel.c_str()).y + 2.f;
                 }
@@ -2848,7 +2872,7 @@ static void RenderRobotEspFromFrame(
             char distBuf[32]{};
             snprintf(distBuf, sizeof(distBuf), "%.0fm", distM);
             float labelY = head.y - 4.f;
-            if (var::bot_names && !botLabel.empty()) {
+            if (var::bot_names && !botLabel.empty() && !botNameHidden) {
                 const float nameH = ImGui::GetFont()->CalcTextSizeA(
                     Visuals::LabelTextPx(distM),
                     FLT_MAX, 0.f,
@@ -3863,26 +3887,13 @@ static void RenderWorldEspFromFrame(
         }
 
         // Collision debug (visibility work): draw the decoded shapes for this
-        // entry's component and trace the vischeck ray from the frame camera to
-        // it. Both are bounded (radius + per-frame budgets) and drawing only -
-        // no reads here, so the paint path stays DMA-free.
-        if (UpgradeOptions::collisionDebugShapes || UpgradeOptions::collisionDebugRays) {
+        // entry's component. Shapes only here: the visibility RAYS are for
+        // players and bots, not loot. Drawing only - no reads, so the paint
+        // path stays DMA-free.
+        if (UpgradeOptions::collisionDebugShapes) {
             const Vector3 dbgEye = frameCam.Location;
-            if (UpgradeOptions::collisionDebugShapes)
-                CollisionDebug::DrawShapeOutlines(drawList, engine, frameCam, dbgEye,
-                    entry.rootComponent, entry.APawn);
-            if (UpgradeOptions::collisionDebugRays) {
-                Vector3 dbgTarget = entry.WorldPos;
-                if (entry.hasBotHeadWorldPos)
-                    dbgTarget = entry.BotHeadWorldPos;
-                else if (std::isfinite(entry.CenterWorldPos.x)
-                    && std::isfinite(entry.CenterWorldPos.y)
-                    && std::isfinite(entry.CenterWorldPos.z)
-                    && !(entry.CenterWorldPos.x == 0.0 && entry.CenterWorldPos.y == 0.0
-                        && entry.CenterWorldPos.z == 0.0))
-                    dbgTarget = entry.CenterWorldPos;
-                CollisionDebug::DrawRay(drawList, engine, frameCam, dbgEye, dbgTarget, nullptr);
-            }
+            CollisionDebug::DrawShapeOutlines(drawList, engine, frameCam, dbgEye,
+                entry.rootComponent, entry.APawn);
         }
 
         // Extraction hatches: append the replicated SDK state to the label.

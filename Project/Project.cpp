@@ -64,6 +64,19 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         context.setOption("no-breaks", true);
         return context.run();
     }
+
+    // Single-instance guard: exactly one overlay may run at a time. A second
+    // ArcRaiders.exe exits here, before it reads settings, opens the diagnostics
+    // log, attaches the DMA device or creates a window, so two copies cannot
+    // fight over the shared config file, the log or the game attach. The handle
+    // is deliberately held until the process ends -- that ownership IS the lock;
+    // closing it early would let the next launch straight through. Fails open if
+    // the mutex cannot be created, matching every other guard in this app.
+    HANDLE singleInstance = CreateMutexW(nullptr, TRUE, L"Local\\ArcRaiders.SingleInstance");
+    if (singleInstance && GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(singleInstance);
+        return 0;
+    }
     ImGui_ImplWin32_EnableDpiAwareness();
     float main_scale = ImGui_ImplWin32_GetDpiScaleForMonitor(::MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY));
 

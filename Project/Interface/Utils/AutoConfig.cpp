@@ -177,7 +177,6 @@ struct Snapshot {
     float color_dead_bots[4]{};
     float bot_color_visible[4]{};
     float bot_color_invisible[4]{};
-    float bot_color_occluded[4]{};
 
     bool enable_aimbot{};
     bool robotAimEnabled{};
@@ -437,7 +436,6 @@ Snapshot CaptureSnapshot()
     s.bot_esp_distance = var::bot_esp_distance;
     std::memcpy(s.bot_color_visible, var::bot_color_visible, sizeof(s.bot_color_visible));
     std::memcpy(s.bot_color_invisible, var::bot_color_invisible, sizeof(s.bot_color_invisible));
-    std::memcpy(s.bot_color_occluded, var::bot_color_occluded, sizeof(s.bot_color_occluded));
     std::memcpy(s.color_dead_bots, var::color_dead_bots, sizeof(s.color_dead_bots));
 
     s.enable_aimbot = var::enable_aimbot;
@@ -655,7 +653,6 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.bot_esp_distance == b.bot_esp_distance &&
         ColorsEqual(a.bot_color_visible, b.bot_color_visible) &&
         ColorsEqual(a.bot_color_invisible, b.bot_color_invisible) &&
-        ColorsEqual(a.bot_color_occluded, b.bot_color_occluded) &&
         ColorsEqual(a.color_dead_bots, b.color_dead_bots) &&
         a.enable_aimbot == b.enable_aimbot &&
         a.robotAimEnabled == b.robotAimEnabled &&
@@ -1095,7 +1092,6 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     }
     else if (key == "bot_color_visible") ParseColor4(val, var::bot_color_visible);
     else if (key == "bot_color_invisible") ParseColor4(val, var::bot_color_invisible);
-    else if (key == "bot_color_occluded") ParseColor4(val, var::bot_color_occluded);
     else if (key == "enable_aimbot") var::enable_aimbot = ParseBool(val, var::enable_aimbot);
     else if (key == "robotAimEnabled") var::robotAimEnabled = ParseBool(val, var::robotAimEnabled);
     else if (key == "aim_hold_key") var::aim_hold_key = std::atoi(val.c_str());
@@ -1375,7 +1371,6 @@ void SerializeIni(std::ostream& file)
     file << "bot_esp_distance=" << var::bot_esp_distance << '\n';
     WriteColor4(file, "bot_color_visible", var::bot_color_visible);
     WriteColor4(file, "bot_color_invisible", var::bot_color_invisible);
-    WriteColor4(file, "bot_color_occluded", var::bot_color_occluded);
 
     file << "enable_aimbot=" << (var::enable_aimbot ? 1 : 0) << '\n';
     file << "robotAimEnabled=" << (var::robotAimEnabled ? 1 : 0) << '\n';

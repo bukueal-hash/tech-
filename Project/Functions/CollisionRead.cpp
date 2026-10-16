@@ -50,7 +50,12 @@ namespace {
 // once-per-session background job, and walkCapHit now reports it if this ever
 // binds again.
 constexpr int kMaxActorsWalked = 16384;
-constexpr int kMaxAssetsStored = 192;
+// Raised from 192. A live probe filled the old cap exactly (171 brush + 21 mesh
+// assets) and rejected 117 more with assetsOverCacheCap, so a level's brush
+// geometry -- now the source of the vischeck walls -- was being dropped on the
+// floor. Still a bound (this is decode time and geometry memory), just one a real
+// level does not hit; the over-cap counter still reports it if it ever binds.
+constexpr int kMaxAssetsStored = 1024;
 constexpr int kMaxBoundsChecks = 48;
 // Coarse occluders recorded across the whole walk. One per placed static mesh
 // whose collision did not decode, so a level's walls are representable at all;
@@ -93,7 +98,8 @@ std::unordered_map<uintptr_t, AssetRecord> g_assets;
 std::unordered_map<uintptr_t, OccluderBox> g_occluders;
 
 // StaticMesh::ExtendedBounds: origin + extent + radius. Declared here (not inside
-// the walk) because both the decode cross-check and the occluder box read it.
+// the walk) because both the decode cross-check and the actor stand-in path read
+// it. (The occluder generator reads the wider AssetBoundsBlock below instead.)
 struct AssetBoundsLocal
 {
     Vector3 origin{};
@@ -101,32 +107,19 @@ struct AssetBoundsLocal
     double radius = 0.0;
 };
 
-/** The asset's bounds box through a component transform, as a world AABB. */
-bool WorldAabbFromAssetBounds(const FTransform& ctw, const AssetBoundsLocal& b,
-    Vector3& outMin, Vector3& outMax)
+// UStaticMesh bounds block, read in one shot: the positive and negative bounds
+// extensions that UE folds into ExtendedBounds, then the extended origin/extent.
+// Reading it whole keeps the occluder generator at one direct-read site (the
+// sixth pinned one) while recovering the UN-extended box: the visible mesh's
+// true box is the extended box minus the extensions, so the oriented occluder
+// hugs the material instead of the padded bounds.
+struct AssetBoundsBlock
 {
-    Vector3 mn;
-    Vector3 mx;
-    for (int i = 0; i < 8; ++i) {
-        const Vector3 local(
-            b.origin.x + ((i & 1) ? b.extent.x : -b.extent.x),
-            b.origin.y + ((i & 2) ? b.extent.y : -b.extent.y),
-            b.origin.z + ((i & 4) ? b.extent.z : -b.extent.z));
-        const Vector3 w = CollisionGeom::TransformPoint(ctw, local);
-        if (!std::isfinite(w.x) || !std::isfinite(w.y) || !std::isfinite(w.z))
-            return false;
-        if (i == 0) {
-            mn = w;
-            mx = w;
-        } else {
-            mn = Vector3((std::min)(mn.x, w.x), (std::min)(mn.y, w.y), (std::min)(mn.z, w.z));
-            mx = Vector3((std::max)(mx.x, w.x), (std::max)(mx.y, w.y), (std::max)(mx.z, w.z));
-        }
-    }
-    outMin = mn;
-    outMax = mx;
-    return true;
-}
+    Vector3 posExt{};
+    Vector3 negExt{};
+    Vector3 origin{};
+    Vector3 extent{};
+};
 // component -> asset, so a consumer that has a component pointer (the ESP paint
 // pass, keyed by root component) resolves its shapes in O(1) instead of scanning
 // every asset's instance list per frame.
@@ -257,6 +250,36 @@ void NoteSkippedRootClass(const std::string& name, ProbeResult& r)
         return;
     }
     ++r.skippedRootClassesOther;
+}
+
+/**
+ * Tally the class of a static-mesh component whose StaticMesh read back unusable.
+ * Bounded exactly like NoteSkippedRootClass: three distinct names plus a catch-all
+ * count, and the owner actor's class captured for the first few samples so a name
+ * can be read in context (a mesh-less component kind on a deco actor is benign; the
+ * same kind on every building actor is the bug).
+ */
+void NoteUnresolvedMeshClass(const std::string& compClass, uintptr_t actor, ProbeResult& r)
+{
+    if (compClass.empty())
+        return;
+    for (int i = 0; i < r.unresolvedMeshClasses; ++i) {
+        if (r.unresolvedMeshClassSample[i] == compClass) {
+            ++r.unresolvedMeshClassCounts[i];
+            return;
+        }
+    }
+    if (r.unresolvedMeshClasses < 3) {
+        r.unresolvedMeshClassSample[r.unresolvedMeshClasses] = compClass;
+        r.unresolvedMeshClassCounts[r.unresolvedMeshClasses] = 1;
+        const uintptr_t actorClass = IsPlausiblePtr(actor)
+            ? steam_decrypt::GetActorClassPtr(actor) : 0;
+        r.unresolvedMeshActorClassSample[r.unresolvedMeshClasses] = IsPlausiblePtr(actorClass)
+            ? steam_decrypt::GetActorFNameString(actorClass) : std::string{};
+        ++r.unresolvedMeshClasses;
+        return;
+    }
+    ++r.unresolvedMeshClassesOther;
 }
 
 void RecordActorDecoded(uintptr_t actor, uintptr_t component, uintptr_t asset,
@@ -466,78 +489,144 @@ void DecodeAsset(AssetRecord& rec, std::vector<uint8_t>& scratch, ProbeResult& r
     rec.state = rec.primitives.empty() ? 4 : 1;
 }
 
+/** Append `n` little-endian 8-byte words from `p` as "\"off=0xval\"" entries. */
+void AppendWordDump(std::ostringstream& f, const uint8_t* p, size_t n)
+{
+    for (size_t o = 0; o + 8 <= n * 8; o += 8) {
+        if (o)
+            f << ",";
+        uintptr_t v = 0;
+        std::memcpy(&v, p + o, sizeof(v));
+        f << "\"" << std::hex << o << "=0x" << v << std::dec << "\"";
+    }
+}
+
 /**
- * Diagnostic only, nothing here feeds the BVH. The SDK dump does not reflect a
- * static mesh's RenderData, so this searches the UStaticMesh object for a pointer
- * to a LOD array (a TIndirectArray: pointer, count, max), reads LOD0, and logs
- * every byte-array header in it whose count could be an index buffer, with the
- * triangle count each would imply at 16 and 32 bits per index. Reads go through
- * ReadBlock, so they are budgeted like the rest of this probe.
+ * Diagnostic only, nothing here feeds the BVH. Anchored at UStaticMesh::RenderData
+ * (0x168, verified live -- it sits inside the dump's unnamed StaticMesh pad block),
+ * this walks RenderData -> LODResources -> LOD0 -> PositionVertexBuffer +
+ * IndexBuffer and reads the real mesh geometry. Every field and offset is
+ * VALIDATED, never trusted: the LOD/buffer layout comes from SDK CL-1424961, which
+ * differs from this build (its BodySetup 0x250 vs this build's dumped 0x248), so a
+ * live run is what decides. It logs the raw word dumps of each struct plus the
+ * decoded position range, so the true layout can be pinned from the log. Reads go
+ * through ReadBlock, so they are budgeted like the rest of this probe.
  */
 void ProbeRenderBuffers(uintptr_t asset, ProbeResult& r)
 {
-    constexpr size_t kObjScan = 0x400;
-    constexpr size_t kLodScan = 0x800;
-    constexpr size_t kMaxSlotHits = 8;
-    constexpr size_t kMaxCandidates = 24;
+    constexpr std::ptrdiff_t kRenderData = 0x168;   // UStaticMesh::RenderData
+    constexpr std::ptrdiff_t kLodArrayData = 0x00;  // RenderData.LODResources (TArray)
+    constexpr std::ptrdiff_t kLodArrayCount = 0x08;
+    constexpr std::ptrdiff_t kLodVertexBuffers = 0x00; // FStaticMeshLODResources
+    constexpr std::ptrdiff_t kLodIndexBuffer = 0x58;
+    constexpr std::ptrdiff_t kVBufPosition = 0x58;  // FStaticMeshVertexBuffers
+    constexpr std::ptrdiff_t kPosData = 0x08;       // FPositionVertexBuffer
+    constexpr std::ptrdiff_t kPosNum = 0x10;
+    constexpr std::ptrdiff_t kIBufData = 0x00;      // FRawStaticIndexBuffer
+    constexpr std::ptrdiff_t kIBufBytes = 0x08;
+    constexpr std::ptrdiff_t kIBuf16 = 0x10;
 
-    std::vector<uint8_t> obj;
-    if (!ReadBlock(asset, kObjScan, obj, r))
-        return;
+    const auto rd64 = [](const uint8_t* p) { uintptr_t v = 0; std::memcpy(&v, p, 8); return v; };
+    const auto rd32 = [](const uint8_t* p) { int32_t v = 0; std::memcpy(&v, p, 4); return v; };
 
     std::ostringstream f;
     f << "{\"location\":\"CollisionRead.cpp\",\"message\":\"render_probe\",\"timestamp\":"
-      << EntityDiagnostics::NowMs() << ",\"asset\":\"0x" << std::hex << asset << std::dec
-      << "\",\"slots\":[";
-    size_t slotHits = 0;
-    for (size_t off = 0; off + 8 <= obj.size() && slotHits < kMaxSlotHits; off += 8) {
-        uintptr_t rd = 0;
-        std::memcpy(&rd, obj.data() + off, sizeof(rd));
-        if (!IsPlausiblePtr(rd))
-            continue;
-        std::vector<uint8_t> hdr;
-        if (!ReadBlock(rd, 0x10, hdr, r))
-            continue;
-        uintptr_t lodArr = 0;
-        int32_t lodCount = 0;
-        std::memcpy(&lodArr, hdr.data(), sizeof(lodArr));
-        std::memcpy(&lodCount, hdr.data() + 8, sizeof(lodCount));
-        if (lodCount < 1 || lodCount > 8 || !IsPlausiblePtr(lodArr))
-            continue;
-        std::vector<uint8_t> lodPtr;
-        if (!ReadBlock(lodArr, sizeof(uintptr_t), lodPtr, r))
-            continue;
-        uintptr_t lod0 = 0;
-        std::memcpy(&lod0, lodPtr.data(), sizeof(lod0));
-        if (!IsPlausiblePtr(lod0))
-            continue;
-        std::vector<uint8_t> lod;
-        if (!ReadBlock(lod0, kLodScan, lod, r))
-            continue;
+      << EntityDiagnostics::NowMs() << ",\"asset\":\"0x" << std::hex << asset << std::dec << "\"";
 
-        f << (slotHits ? "," : "") << "{\"slot\":\"0x" << std::hex << off
-          << "\",\"lods\":" << std::dec << lodCount << ",\"lod0\":\"0x" << std::hex << lod0
-          << "\",\"candidates\":[";
-        ++slotHits;
-        size_t cands = 0;
-        for (size_t lo = 0; lo + 0x10 <= lod.size() && cands < kMaxCandidates; lo += 8) {
-            uintptr_t data = 0;
-            int32_t count = 0;
-            int32_t max = 0;
-            std::memcpy(&data, lod.data() + lo, sizeof(data));
-            std::memcpy(&count, lod.data() + lo + 8, sizeof(count));
-            std::memcpy(&max, lod.data() + lo + 12, sizeof(max));
-            // Byte-sized storage that could hold a few triangles up to a large mesh.
-            if (!IsPlausiblePtr(data) || count < 12 || count > 1200000 || max < count)
-                continue;
-            f << (cands ? "," : "") << "{\"off\":\"0x" << std::hex << lo
-              << "\",\"bytes\":" << std::dec << count
-              << ",\"tri16\":" << count / 6 << ",\"tri32\":" << count / 12 << "}";
-            ++cands;
-        }
-        f << "]}";
+    std::vector<uint8_t> b;
+    if (!ReadBlock(asset + kRenderData, 8, b, r)) {
+        f << ",\"ok\":0,\"why\":\"renderData unreadable\"}\n";
+        EntityDiagnostics::LogRaw(f.str());
+        return;
     }
-    f << "]}\n";
+    const uintptr_t renderData = rd64(b.data());
+    f << ",\"renderData\":\"0x" << std::hex << renderData << std::dec << "\"";
+    if (!IsPlausiblePtr(renderData)) {
+        f << ",\"ok\":0,\"why\":\"renderData not a pointer\"}\n";
+        EntityDiagnostics::LogRaw(f.str());
+        return;
+    }
+
+    if (!ReadBlock(renderData, 0x30, b, r)) {
+        f << ",\"ok\":0,\"why\":\"renderData header unreadable\"}\n";
+        EntityDiagnostics::LogRaw(f.str());
+        return;
+    }
+    const uintptr_t lodData = rd64(b.data() + kLodArrayData);
+    const int32_t lodCount = rd32(b.data() + kLodArrayCount);
+    f << ",\"lodData\":\"0x" << std::hex << lodData << "\",\"lodCount\":" << std::dec << lodCount
+      << ",\"renderDataWords\":[";
+    AppendWordDump(f, b.data(), 0x30 / 8);
+    f << "]";
+    if (lodCount < 1 || lodCount > 16 || !IsPlausiblePtr(lodData)) {
+        f << ",\"ok\":0,\"why\":\"lod array implausible\"}\n";
+        EntityDiagnostics::LogRaw(f.str());
+        return;
+    }
+
+    // LODResources is either a value array (element 0 == lodData) or an indirect
+    // array (element 0 == *(lodData)); dump the first LOD's words either way.
+    std::vector<uint8_t> e;
+    if (!ReadBlock(lodData, 0xC0, e, r)) {
+        f << ",\"ok\":0,\"why\":\"LOD0 unreadable\"}\n";
+        EntityDiagnostics::LogRaw(f.str());
+        return;
+    }
+    f << ",\"lod0FirstWord\":\"0x" << std::hex << rd64(e.data()) << std::dec << "\",\"lod0Words\":[";
+    AppendWordDump(f, e.data(), 0xC0 / 8);
+    f << "]";
+
+    // Best-effort decode: value-array LOD0, position buffer at +0x58, index at +0x58.
+    const uintptr_t lod0 = lodData;
+    std::vector<uint8_t> pb;
+    if (ReadBlock(lod0 + kVBufPosition, 0x20, pb, r)) {
+        const uintptr_t posData = rd64(pb.data() + kPosData);
+        const int32_t posNum = rd32(pb.data() + kPosNum);
+        f << ",\"posBufWords\":[";
+        AppendWordDump(f, pb.data(), 0x20 / 8);
+        f << "],\"posData\":\"0x" << std::hex << posData << "\",\"posNum\":" << std::dec << posNum;
+        if (IsPlausiblePtr(posData) && posNum > 2 && posNum < 4000000) {
+            std::vector<uint8_t> vb;
+            const size_t sample = (std::min)(static_cast<size_t>(posNum), static_cast<size_t>(256)) * 12;
+            if (ReadBlock(posData, sample, vb, r)) {
+                double mn[3] = { 1e30, 1e30, 1e30 };
+                double mx[3] = { -1e30, -1e30, -1e30 };
+                bool finite = true;
+                for (size_t o = 0; o + 12 <= vb.size(); o += 12) {
+                    float vx;
+                    float vy;
+                    float vz;
+                    std::memcpy(&vx, vb.data() + o, 4);
+                    std::memcpy(&vy, vb.data() + o + 4, 4);
+                    std::memcpy(&vz, vb.data() + o + 8, 4);
+                    if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(vz)) {
+                        finite = false;
+                        break;
+                    }
+                    mn[0] = (std::min)(mn[0], static_cast<double>(vx));
+                    mx[0] = (std::max)(mx[0], static_cast<double>(vx));
+                    mn[1] = (std::min)(mn[1], static_cast<double>(vy));
+                    mx[1] = (std::max)(mx[1], static_cast<double>(vy));
+                    mn[2] = (std::min)(mn[2], static_cast<double>(vz));
+                    mx[2] = (std::max)(mx[2], static_cast<double>(vz));
+                }
+                f << ",\"posFinite\":" << (finite ? 1 : 0)
+                  << ",\"posMin\":[" << mn[0] << "," << mn[1] << "," << mn[2] << "]"
+                  << ",\"posMax\":[" << mx[0] << "," << mx[1] << "," << mx[2] << "]";
+            }
+        }
+    }
+    std::vector<uint8_t> ib;
+    if (ReadBlock(lod0 + kLodIndexBuffer, 0x20, ib, r)) {
+        const uintptr_t ibData = rd64(ib.data() + kIBufData);
+        const int32_t ibBytes = rd32(ib.data() + kIBufBytes);
+        const int32_t ib16 = rd32(ib.data() + kIBuf16);
+        f << ",\"idxBufWords\":[";
+        AppendWordDump(f, ib.data(), 0x20 / 8);
+        f << "],\"idxData\":\"0x" << std::hex << ibData << "\",\"idxBytes\":" << std::dec << ibBytes
+          << ",\"idx16\":" << ib16;
+    }
+    f << ",\"ok\":1}\n";
     EntityDiagnostics::LogRaw(f.str());
 }
 
@@ -649,6 +738,29 @@ void EmitSummaryLine(const ProbeResult& r)
       << EntityDiagnostics::Sanitize(r.skippedRootClassSample[2], 40) << " x"
       << r.skippedRootClassCounts[2] << "\"]"
       << ",\"skippedRootClassesOther\":" << r.skippedRootClassesOther
+      // What the unusable StaticMesh slots actually were: class name + count per
+      // sampled kind, the owner actor class beside it, and the null/garbage split.
+      << ",\"unresolvedMeshClasses\":" << r.unresolvedMeshClasses
+      << ",\"unresolvedMeshClassSample\":[\""
+      << EntityDiagnostics::Sanitize(r.unresolvedMeshClassSample[0], 40) << " on "
+      << EntityDiagnostics::Sanitize(r.unresolvedMeshActorClassSample[0], 40) << " x"
+      << r.unresolvedMeshClassCounts[0] << "\",\""
+      << EntityDiagnostics::Sanitize(r.unresolvedMeshClassSample[1], 40) << " on "
+      << EntityDiagnostics::Sanitize(r.unresolvedMeshActorClassSample[1], 40) << " x"
+      << r.unresolvedMeshClassCounts[1] << "\",\""
+      << EntityDiagnostics::Sanitize(r.unresolvedMeshClassSample[2], 40) << " on "
+      << EntityDiagnostics::Sanitize(r.unresolvedMeshActorClassSample[2], 40) << " x"
+      << r.unresolvedMeshClassCounts[2] << "\"]"
+      << ",\"unresolvedMeshClassesOther\":" << r.unresolvedMeshClassesOther
+      << ",\"unresolvedMeshNull\":" << r.unresolvedMeshNull
+      << ",\"unresolvedMeshGarbage\":" << r.unresolvedMeshGarbage
+      // Cache split by kind: brushes vs meshes, each with its primitive total, plus
+      // the placed-instance count of the mesh assets that can actually reach the BVH.
+      << ",\"cachedBrushAssets\":" << r.cachedBrushAssets
+      << ",\"cachedMeshAssets\":" << r.cachedMeshAssets
+      << ",\"cachedBrushPrimitives\":" << r.cachedBrushPrimitives
+      << ",\"cachedMeshPrimitives\":" << r.cachedMeshPrimitives
+      << ",\"bvhEligibleInstances\":" << r.bvhEligibleInstances
       << ",\"reads\":" << r.reads
       << ",\"bytesRead\":" << r.bytesRead
       << ",\"elapsedMs\":" << r.elapsedMs
@@ -769,7 +881,17 @@ void RunProbeJob()
         if (!brushBodySetup)
             r.reads += 1;
         if (!IsPlausiblePtr(asset)) {
+            // No StaticMesh pointer to decode: fall back to the component's own
+            // bounds so the actor still gets a shape, instead of vanishing.
             ++r.assetsUnresolved;
+            if (!brushBodySetup) {
+                if (asset == 0)
+                    ++r.unresolvedMeshNull;
+                else
+                    ++r.unresolvedMeshGarbage;
+                NoteUnresolvedMeshClass(className, actor, r);
+                RecordActorStandIn(actor, component, className, r);
+            }
             continue;
         }
 
@@ -839,10 +961,10 @@ void RunProbeJob()
         // Coarse occluder for this placement, when there is nothing else to
         // represent it with. See OccluderBox in the header: an empty AggGeom is
         // complex-only collision, which is most of a level's walls, and without
-        // this the visibility scene has no cover to find. It reads the same
-        // ExtendedBounds offset the cross-check below reads — a deliberately
-        // recorded sixth direct-read site in direct-read-baseline.txt — and it
-        // happens here instead of under the cache lock.
+        // this the visibility scene has no cover to find. It reads the bounds
+        // block (positive/negative extensions + ExtendedBounds) in one shot — a
+        // deliberately recorded sixth direct-read site in direct-read-baseline.txt
+        // — and it happens here instead of under the cache lock.
         if (rec->state != 1 && !rec->directBodySetup && g_occluders.size() < kMaxOccluderBoxes) {
             const double qOc = ctw.Rotation.x * ctw.Rotation.x
                 + ctw.Rotation.y * ctw.Rotation.y
@@ -854,25 +976,39 @@ void RunProbeJob()
                 && std::abs(ctw.Scale3D.x) > 0.001 && std::abs(ctw.Scale3D.y) > 0.001
                 && std::abs(ctw.Scale3D.z) > 0.001;
             if (ocTransformOk) {
-                const AssetBoundsLocal ob = Memory::read_nocache<AssetBoundsLocal>(
-                    asset + Offsets::StaticMesh_ExtendedBounds);
+                const AssetBoundsBlock bb = Memory::read_nocache<AssetBoundsBlock>(
+                    asset + Offsets::StaticMesh_PositiveBoundsExtension);
                 r.reads += 1;
-                const bool ocBoundsOk = std::isfinite(ob.extent.x)
-                    && std::isfinite(ob.extent.y) && std::isfinite(ob.extent.z)
-                    && ob.extent.x > 0.0 && ob.extent.y > 0.0 && ob.extent.z > 0.0
-                    && CollisionGeom::VectorMaxAbs(ob.extent) < 100000.0;
-                Vector3 boxMin;
-                Vector3 boxMax;
-                if (ocBoundsOk
-                    && WorldAabbFromAssetBounds(ctw, ob, boxMin, boxMax)) {
+                // Fold the extensions back out: UE stores ExtendedBounds as the
+                // mesh box grown by the positive/negative extensions, so the mesh's
+                // own half extent is the stored one minus their mean and the centre
+                // shifts by the mean of the two. Zero extensions are a no-op.
+                const Vector3 half(
+                    bb.extent.x - (bb.posExt.x + bb.negExt.x) * 0.5,
+                    bb.extent.y - (bb.posExt.y + bb.negExt.y) * 0.5,
+                    bb.extent.z - (bb.posExt.z + bb.negExt.z) * 0.5);
+                Vector3 org(
+                    bb.origin.x - (bb.posExt.x - bb.negExt.x) * 0.5,
+                    bb.origin.y - (bb.posExt.y - bb.negExt.y) * 0.5,
+                    bb.origin.z - (bb.posExt.z - bb.negExt.z) * 0.5);
+                const bool ocBoundsOk = std::isfinite(half.x) && std::isfinite(half.y)
+                    && std::isfinite(half.z) && half.x > 0.0 && half.y > 0.0 && half.z > 0.0
+                    && CollisionGeom::VectorMaxAbs(half) < 100000.0
+                    && std::isfinite(org.x) && std::isfinite(org.y) && std::isfinite(org.z);
+                if (ocBoundsOk) {
+                    // A centre flung far from its own box is a misread; snap it
+                    // back rather than place a wall the mesh does not occupy.
+                    if (CollisionGeom::VectorMaxAbs(org)
+                        > CollisionGeom::VectorMaxAbs(half) * 2.35)
+                        org = Vector3(0.0, 0.0, 0.0);
                     {
                         std::lock_guard<std::mutex> lock(g_cacheMu);
-                        g_occluders[component] = OccluderBox{ boxMin, boxMax };
+                        g_occluders[component] = OccluderBox{ org, half, ctw };
                     }
                     // The same read, kept for the actor index: an item standing on
                     // a mesh whose collision did not decode still gets its box, and
                     // the box is the asset's own bounds in the component's frame.
-                    RecordActorBoundsBox(actor, component, ob.origin, ob.extent, ctw, r);
+                    RecordActorBoundsBox(actor, component, bb.origin, bb.extent, ctw, r);
                 }
             }
         }
@@ -965,6 +1101,10 @@ void RunProbeJob()
 
     if (r.actorsSeen == 0)
         r.note = "actor cache empty - the world scan has not populated yet";
+    else if (r.assetsUnique == 0 && r.assetsFromCache == 0 && r.staticMeshComponentRoots > 0)
+        r.note = std::to_string(r.assetsUnresolved) + " of "
+            + std::to_string(r.staticMeshComponentRoots)
+            + " static-mesh components had no readable StaticMesh pointer - nothing to decode";
     else if (r.assetsUnique == 0 && r.assetsFromCache == 0)
         r.note = "no StaticMeshComponent actors in the cached prefix";
     else if (r.assetsBodySetupNull > 0 && r.assetsParsed == 0)
@@ -985,6 +1125,23 @@ void RunProbeJob()
     {
         std::lock_guard<std::mutex> lock(g_cacheMu);
         r.occluderBoxes = static_cast<int>(g_occluders.size());
+        // Split the cache by kind. This is the number that says whether the BVH is
+        // near-empty because brushes filled every slot (they are dropped from the
+        // scene) or because the meshes themselves carry no simple collision.
+        for (const auto& kv : g_assets) {
+            const AssetRecord& a = kv.second;
+            const int prims = static_cast<int>(a.primitives.size());
+            const int insts = static_cast<int>(a.instances.size());
+            if (a.directBodySetup) {
+                ++r.cachedBrushAssets;
+                r.cachedBrushPrimitives += prims;
+            } else {
+                ++r.cachedMeshAssets;
+                r.cachedMeshPrimitives += prims;
+                if (a.state == 1 && prims > 0)
+                    r.bvhEligibleInstances += insts;
+            }
+        }
     }
 
     r.ran = true;
@@ -1219,10 +1376,15 @@ void ForEachParsedAsset(
         // place and is skipped rather than handed over empty.
         if (kv.second.state != 1 || kv.second.primitives.empty())
             continue;
-        // Brushes are BodySetups, not UStaticMesh: the visibility scene is static
-        // meshes only, so they stay out of the BVH (they still serve the paint paths).
-        if (kv.second.directBodySetup)
-            continue;
+        // Brushes are BodySetups, not UStaticMesh, and were once kept out of the
+        // scene on the assumption that the level's walls are static meshes. A live
+        // probe disproved that: the mesh cache held 21 assets for 1 primitive total
+        // (their collision is complex tri-mesh, which this decoder cannot read),
+        // while 171 brush BodySetups carried 233 primitives -- the level's real
+        // simple collision. Dropping them left the vischeck scene with one mesh and
+        // 30 coarse boxes, which is why the rays never saw a wall. Brush geometry is
+        // simple shapes in a BodySetup exactly like a mesh's, so it goes in the same
+        // way; the paint paths have always consumed it through the same index.
         fn(kv.first, kv.second.primitives, kv.second.instances);
     }
 }

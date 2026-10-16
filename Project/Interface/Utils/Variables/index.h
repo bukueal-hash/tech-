@@ -74,8 +74,6 @@ namespace var {
     extern float color_dead_bots[4];
     extern float bot_color_visible[4];
     extern float bot_color_invisible[4];
-    /** Bots behind cover (occluded from the camera). Own colour, not the not-visible one. */
-    extern float bot_color_occluded[4];
 
     /* Aimbot */
     extern bool enable_aimbot;

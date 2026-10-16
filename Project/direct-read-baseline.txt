@@ -22,12 +22,14 @@ Project/Functions/BoneList.cpp	26
 # StaticMesh::ExtendedBounds, which is collision geometry the ESP frame does not
 # carry and nothing else reads. The sixth site is the coarse occluder box: for a
 # placed static mesh whose collision is complex-only and therefore does not decode,
-# the probe records the asset's own bounds box as a world AABB so a level's walls
-# are representable to the visibility scene at all. It reads the same offset the
-# decode cross-check reads, but it is a separate site because it runs once per
-# placement rather than up to kMaxBoundsChecks times. When the visibility stage
-# lands, the per-asset cache it fills becomes the shared source and these sites
-# belong in the frame rather than here.
+# the probe records the asset's bounds box, oriented with the mesh and with the
+# positive/negative bounds extensions folded back out, so a level's walls are
+# representable to the visibility scene at all. It reads the bounds block (the
+# extensions immediately followed by ExtendedBounds) in one shot, overlapping the
+# offset the decode cross-check reads, but it is a separate site because it runs
+# once per placement rather than up to kMaxBoundsChecks times. When the visibility
+# stage lands, the per-asset cache it fills becomes the shared source and these
+# sites belong in the frame rather than here.
 # CollisionRead 8 = 6 + the two per-actor stand-in reads added with the
 # actor-keyed geometry index. A player or a bot is a character: its root component
 # is a CapsuleComponent and its mesh has no FKAggregateGeom, so the asset path

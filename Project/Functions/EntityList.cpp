@@ -253,7 +253,8 @@ float ReadPawnHealthForAdmit(uintptr_t pawn)
 {
     // The scope covers the nested HealthComponent chase and stat read too.
     ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Health);
-    return static_cast<float>(Engine::ReadHealthComponentStat(pawn, Offsets::Health));
+    return static_cast<float>(
+        Engine::ReadHealthSlot(pawn, Offsets::Health, Offsets::HealthLegacy));
 }
 
 Vector3 ResolvePlayerWorldPos(uintptr_t pawn, uintptr_t root, uintptr_t /*legacy*/)

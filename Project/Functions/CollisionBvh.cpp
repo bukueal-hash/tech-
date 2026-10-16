@@ -3,6 +3,7 @@
 #include "CollisionRead.h"
 #include "../Core/CollisionTess.hpp"
 #include "../Core/EntityDiagnostics.hpp"
+#include "../Interface/Utils/UpgradeOptions.hpp"
 
 // Embree 4 static. The define is what selects the static API declarations; the
 // generated rtcore_config.h sets it too when the library was built static, and
@@ -339,11 +340,16 @@ BuildStats RebuildFromCache()
 
     // Coarse occluders come from the same walk but a different list: the placed
     // static meshes whose collision did NOT decode. They are copied out first so
-    // the reader's lock is never held across the tessellation below.
+    // the reader's lock is never held across the tessellation below. Gated on the
+    // config flag: a bounds box is the mesh's full extent, so a target nearer than
+    // a building can sit inside the building's own box and read as blocked. Off by
+    // default now that brushes supply the level's real walls (UpgradeOptions).
     std::vector<CollisionRead::OccluderBox> occluders;
-    CollisionRead::ForEachOccluderBox([&occluders](const CollisionRead::OccluderBox& box) {
-        occluders.push_back(box);
-    });
+    if (UpgradeOptions::collisionBvhBoxOccluders) {
+        CollisionRead::ForEachOccluderBox([&occluders](const CollisionRead::OccluderBox& box) {
+            occluders.push_back(box);
+        });
+    }
 
     // Neither list is required on its own: a level whose meshes are all
     // complex-collision has an empty snapshot and every occluder, while a prop-only
@@ -377,35 +383,88 @@ BuildStats RebuildFromCache()
             ++stats.assets;
     }
 
-    // One box per coarse occluder, as an axis-aligned 12-triangle mesh in world
-    // space (identity component transform): the box is already in world space, so
-    // it is the primitive's own frame, not a placement of an asset's frame.
-    // Provenance boundary for the debug draw: every triangle above this index is
-    // decoded collision, every one below it belongs to a coarse occluder box.
+    // One box per coarse occluder, kept in the mesh's own frame and placed through
+    // its component transform, so the box is ORIENTED with the mesh. A world AABB
+    // (what this used to be) inflates a rotated mesh on every diagonal and blocks
+    // the air beside the building. Provenance boundary for the debug draw: every
+    // triangle above this index is decoded collision, every one below it belongs
+    // to a coarse occluder box.
     const int decodedTriangles = static_cast<int>(mesh.TriangleCount());
 
     int occluderBoxes = 0;
     std::vector<std::array<double, 3>> occluderExtents;
     {
+        const double maxHalfCm = static_cast<double>(UpgradeOptions::collisionBvhBoxMaxHalfCm);
+        const double maxCornerCm = static_cast<double>(UpgradeOptions::collisionBvhBoxMaxCornerCm);
+        const double minWorldHeightCm = static_cast<double>(UpgradeOptions::collisionBvhBoxMinWorldHeightCm);
+        const double verticalThinFactor = static_cast<double>(UpgradeOptions::collisionBvhBoxVerticalThin);
         std::vector<CollisionGeom::Primitive> one(1);
-        const FTransform identity = CollisionGeom::IdentityTransform();
         for (const CollisionRead::OccluderBox& box : occluders) {
-            const Vector3 half((box.max.x - box.min.x) * 0.5,
-                (box.max.y - box.min.y) * 0.5, (box.max.z - box.min.z) * 0.5);
+            Vector3 half = box.halfExtents;
             // A degenerate box would add triangles with no volume: skip it, and
             // count it, rather than committing geometry that can never block.
-            if (!(half.x > 0.5) || !(half.y > 0.5) || !(half.z > 0.5))
+            if (!(half.x > 0.5) || !(half.y > 0.5) || !(half.z > 0.5)) {
+                ++stats.boxOccludersSkipped;
                 continue;
+            }
+            // Buildings-only filters, ported from the reference reader. A bounds
+            // box for a wall, floor slab, pipe or small prop is thin on some axis
+            // and blocks air a target can stand in, so it is not cover:
+            //  - reject an axis longer than maxHalfCm (a whole building, not a wall);
+            //  - reject a scaled corner longer than maxCornerCm (a huge diagonal);
+            //  - reject a box whose WORLD vertical extent is under minWorldHeightCm
+            //    (a floor, or a wall lying flat);
+            //  - otherwise thin the most-vertical local axis by verticalThinFactor,
+            //    so a slab that only just clears the height test hugs the surface
+            //    instead of standing as a full-height wall.
+            // A cm threshold of 0 disables that test; a thin factor of 0 (or >= 1)
+            // disables the thinning.
+            const FQuat& rot = box.transform.Rotation;
+            const Vector3 scaledHalf(std::abs(box.transform.Scale3D.x) * half.x,
+                std::abs(box.transform.Scale3D.y) * half.y,
+                std::abs(box.transform.Scale3D.z) * half.z);
+            if (maxHalfCm > 0.0
+                && (std::max)(half.x, (std::max)(half.y, half.z)) > maxHalfCm) {
+                ++stats.boxOccludersSkipped;
+                continue;
+            }
+            const double corner = std::sqrt(scaledHalf.x * scaledHalf.x
+                + scaledHalf.y * scaledHalf.y + scaledHalf.z * scaledHalf.z);
+            if (maxCornerCm > 0.0 && corner > maxCornerCm) {
+                ++stats.boxOccludersSkipped;
+                continue;
+            }
+            // Each local axis' contribution to world space and to world Z, from the
+            // rotation alone: the world AABB half extents are the sum of the
+            // absolute axis contributions, and |z| is the vertical footprint.
+            const Vector3 ax = rot.RotateVector(Vector3(scaledHalf.x, 0.0, 0.0));
+            const Vector3 ay = rot.RotateVector(Vector3(0.0, scaledHalf.y, 0.0));
+            const Vector3 az = rot.RotateVector(Vector3(0.0, 0.0, scaledHalf.z));
+            const double worldHalfZ = std::abs(ax.z) + std::abs(ay.z) + std::abs(az.z);
+            if (minWorldHeightCm > 0.0 && worldHalfZ * 2.0 < minWorldHeightCm) {
+                ++stats.boxOccludersSkipped;
+                continue;
+            }
+            if (verticalThinFactor > 0.0 && verticalThinFactor < 1.0) {
+                const double vx = std::abs(ax.z);
+                const double vy = std::abs(ay.z);
+                const double vz = std::abs(az.z);
+                if (vx >= vy && vx >= vz && vx > 1e-9) half.x *= verticalThinFactor;
+                else if (vy >= vx && vy >= vz && vy > 1e-9) half.y *= verticalThinFactor;
+                else if (vz > 1e-9) half.z *= verticalThinFactor;
+            }
             CollisionGeom::Primitive& p = one[0];
             p = CollisionGeom::Primitive{};
             p.shape = CollisionGeom::Shape::Box;
             p.halfExtents = half;
-            p.center = Vector3((box.min.x + box.max.x) * 0.5,
-                (box.min.y + box.max.y) * 0.5, (box.min.z + box.max.z) * 0.5);
+            p.center = box.center;
             p.rotation = FQuat{ 0.0, 0.0, 0.0, 1.0 };
-            if (CollisionTess::AppendAsset(one, identity, mesh, counts) > 0) {
+            if (CollisionTess::AppendAsset(one, box.transform, mesh, counts) > 0) {
                 ++occluderBoxes;
-                occluderExtents.push_back({ half.x * 2.0, half.y * 2.0, half.z * 2.0 });
+                // Recorded for the size histogram as the box's world AABB size.
+                const double worldHalfX = std::abs(ax.x) + std::abs(ay.x) + std::abs(az.x);
+                const double worldHalfY = std::abs(ax.y) + std::abs(ay.y) + std::abs(az.y);
+                occluderExtents.push_back({ worldHalfX * 2.0, worldHalfY * 2.0, worldHalfZ * 2.0 });
             }
         }
     }
@@ -464,6 +523,7 @@ BuildStats RebuildFromCache()
       << ",\"decodedTriangles\":" << stats.decodedTriangles
       << ",\"occluderTriangles\":" << stats.occluderTriangles
       << ",\"boxOccluders\":" << stats.boxOccluders
+      << ",\"boxOccludersSkipped\":" << stats.boxOccludersSkipped
       << ",\"boxes\":" << stats.boxes
       << ",\"spheres\":" << stats.spheres
       << ",\"capsules\":" << stats.capsules

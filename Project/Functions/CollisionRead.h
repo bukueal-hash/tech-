@@ -32,24 +32,31 @@ struct AssetInstance
 };
 
 /**
- * A world-space AABB standing in for one placed static mesh whose collision could
- * NOT be decoded.
+ * A box standing in for one placed static mesh whose collision could NOT be
+ * decoded.
  *
  * Why this exists: level meshes carry complex (per-poly, cooked tri-mesh)
  * collision, which the simple-shape reader does not parse, so a live raid decoded
  * 1 of 17 collision assets (16 declared an empty AggGeom). The committed scene was
  * therefore almost empty of the one thing a visibility check needs -- walls -- and
  * every ray answered "clear" over solid geometry. The asset's own bounds box is
- * already read in this pass for the decode cross-check, so placing that box in
- * world space costs no new offset, and 12 triangles per instance is nothing for
- * the BVH. It is deliberately coarse: a box is never SMALLER than the shape it
- * stands for, so a query can call cover where there is none, and the count is
- * reported separately (BuildStats::boxOccluders) so that crudeness stays visible.
+ * already read in this pass for the decode cross-check, so placing that box costs
+ * no new offset, and 12 triangles per instance is nothing for the BVH.
+ *
+ * The box is kept in the component's LOCAL frame and placed through `transform`,
+ * so it is ORIENTED with the mesh. A world AABB (what this used to be) inflates a
+ * rotated mesh on every diagonal and blocks the air beside the building -- the
+ * "bot nearer than the building reads as behind it" report. The local box is the
+ * asset's ExtendedBounds with the positive/negative bounds extensions folded back
+ * out (see the generator). It is still coarse: a box is never smaller than the
+ * shape it stands for, and the count is reported (BuildStats::boxOccluders) so the
+ * crudeness stays visible.
  */
 struct OccluderBox
 {
-    Vector3 min{};
-    Vector3 max{};
+    Vector3 center{};        // local (component) space centre
+    Vector3 halfExtents{};   // local (component) space half extents
+    FTransform transform{};  // component-to-world
 };
 
 /** Counters for one probe run. Bounded arrays, no per-asset payload. */
@@ -114,6 +121,17 @@ struct ProbeResult
     int brushBoundsRejects = 0;
     std::string brushBoundsSample[2];
 
+    // Where the cached geometry actually is, split by kind. Brushes (BodySetups)
+    // and StaticMeshes share one cache and one cap. This split was added to answer
+    // "why is the vischeck scene nearly empty": it showed the meshes carry almost
+    // no simple collision (complex tri-mesh) while the brushes carry the level's,
+    // which is what justified feeding brushes to the BVH as well.
+    int cachedBrushAssets = 0;
+    int cachedMeshAssets = 0;
+    int cachedBrushPrimitives = 0;
+    int cachedMeshPrimitives = 0;
+    int bvhEligibleInstances = 0;   // placed instances of mesh assets that can reach the BVH
+
     // Geometry
     int primitivesStored = 0;
     int declaredByShape[CollisionGeom::kShapeCount]{};
@@ -144,6 +162,21 @@ struct ProbeResult
     std::string skippedRootClassSample[3];
     int skippedRootClassCounts[3]{};
     int skippedRootClassesOther = 0;   // types beyond the three named ones
+
+    // The other half of "missing buildings": static-mesh component roots whose
+    // StaticMesh slot (0x6E8) read back null or implausible even though the class
+    // check passed (assetsUnresolved). A count alone cannot say whether those are
+    // one component kind being read at the wrong offset or many kinds that are
+    // genuinely mesh-less here, so the component class names are tallied (bounded,
+    // three names + other) and the owner actor's class is kept for the samples.
+    // null vs garbage separates "wrong object entirely" from "wrong offset".
+    int unresolvedMeshClasses = 0;
+    std::string unresolvedMeshClassSample[3];
+    int unresolvedMeshClassCounts[3]{};
+    int unresolvedMeshClassesOther = 0;
+    std::string unresolvedMeshActorClassSample[3];
+    int unresolvedMeshNull = 0;        // StaticMesh slot held 0
+    int unresolvedMeshGarbage = 0;     // StaticMesh slot held a non-null implausible value
 
     uint64_t reads = 0;
     uint64_t bytesRead = 0;

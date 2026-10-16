@@ -14,7 +14,7 @@
 // [live] Health - ArcOffsets::HealthComponent::CURRENT_HEALTH = 0x6D0 (the 0x700 dump field is an FName shadow)
 // [live] LastRenderTime - user-provided 2026-09-23: PrimitiveComponent::LastRenderTime = 0x480 (plain float; drop's 0x4C0 reads zero now)
 // [live] LastRenderTimeOnScreen - user-provided 2026-09-23: LastRenderTimeOnScreen = 0x484 (plain float; was 0x4C4)
-// [live] MaxHealth - ArcOffsets::HealthComponent::MAX_HEALTH = 0x348 (native, in the dump's Pad_0340 hole)
+// MaxHealth - HealthComponent.MaxHealth = 0x378 (reflected double in sdk/sdk.txt; replaces the 0x348 live pin)
 // [live] PCOwner - pre-regeneration owner slot 0xD0; SDK reflects 0x428 which broke PCM discovery
 
 namespace Offsets {
@@ -339,9 +339,13 @@ namespace Offsets {
     constexpr std::ptrdiff_t PlayerState_MaxHealth                  = 0x558;                                       // 0x558 - derived - no dump source  [lit/probed]
     constexpr std::ptrdiff_t PlayerState_Armor                      = 0x560;                                       // 0x560 - derived - no dump source  [lit/probed]
     constexpr std::ptrdiff_t PlayerState_MaxArmor                   = 0x568;                                       // 0x568 - derived - no dump source  [lit/probed]
-    constexpr std::ptrdiff_t Health                                 = 0x6D0;                                       // 0x6D0 - ArcOffsets::HealthComponent::CURRENT_HEALTH = 0x6D0 (live-verified; was the 0x700 FName shadow)  [live]
-    constexpr std::ptrdiff_t HealthNameShadow                       = 0x700;                                       // Angelscript.HealthComponent.CachedHealth = 0x700 - FName on this build - value read is a name index, not a float
-    constexpr std::ptrdiff_t MaxHealth                              = 0x348;                                       // 0x348 - ArcOffsets::HealthComponent::MAX_HEALTH = 0x348 (native, inside the dump's Pad_0340 hole)  [live]
+    // Current health is HealthComponent.CachedHealth @ 0x700 (double) per sdk/sdk.txt. The old 0x6D0 pin sits
+    // inside HealthComponent's padding run Pad_04C0_7 = uint8_t[0x240] (0x4C0..0x700), so it always reads 0 -
+    // which is exactly the "shield shows, health bar empty" report. Kept as the fallback slot only.
+    constexpr std::ptrdiff_t Health                                 = 0x700;                                       // Angelscript.HealthComponent.CachedHealth = 0x700 - double, current HP  [sdk]
+    constexpr std::ptrdiff_t HealthLegacy                           = 0x6D0;                                       // 0x6D0 - old pin; lives in HealthComponent padding (reads 0) - fallback only
+    constexpr std::ptrdiff_t HealthNameShadow                       = 0x700;                                       // alias of Health (CachedHealth)
+    constexpr std::ptrdiff_t MaxHealth                              = 0x378;                                       // Angelscript.HealthComponent.MaxHealth = 0x378 - double, reflected in sdk/sdk.txt (was the 0x348 live pin)
     constexpr std::ptrdiff_t Shield                                 = 0x1C0;                                       // Angelscript.HealthComponent.Armor = 0x1C0 - FArmorSlot block
     constexpr std::ptrdiff_t ShieldMax                              = Shield + 0x10;                               // Shield + 0x10 - FArmorSlot::CurrentMaxArmor  [lit/probed]
     constexpr std::ptrdiff_t MaxDBNO                                = 0x380;                                       // Angelscript.HealthComponent.MaxDBNOHealth = 0x380 - FName
@@ -570,7 +574,7 @@ namespace Offsets {
     constexpr std::ptrdiff_t CachedHealth                           = Health;                                      // Health - alias  [lit/probed]
     constexpr std::ptrdiff_t HC_ArmorSlot                           = 0x1C0;                                       // UHealthComponent.Armor = 0x1C0
     constexpr std::ptrdiff_t HC_ArmorSlotMax                        = HC_ArmorSlot + 0x10;                         // HC_ArmorSlot + 0x10  [lit/probed]
-    constexpr std::ptrdiff_t HC_MaxHealth                           = 0x348;                                       // ArcOffsets::HealthComponent::MAX_HEALTH = 0x348 (live-verified; dump's 0x378 double sits past it)
+    constexpr std::ptrdiff_t HC_MaxHealth                           = 0x378;                                       // Angelscript.HealthComponent.MaxHealth = 0x378 - double, reflected in sdk/sdk.txt
     constexpr std::ptrdiff_t IsDestroyed                            = Constructable_bIsDestroyed;                  // Constructable_bIsDestroyed - alias  [lit/probed]
     constexpr std::ptrdiff_t EPS_SquadSlotIndex                     = 0x4F0;                                       // UEmbarkPlayerState.SquadSlotIndex = 0x4F0
     constexpr std::ptrdiff_t EPS_bIsReconnecting                    = 0x4F4;                                       // UEmbarkPlayerState.bIsReconnecting = 0x4F4 (byte 0x4F4 mask 0xD8)

@@ -162,6 +162,19 @@ bool DrawRay(ImDrawList* drawList, Engine& engine, const Engine::CameraCache& ca
     bool entity = false);
 
 /**
+ * Trace one per-bone visibility ray and draw it crosshair-to-bone in the caller's
+ * two colours: `visibleColor` when the bone is clear, `hiddenColor` when cover is
+ * between the camera and it. Returns whether the bone was blocked.
+ *
+ * Distinct from DrawRay because a bone ray reports the ESP's own visible and
+ * not-visible colours rather than the debug verdict palette, so a partly exposed
+ * body shows which parts are actually shootable. Drawing only: the query is a CPU
+ * BVH traversal and reads nothing.
+ */
+bool DrawBoneRay(ImDrawList* drawList, Engine& engine, const Engine::CameraCache& cam,
+    const Vector3& target, uint32_t visibleColor, uint32_t hiddenColor);
+
+/**
  * Wireframe the published scene's own triangles through `cam`, culled by radius
  * and capped per lane. Returns the number of triangles drawn.
  *

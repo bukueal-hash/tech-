@@ -767,25 +767,11 @@ static uintptr_t GiOwningSlotRung(uintptr_t world, bool& backRef)
     return 0;
 }
 
-/** DISABLED STUB. Was the legacy CL-1341255 SIMD-obfuscated slot decode; the
- *  TLS decode it was meant to do is not implemented, so this always returns 0.
- *  The working TLS rung is GiFromTls in PlayerChain. */
-static uintptr_t GiFromDecryptSlot(uintptr_t world)
-{
-    (void)world;
-    return 0;
-}
+/** Retired rung: SIMD slot decode superseded by PlayerChain::GiFromTls. */
+static constexpr uintptr_t GiFromDecryptSlot(uintptr_t) { return 0; }
 
-/** DISABLED STUB. Previous build's slot (0x3B0); `legacy` is hard-wired to 0,
- *  so this always returns 0. Kept so the PlayerChain hook table stays intact. */
-static uintptr_t GiFromLegacySlotRung(uintptr_t world)
-{
-    const uintptr_t legacy = 0;
-
-    if (!legacy || !ValidateGameInstance(legacy, nullptr, nullptr, world))
-        return 0;
-    return legacy;
-}
+/** Retired rung: Legacy 0x3B0 slot retired in CL-1424961+. */
+static constexpr uintptr_t GiFromLegacySlotRung(uintptr_t) { return 0; }
 
 /** Last resort: scan UWorld for a slot whose GI chain validates. */
 static uintptr_t GiFromScanRung(uintptr_t world)

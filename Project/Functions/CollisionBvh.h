@@ -62,6 +62,10 @@ struct BuildStats
     // difference between "decoded collision" and "the mesh's bounding box" is
     // visible in every record and on the panel.
     int boxOccluders = 0;
+    // Boxes dropped by the buildings-only filter (thinner than the min extent on
+    // some axis): panels, slabs, pipes and small props. Reported so the filter is
+    // visible in the record instead of only its effect on boxOccluders.
+    int boxOccludersSkipped = 0;
     OccluderSizeSummary occluderSize;
     int skipped = 0;         // primitives with no usable size/transform
     double tessMs = 0.0;

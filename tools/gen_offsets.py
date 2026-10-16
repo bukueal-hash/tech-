@@ -58,12 +58,11 @@ LIVE_OVERRIDES = {
     # reading it left visibility at "unknown".
     "LastRenderTime": "user-provided 2026-09-23: PrimitiveComponent::LastRenderTime = 0x480 (plain float; drop's 0x4C0 reads zero now)",
     "LastRenderTimeOnScreen": "user-provided 2026-09-23: LastRenderTimeOnScreen = 0x484 (plain float; was 0x4C4)",
-    # The dump types HealthComponent.CachedHealth (0x700) and MaxHealth (0x378)
-    # as FName, so both reads returned a name index instead of a number. The
-    # live-verified doubles are CURRENT_HEALTH 0x6D0 and MAX_HEALTH 0x348 (the
-    # latter inside the dump's Pad_0340 hole).
+    # The dump types HealthComponent.CachedHealth (0x700) as FName, so its read
+    # returned a name index. The live-verified current health is 0x6D0.
+    # HealthComponent.MaxHealth is reflected as a double at 0x378 in sdk/sdk.txt,
+    # so it is read from the SDK (the old 0x348 pin is retired).
     "Health": "ArcOffsets::HealthComponent::CURRENT_HEALTH = 0x6D0 (the 0x700 dump field is an FName shadow)",
-    "MaxHealth": "ArcOffsets::HealthComponent::MAX_HEALTH = 0x348 (native, in the dump's Pad_0340 hole)",
     # The dump reflects APlayerCameraManager::PCOwner at 0x428, but that value
     # reads nothing live: it broke PCM discovery (PCM=none, fallback FOV 90).
     # The pre-regeneration owner slot 0xD0 is what the live target actually
@@ -493,8 +492,8 @@ SECTIONS = [
          "ArcOffsets::HealthComponent::CURRENT_HEALTH = 0x6D0 (live-verified; was the 0x700 FName shadow)"),
         ("HealthNameShadow", "std::ptrdiff_t", "prop:Angelscript.HealthComponent.CachedHealth",
          "FName on this build — value read is a name index, not a float"),
-        ("MaxHealth", "std::ptrdiff_t", "lit:0x348",
-         "ArcOffsets::HealthComponent::MAX_HEALTH = 0x348 (native, inside the dump's Pad_0340 hole)"),
+        ("MaxHealth", "std::ptrdiff_t", "prop:Angelscript.HealthComponent.MaxHealth",
+         "HealthComponent.MaxHealth double (sdk/sdk.txt 0x378)"),
         ("Shield", "std::ptrdiff_t", "prop:Angelscript.HealthComponent.Armor",
          "FArmorSlot block"),
         ("ShieldMax", "std::ptrdiff_t", "expr:Shield + 0x10",

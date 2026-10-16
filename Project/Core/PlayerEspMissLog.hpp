@@ -19,6 +19,7 @@
 // injectable clock) are unit-tested in Tests/player_esp_miss_tests.cpp.
 
 #include "AgentLog.h"
+#include "EntityDiagnostics.hpp"
 
 #include <algorithm>
 #include <array>
@@ -148,30 +149,7 @@ struct ActorMiss {
     }
 };
 
-inline std::string JsonEscape(const std::string& value)
-{
-    std::string out;
-    out.reserve(value.size() + 8);
-    for (const char c : value) {
-        switch (c) {
-        case '\\': out += "\\\\"; break;
-        case '"': out += "\\\""; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default:
-            if (static_cast<unsigned char>(c) < 0x20) {
-                char buf[8];
-                std::snprintf(buf, sizeof(buf), "\\u%04x",
-                    static_cast<unsigned>(static_cast<unsigned char>(c)));
-                out += buf;
-            } else {
-                out += c;
-            }
-        }
-    }
-    return out;
-}
+using EntityDiagnostics::JsonEscape;
 
 inline std::string ActorKeyHex(uintptr_t key)
 {

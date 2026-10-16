@@ -84,8 +84,10 @@ bool FnameLooksLikeWorldContainer(const std::string& actorFName);
 /** Dropped world pickups (guns, plants, salvage on ground). */
 bool FnameLooksLikeDroppedPickup(const std::string& actorFName);
 
-/** Lowercase ASCII copy (shared by AssetNames / ItemList / ContainerList). */
-std::string ToLowerCopy(std::string s);
+#include "StringUtils.hpp"
+
+/** Lowercase ASCII copy (delegates to canonical StringUtils::ToLowerCopy). */
+inline std::string ToLowerCopy(std::string s) { return StringUtils::ToLowerCopy(std::move(s)); }
 
 /** Clean UE FName into a readable label when CSV/loc lookups miss. */
 std::string HumanizeActorFName(const std::string& actorFName);

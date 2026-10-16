@@ -656,9 +656,6 @@ void DrawArcEspTab()
                         "##bot_invis",
                         "Draw ARC robots. Colors: visible (left), invisible (right).");
                     ArcMenuHoverTooltip("Draw ARC robots. Colors: visible (left), invisible (right).");
-                    ArcMenuLayout::Label("Behind cover");
-                    ArcMenuLayout::ColorEditAtColumn("##bot_occluded", var::bot_color_occluded);
-                    ArcMenuHoverTooltip("Color for robots that are visible on the radar but blocked from the camera.");
                     ArcMenuLayout::SliderFloat(
                         "Bot ESP distance", "##bot_esp_distance", &var::bot_esp_distance, 50.f, var::kMaxDistanceSliderM, "%.0f m");
                     ArcMenuHoverTooltip("Maximum distance for robot ESP rendering.");
@@ -865,6 +862,39 @@ void DrawArcCollisionContent()
                 static_cast<unsigned long long>(cmp.mismatch));
         }
 
+        // Build input: whether the coarse bounds boxes are committed at all.
+        ArcMenuLayout::Checkbox("Include building bounds boxes", &UpgradeOptions::collisionBvhBoxOccluders);
+        ArcMenuHoverTooltip(
+            "Adds one box per placed complex-collision (tri-mesh) mesh as cover in the BVH, oriented "
+            "with the mesh (placed through its component transform, its bounds with the positive/"
+            "negative extensions folded back out). This is how walls the BSP misses, and scenery "
+            "(rocks, trees), get represented at all -- a box is never smaller than the mesh, so a "
+            "target nearer than a concave building can still read as blocked. On by default; the "
+            "filters below can trim it. Takes effect on the next Build collision BVH.");
+        if (UpgradeOptions::collisionBvhBoxOccluders) {
+            ArcMenuLayout::SliderFloat("Building box max axis", "##collision_bvh_box_max_half",
+                &UpgradeOptions::collisionBvhBoxMaxHalfCm, 0.f, 2000.f, "%.0f cm");
+            ArcMenuHoverTooltip(
+                "Drop a bounds box any local axis of which is longer than this. A whole building's "
+                "bounds is huge; this keeps wall-sized boxes and drops the giant ones. 0 disables.");
+            ArcMenuLayout::SliderFloat("Building box max corner", "##collision_bvh_box_max_corner",
+                &UpgradeOptions::collisionBvhBoxMaxCornerCm, 0.f, 3000.f, "%.0f cm");
+            ArcMenuHoverTooltip(
+                "Drop a bounds box whose scaled corner is longer than this (a huge diagonal). "
+                "0 disables.");
+            ArcMenuLayout::SliderFloat("Building box min height", "##collision_bvh_box_min_world_height",
+                &UpgradeOptions::collisionBvhBoxMinWorldHeightCm, 0.f, 1000.f, "%.0f cm");
+            ArcMenuHoverTooltip(
+                "Drop a bounds box whose world vertical extent is under this, so a floor slab or a "
+                "wall lying flat -- which blocks air a target stands in -- is not cover. 0 disables.");
+            ArcMenuLayout::SliderFloat("Building box vertical thin", "##collision_bvh_box_vertical_thin",
+                &UpgradeOptions::collisionBvhBoxVerticalThin, 0.f, 1.f, "%.2f");
+            ArcMenuHoverTooltip(
+                "Thin the most-vertical axis of whatever survives, as a fraction (0.38 = reference), "
+                "so a slab that only just clears the height test hugs the surface instead of standing "
+                "as a full-height wall. 0 disables.");
+        }
+
         if (!lastBuildNote.empty()) {
             ArcMenuLayout::HoverableTextColoredF(ImVec4(1.f, 0.75f, 0.35f, 1.f), "%s", lastBuildNote.c_str());
             ArcMenuHoverTooltip("No scene was published: fix this before trusting a query.");
@@ -882,6 +912,12 @@ void DrawArcCollisionContent()
             ArcMenuHoverTooltip(
                 "Shapes by type. Hulls are tessellated from their real point cloud; hull-as-box counts "
                 "hulls whose cloud did not decode and fell back to the ElemBox; skipped means no usable size.");
+            ArcMenuLayout::HoverableTextF("bounds boxes %d  dropped by filter %d",
+                lastBuild.boxOccluders, lastBuild.boxOccludersSkipped);
+            ArcMenuHoverTooltip(
+                "Coarse bounds boxes committed as cover, and how many the buildings-only filters "
+                "dropped (too large, too diagonal, or too short). All dropped means every box failed "
+                "a filter; none dropped means nothing was filtered.");
             ArcMenuLayout::HoverableTextF("tess %.0f ms   commit %.0f ms   total %.0f ms",
                 lastBuild.tessMs, lastBuild.commitMs, lastBuild.totalMs);
             ArcMenuHoverTooltip("Where the build time went: shape tessellation vs BVH commit.");
@@ -958,6 +994,14 @@ void DrawArcCollisionContent()
         ArcMenuHoverTooltip(
             "Only geometry and rays within this distance of the camera are drawn; larger means "
             "more lines per frame.");
+        ArcMenuLayout::SliderFloat("Vis clearance", "##vis_check_clearance",
+            &UpgradeOptions::visCheckClearanceCm, 0.f, 100.f, "%.0f cm");
+        ArcMenuHoverTooltip(
+            "How far short of the target the visibility ray stops. Keep it near 50 cm: collision "
+            "geometry does not line up with the visual mesh (floor thickness, body overshoot, "
+            "near-surface props), so a small value false-blocks a target standing near any of "
+            "those and reads as invisible up close. Lower it only toward the thinnest wall you "
+            "care about -- a wall within this distance of the target is ignored and reads visible.");
         ArcMenuLayout::HoverableTextF("last frame: %d prims / %d components, %d segs",
             ds.primitives, ds.components, ds.segments);
         ArcMenuLayout::HoverableTextF("shapes: %d decoded, %d stand-in",
@@ -978,7 +1022,8 @@ void DrawArcCollisionContent()
         ArcMenuHoverTooltip(
             "Two different reasons a ray had no answer, and they need opposite fixes. \"Span too "
             "short\" is about the two points: the segment is shorter than the 5 cm tnear plus the "
-            "50 cm clearance, so neither a hit nor a miss would mean anything. \"No BVH\" is about "
+            "visibility clearance (the Vis clearance slider), so neither a hit nor a miss would mean "
+            "anything. \"No BVH\" is about "
             "the scene: nothing is published, so every query answers CLEAR by contract and the "
             "whole vischeck is inert -- run the collision probe. Those rays are drawn steel blue, "
             "an unjudgeable span grey, and a no-BVH ray no longer counts as a clear one.");

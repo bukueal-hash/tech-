@@ -35,7 +35,6 @@ namespace var {
     float bot_esp_distance = 500.f;
     float bot_color_visible[4] = { 0.25f, 0.55f, 1.0f, 1.0f };
     float bot_color_invisible[4] = { 0.15f, 0.35f, 0.85f, 1.0f };
-    float bot_color_occluded[4] = { 1.0f, 0.55f, 0.1f, 1.0f };
 
     /* Aimbot */
     bool enable_aimbot = false;

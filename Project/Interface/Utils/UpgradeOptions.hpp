@@ -39,6 +39,17 @@ inline bool collisionDebugHitMarkers = true;
 inline bool collisionDebugSceneDecoded = true;
 inline bool collisionDebugSceneBoxes = true;
 inline int collisionDebugSceneTriCap = 3000;  // triangles per lane, per frame
+// Coarse bounds occluders IN the BVH: one box per placed mesh whose collision is
+// complex (tri-mesh) and does not decode from FKAggregateGeom. The box is the
+// mesh's own bounds (with the positive/negative extensions folded back out),
+// oriented with the mesh, and it is never smaller than the real mesh -- so it
+// stands in for walls the level's BSP does not cover and for scenery (rocks,
+// trees) that has no decodable shape at all. It is coarse: a box is not the real
+// shape, so a target nearer than a concave building can still sit inside the box
+// and read as blocked. ON by default now, so real-world scenery is represented at
+// all; the visibility it produces is only as good as a box until real mesh
+// triangles are decoded. Takes effect on the next Build collision BVH.
+inline bool collisionBvhBoxOccluders = true;
 // ── The vischeck as a feature, not a debug draw ─────────────────────────────
 // vischeck_aim: a candidate the BVH says is behind cover is refused this tick
 // (TargetRejection::Occluded). On by default, because aiming at someone behind a
@@ -48,7 +59,34 @@ inline int collisionDebugSceneTriCap = 3000;  // triangles per lane, per frame
 // ESP does not hide anything: a bot behind cover keeps its box and is drawn in
 // the not-visible colour (see BotEspColor) instead.
 inline bool visCheckAim = true;
-inline float collisionDebugRadiusM = 30.f;
+// How far short of the target the visibility ray stops, in cm. This is the
+// near-target tolerance from the Embree reference: the ray is tested from the eye
+// to (target - clearance), so any geometry closer to the target than this is
+// ignored and the point reads visible. Keep it near 50 cm. Collision geometry does
+// not line up with the visual mesh -- floors have thickness so a ray to a low bone
+// clips the floor, body collision overshoots the visual body, and props sit within
+// a few cm -- so a small value false-blocks any target standing near those, which
+// reads on screen as "invisible" up close. Lower it only toward the thickness of
+// the thinnest wall you care about.
+inline float visCheckClearanceCm = 50.f;
+// Optional buildings-only filters for the coarse bounds boxes (the "Include
+// building bounds boxes" toggle). They exist to trim boxes that fill air a target
+// can stand in, but a box is never the real shape, so they are OFF by default: a
+// max-axis or max-corner cap drops whole buildings and trees (anything larger than
+// the cap), and a min-height or vertical-thin drops low walls and rocks -- the
+// exact scenery these boxes are the only representation of until real mesh
+// triangles are decoded. Raise a value to re-enable that trim:
+//  - collisionBvhBoxMaxHalfCm: reject a box any local axis of which is longer;
+//  - collisionBvhBoxMaxCornerCm: reject a box whose scaled corner is longer;
+//  - collisionBvhBoxMinWorldHeightCm: reject a box shorter than this vertically;
+//  - collisionBvhBoxVerticalThin: thin the most-vertical axis by this fraction.
+// A cm threshold of 0 disables that test; a thin factor of 0 (or >= 1) disables
+// the thinning.
+inline float collisionBvhBoxMaxHalfCm = 0.f;
+inline float collisionBvhBoxMaxCornerCm = 0.f;
+inline float collisionBvhBoxMinWorldHeightCm = 0.f;
+inline float collisionBvhBoxVerticalThin = 0.f;
+inline float collisionDebugRadiusM = 200.f;
 inline int collisionDebugMaxPrims = 400;
 inline int collisionDebugMaxRays = 24;
 inline int playerPreset = 1;
@@ -137,6 +175,7 @@ inline BoolKey bools[] = {
     {"collision_debug_hit_markers", &collisionDebugHitMarkers},
     {"collision_debug_scene_decoded", &collisionDebugSceneDecoded},
     {"collision_debug_scene_boxes", &collisionDebugSceneBoxes},
+    {"collision_bvh_box_occluders", &collisionBvhBoxOccluders},
     // The vischeck as a FEATURE, not a debug draw. Both fail open when no BVH
     // scene is published (Functions/CollisionBvh.h, BlockedForConsumer), so they
     // change nothing until the collision probe has built a scene.
@@ -171,7 +210,12 @@ inline FloatKey floats[] = {
     {"player_response_curve", &playerResponseCurve, 0.f, 1.f, true},
     {"player_max_counts_per_tick", &playerMaxCountsPerTick, 1.f, 100.f, true, true},
     {"player_max_counts", &playerMaxCounts, 1.f, 100.f},
-    {"collision_debug_radius_m", &collisionDebugRadiusM, 1.f, 200.f}
+    {"collision_debug_radius_m", &collisionDebugRadiusM, 1.f, 200.f},
+    {"vis_check_clearance_cm", &visCheckClearanceCm, 0.f, 100.f},
+    {"collision_bvh_box_max_half_cm", &collisionBvhBoxMaxHalfCm, 0.f, 2000.f},
+    {"collision_bvh_box_max_corner_cm", &collisionBvhBoxMaxCornerCm, 0.f, 3000.f},
+    {"collision_bvh_box_min_world_height_cm", &collisionBvhBoxMinWorldHeightCm, 0.f, 1000.f},
+    {"collision_bvh_box_vertical_thin", &collisionBvhBoxVerticalThin, 0.f, 1.f}
 };
 struct IntKey { const char* key; int* value; int hi; };
 inline IntKey ints[] = {

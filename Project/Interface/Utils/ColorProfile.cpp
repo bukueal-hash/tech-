@@ -30,7 +30,6 @@ const Entry* Table(int& outCount)
 {
     static const Entry kTable[] = {
         { "bot_color_invisible",        var::bot_color_invisible },
-        { "bot_color_occluded",          var::bot_color_occluded },
         { "bot_color_visible",          var::bot_color_visible },
         { "color_arc_entities",         var::color_arc_entities },
         { "color_dead_bots",            var::color_dead_bots },

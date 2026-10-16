@@ -25,6 +25,8 @@ constexpr ImU32 kSphereColor = IM_COL32(120, 255, 160, 130);
 constexpr ImU32 kCapsuleColor = IM_COL32(255, 210, 110, 130);
 constexpr ImU32 kConvexColor = IM_COL32(230, 130, 255, 130);
 constexpr ImU32 kClearRay = IM_COL32(70, 240, 120, 190);
+// Minimum per-frame budget for player/bot rays (the entity lane).
+constexpr int kEntityRayFloor = 64;
 constexpr ImU32 kBlockedRay = IM_COL32(255, 80, 80, 190);
 constexpr ImU32 kTooCloseRay = IM_COL32(170, 170, 170, 160);
 // No BVH published is its own colour, not the grey of an unjudgeable span: the
@@ -112,9 +114,26 @@ void DrawSegment(ImDrawList* dl, Engine& engine, const Engine::CameraCache& cam,
     const Vector3& a, const Vector3& b, ImU32 color, float thickness)
 {
     ImVec2 sa, sb;
-    if (!Project(engine, cam, b, sb)) {
-        ++g_frame.projectFailed;
-        return;
+    // Same near-plane pull as the start point below, mirrored: a target that
+    // cannot project (behind the camera or at its origin) is pulled back toward
+    // the eye instead of dropping the whole ray.
+    constexpr double kClipCm = 150.0;
+    Vector3 pb = b;
+    if (!Project(engine, cam, pb, sb)) {
+        const double ex = a.x - b.x;
+        const double ey = a.y - b.y;
+        const double ez = a.z - b.z;
+        const double len = std::sqrt(ex * ex + ey * ey + ez * ez);
+        if (!(len > kClipCm)) {
+            ++g_frame.projectFailed;
+            return;
+        }
+        const double t = kClipCm / len;
+        pb = Vector3(b.x + ex * t, b.y + ey * t, b.z + ez * t);
+        if (!Project(engine, cam, pb, sb)) {
+            ++g_frame.projectFailed;
+            return;
+        }
     }
     if (!Project(engine, cam, a, sa)) {
         // A ray starts at the camera origin, and that point cannot project (its
@@ -122,9 +141,9 @@ void DrawSegment(ImDrawList* dl, Engine& engine, const Engine::CameraCache& cam,
         // the near plane instead. A segment too short to reach past that point is
         // not drawn.
         constexpr double kNearCm = 150.0;
-        const double dx = b.x - a.x;
-        const double dy = b.y - a.y;
-        const double dz = b.z - a.z;
+        const double dx = pb.x - a.x;
+        const double dy = pb.y - a.y;
+        const double dz = pb.z - a.z;
         const double lenCm = std::sqrt(dx * dx + dy * dy + dz * dz);
         if (!(lenCm > kNearCm)) {
             ++g_frame.projectFailed;
@@ -522,6 +541,89 @@ int DrawSceneWireframe(ImDrawList* drawList, Engine& engine,
     return drawn;
 }
 
+/** Magenta ring-and-X: a visibility ray that was dropped instead of drawn. */
+constexpr ImU32 kDropColor = IM_COL32(255, 0, 255, 255);
+
+/**
+ * Screen spot for a dropped ray's marker. A target that projects (even off-screen)
+ * is pinned to the screen edge. A target behind the camera is anchored at the point
+ * 150 cm along its ray from the eye. If even that has no screen position, the marker
+ * goes to the bottom centre, so a drop is never invisible.
+ */
+ImVec2 DropAnchor(Engine& engine, const Engine::CameraCache& cam, const Vector3& eye,
+    const Vector3& target)
+{
+    const ImVec2 size = ImGui::GetIO().DisplaySize;
+    constexpr float kInset = 12.f;
+    ImVec2 p{};
+    bool found = Project(engine, cam, target, p);
+    if (!found) {
+        constexpr double kAnchorCm = 150.0;
+        const double dx = target.x - eye.x;
+        const double dy = target.y - eye.y;
+        const double dz = target.z - eye.z;
+        const double len = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (std::isfinite(len) && len > kAnchorCm) {
+            const double t = kAnchorCm / len;
+            found = Project(engine, cam,
+                Vector3(eye.x + dx * t, eye.y + dy * t, eye.z + dz * t), p);
+        }
+    }
+    if (!found)
+        return ImVec2(size.x * 0.5f, (std::max)(kInset, size.y - kInset));
+    return ImVec2(std::clamp(p.x, kInset, (std::max)(kInset, size.x - kInset)),
+        std::clamp(p.y, kInset, (std::max)(kInset, size.y - kInset)));
+}
+
+/**
+ * The crosshair in screen space: the projection of a point straight ahead of the
+ * camera. The camera origin itself never projects (its view depth is 0), so a
+ * world-space segment from the eye depended on a near-plane pull that dropped the
+ * entire ray whenever the pull failed. A visibility ray is meant to run crosshair
+ * to target, and both of those are screen positions, so the line is built in
+ * screen space where neither endpoint can be behind the camera.
+ */
+bool CrosshairScreen(Engine& engine, const Engine::CameraCache& cam, ImVec2& out)
+{
+    Vector3 axisX{};
+    Vector3 axisY{};
+    Vector3 axisZ{};
+    EngineProjection::RotationGetAxes(cam.Rotation, axisX, axisY, axisZ);
+    const Vector3 ahead(cam.Location.x + axisX.x * 1000.0,
+        cam.Location.y + axisX.y * 1000.0,
+        cam.Location.z + axisX.z * 1000.0);
+    return Project(engine, cam, ahead, out);
+}
+
+/** Draw the ray crosshair -> target, coloured by the query. */
+void DrawCrosshairRay(ImDrawList* dl, Engine& engine, const Engine::CameraCache& cam,
+    const Vector3& target, ImU32 color, float thickness)
+{
+    ImVec2 from;
+    if (!CrosshairScreen(engine, cam, from)) {
+        ++g_frame.projectFailed;
+        return;
+    }
+    ImVec2 to;
+    if (!Project(engine, cam, target, to)) {
+        ++g_frame.projectFailed;
+        return;
+    }
+    dl->AddLine(from, to, color, thickness);
+    ++g_frame.segments;
+}
+
+/** Draw the drop marker for a ray that was not drawn. */
+void DropMarker(ImDrawList* dl, Engine& engine, const Engine::CameraCache& cam,
+    const Vector3& eye, const Vector3& target)
+{
+    const ImVec2 at = DropAnchor(engine, cam, eye, target);
+    constexpr float kR = 6.f;
+    dl->AddCircle(at, kR, kDropColor, 12, 2.f);
+    dl->AddLine(ImVec2(at.x - kR, at.y - kR), ImVec2(at.x + kR, at.y + kR), kDropColor, 2.f);
+    dl->AddLine(ImVec2(at.x + kR, at.y - kR), ImVec2(at.x - kR, at.y + kR), kDropColor, 2.f);
+}
+
 bool DrawRay(ImDrawList* drawList, Engine& engine, const Engine::CameraCache& cam,
     const Vector3& eye, const Vector3& target, const char* label, bool entity)
 {
@@ -533,8 +635,13 @@ bool DrawRay(ImDrawList* drawList, Engine& engine, const Engine::CameraCache& ca
     // bot is traced. Only the total is capped by maxRays per lane.
     int& laneRays = entity ? g_frame.entityRays : g_frame.worldRays;
     bool& laneBudgetHit = entity ? g_entityRayBudgetHit : g_worldRayBudgetHit;
-    if (laneRays >= opt.maxRays) {
+    // Player and bot rays ignore the distance cap and get their own budget floor,
+    // so a distant or crowded target is not silently dropped.
+    const int laneCap = entity ? (opt.maxRays > kEntityRayFloor ? opt.maxRays : kEntityRayFloor)
+                               : opt.maxRays;
+    if (laneRays >= laneCap) {
         laneBudgetHit = true;
+        DropMarker(drawList, engine, cam, eye, target);
         return false;
     }
 
@@ -542,15 +649,20 @@ bool DrawRay(ImDrawList* drawList, Engine& engine, const Engine::CameraCache& ca
     const double dy = target.y - eye.y;
     const double dz = target.z - eye.z;
     const double distanceCm = std::sqrt(dx * dx + dy * dy + dz * dz);
-    if (!std::isfinite(distanceCm) || distanceCm > static_cast<double>(opt.radiusM) * 100.0)
+    if (!std::isfinite(distanceCm))
         return false;
+    if (!entity && distanceCm > static_cast<double>(opt.radiusM) * 100.0) {
+        DropMarker(drawList, engine, cam, eye, target);
+        return false;
+    }
 
     ++laneRays;
 
     // The module's own counters are the honest way to tell "not judged" from
     // "judged and clear": both return false, and only the counters separate them.
     const CollisionBvh::QueryStats before = CollisionBvh::Stats();
-    const bool blocked = CollisionBvh::Occluded(eye, target);
+    const bool blocked = CollisionBvh::Occluded(eye, target, 5.0,
+        static_cast<double>(UpgradeOptions::visCheckClearanceCm));
     const CollisionBvh::QueryStats after = CollisionBvh::Stats();
     const RayVerdict verdict = ClassifyRay(before, after, blocked);
 
@@ -574,7 +686,10 @@ bool DrawRay(ImDrawList* drawList, Engine& engine, const Engine::CameraCache& ca
         break;
     }
 
-    DrawSegment(drawList, engine, cam, eye, target, color, 1.5f);
+    const int segmentsBefore = g_frame.segments;
+    DrawCrosshairRay(drawList, engine, cam, target, color, 1.5f);
+    if (g_frame.segments == segmentsBefore)
+        DropMarker(drawList, engine, cam, eye, target);
 
     // With no scene there is nothing to hit, so the marker query is skipped: it
     // could only add nothing, and it would count a second no-scene query per ray
@@ -597,6 +712,30 @@ bool DrawRay(ImDrawList* drawList, Engine& engine, const Engine::CameraCache& ca
         if (Project(engine, cam, target, at))
             drawList->AddText(ImVec2(at.x + 6.f, at.y - 6.f), color, label);
     }
+    return blocked;
+}
+
+bool DrawBoneRay(ImDrawList* drawList, Engine& engine, const Engine::CameraCache& cam,
+    const Vector3& target, uint32_t visibleColor, uint32_t hiddenColor)
+{
+    if (!drawList)
+        return false;
+    if (!std::isfinite(target.x) || !std::isfinite(target.y) || !std::isfinite(target.z))
+        return false;
+
+    // Same family of query the vischeck consumer uses, so a bone that reads clear
+    // here is a bone the aim will treat as reachable.
+    const bool blocked = CollisionBvh::BlockedForConsumer(cam.Location, target,
+        static_cast<double>(UpgradeOptions::visCheckClearanceCm));
+    const int segmentsBefore = g_frame.segments;
+    DrawCrosshairRay(drawList, engine, cam, target,
+        static_cast<ImU32>(blocked ? hiddenColor : visibleColor), 1.5f);
+    if (g_frame.segments == segmentsBefore)
+        ++g_frame.projectFailed;
+    else if (blocked)
+        ++g_frame.occluded;
+    else
+        ++g_frame.clear;
     return blocked;
 }
 

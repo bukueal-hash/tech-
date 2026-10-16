@@ -490,18 +490,16 @@ inline void ReadConvexHull(const uint8_t* e, const RemoteRead& readRemote, Primi
     const TArrayHeader verts = ReadTArrayHeader(e + Layout::kConvexElem_VertexData);
     const TArrayHeader idx = ReadTArrayHeader(e + Layout::kConvexElem_IndexData);
     // IndexData is editor-only and cooked builds strip it: with no index the hull
-    // is rebuilt from its point cloud. A present but malformed index is refused.
-    const bool haveIndex = idx.count >= 3;
-    if (verts.count <= 0 || verts.count > Layout::kMaxHullVertices || verts.data < 0x10000
-        || (haveIndex && (idx.count > Layout::kMaxHullIndices || idx.count % 3 != 0
-            || idx.data < 0x10000)))
+    // is rebuilt from its point cloud. A present index may be 32-bit (editor,
+    // typical cooked) or 16-bit (compact cooked), so both are tried, and a
+    // triangle whose index is out of range is dropped rather than throwing away
+    // the whole hull.
+    if (verts.count <= 0 || verts.count > Layout::kMaxHullVertices || verts.data < 0x10000)
         return;
 
     // FVector is three doubles in this build (SDK: Vector, 0x18 bytes).
     std::vector<uint8_t> vbuf(static_cast<size_t>(verts.count) * 0x18);
-    std::vector<uint8_t> ibuf(haveIndex ? static_cast<size_t>(idx.count) * sizeof(int32_t) : 0);
-    if (!readRemote(verts.data, vbuf.data(), vbuf.size())
-        || (haveIndex && !readRemote(idx.data, ibuf.data(), ibuf.size())))
+    if (!readRemote(verts.data, vbuf.data(), vbuf.size()))
         return;
 
     const ConvexTransform xf = ReadConvexTransform(e);
@@ -517,20 +515,49 @@ inline void ReadConvexHull(const uint8_t* e, const RemoteRead& readRemote, Primi
         hull.push_back(inComponent);
     }
 
+    // Decode `idx.count` indices of `elemSize` bytes each, keeping only triangles
+    // every vertex of which is in range. Empty when none survive or the read fails.
+    const auto decode = [&](size_t elemSize) -> std::vector<uint32_t> {
+        std::vector<uint32_t> tris;
+        std::vector<uint8_t> ibuf(static_cast<size_t>(idx.count) * elemSize);
+        if (!readRemote(idx.data, ibuf.data(), ibuf.size()))
+            return tris;
+        const auto at = [&](int32_t k) -> uint32_t {
+            if (elemSize == 2) {
+                uint16_t u = 0;
+                std::memcpy(&u, ibuf.data() + static_cast<size_t>(k) * 2, 2);
+                return u;
+            }
+            uint32_t u = 0;
+            std::memcpy(&u, ibuf.data() + static_cast<size_t>(k) * 4, 4);
+            return u;
+        };
+        for (int32_t t = 0; t + 2 < idx.count; t += 3) {
+            const uint32_t a = at(t);
+            const uint32_t b = at(t + 1);
+            const uint32_t c = at(t + 2);
+            if (a >= static_cast<uint32_t>(verts.count) || b >= static_cast<uint32_t>(verts.count)
+                || c >= static_cast<uint32_t>(verts.count))
+                continue;
+            tris.push_back(a);
+            tris.push_back(b);
+            tris.push_back(c);
+        }
+        return tris;
+    };
+
     std::vector<uint32_t> tris;
-    if (!haveIndex) {
-        tris = BuildHullTriangles(hull);
+    if (idx.count >= 3 && idx.count <= Layout::kMaxHullIndices && idx.data >= 0x10000) {
+        tris = decode(sizeof(int32_t)); // int32 first: the common editor/cooked form
         if (tris.empty())
-            return;
+            tris = decode(sizeof(uint16_t)); // compact cooked form
     }
-    tris.reserve(static_cast<size_t>(idx.count));
-    for (int32_t k = 0; haveIndex && k < idx.count; ++k) {
-        int32_t vi = 0;
-        std::memcpy(&vi, ibuf.data() + static_cast<size_t>(k) * sizeof(int32_t), sizeof(vi));
-        if (vi < 0 || vi >= verts.count)
-            return;
-        tris.push_back(static_cast<uint32_t>(vi));
-    }
+    // No usable index (stripped, malformed, or entirely out of range): rebuild the
+    // hull from its point cloud rather than discard it.
+    if (tris.empty())
+        tris = BuildHullTriangles(hull);
+    if (tris.empty())
+        return;
 
     p.hull = std::move(hull);
     p.hullIndices = std::move(tris);

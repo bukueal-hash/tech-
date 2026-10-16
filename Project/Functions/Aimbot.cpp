@@ -2389,7 +2389,8 @@ void Engine::AimAssistence()
     bool visBlockedTarget = false;
     if (UpgradeOptions::visCheckAim && IsPlausibleWorldPos(aimProjCam.Location))
         visBlockedTarget = CollisionBvh::BlockedForConsumer(
-            aimProjCam.Location, bestTarget->worldPos);
+            aimProjCam.Location, bestTarget->worldPos,
+            static_cast<double>(UpgradeOptions::visCheckClearanceCm));
     {
         FeaturePolicy::TargetGateCounts gate;
         gate.considered = static_cast<uint16_t>((std::min)(

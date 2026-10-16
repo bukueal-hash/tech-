@@ -1715,7 +1715,7 @@ public:
 
     /** Probe-pick (dump-first): try the reflected slot, fall back to the legacy
      *  live pin on garbage/failed reads. */
-    double ReadHealthSlot(uintptr_t actor, std::ptrdiff_t dumpOff, std::ptrdiff_t legacyOff)
+    static double ReadHealthSlot(uintptr_t actor, std::ptrdiff_t dumpOff, std::ptrdiff_t legacyOff)
     {
         const double dump = ReadHealthComponentSane(actor, dumpOff);
         if (std::isfinite(dump))
@@ -1725,7 +1725,9 @@ public:
 
     double get_health(uintptr_t actor)
     {
-        return ReadHealthComponentSane(actor, Offsets::Health);
+        // CachedHealth @ 0x700 first (sdk), then the old 0x6D0 pin. The legacy pin
+        // is inside padding and reads 0, so it only wins if 0x700 fails to resolve.
+        return ReadHealthSlot(actor, Offsets::Health, Offsets::HealthLegacy);
     }
 
     double get_maxhealth(uintptr_t actor)

@@ -21,9 +21,6 @@
 
 
 
-inline void ArcAsyncLog_Start() {}
-inline void ArcAsyncLog_Stop() {}
-inline void ArcAsyncLog_Push(std::string, std::string) {}
 
 inline constexpr const char* kArcDebugLogPath = "NUL";
 // The trace file used to be named debug-<agent-session>.log (debug-5681af.log,
@@ -345,12 +342,4 @@ inline void EspPaintProfileFlushToLog()
       << ",\"ts\":" << ts << "}\n";
     EntityDiagnostics::LogRaw(f.str());
 }
-
-inline void ArcAgentLog(
-    const char*,
-    const char*,
-    const char*,
-    const char*,
-    const std::string&)
-{
-}
+
