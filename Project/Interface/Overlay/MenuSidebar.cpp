@@ -4,6 +4,7 @@
 #include "MenuTheme.h"
 
 #include <cfloat>
+#include <cstdio>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -15,16 +16,15 @@
 #include "../../Core/Engine.h"
 #include "../../Core/PoiParser.hpp"
 #include "../../Core/PoiStore.hpp"
-#include "../../Core/ColorProfiles.hpp"
-#include "../Utils/ColorProfile.h"
 #include "../../Functions/WorldScanCommon.h"
-#include "../../Functions/CollisionRead.h"
-#include "../../Functions/CollisionBvh.h"
-#include "../../Functions/CollisionDebug.h"
+#include "../../Functions/AimMonitor.h"
 #include "../Render.h"
 #include "../OverlayHost.h"
 #include "../Utils/Variables/index.h"
 #include "../Utils/AutoConfig.h"
+
+// Defined in Functions/Esp.cpp: latest aim status line for the Debug tab.
+const char* AimStatusLine();
 #include "../Utils/UpgradeOptions.hpp"
 #include "../Utils/Visuals/Crosshair.hpp"
 #include "../../Hardware/KmBox.h"
@@ -35,7 +35,7 @@
 #include "ImGuiKeybind.h"
 #include "../../Core/WorldItemCategory.h"
 #include "../../Core/EntityFilters.hpp"
-#include "AimbotDebugPanel.hpp"
+#include "../../Core/EmbreeVisCheck.hpp"
 
 namespace {
 
@@ -295,7 +295,7 @@ void DrawMainMenu()
     const char* tabTips[] = {
         "ESP sub-tab: player/bot ESP. Loot sub-tab: container/loot ESP.",
         "Mini-map: enable, size, and world range.",
-        "Aimbot controls: FOV, distance, humanizer, and hotkey.",
+        "Clean-shell placeholders, ESP visibility colours, and crosshair settings.",
         "General settings: controller, KmBox, overlay. Debug: diagnostics, caches, camera.",
         "Project disclaimer and high-level feature list.",
         "Exit ARC completely (same as END key)."
@@ -447,7 +447,7 @@ static void DrawPlayerEspDiagnostics(Engine& eng)
         ? "not read (Squad tags off)"
         : (row.squadResolved ? "resolved" : "unresolved");
     const bool inventoryRequested = var::show_weapon || var::show_armor_line
-        || var::show_player_kit || var::enable_aimbot;
+        || var::show_player_kit;
     const char* inventoryState = !inventoryRequested
         ? "not read (features off)"
         : (row.inventoryResolved ? "resolved" : "unresolved");
@@ -521,7 +521,7 @@ void DrawArcEspTab()
                     ImGui::BeginDisabled(!var::enableesp);
                     ArcMenuLayout::Checkbox("Box", &var::box);
                     ArcMenuHoverTooltip("Draw the selected box style around tracked players; independent of bot boxes.");
-                    ImGui::BeginDisabled(!var::box);
+                    if (var::box) {
                     static const char* kPlayerBoxStyles[] = { "Full", "Corners", "Dashed", "Rounded" };
                     ArcMenuLayout::Combo("Box style", "##player_box_style", &var::player_box_style,
                         kPlayerBoxStyles, IM_ARRAYSIZE(kPlayerBoxStyles));
@@ -535,7 +535,7 @@ void DrawArcEspTab()
                         var::player_box_fill_color, "##player_box_fill_color",
                         "Fill the player rectangle; color alpha controls opacity. Independent of body silhouette.");
                     ArcMenuHoverTooltip("Fill the player rectangle; color alpha controls opacity. Independent of body silhouette.");
-                    ImGui::EndDisabled();
+                    }
                     ArcMenuLayout::CheckboxWithColorRow("Head dot", &var::show_head_dot,
                         var::head_dot_color, "##head_dot_color",
                         "Draw a dot on the cached head bone, independent of box and skeleton toggles. Omitted when no valid head bone is available.");
@@ -620,12 +620,12 @@ void DrawArcEspTab()
                         "resolves, TeamID grouping as the fallback.");
                     ImGui::EndDisabled();
                     ArcMenuLayout::CheckboxWithColorRow("Off-screen arrows", &UpgradeOptions::offscreen, UpgradeOptions::arrowColor, "##offscreen_arrow_color",
-                        "Directional screen-edge markers for fresh living enemies outside the screen, within normal player ESP range. Does not enable player ESP.");
-                    ArcMenuHoverTooltip("Directional screen-edge markers for fresh living enemies outside the screen, within normal player ESP range. Does not enable player ESP.");
+                        "Directional markers for fresh living enemies outside the screen. Does not enable player ESP.");
+                    ArcMenuHoverTooltip("Directional markers for fresh living enemies outside the screen, placed near the screen edge.");
                     ArcMenuLayout::SliderFloat("Arrow size", "##offscreen_size", &UpgradeOptions::arrowSize, 5.f, 30.f, "%.0f px");
                     ArcMenuHoverTooltip("Off-screen triangle length in screen pixels.");
-                    ArcMenuLayout::SliderFloat("Arrow inset", "##offscreen_inset", &UpgradeOptions::arrowInset, 20.f, 200.f, "%.0f px");
-                    ArcMenuHoverTooltip("Distance from the screen edge; automatically bounded on small viewports.");
+                    ArcMenuLayout::SliderFloat("Arrow gap", "##offscreen_inset", &UpgradeOptions::arrowInset, 20.f, 200.f, "%.0f px");
+                    ArcMenuHoverTooltip("Extra pixels to inset or extend the off-screen marker radius.");
                     ArcMenuLayout::Checkbox("Threat warnings", &UpgradeOptions::warnings);
                     ArcMenuHoverTooltip("Fresh cached enemy positions only: nearby/multiple enemies, behind and sustained approach. Not proof an enemy sees or targets you; warning range participates in player collection and position refresh.");
                     ArcMenuLayout::SliderFloat("Warning range", "##warning_range", &UpgradeOptions::warningRange, 5.f, 500.f, "%.0f m");
@@ -668,6 +668,8 @@ void DrawArcEspTab()
                     ArcMenuHoverTooltip("Draw lines from screen bottom to robots.");
                     ArcMenuLayout::Checkbox("Distance##bot", &var::bot_show_distance);
                     ArcMenuHoverTooltip("Show distance in meters below each robot.");
+                    ArcMenuLayout::Checkbox("Entity ESP log##entity", &var::esp_entity_debug);
+                    ArcMenuHoverTooltip("Log every bot and player each second: distance and whether ESP painted it (help/entity_diagnostics.ndjson).");
                     DrawSubtypeFilters("ARC type filters", EntityFilters::arcMask, EntityFilters::kArcs, true);
                     ArcMenuLayout::Checkbox("Heart", &var::bot_heart);
                     ArcMenuHoverTooltip("Pulsating heart at box center; robot aim targets the same point.");
@@ -708,350 +710,42 @@ void DrawArcEspTab()
             DrawArcLootContent();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Collision"))
+        if (ImGui::BeginTabItem("Quest"))
         {
             ArcMenuHoverTooltip(
-                "Collision geometry readout: what the AggGeom reader pulled out of the target, "
-                "per asset, plus the AABB agreement check. Read-only - it changes nothing that "
-                "is drawn.");
-            DrawArcCollisionContent();
+                "Quest objective items (ST_ItemNames_QuestItems / DA_Item_Salvage_Quest_*). "
+                "They draw as a gold star on the ESP and radar, from any distance.");
+            DrawArcQuestContent();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
     }
 }
 
+// Quest objective items: previously unconditional (no UI). Its own tab so the
+// master toggle and the pulse can be changed without hunting through Loot.
+void DrawArcQuestContent()
+{
+    ArcMenuLayout::HoverableText("Quest items");
+    ArcMenuHoverTooltip(
+        "Objective items the game tags as quest loot: gold star on the ESP and radar, "
+        "always drawn from far away and never filtered by loot settings. These controls "
+        "are the only filter they have.");
+    ArcMenuLayout::Checkbox("Show quest items", &var::show_world_quest);
+    ArcMenuHoverTooltip(
+        "Master switch for quest item markers on both the ESP and the radar. On by "
+        "default, which is the previous always-on behaviour. Off hides them entirely.");
+    ImGui::BeginDisabled(!var::show_world_quest);
+    ArcMenuLayout::Checkbox("Pulse", &var::quest_pulse);
+    ArcMenuHoverTooltip(
+        "Slowly breathe the gold star so it stands out in a pile of loot. Off draws a "
+        "steady star, which reads calmer and is easier to read while moving.");
+    ImGui::EndDisabled();
+}
+
 // Collision geometry (visibility groundwork): its own tab, because it is a
 // reader with its own state rather than a loot setting. Moved here unchanged
 // from under Loot.
-void DrawArcCollisionContent()
-{
-    ArcMenuLayout::HoverableText("Collision geometry (AggGeom)");
-    ArcMenuHoverTooltip(
-        "Reads UStaticMeshComponent -> UStaticMesh -> UBodySetup -> FKAggregateGeom on the target "
-        "and caches the decoded shapes per asset. This is the visibility groundwork: it collects "
-        "evidence, it does not change what is drawn or aimed at. Best run in raid, and again after "
-        "a map load so the cache covers the new level.");
-    ArcMenuLayout::Checkbox("Enable collision probe", &UpgradeOptions::collisionProbe);
-    ArcMenuHoverTooltip(
-        "Arm the probe. Off = nothing below is read. On = the button below reads collision "
-        "geometry for up to 256 cached actors.");
-    {
-        const CollisionRead::ProbeResult cr = CollisionRead::GetProbeResult();
-        ImGui::BeginDisabled(cr.running || !UpgradeOptions::collisionProbe);
-        if (ImGui::Button("Run Collision Probe"))
-            CollisionRead::StartProbe();
-        ImGui::SetItemTooltip(
-            "Runs on a background job and writes collision_asset / collision_probe lines to the "
-            "verify log. Takes under a second for a warm actor list.");
-        ImGui::SameLine();
-        if (ImGui::Button("Clear collision cache"))
-            CollisionRead::ClearCache();
-        ImGui::SetItemTooltip(
-            "Drop the per-asset cache. Asset pointers only mean something inside one level, so "
-            "clear this after a map change before the next run.");
-        ImGui::EndDisabled();
-
-        if (cr.running) {
-            ArcMenuLayout::HoverableText("reading geometry...");
-            ArcMenuHoverTooltip("The probe job is running; results appear when it finishes.");
-        } else if (!cr.ran) {
-            ArcMenuLayout::HoverableText("not run yet");
-            ArcMenuHoverTooltip("Nothing collected yet - run the probe above (in raid).");
-        } else if (!cr.note.empty()) {
-            ArcMenuLayout::HoverableTextColoredF(ImVec4(1.f, 0.4f, 0.4f, 1.f), "%s", cr.note.c_str());
-            ArcMenuHoverTooltip("The probe stopped early: the count below is what it did read.");
-            ArcMenuLayout::HoverableTextF("actors %d walked  %d static-mesh roots",
-                cr.actorsWalked, cr.staticMeshComponentRoots);
-        } else {
-            ArcMenuLayout::HoverableTextF("%d/%d assets parsed  (%d shared, %d null BodySetup)",
-                cr.assetsParsed, cr.assetsUnique, cr.assetsFromCache, cr.assetsBodySetupNull);
-            ArcMenuHoverTooltip(
-                "Assets whose AggGeom decoded / assets read / actors served from the cache / "
-                "assets whose UStaticMesh::BodySetup read null (the slot is Transient).");
-            ArcMenuLayout::HoverableTextF("%d primitives  (%d declared, %d capped, %d unsupported)",
-                cr.primitivesStored, cr.declaredByShape[0] + cr.declaredByShape[1]
-                    + cr.declaredByShape[2] + cr.declaredByShape[3],
-                cr.truncatedByShape[0] + cr.truncatedByShape[1]
-                    + cr.truncatedByShape[2] + cr.truncatedByShape[3],
-                cr.unsupportedByShape[4] + cr.unsupportedByShape[5] + cr.unsupportedByShape[6]
-                    + cr.unsupportedByShape[7] + cr.unsupportedByShape[8]);
-            ArcMenuHoverTooltip(
-                "Stored shapes, shapes the assets declared, declared shapes that hit the per-array "
-                "cap, and non-empty arrays this build's dump gives no layout for.");
-            ArcMenuLayout::HoverableTextF("boxes %d  spheres %d  capsules %d  convex %d",
-                cr.parsedByShape[1], cr.parsedByShape[0], cr.parsedByShape[2], cr.parsedByShape[3]);
-            ArcMenuHoverTooltip("Decoded shapes by type.");
-            ArcMenuLayout::HoverableTextColoredF(
-                (cr.boundsChecked > 0 && cr.boundsAgree25cm * 2 >= cr.boundsChecked)
-                    ? ImVec4(0.45f, 1.0f, 0.55f, 1.0f) : ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
-                "AABB vs asset bounds: %d/%d within 25cm (median %.1f cm)",
-                cr.boundsAgree25cm, cr.boundsChecked, cr.medianBoundsDeltaCm);
-            ArcMenuHoverTooltip(
-                "The decoded shapes' world AABB against the asset's own ExtendedBounds, under the "
-                "same component transform. Both come from the target, so agreement is evidence the "
-                "decode is right; a large delta means complex-only collision or a decode problem.");
-            ArcMenuLayout::HoverableTextF("roots skipped: %d  (missing %d)",
-                cr.otherComponentRoots, cr.rootsMissing);
-            ArcMenuHoverTooltip(
-                "Actors whose root component is not a StaticMeshComponent (the static-mesh path "
-                "does not apply to them) and actors whose root would not resolve.");
-            if (cr.skippedRootClasses > 0) {
-                ArcMenuLayout::HoverableTextF("skipped root classes: %s %s %s",
-                    cr.skippedRootClassSample[0].c_str(),
-                    cr.skippedRootClassSample[1].c_str(),
-                    cr.skippedRootClassSample[2].c_str());
-                ArcMenuHoverTooltip(
-                    "Bounded sample of the root component classes the static-mesh path skipped, "
-                    "so the coverage gap has names instead of only a count.");
-            }
-            ArcMenuLayout::HoverableTextF("cache: %s", CollisionRead::CacheSummary().c_str());
-            ArcMenuHoverTooltip("Per-asset collision cache held by the reader.");
-            ArcMenuLayout::HoverableTextF("%llu reads  %.1f KB  %.0f ms",
-                static_cast<unsigned long long>(cr.reads),
-                static_cast<double>(cr.bytesRead) / 1024.0, cr.elapsedMs);
-            ArcMenuHoverTooltip("DMA cost of the run, for the read ledger and the frame budget.");
-        }
-    }
-
-    // ── Stage 3/4: the triangle BVH and its queries ────────────────────────
-    ImGui::Separator();
-    ArcMenuLayout::HoverableText("Collision BVH (Embree)");
-    ArcMenuHoverTooltip(
-        "Tessellates every cached asset instance into world space and builds one triangle BVH over "
-        "it. Build it after a probe run, and again after a map load. The self-test proves the ray "
-        "pipeline on synthetic geometry, so it works with no target attached.");
-    static CollisionBvh::BuildStats lastBuild{};
-    static CollisionBvh::SelfTestResult lastTest{};
-    static std::string lastBuildNote;
-    {
-        ImGui::BeginDisabled(!UpgradeOptions::collisionProbe);
-        if (ImGui::Button("Build collision BVH")) {
-            lastBuild = CollisionBvh::RebuildFromCache();
-            lastBuildNote = lastBuild.note;
-        }
-        ImGui::SetItemTooltip(
-            "Tessellate the cached shapes and commit the BVH. Seconds on a full level; runs on the "
-            "UI thread because it is an explicit request, never on the aim tick.");
-        ImGui::SameLine();
-        if (ImGui::Button("Run BVH self-test")) {
-            lastTest = CollisionBvh::RunSelfTest();
-            lastBuildNote.clear();
-            lastBuild = CollisionBvh::BuildStats{};  // the self-test owns the scene now
-        }
-        ImGui::SetItemTooltip(
-            "Six synthetic checks: a box tessellates to 12 triangles, a ray through a wall is "
-            "blocked, a ray around it is clear, the closest hit lands on the near face at 200 cm, a "
-            "span shorter than the clearance is not judged, and a cleared scene answers clear.");
-        ImGui::EndDisabled();
-
-        // Opt-in, takes effect on the next build. Adds two BVH queries per ray.
-        static bool compareOcclusion = false;
-        if (ImGui::Checkbox("Compare box vs mesh occlusion", &compareOcclusion))
-            CollisionBvh::SetOcclusionComparison(compareOcclusion);
-        ArcMenuHoverTooltip(
-            "Counts, per query, whether the coarse occluder boxes and the decoded mesh/hull "
-            "triangles block the same ray. Takes effect on the next Build collision BVH.");
-        if (compareOcclusion) {
-            const CollisionBvh::OcclusionCompare cmp = CollisionBvh::CompareStats();
-            ImGui::Text("both %llu  box-only %llu  mesh-only %llu  neither %llu  mismatch %llu",
-                static_cast<unsigned long long>(cmp.bothBlock),
-                static_cast<unsigned long long>(cmp.boxOnly),
-                static_cast<unsigned long long>(cmp.meshOnly),
-                static_cast<unsigned long long>(cmp.neither),
-                static_cast<unsigned long long>(cmp.mismatch));
-        }
-
-        // Build input: whether the coarse bounds boxes are committed at all.
-        ArcMenuLayout::Checkbox("Include building bounds boxes", &UpgradeOptions::collisionBvhBoxOccluders);
-        ArcMenuHoverTooltip(
-            "Adds one box per placed complex-collision (tri-mesh) mesh as cover in the BVH, oriented "
-            "with the mesh (placed through its component transform, its bounds with the positive/"
-            "negative extensions folded back out). This is how walls the BSP misses, and scenery "
-            "(rocks, trees), get represented at all -- a box is never smaller than the mesh, so a "
-            "target nearer than a concave building can still read as blocked. On by default; the "
-            "filters below can trim it. Takes effect on the next Build collision BVH.");
-        if (UpgradeOptions::collisionBvhBoxOccluders) {
-            ArcMenuLayout::SliderFloat("Building box max axis", "##collision_bvh_box_max_half",
-                &UpgradeOptions::collisionBvhBoxMaxHalfCm, 0.f, 2000.f, "%.0f cm");
-            ArcMenuHoverTooltip(
-                "Drop a bounds box any local axis of which is longer than this. A whole building's "
-                "bounds is huge; this keeps wall-sized boxes and drops the giant ones. 0 disables.");
-            ArcMenuLayout::SliderFloat("Building box max corner", "##collision_bvh_box_max_corner",
-                &UpgradeOptions::collisionBvhBoxMaxCornerCm, 0.f, 3000.f, "%.0f cm");
-            ArcMenuHoverTooltip(
-                "Drop a bounds box whose scaled corner is longer than this (a huge diagonal). "
-                "0 disables.");
-            ArcMenuLayout::SliderFloat("Building box min height", "##collision_bvh_box_min_world_height",
-                &UpgradeOptions::collisionBvhBoxMinWorldHeightCm, 0.f, 1000.f, "%.0f cm");
-            ArcMenuHoverTooltip(
-                "Drop a bounds box whose world vertical extent is under this, so a floor slab or a "
-                "wall lying flat -- which blocks air a target stands in -- is not cover. 0 disables.");
-            ArcMenuLayout::SliderFloat("Building box vertical thin", "##collision_bvh_box_vertical_thin",
-                &UpgradeOptions::collisionBvhBoxVerticalThin, 0.f, 1.f, "%.2f");
-            ArcMenuHoverTooltip(
-                "Thin the most-vertical axis of whatever survives, as a fraction (0.38 = reference), "
-                "so a slab that only just clears the height test hugs the surface instead of standing "
-                "as a full-height wall. 0 disables.");
-        }
-
-        if (!lastBuildNote.empty()) {
-            ArcMenuLayout::HoverableTextColoredF(ImVec4(1.f, 0.75f, 0.35f, 1.f), "%s", lastBuildNote.c_str());
-            ArcMenuHoverTooltip("No scene was published: fix this before trusting a query.");
-        } else if (lastBuild.built) {
-            ArcMenuLayout::HoverableTextColoredF(ImVec4(0.45f, 1.0f, 0.55f, 1.0f),
-                "gen %llu: %d tris from %d assets / %d instances",
-                static_cast<unsigned long long>(lastBuild.generation), lastBuild.triangles,
-                lastBuild.assets, lastBuild.instances);
-            ArcMenuHoverTooltip(
-                "The published scene: generation counter, triangles, contributing assets and world "
-                "placements actually tessellated.");
-            ArcMenuLayout::HoverableTextF("boxes %d  spheres %d  capsules %d  hulls %d  hull-as-box %d  skipped %d",
-                lastBuild.boxes, lastBuild.spheres, lastBuild.capsules,
-                lastBuild.convexHulls, lastBuild.convexAsBox, lastBuild.skipped);
-            ArcMenuHoverTooltip(
-                "Shapes by type. Hulls are tessellated from their real point cloud; hull-as-box counts "
-                "hulls whose cloud did not decode and fell back to the ElemBox; skipped means no usable size.");
-            ArcMenuLayout::HoverableTextF("bounds boxes %d  dropped by filter %d",
-                lastBuild.boxOccluders, lastBuild.boxOccludersSkipped);
-            ArcMenuHoverTooltip(
-                "Coarse bounds boxes committed as cover, and how many the buildings-only filters "
-                "dropped (too large, too diagonal, or too short). All dropped means every box failed "
-                "a filter; none dropped means nothing was filtered.");
-            ArcMenuLayout::HoverableTextF("tess %.0f ms   commit %.0f ms   total %.0f ms",
-                lastBuild.tessMs, lastBuild.commitMs, lastBuild.totalMs);
-            ArcMenuHoverTooltip("Where the build time went: shape tessellation vs BVH commit.");
-        }
-
-        if (lastTest.ran) {
-            ArcMenuLayout::HoverableTextColoredF(
-                lastTest.passed ? ImVec4(0.45f, 1.0f, 0.55f, 1.0f) : ImVec4(1.f, 0.4f, 0.4f, 1.f),
-                "self-test %s: %d/%d cases", lastTest.passed ? "PASS" : "FAIL",
-                lastTest.cases - lastTest.failed, lastTest.cases);
-            ArcMenuHoverTooltip("Synthetic ray checks through the real tessellation and BVH code.");
-            if (!lastTest.passed)
-                ArcMenuLayout::HoverableTextF("%s", lastTest.detail.c_str());
-            ArcMenuHoverTooltip("Per-case result with the observed value.");
-        }
-        ArcMenuLayout::HoverableTextF("queries: %s", CollisionBvh::Summary().c_str());
-        ArcMenuHoverTooltip("Published scene and query counters since launch.");
-    }
-
-    // ── Vischeck as a feature (not a debug draw) ───────────────────────────
-    ImGui::Separator();
-    ArcMenuLayout::HoverableText("Visibility (vischeck)");
-    ArcMenuHoverTooltip(
-        "What the collision BVH's occlusion answer DOES, beyond drawing rays. Both switches fail "
-        "open: with no scene published every segment reads clear, so neither can change behaviour "
-        "until the probe has built one. The scene's occluders include conservative bounds boxes for "
-        "meshes whose real collision is complex, so cover can read where a thin gap exists.");
-    ArcMenuLayout::Checkbox("Refuse occluded aim target", &UpgradeOptions::visCheckAim);
-    ArcMenuHoverTooltip(
-        "The tick's chosen target is refused (TargetRejection::Occluded) when the BVH finds cover "
-        "between the camera and the aim point, so the aim is never pulled at something the shot "
-        "cannot reach. The lock itself is kept -- clearing cover resumes the same target.");
-
-    // ── Debug draw: the shapes and the rays ────────────────────────────────
-    ImGui::Separator();
-    ArcMenuLayout::HoverableText("Collision debug draw");
-    ArcMenuHoverTooltip(
-        "Draws what the BVH was built from and what the rays answered, so a wrong decode and a "
-        "wrong query can be told apart by eye. Overlay only: it reads nothing and changes nothing "
-        "that is drawn or aimed at. Per-frame caps live in auto_config.ini "
-        "(collision_debug_max_prims, collision_debug_max_rays).");
-    {
-        const CollisionDebug::Stats ds = CollisionDebug::LastFrame();
-        ArcMenuLayout::Checkbox("Draw collision shapes", &UpgradeOptions::collisionDebugShapes);
-        ArcMenuHoverTooltip(
-            "Wireframe of every decoded primitive near the camera: boxes are their 12 edges, "
-            "spheres three great circles, capsules two rings plus four sides, and convex hulls "
-            "their box (magenta) until the hull point cloud is read. Blue = box, green = sphere, "
-            "amber = capsule. If a shape does not line up with the object it belongs to, the "
-            "decode or the element transform is wrong.");
-        ArcMenuLayout::Checkbox("Draw visibility rays", &UpgradeOptions::collisionDebugRays);
-        ArcMenuHoverTooltip(
-            "One ray from the camera to each drawn world object and each drawn actor, coloured by "
-            "the query: green clear, red blocked, grey not judgeable (the span is shorter than the "
-            "biases). Aimed at the head anchor where one exists, so the line and the box disagree "
-            "only if the query does. Capped per frame; if the budget is hit the panel says so.");
-        ArcMenuLayout::Checkbox("Mark hit points", &UpgradeOptions::collisionDebugHitMarkers);
-        ArcMenuHoverTooltip("Draw a marker at the closest blocker along each ray.");
-        ArcMenuLayout::Checkbox("Draw scene triangles", &UpgradeOptions::collisionDebugSceneDecoded);
-        ArcMenuHoverTooltip(
-            "Wireframe of the triangles the BVH was actually built from - the shapes the decode "
-            "read, placed in the world. Icy blue, thin lines, culled by the debug radius below "
-            "(centroid distance). This is the scene's own buffers, not a re-tessellation, so what "
-            "you see is exactly what a ray is tested against.");
-        ArcMenuLayout::Checkbox("Draw occluder boxes", &UpgradeOptions::collisionDebugSceneBoxes);
-        ArcMenuHoverTooltip(
-            "Amber: the coarse bounds boxes standing in for placed meshes whose collision is "
-            "complex (tri-mesh) and therefore does not decode from FKAggregateGeom. A level's "
-            "walls are usually these, and a box is never smaller than the real mesh, so this is "
-            "the layer that makes over-blocking visible. Each lane is capped separately "
-            "(collision_debug_scene_tri_cap).");
-        ArcMenuLayout::SliderFloat("Debug radius", "##collision_dbg_radius",
-            &UpgradeOptions::collisionDebugRadiusM, 1.f, 200.f, "%.0f m");
-        ArcMenuHoverTooltip(
-            "Only geometry and rays within this distance of the camera are drawn; larger means "
-            "more lines per frame.");
-        ArcMenuLayout::SliderFloat("Vis clearance", "##vis_check_clearance",
-            &UpgradeOptions::visCheckClearanceCm, 0.f, 100.f, "%.0f cm");
-        ArcMenuHoverTooltip(
-            "How far short of the target the visibility ray stops. Keep it near 50 cm: collision "
-            "geometry does not line up with the visual mesh (floor thickness, body overshoot, "
-            "near-surface props), so a small value false-blocks a target standing near any of "
-            "those and reads as invisible up close. Lower it only toward the thinnest wall you "
-            "care about -- a wall within this distance of the target is ignored and reads visible.");
-        ArcMenuLayout::HoverableTextF("last frame: %d prims / %d components, %d segs",
-            ds.primitives, ds.components, ds.segments);
-        ArcMenuLayout::HoverableTextF("shapes: %d decoded, %d stand-in",
-            ds.decoded, ds.standIns);
-        ArcMenuHoverTooltip(
-            "Decoded = from FKAggregateGeom (blue box, green sphere, amber capsule, magenta "
-            "hull). Stand-in (pink) = geometry no AggGeom exists for: a player or bot capsule "
-            "read from its CapsuleComponent, or a primitive component's own LocalBounds box. "
-            "Players and bots can only ever appear as stand-ins, because their root is a "
-            "capsule or a skeletal mesh, not a static mesh.");
-        ArcMenuLayout::HoverableTextF("rays: %d world, %d entity",
-            ds.worldRays, ds.entityRays);
-        ArcMenuHoverTooltip("What the debug draw actually emitted in the last painted frame.");
-        ArcMenuLayout::HoverableTextF("rays: %d clear, %d blocked", ds.clear, ds.occluded);
-        ArcMenuHoverTooltip("Query outcomes for the rays traced in that frame.");
-        ArcMenuLayout::HoverableTextF("rays unanswered: %d span too short, %d no BVH",
-            ds.tooClose, ds.noScene);
-        ArcMenuHoverTooltip(
-            "Two different reasons a ray had no answer, and they need opposite fixes. \"Span too "
-            "short\" is about the two points: the segment is shorter than the 5 cm tnear plus the "
-            "visibility clearance (the Vis clearance slider), so neither a hit nor a miss would mean "
-            "anything. \"No BVH\" is about "
-            "the scene: nothing is published, so every query answers CLEAR by contract and the "
-            "whole vischeck is inert -- run the collision probe. Those rays are drawn steel blue, "
-            "an unjudgeable span grey, and a no-BVH ray no longer counts as a clear one.");
-        if (ds.noScene > 0)
-            ArcMenuLayout::HoverableText("no BVH published - run the collision probe");
-        if (ds.culled > 0 || ds.projectFailed > 0) {
-            ArcMenuLayout::HoverableTextF("culled %d, off-view %d", ds.culled, ds.projectFailed);
-            ArcMenuHoverTooltip(
-                "Primitives skipped by the radius or the frame cap, and loops dropped because a "
-                "point left the view.");
-        }
-        if (ds.raysBudgetExhausted || ds.entityRaysBudgetExhausted)
-            ArcMenuLayout::HoverableTextF("ray budget reached (%s) - raise collision_debug_max_rays",
-                ds.entityRaysBudgetExhausted ? "entity" : "world");
-        ArcMenuLayout::HoverableTextF("scene: %d tris | drew %d (decoded %d / occluder %d)",
-            ds.sceneTriangles, ds.sceneDecoded + ds.sceneBoxes, ds.sceneDecoded, ds.sceneBoxes);
-        ArcMenuHoverTooltip(
-            "The published scene: all committed triangles, then how many were drawn in the last "
-            "painted frame from each lane. Zero triangles drawn against a non-zero scene means the "
-            "radius cull or a lane cap stopped them, which the lines below report.");
-        if (ds.sceneNoScene)
-            ArcMenuLayout::HoverableText("no BVH published - nothing to wireframe");
-        if (ds.sceneCulled > 0 || ds.sceneTruncated)
-            ArcMenuLayout::HoverableTextF("scene culled %d%s", ds.sceneCulled,
-                ds.sceneTruncated ? ", lane cap reached" : "");
-    }
-}
-
 void DrawArcLootContent()
 {
     ArcMenuLayout::Checkbox("Enable world ESP", &var::enable_world);
@@ -1071,8 +765,6 @@ void DrawArcLootContent()
     DrawSubtypeFilters("Mine types", EntityFilters::mineMask, EntityFilters::kMines);
     DrawSubtypeFilters("Trap types", EntityFilters::trapMask, EntityFilters::kTraps);
     DrawSubtypeFilters("Extraction types", EntityFilters::extractionMask, EntityFilters::kExtractions);
-    ArcMenuLayout::Checkbox("World bounds", &UpgradeOptions::worldBounds);
-    ArcMenuHoverTooltip("Wireframe asset bounds for supported root StaticMeshComponents only. Worker reads validated asset extents and transform; invalid, unsupported or older-than-2s bounds are omitted. Adds scanner reads; labels remain unchanged.");
     ArcMenuLayout::Checkbox("Color loot by rarity", &var::loot_rarity_color);
     ArcMenuHoverTooltip("Color dropped pickup labels by item rarity tier.");
     ArcMenuLayout::Label("Loot label color");
@@ -1095,18 +787,26 @@ void DrawArcLootContent()
         "'Open container' is on).");
     {
         static const char* kStateModes[] = { "Normal", "Dim", "Grey", "Hide" };
+        // The mode only does something when opened containers are drawn at all
+        // (the "Open container" row or "Grey looted crates"); grey it out otherwise
+        // so it cannot silently do nothing and look broken.
+        ImGui::BeginDisabled(!var::show_world_open_container && !var::grey_looted_containers);
         int om = std::clamp(var::state_opened_mode, 0, 3);
         if (ArcMenuLayout::Combo("Opened container", "##state_opened_mode", &om,
                 kStateModes, IM_ARRAYSIZE(kStateModes)))
             var::state_opened_mode = om;
+        ImGui::EndDisabled();
         ArcMenuHoverTooltip(
             "How a looted/opened container draws in BOTH the ESP and the radar, "
             "so the two surfaces can never disagree.");
 
+        // Same: inert while the master "Dead bot bodies" toggle is off.
+        ImGui::BeginDisabled(!var::show_dead_bots);
         int dm = std::clamp(var::state_dead_mode, 0, 3);
         if (ArcMenuLayout::Combo("Dead bot / Arc", "##state_dead_mode", &dm,
                 kStateModes, IM_ARRAYSIZE(kStateModes)))
             var::state_dead_mode = dm;
+        ImGui::EndDisabled();
         ArcMenuHoverTooltip("How a destroyed bot/Arc draws in both the ESP and the radar.");
 
         ImGui::BeginDisabled(
@@ -1428,168 +1128,177 @@ void DrawArcRadarTab()
     ArcMenuLayout::HoverableTextF("Players/bots use Visuals ESP colors; rare loot uses rarity colors; SP containers use their type colors.");
 }
 
-void DrawArcTriggerbotContent()
-{
-    ArcMenuLayout::Checkbox("Enable Triggerbot", &var::enable_triggerbot);
-    ArcMenuHoverTooltip("Auto-fire when target is within deadzone. Requires KmBox connected.");
-
-    ImGui::Separator();
-    static const char* kHoldModeLabels[] = { "Hold key", "Toggle", "Always on" };
-    int holdMode = var::trigger_hold_mode;
-    if (ArcMenuLayout::Combo("Activation", "##trigger_hold_mode", &holdMode, kHoldModeLabels, IM_ARRAYSIZE(kHoldModeLabels)))
-        var::trigger_hold_mode = holdMode;
-    ArcMenuHoverTooltip("Hold key = fire while key is held. Toggle = press once to enable, press again to disable. Always on = fires whenever target is in deadzone.");
-
-    ImGui::BeginDisabled(var::trigger_hold_mode == 2);
-    ImGui::Keybind("Trigger hotkey", &var::trigger_hold_key);
-    ArcMenuHoverTooltip("Key binding for triggerbot activation. Ignored in Always on mode.");
-    ImGui::EndDisabled();
-
-    ImGui::Separator();
-    ArcMenuLayout::SliderFloat("Deadzone (px)", "##trigger_deadzone", &var::trigger_deadzone_px, 1.f, 50.f, "%.0f");
-    ArcMenuHoverTooltip("Max pixel distance from crosshair to fire. Lower = more precise.");
-    ImGui::SliderInt("Fire delay (ms)", &var::trigger_fire_delay_ms, 0, 500, "%d ms");
-    ArcMenuHoverTooltip("Min time between shots. 0 = no limit. 30-50 for semi-auto, 0 for full-auto.");
-    ArcMenuLayout::Checkbox("Auto hold (full-auto)", &var::trigger_auto_hold);
-    ArcMenuHoverTooltip("Hold fire button while target is in deadzone instead of clicking repeatedly.");
-}
-
 void DrawArcAimbotTab()
 {
     if (ImGui::BeginTabBar("##aimbot_tabs", ImGuiTabBarFlags_None))
     {
         if (ImGui::BeginTabItem("Aimbot"))
         {
-            ArcMenuHoverTooltip("Aim assist settings: target selection, priority, motion, and hardware.");
-            
+            ArcMenuHoverTooltip("Phase 1 aim assist. Read-only: nothing is written to the game.");
             ArcMenuLayout::Checkbox("Enable Aimbot", &var::enable_aimbot);
-            ArcMenuHoverTooltip("KmBox hardware aim — requires MAKCU or Net device connected. One profile: players and ARC are targeted alike; whichever candidate is nearest the crosshair wins.");
+            ArcMenuHoverTooltip("Master switch. Off stops the aim tick immediately.");
 
+            // Was the whole content of the removed ESP "Viz" tab.
+            ArcMenuLayout::Checkbox("Per-bone vischeck", &UpgradeOptions::visCheckPerBone);
+            ArcMenuHoverTooltip("Per-bone raycast visibility (Embree): each bone coloured visible/behind-cover; the box shows when any bone ray is clear.");
+            ImGui::BeginDisabled(!UpgradeOptions::visCheckPerBone);
+            ArcMenuLayout::SliderFloat("Ray range", "##ray_range_m", &UpgradeOptions::rayRangeM, 0.f, 500.f, "%.0f m");
+            ArcMenuHoverTooltip("How far the vischeck rays reach, in metres. Targets farther than this are not traced (no ray drawn, treated as visible). 0 = unlimited.");
+            ImGui::EndDisabled();
+
+            // Phase 1 movement settings. The layout helper takes floats, so each
+            // int setting goes through a temp and is rounded back.
+            float aimRadius = static_cast<float>(var::aim_radius);
+            if (ArcMenuLayout::SliderFloat(
+                    "Aim FOV", "##aim_radius", &aimRadius, 10.f, 120.f, "%.0f px"))
+                var::aim_radius = static_cast<int>(aimRadius + 0.5f);
+            ArcMenuHoverTooltip("FOV circle around the crosshair. Targets outside it are ignored.");
+
+            ArcMenuLayout::Checkbox("Show FOV circle", &var::aim_show_circle);
+            ArcMenuHoverTooltip("Draws the FOV circle while the menu is open so you can size it live, and in raid. Off = invisible everywhere.");
+            if (var::aim_show_circle) {
+                const ImVec2 scrCenter(ImGui::GetIO().DisplaySize.x * 0.5f,
+                                       ImGui::GetIO().DisplaySize.y * 0.5f);
+                ImGui::GetForegroundDrawList()->AddCircle(
+                    scrCenter, aimRadius, IM_COL32(90, 180, 255, 160), 64, 1.5f);
+            }
+
+            ArcMenuLayout::Checkbox("Deadzone", &var::aim_deadzone);
+            ArcMenuHoverTooltip("Stop moving once the crosshair is inside the deadzone. Off = keep correcting even at tiny error (may buzz).");
+            ArcMenuLayout::SliderFloat(
+                "Deadzone size", "##aim_stop_zone", &var::aim_stop_zone, 0.5f, 6.f, "%.1f px");
+            ArcMenuHoverTooltip("How many pixels around the crosshair count as on target. No move is sent inside it.");
+
+            float aimSpeed = static_cast<float>(var::aim_speed);
+            if (ArcMenuLayout::SliderFloat(
+                    "Max speed", "##aim_speed", &aimSpeed, 10.f, 300.f, "%.0f u/s"))
+                var::aim_speed = static_cast<int>(aimSpeed + 0.5f);
+            ArcMenuHoverTooltip("Cap on relative mouse units per second. Lower is smoother and slower.");
+
+            float aimResponse = static_cast<float>(var::aim_response);
+            if (ArcMenuLayout::SliderFloat(
+                    "Response", "##aim_response", &aimResponse, 1.f, 100.f, "%.0f"))
+                var::aim_response = static_cast<int>(aimResponse + 0.5f);
+            ArcMenuHoverTooltip("How much of the remaining error is corrected each tick. Retimed to a 20 ms tick.");
+
+            ArcMenuLayout::Checkbox("Aim jitter", &var::aim_jitter);
+            ArcMenuHoverTooltip("Wiggles response +-5% and FOV +-1 px every tick so your aim never follows a perfectly repeatable curve.");
+
+            ArcMenuLayout::Checkbox("Close-range boost", &var::aim_close_range);
+            ArcMenuHoverTooltip("Under the close distance: double aim speed and faster autofire (one confirm, bigger ring, box points allowed).");
+            float aimCloseDist = var::aim_close_distance;
+            if (ArcMenuLayout::SliderFloat(
+                    "Close distance", "##aim_close_distance", &aimCloseDist, 2.f, 10.f, "%.0f m"))
+                var::aim_close_distance = aimCloseDist;
+            ArcMenuHoverTooltip("Targets closer than this get the close-range boost.");
+
+            ArcMenuLayout::SliderFloat(
+                "Recoil comp", "##aim_recoil_comp", &var::aim_recoil_comp, 1.f, 2.f, "%.2f");
+            ArcMenuHoverTooltip("Multiplies the vertical move while you shoot (pad RT or autofire) to fight weapon climb. 1.00 = off.");
+
+            // Phase 2: which target, where on the body, and how far away.
+            static const char* const kPriorityNames[] = { "Screen", "Distance", "Balanced" };
+            int aimPriority = var::aim_priority;
+            if (ArcMenuLayout::Combo(
+                    "Priority", "##aim_priority", &aimPriority,
+                    kPriorityNames, IM_ARRAYSIZE(kPriorityNames)))
+                var::aim_priority = aimPriority;
+            ArcMenuHoverTooltip("Screen = closest to the crosshair. Distance = nearest actor. Balanced = both.");
+
+            static const char* const kBoneNames[] = {
+                "Closest to crosshair",
+                "Head", "Neck", "Chest",
+                "Spine 3", "Spine 2", "Spine 1", "Pelvis",
+                "Upper arm L", "Lower arm L", "Hand L",
+                "Upper arm R", "Lower arm R", "Hand R",
+                "Thigh L", "Calf L", "Foot L",
+                "Thigh R", "Calf R", "Foot R",
+            };
+            int aimBone = var::aim_bone;
+            if (ArcMenuLayout::Combo(
+                    "Aim point", "##aim_bone", &aimBone,
+                    kBoneNames, IM_ARRAYSIZE(kBoneNames)))
+                var::aim_bone = aimBone;
+            ArcMenuHoverTooltip("Closest = the bone nearest the crosshair; it sticks until another is clearly closer. A fixed bone is used when valid, else the estimated box point. Bots always aim at the heart (box centre).");
+
+            float aimPoint = static_cast<float>(var::aim_point_percent);
+            if (ArcMenuLayout::SliderFloat(
+                    "Estimated head", "##aim_point_percent", &aimPoint, 2.f, 45.f, "%.0f %%"))
+                var::aim_point_percent = static_cast<int>(aimPoint + 0.5f);
+            ArcMenuHoverTooltip("Fallback head point, measured down from the top of the box. Chest is always 45%.");
+
+            float aimDistance = static_cast<float>(var::aim_max_distance);
+            if (ArcMenuLayout::SliderFloat(
+                    "Max aim distance", "##aim_max_distance", &aimDistance,
+                    5.f, static_cast<float>(var::kMaxDistanceSliderM), "%.0f m"))
+                var::aim_max_distance = static_cast<int>(aimDistance + 0.5f);
+            ArcMenuHoverTooltip("Actors further away than this are ignored.");
+
+            ArcMenuLayout::Checkbox("Sticky lock", &var::aim_sticky);
+            ArcMenuHoverTooltip("Keep the same actor while it stays near the crosshair, so the pick cannot flicker.");
             ImGui::Separator();
-            ArcMenuLayout::SliderFloat("FOV", "##aimbot_fov", &var::aimbot_fov, 1.f, 360.f, "%.1f");
-            ArcMenuHoverTooltip("Target cone for aim pick.");
-            ArcMenuLayout::Checkbox("Show FOV", &var::show_fov);
-            ArcMenuHoverTooltip("Draw the aim FOV circle on screen.");
-            ArcMenuLayout::SliderFloat(
-                "Max distance (m)", "##aimbot_distance", &var::aimbot_distance, 5.f, var::kMaxDistanceSliderM, "%.0f");
-            ArcMenuHoverTooltip("Do not consider targets beyond this distance.");
 
+            // Phase 3: trust gates. With all three off the aim point is a guess.
+            ArcMenuLayout::Checkbox("Require confirmed enemy", &var::aim_require_enemy);
+            ArcMenuHoverTooltip("Reject actors whose team could not be read. Off = unknown team is treated as enemy.");
+            ArcMenuLayout::Checkbox("Require visible", &var::aim_require_visible);
+            ArcMenuHoverTooltip("Needs the game's own on-screen stamp, sampled within 0.5 s. Needs ESP visibility colours on.");
+            ArcMenuLayout::Checkbox("Require validated bones", &var::aim_require_bones);
+            ArcMenuHoverTooltip("Reject targets whose head/chest bone did not validate, instead of using the box estimate.");
+
+            if (!var::aim_require_enemy && !var::aim_require_visible && !var::aim_require_bones) {
+                ArcMenuLayout::HoverableTextColoredF(ImVec4(1.f, 0.72f, 0.3f, 1.f),
+                    "Approximate mode: enemy, line of sight and bone are unconfirmed.");
+                ArcMenuHoverTooltip("Shown when all three Require boxes are off. Aim still works; the target is just not double-checked.");
+            }
             ImGui::Separator();
+
+            // Phase 4: autofire. Saved with the config; clicks only from a
+            // converged bone point.
+            ArcMenuLayout::Checkbox("Autofire", &var::aim_autofire);
+            ArcMenuHoverTooltip("Clicks from a converged aim point on a real bone. Saved in auto config.");
+
+            float shootRadius = static_cast<float>(var::aim_autofire_radius);
+            if (ArcMenuLayout::SliderFloat(
+                    "Shoot radius", "##aim_autofire_radius", &shootRadius, 3.f, 12.f, "%.0f px"))
+                var::aim_autofire_radius = static_cast<int>(shootRadius + 0.5f);
+            ArcMenuHoverTooltip("Widest error that still counts as aligned. Smaller is stricter.");
+
+            float shootInterval = static_cast<float>(var::aim_autofire_interval);
+            if (ArcMenuLayout::SliderFloat(
+                    "Shoot interval", "##aim_autofire_interval", &shootInterval, 80.f, 1000.f, "%.0f ms"))
+                var::aim_autofire_interval = static_cast<int>(shootInterval + 0.5f);
+            ArcMenuHoverTooltip("Minimum time between clicks.");
+
+            float clickHold = static_cast<float>(var::aim_click_hold);
+            if (ArcMenuLayout::SliderFloat(
+                    "Click hold", "##aim_click_hold", &clickHold, 10.f, 100.f, "%.0f ms"))
+                var::aim_click_hold = static_cast<int>(clickHold + 0.5f);
+            ArcMenuHoverTooltip("How long the device button stays down. The paint thread waits for this, so keep it short.");
+
+            ArcMenuLayout::Checkbox("Aim telemetry", &var::aim_telemetry);
+            ArcMenuHoverTooltip("One 1 Hz line under the ring: actors seen, in the ring, drop reasons, pick type and autofire state.");
+            ImGui::Separator();
+
             ArcMenuLayout::SliderFloat(
-                "Deadzone", "##aim_deadzone", &var::aim_deadzone_px, 0.f, 50.f, "%.0f px");
-            ArcMenuHoverTooltip("Stop moving when target is within this many pixels of crosshair.");
-            ArcMenuLayout::Checkbox("Bullet prediction", &var::predict);
-            ArcMenuHoverTooltip("Lead moving targets by travel time (uses cached velocity).");
+                "Calibration X", "##aim_calib_x", &var::aim_calib_x, 0.1f, 20.f, "%.2f px/unit");
+            ArcMenuHoverTooltip("Pixels the view moves per mouse unit horizontally. Raise it if you overshoot.");
+
             ArcMenuLayout::SliderFloat(
-                "Bullet speed (cm/s)",
-                "##aim_bullet_speed_cm_s",
-                &var::aim_bullet_speed_cm_s,
-        20000.f,
-        150000.f,
-        "%.0f");
-    ArcMenuHoverTooltip("Travel speed used for lead prediction. Default 80000 (~800 m/s).");
-    static const char* motionPresets[] = { "Sticky", "Balanced", "Natural", "Custom" };
-    if (ArcMenuLayout::Combo("Motion preset", "##motion_preset", &UpgradeOptions::playerPreset, motionPresets, IM_ARRAYSIZE(motionPresets)))
-        UpgradeOptions::ApplyPreset(UpgradeOptions::playerPreset);
-    ArcMenuHoverTooltip("Deterministic motion presets: Sticky 65ms/50-count cap, Balanced 120ms/35, Natural 220ms/20. Applies to players and ARC alike. No injected shake; calibration stays unchanged.");
-    struct MotionRow { const char* label; const char* id; float* value; float lo, hi; const char* tip; };
-    const MotionRow motionRows[] = {
-        {"Response", "##aim_response", &UpgradeOptions::playerResponseMs,20.f,500.f,"Response time in milliseconds; lower pulls faster. Time-normalized exponential smoothing, not a reaction-delay timer. Shared by players and ARC."},
-        {"Output rate", "##aim_rate", &UpgradeOptions::playerRate,30.f,250.f,"Maximum hardware commands per second; actual worker/device cadence can be lower."},
-        {"Calibration X", "##aim_counts", &UpgradeOptions::playerCountsPerPixel,0.05f,10.f,"Horizontal mouse counts per overlay pixel; hardware/game sensitivity dependent. Requires real hardware calibration."},
-        {"Calibration Y", "##aim_counts_y", &UpgradeOptions::playerCountsPerPixelY,0.05f,10.f,"Vertical counts per overlay pixel, independent of X. Defaults to the X value; lower it to stop vertical overshoot."},
-        {"Response curve", "##aim_curve", &UpgradeOptions::playerResponseCurve,0.f,1.f,"0 is exactly linear (the previous behaviour). Above 0, error nearer than 30 px is pulled slower and error further away faster."},
-        {"Per-tick cap", "##aim_tickcap", &UpgradeOptions::playerMaxCountsPerTick,0.f,100.f,"Absolute mouse-count cap per tick; always tightens, never loosens, the distance burst cap. 0 defers entirely."},
-        {"Count cap", "##aim_cap", &UpgradeOptions::playerMaxCounts,1.f,100.f,"Maximum mouse-count vector magnitude per command, including fractional accumulation and integer output."},
-    };
-    for (const auto& row : motionRows) {
-        if (ArcMenuLayout::SliderFloat(row.label,row.id,row.value,row.lo,row.hi,"%.2f"))
-            UpgradeOptions::playerPreset=3;
-        ArcMenuHoverTooltip(row.tip);
-    }
-    // One profile: FOV and range are the Aimbot tab's own (aimbot_fov /
-    // aimbot_distance) for players and ARC alike. The separate ARC cone and ARC
-    // distance sliders are gone, and so is the ARC aim hotkey — it was never read
-    // by the aim path, so it only ever looked like a gate. Saved arc_aim_fov /
-    // arc_aim_distance / arc_aim_key keys stay readable; they no longer drive
-    // anything.
-    ImGui::Keybind("ARC part hotkey", &UpgradeOptions::arcWeakspotKey);
-    ArcMenuHoverTooltip("While ARC aim is active, select the cached component point nearest the crosshair. Component order is not proven to match HP indices, so no damage/weakspot claim is made. Missing points fall back to the normal heart point.");
-    ArcMenuLayout::Checkbox("ARC prediction", &UpgradeOptions::arcPrediction);
-    ArcMenuHoverTooltip("Lead ARC cached part/heart position using fresh cached velocity and the shared configured bullet speed; off by default.");
-    ArcMenuLayout::Checkbox("ARC sticky lock", &UpgradeOptions::arcSticky);
-    ArcMenuHoverTooltip("Retain the ARC lock within its FOV plus the shared sticky pixel bias; never retain an unobserved stale target for hardware movement.");
-    ArcMenuLayout::Checkbox("Strict target gate (player)", &UpgradeOptions::playerStrictGate);
-    ArcMenuHoverTooltip("On by default. Strict drops a candidate whose aim data is not this tick's own sample (an interpolated hold-drift point) or is older than the pipeline's freshness bound, and names the reason. Off restores the pre-4.2 candidate rules exactly.");
-    ArcMenuLayout::Checkbox("Strict target gate (ARC)", &UpgradeOptions::arcStrictGate);
-    ArcMenuHoverTooltip("Same gate for ARC targets, where the age of the resolved bot entry is what is bounded. A bot's aim point is inferred from its box, so it is reported as estimated either way -- estimated is a label, not a refusal.");
-    ArcMenuLayout::Checkbox("FOV axis is horizontal", &UpgradeOptions::fovAxisHorizontal);
-    ArcMenuHoverTooltip("Off (default) keeps the projection's vertical FOV reading it has always used. On makes the projection agree with the aim FOV ring, which has always measured its radius from half the width. Only the projection's reading changes; no other value moves.");
-    ArcMenuLayout::Checkbox("Practice / calibration reference", &var::practice_mode);
-    ArcMenuHoverTooltip("Draws a screen-centre cross, the FOV rings, a 5-degree axis ruler and a counts probe for reading counts-per-pixel off real input. Nothing else is drawn and normal ESP output does not depend on it.");
-    ArcMenuLayout::Checkbox("Random bone", &var::randombone);
-    ArcMenuHoverTooltip("Optional weighted high-value bone drift with interpolated transitions. Overrides Aim bone; off by default in a fresh config. Existing saved choice is preserved.");
-    static const char* kAimBoneLabels[] = {
-        "Head", "Chest", "Pelvis", "Arms", "Legs", "Closest bone"
-    };
-    int aimBone = static_cast<int>(var::aim_bone_mode);
-    if (ArcMenuLayout::Combo(
-            "Aim bone",
-            "##aim_bone_mode",
-            &aimBone,
-            kAimBoneLabels,
-            IM_ARRAYSIZE(kAimBoneLabels)))
-        var::aim_bone_mode = static_cast<AimBoneMode>(aimBone);
-    ArcMenuHoverTooltip("Fixed bone, or closest bone inside the FOV circle each tick. Ignored while Random bone is on.");
-
-    static const char* kAimPriorityLabels[] = {
-        "FOV", "Distance", "Threat", "Low health", "FOV + distance"
-    };
-    int aimPriority = static_cast<int>(var::aimbot_priority);
-    if (ArcMenuLayout::Combo(
-            "Target priority",
-            "##aimbot_priority",
-            &aimPriority,
-            kAimPriorityLabels,
-            IM_ARRAYSIZE(kAimPriorityLabels)))
-        var::aimbot_priority = static_cast<AimbotPriority>(aimPriority);
-    ArcMenuHoverTooltip("How candidates are scored inside the FOV. Threat uses weapon tier when available.");
-
-    ArcMenuLayout::Checkbox("Sticky lock", &var::sticky_target_lock);
-    ArcMenuHoverTooltip("Prefer the currently locked target; resists hopping to a marginal rival.");
-    ImGui::BeginDisabled(!var::sticky_target_lock && !UpgradeOptions::arcSticky);
-    ArcMenuLayout::SliderFloat(
-        "Sticky FOV bias",
-        "##aim_sticky_fov_bias_px",
-        &var::aim_sticky_fov_bias_px,
-        0.f,
-        120.f,
-        "%.0f px");
-    ArcMenuHoverTooltip("Extra FOV pixels granted to a sticky Player or ARC lock. Retention is bounded by its own FOV plus this bias, never unlimited.");
-    ImGui::EndDisabled();
-
-    ArcMenuLayout::HoverableText("Hardware motion uses deterministic response smoothing. Legacy jitter and unobserved-target movement are disabled.");
-    ArcMenuHoverTooltip("Old humanizer, randomized pull profiles and hardware loss-of-sight replay are no longer used. Saved legacy keys remain readable for compatibility.");
-
-    ImGui::Separator();
-    ArcMenuLayout::HoverableText("Hardware aim (KMBox / MAKCU)");
-    ArcMenuHoverTooltip("Hardware mouse status. Configure the device under Settings -> General.");
-    if (!g_kmbox.kmboxConfig.initialized)
-        ArcMenuLayout::HoverableTextColoredF(ImVec4(1.f, 0.4f, 0.2f, 1.f),
-            "KMBox not connected — aim will not run (Settings -> Re-init KmBox)");
-    else
-        ImGui::TextDisabled("KMBox connected — hardware aim active (read-only DMA, no memory writes).");
-    ArcMenuHoverTooltip("Hardware aim status. Configure the device under Settings -> General.");
-
-    ImGui::Separator();
-        ImGui::Keybind("Aim hotkey", &var::aim_hold_key);
-    ArcMenuHoverTooltip("Hold to run aim assist.");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Triggerbot"))
-        {
-            ArcMenuHoverTooltip("Auto-fire on target: deadzone, delay, and activation mode.");
-            DrawArcTriggerbotContent();
+                "Calibration Y", "##aim_calib_y", &var::aim_calib_y, 0.1f, 20.f, "%.2f px/unit");
+            ArcMenuHoverTooltip("Pixels the view moves per mouse unit vertically. Raise it if you overshoot.");
+            ImGui::Separator();
+            ImGui::Keybind("Aim hotkey", &var::aim_hold_key);
+            ArcMenuHoverTooltip("Hold this key to aim. Release stops the tick instantly.");
+            ImGui::Separator();
+            ArcMenuLayout::HoverableText("KMBox / MAKCU device status");
+            ArcMenuHoverTooltip("Configure the KMBox or MAKCU device under Settings -> General.");
+            if (!g_kmbox.kmboxConfig.initialized)
+                ArcMenuLayout::HoverableTextColoredF(ImVec4(1.f, 0.4f, 0.2f, 1.f),
+                    "Not connected — configure under Settings -> General");
+            else
+                ImGui::TextDisabled("Connected — ready to send aim moves.");
+            ArcMenuHoverTooltip("Device state right now. Moves are sent only while Connected.");
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Crosshair"))
@@ -1726,194 +1435,6 @@ void DrawArcSettingsTab()
             if (ImGui::Button("Re-init KmBox"))
                 ArcMenuResetKmBox();
             ArcMenuHoverTooltip("Reconnect hardware mouse device (KmBox/MAKCU).");
-            ImGui::Separator();
-
-            // Raid hotkeys (B3/B4) are polled globally and cannot be rebound, so
-            // this is the one place a user can discover them.
-            ArcMenuLayout::HoverableText("Raid hotkeys (hold Alt, menu closed):");
-            ArcMenuLayout::HoverableTextF(
-                "Alt+N  Near loot HUD        Alt+C  Crosshair\n"
-                "Alt+M  Radar map mode       Alt+G  World loot ESP\n"
-                "Alt+T  Triggerbot           Alt+H  Raid HUD\n"
-                "Alt+R  Force rescan (3s cooldown)\n"
-                "Alt+- / Alt+=  Radar zoom in / out");
-            ArcMenuHoverTooltip(
-                "Alt must be pressed before the letter — pressing the letter first "
-                "and then Alt does nothing. The overlay is click-through during a "
-                "raid, so these are polled globally and the keystroke also reaches "
-                "the game; Alt+letter keeps that from colliding with normal binds. "
-                "Rescan flushes the read cache and rebuilds the ESP caches.");
-
-            // D19 color profiles: 8 switchable palettes over every color var.
-            ImGui::Separator();
-            ArcMenuLayout::HoverableText("Color profiles");
-            ArcMenuHoverTooltip(
-                "Swap the whole palette in one step. Capture stores the colors "
-                "you have set in the menu into a slot; picking a slot writes it "
-                "back. Slots live in Data\\color_profiles.json, separate from "
-                "auto_config.ini, so a look can be shared without sharing an "
-                "entire config.");
-
-            static const char* const kProfileLabels[ColorProfiles::kSlotCount + 1] = {
-                "Off", "Slot 1", "Slot 2", "Slot 3", "Slot 4",
-                "Slot 5", "Slot 6", "Slot 7", "Slot 8"
-            };
-            int profileSel = var::color_profile_slot + 1;  // -1 (off) -> 0
-            if (profileSel < 0 || profileSel > ColorProfiles::kSlotCount)
-                profileSel = 0;
-            if (ArcMenuLayout::Combo(
-                    "Apply profile", "##color_profile_slot",
-                    &profileSel, kProfileLabels, ColorProfiles::kSlotCount + 1)) {
-                var::color_profile_slot = profileSel - 1;
-                if (var::color_profile_slot >= 0)
-                    ColorProfile::ApplySlot(var::color_profile_slot);
-                AutoConfig_MarkDirty();
-            }
-            ArcMenuHoverTooltip(
-                "Off leaves your colors untouched. Picking a slot writes that "
-                "saved palette over the current colors; keys the slot does not "
-                "contain are left alone, so an older profile cannot wipe a "
-                "newly added color.");
-
-            ColorProfile::EnsureLoaded();
-            const int profileSlot = var::color_profile_slot;
-            static int s_profileSave = 0;  // 0 idle, 1 ok, 2 failed
-            ImGui::BeginDisabled(profileSlot < 0);
-            if (ImGui::Button("Save colors into this slot"))
-                s_profileSave = ColorProfile::CaptureSlot(profileSlot) ? 1 : 2;
-            ArcMenuHoverTooltip(
-                "Copies every color currently set in the menu into the selected "
-                "slot and writes Data\\color_profiles.json.");
-            if (ImGui::Button("Clear this slot"))
-                s_profileSave = ColorProfile::ClearSlot(profileSlot) ? 1 : 2;
-            ArcMenuHoverTooltip("Forgets the selected slot's saved palette.");
-            ImGui::EndDisabled();
-
-            if (s_profileSave == 1)
-                ArcMenuLayout::HoverableTextColoredF(
-                    ImVec4(0.45f, 1.f, 0.55f, 1.f), "Profile file saved");
-            else if (s_profileSave == 2)
-                ArcMenuLayout::HoverableTextColoredF(
-                    ImVec4(1.f, 0.45f, 0.45f, 1.f),
-                    "Could not write Data\\color_profiles.json");
-            if (s_profileSave != 0)
-                ArcMenuHoverTooltip(
-                    "The file sits beside ArcRaiders.exe, in Data\\. Saving "
-                    "rewrites it whole and keeps every other slot.");
-
-            if (profileSlot >= 0) {
-                const std::string profileName = ColorProfile::SlotName(profileSlot);
-                if (!profileName.empty())
-                    ArcMenuLayout::HoverableTextF(
-                        "Slot %d \"%s\" covers %d colors",
-                        profileSlot + 1, profileName.c_str(),
-                        ColorProfile::ColorCount());
-                else
-                    ArcMenuLayout::HoverableTextF(
-                        "Slot %d is empty - save a palette into it.",
-                        profileSlot + 1);
-                ArcMenuHoverTooltip(
-                    "Color count is how many keys a complete profile carries. "
-                    "A lower count means the file was saved by an older build.");
-            }
-            ImGui::Separator();
-
-            // D20 baseline / diff / export / apply.
-            ArcMenuLayout::HoverableText("Config baseline");
-            ArcMenuHoverTooltip(
-                "Freeze the current settings, see exactly what changed since, "
-                "and move settings in or out as a file. Everything lives in "
-                "Data\\ beside ArcRaiders.exe and is plain key=value, so it can "
-                "be edited by hand and loaded straight back.");
-
-            static std::vector<std::string> s_cfgDiff;
-            static bool s_cfgDiffShown = false;
-            static int s_cfgOp = 0;  // 0 none, 1 baseline, 2 export, 3 import
-            static bool s_cfgOpOk = false;
-
-            if (ImGui::Button("Set baseline here")) {
-                s_cfgOp = 1;
-                s_cfgOpOk = AutoConfig_SnapshotBaseline();
-            }
-            ArcMenuHoverTooltip(
-                "Flushes and copies the live settings to "
-                "Data\\config_baseline.ini, replacing any previous baseline.");
-
-            if (ImGui::Button("Diff against baseline")) {
-                // Flush first: the diff must see the settings on screen, not the
-                // debounced copy still waiting out its 0.5s save delay.
-                AutoConfig_SaveNow();
-                s_cfgDiff = AutoConfig_DiffBaseline();
-                s_cfgDiffShown = true;
-                s_cfgOp = 0;
-            }
-            ArcMenuHoverTooltip(
-                "Lists every setting that differs from the baseline, one per "
-                "line: \"key: old -> new\", \"+ key\" for keys the baseline "
-                "does not have, \"- key\" for ones only the baseline has. An "
-                "empty list means the two match.");
-
-            if (ImGui::Button("Export config")) {
-                s_cfgOp = 2;
-                s_cfgOpOk = AutoConfig_ExportCurrent();
-            }
-            ArcMenuHoverTooltip("Writes the live settings to Data\\config_export.ini.");
-            if (ImGui::Button("Apply exported config")) {
-                s_cfgOp = 3;
-                s_cfgOpOk = AutoConfig_ImportExported();
-            }
-            ArcMenuHoverTooltip(
-                "Loads Data\\config_export.ini over the current settings and "
-                "schedules a save. Use it after hand-editing an export.");
-
-            if (s_cfgOp != 0) {
-                const ImVec4 opCol = s_cfgOpOk
-                    ? ImVec4(0.45f, 1.f, 0.55f, 1.f)
-                    : ImVec4(1.f, 0.45f, 0.45f, 1.f);
-                const char* opMsg = nullptr;
-                if (s_cfgOp == 1)
-                    opMsg = s_cfgOpOk ? "Baseline saved to Data\\config_baseline.ini"
-                                      : "Could not write the baseline file";
-                else if (s_cfgOp == 2)
-                    opMsg = s_cfgOpOk ? "Exported to Data\\config_export.ini"
-                                      : "Could not write the export file";
-                else
-                    opMsg = s_cfgOpOk ? "Applied Data\\config_export.ini"
-                                      : "Export file missing or held no known keys";
-                ArcMenuLayout::HoverableTextColoredF(opCol, "%s", opMsg);
-                ArcMenuHoverTooltip(
-                    "Files sit beside ArcRaiders.exe in Data\\. A failed write "
-                    "usually means that folder is missing or read-only.");
-            }
-
-            if (s_cfgDiffShown) {
-                ImGui::Separator();
-                if (s_cfgDiff.empty()) {
-                    ArcMenuLayout::HoverableTextColoredF(
-                        ImVec4(0.45f, 1.f, 0.55f, 1.f),
-                        "No differences from baseline");
-                } else {
-                    constexpr size_t kMaxShown = 12;
-                    const size_t shown =
-                        (std::min)(s_cfgDiff.size(), kMaxShown);
-                    ArcMenuLayout::HoverableTextF(
-                        "%d difference(s) vs baseline:",
-                        static_cast<int>(s_cfgDiff.size()));
-                    for (size_t di = 0; di < shown; ++di)
-                        ArcMenuLayout::HoverableText(s_cfgDiff[di].c_str());
-                    if (s_cfgDiff.size() > shown)
-                        ArcMenuLayout::HoverableTextF(
-                            "... and %d more",
-                            static_cast<int>(s_cfgDiff.size() - shown));
-                }
-                if (ImGui::Button("Hide diff")) {
-                    s_cfgDiffShown = false;
-                    s_cfgDiff.clear();
-                }
-                ArcMenuHoverTooltip("Collapse the difference list.");
-            }
-
-            ImGui::Separator();
 
             const int monitorCount = OverlayDisplay_GetMonitorCount();
             int selected = OverlayDisplay_GetSelectedMonitor();
@@ -1978,6 +1499,91 @@ void DrawArcSettingsTab()
 
 void DrawArcDebugContent()
 {
+    ArcMenuLayout::HoverableText("Aim assist - live monitor");
+    ArcMenuHoverTooltip("Live aim state, refreshed every frame while the menu is open. Hold the aim key and watch the counters and log here.");
+    {
+        AimMonitor::Live live{};
+        AimMonitor::Snapshot(live);
+        const ImVec4 okCol(0.45f, 0.90f, 0.45f, 1.f);
+        const ImVec4 badCol(0.95f, 0.40f, 0.40f, 1.f);
+        const ImVec4 warnCol(0.95f, 0.80f, 0.35f, 1.f);
+        auto row = [](const char* label, const char* value, const ImVec4& col) {
+            ImGui::TextUnformatted(label);
+            ImGui::SameLine(170.f);
+            ImGui::TextColored(col, "%s", value);
+        };
+        row("Aim key held", live.keyheld ? "yes" : "no",
+            live.keyheld ? okCol : badCol);
+        row("Enabled", live.enable ? "yes" : "no", live.enable ? okCol : badCol);
+        row("KmBox ready", live.kmbox ? "yes" : "no", live.kmbox ? okCol : badCol);
+        row("MAKCU", live.makcuConnected ? "connected" : "not connected",
+            live.makcuConnected ? okCol : badCol);
+        row("Raid active", live.raid ? "yes" : "no", live.raid ? okCol : badCol);
+        row("Aim tick", live.tickRan ? "ran" : "NEVER RAN",
+            live.tickRan ? okCol : badCol);
+        if (live.tickRan)
+            row("Tick age", (std::to_string(live.tickAgeMs) + " ms").c_str(),
+                live.tickAgeMs < 50 ? okCol : warnCol);
+
+        ImGui::Spacing();
+        row("Moves sent", (std::to_string(live.moveCount)).c_str(),
+            live.moveCount > 0 ? okCol : warnCol);
+        row("Moves accepted",
+            (std::to_string(live.moveOk) + " / " + std::to_string(live.moveCount)).c_str(),
+            live.moveOk > 0 && live.moveOk == live.moveCount ? okCol : warnCol);
+        row("Last move", (std::to_string(live.lastDx) + ", " + std::to_string(live.lastDy)).c_str(),
+            live.hasLastMove && live.lastMoveOk ? okCol : warnCol);
+        if (live.hasLastMove)
+            row("Last move age", (std::to_string(live.lastMoveAgeMs) + " ms").c_str(), warnCol);
+        char errBuf[64];
+        std::snprintf(errBuf, sizeof(errBuf), "%.1f px", live.errPx);
+        row("Error at pick", live.errPx < 0.0 ? "no target" : errBuf,
+            live.errPx < 0.0 ? badCol : (live.errPx <= 6.0 ? okCol : warnCol));
+
+        ImGui::Spacing();
+        ArcMenuLayout::HoverableTextF("Status: %s", live.status);
+        ArcMenuHoverTooltip("Last reason from the aim tick: idle reason, or the 1 Hz held line with seen/ring/dropped counts.");
+
+        ArcMenuLayout::Checkbox("Draw aim monitor on screen", &UpgradeOptions::aimMonitorPanel);
+        ArcMenuHoverTooltip("Small live panel in the top-left corner during a raid (menu closed): key, moves, error and the status line.");
+    }
+
+    ImGui::Separator();
+    ArcMenuLayout::HoverableText("Aim log (live)");
+    ArcMenuHoverTooltip("Same lines Build/aim_debug.log receives, oldest at the top. New lines are added when the aim state changes.");
+    {
+        static bool autoScroll = true;
+        ImGui::Checkbox("Auto-scroll", &autoScroll);
+        char lines[32][200]{};
+        uint64_t times[32]{};
+        const int n = AimMonitor::CopyLog(lines, times, 32);
+        const float logH = ImGui::GetTextLineHeightWithSpacing() * 10.f;
+        if (ImGui::BeginChild("##aimlog", ImVec2(0.f, logH), true,
+                ImGuiWindowFlags_HorizontalScrollbar)) {
+            if (n == 0) {
+                ImGui::TextDisabled("(no aim events yet - hold the aim key in a raid)");
+            }
+            for (int i = 0; i < n; ++i) {
+                const ImVec4 col = std::string(lines[i]).find("aim idle") != std::string::npos
+                    ? ImVec4(0.65f, 0.65f, 0.65f, 1.f)
+                    : ImVec4(0.80f, 0.90f, 1.f, 1.f);
+                ImGui::TextColored(col, "%8.1fs  %s", times[i] * 0.001, lines[i]);
+            }
+            if (autoScroll)
+                ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
+    }
+    ImGui::Separator();
+    ArcMenuLayout::HoverableTextF("Enable Aimbot: %s", var::enable_aimbot ? "yes" : "no");
+    ArcMenuHoverTooltip("Copy of the Aimbot tab master switch.");
+    ArcMenuLayout::HoverableTextF("KmBox ready: %s", g_kmbox.kmboxConfig.initialized ? "yes" : "no");
+    ArcMenuHoverTooltip("MAKCU/KMBox connection. Aim moves are blocked while no.");
+    ArcMenuLayout::HoverableTextF("Raid active: %s", engine.IsEspRaidActive() ? "yes" : "no");
+    ArcMenuHoverTooltip("The aim tick only runs during a raid.");
+    ArcMenuLayout::HoverableTextF("Menu open: %s", showmenu ? "yes" : "no");
+    ArcMenuHoverTooltip("Aim is paused while this overlay menu is open.");
+    ImGui::Separator();
     ArcMenuLayout::HoverableTextF("KmBox type: %s", g_kmbox.kmboxConfig.type.c_str());
     ArcMenuHoverTooltip("Configured hardware mouse type.");
     if (g_kmbox.kmboxConfig.type == "MAKCU") {
@@ -2039,18 +1645,6 @@ void DrawArcDebugContent()
     }
 
     ImGui::Separator();
-    ArcMenuLayout::HoverableText("Aimbot runtime");
-    ArcMenuHoverTooltip("Live aim state for diagnostics.");
-    
-    // Aimbot debug monitor toggle
-    ImGui::Spacing();
-    bool aimbotMonitorVisible = OverlayUI::AimbotDebugPanel::IsVisible();
-    if (ArcMenuLayout::Checkbox("Show Aimbot Debug Monitor", &aimbotMonitorVisible)) {
-        OverlayUI::AimbotDebugPanel::ToggleVisibility();
-    }
-    ArcMenuHoverTooltip("Toggle live aimbot telemetry monitor. Shows target state, aim deltas, jitter, lag, prediction, and performance metrics in real-time.");
-    
-    const int aimKey = var::aim_hold_key ? var::aim_hold_key : VK_SHIFT;
     if (engine.IsInRaid()) {
         ArcMenuLayout::HoverableTextColoredF(ImVec4(0.45f, 1.0f, 0.55f, 1.0f),
             "Raid: active (ESP scanning)");
@@ -2061,19 +1655,6 @@ void DrawArcDebugContent()
     ArcMenuHoverTooltip("ESP scanning state. Scanning only runs while in a raid.");
     ArcMenuLayout::HoverableTextF("In raid raw: %s", engine.IsInRaidRaw() ? "yes" : "no");
     ArcMenuHoverTooltip("Raw in-raid flag read from the game.");
-    ArcMenuLayout::HoverableTextF("Aimbot enabled: %s (players + ARC share this profile)", var::enable_aimbot ? "yes" : "no");
-    ArcMenuHoverTooltip("Master switch for hardware aim.");
-    ArcMenuLayout::HoverableTextF("ARC targets: %s",
-        FeaturePolicy::ShouldCollectRobotTargets(
-            FeaturePolicy::AimFeatures{ var::enable_aimbot, var::robotAimEnabled,
-                var::enable_triggerbot }) ? "active with the aim pass" : "no aim pass running");
-    ArcMenuHoverTooltip("Bots are aim targets whenever the aim pass runs (aimbot or trigger). Target kind is not a separate switch.");
-    ArcMenuLayout::HoverableTextF("Aim hotkey code: %d", aimKey);
-    ArcMenuHoverTooltip("Virtual-key code of the aim hotkey.");
-    ArcMenuLayout::HoverableTextF("Aim hotkey held: %s", KeyBindIsHeld(aimKey) ? "yes" : "no");
-    ArcMenuHoverTooltip("Whether the aim hotkey is currently pressed.");
-    ArcMenuLayout::HoverableTextF("KmBox ready: %s", g_kmbox.kmboxConfig.initialized ? "yes" : "no");
-    ArcMenuHoverTooltip("Hardware mouse ready for aim.");
     ImGui::Separator();
 
     {
@@ -2091,7 +1672,7 @@ void DrawArcDebugContent()
     ArcMenuHoverTooltip("Camera transform is bad or missing — check DMA attach.");
         } else {
             ArcMenuLayout::HoverableTextColoredF(ImVec4(0.45f, 1.0f, 0.55f, 1.0f), "Status: OK");
-    ArcMenuHoverTooltip("Camera transform is sane and usable by aim/ESP.");
+    ArcMenuHoverTooltip("Camera transform is sane and usable by ESP.");
             ArcMenuLayout::HoverableTextF("Location: %.1f, %.1f, %.1f", cam.Location.x, cam.Location.y, cam.Location.z);
             ArcMenuHoverTooltip("Camera world position from the engine cache.");
             ArcMenuLayout::HoverableTextF("Rotation: %.2f, %.2f, %.2f", cam.Rotation.x, cam.Rotation.y, cam.Rotation.z);
@@ -2121,18 +1702,17 @@ void DrawArcDebugContent()
     ArcMenuHoverTooltip(
         "Draws box anchor (red) vs bone pelvis (green) with age/delta text, "
         "and prints [debugSkel] lines. Shows why the skeleton trails moving targets.");
-    ArcMenuLayout::Checkbox("Aim shake probe", &var::debug_aim_shake);
-    ArcMenuHoverTooltip(
-        "Prints [debugShake] per error sign-flip (overshoot oscillation) plus "
-        "extended [debugAim] fields: command, px/mouse, tick time, switches.");
     ArcMenuLayout::Checkbox("Log ghost bot decisions", &var::debug_ghost_bots);
+    ArcMenuHoverTooltip(
+        "Write every bot draw rejection and ghost-expiry decision to help/entity_diagnostics.ndjson. "
+        "Includes actor address, name, reason, position age, distance, identity, and broken state.");
     // Debug-flag-gated baseline: writes an esp_paint_profile line (frame time +
     // per-lock try/miss/wait) to help/entity_diagnostics.ndjson once a second.
     ArcMenuLayout::Checkbox("ESP paint profile (frame + lock waits)",
         &var::debug_esp_paint);
     ArcMenuHoverTooltip(
-        "Write every bot draw rejection and ghost-expiry decision to help/entity_diagnostics.ndjson. "
-        "Includes actor address, name, reason, position age, distance, identity, and broken state.");
+        "Write a once-a-second esp_paint_profile line (paint frame time + per-lock "
+        "try/miss/wait) to help/entity_diagnostics.ndjson.");
     ArcMenuLayout::Checkbox("Hatch detect probe", &var::debug_hatch_detect);
     ArcMenuHoverTooltip(
         "Prints [debugHatch] per hatch-candidate actor: fname, class fname, "
@@ -2141,6 +1721,48 @@ void DrawArcDebugContent()
     ArcMenuHoverTooltip(
         "List nearby ground pickups on-screen. Press F7 to mark the nearest as picked "
         "(hides it via sticky so ESP does not blink it back).");
+
+    ImGui::Separator();
+    ArcMenuLayout::HoverableText("Embree VisCheck");
+    ArcMenuHoverTooltip("Raycast visibility diagnostics: obstruction behaviour, wireframe overlays, and the world BVH scene.");
+    ArcMenuLayout::Checkbox("Dynamic Obstructions (Smoke/Shields)", &UpgradeOptions::visibilityObstructionSpheres);
+    ArcMenuHoverTooltip(
+        "Block rays through smoke, gas, fog, barriers, and barricades.");
+
+    ImGui::Separator();
+    ArcMenuLayout::HoverableText("Debug Wireframe Overlay");
+    ArcMenuHoverTooltip("Draw the raycast scene and rays to screen. Read-only; only drawn when you turn these on.");
+    ArcMenuLayout::Checkbox("Draw World Mesh Triangles", &UpgradeOptions::collisionDebugShapes);
+    ArcMenuHoverTooltip(
+        "Draw white wireframe triangles for the Embree collision scene.");
+    ArcMenuLayout::Checkbox("Draw Obstruction Shapes", &UpgradeOptions::visDebugObstructions);
+    ArcMenuHoverTooltip(
+        "Draw orange wireframe boxes/spheres for active smokes and barriers.");
+    ArcMenuLayout::Checkbox("Draw Raycast Lines", &UpgradeOptions::collisionDebugRays);
+    ArcMenuHoverTooltip(
+        "Draw each camera-to-bone ray. Green = clear, red = blocked.");
+    ArcMenuLayout::Checkbox("Draw Hit Markers", &UpgradeOptions::collisionDebugHitMarkers);
+    ArcMenuHoverTooltip(
+        "Show a red dot where blocked rays stop.");
+    ArcMenuLayout::SliderFloat("Debug Draw Radius", "##vis_dbg_rad",
+        &UpgradeOptions::collisionDebugRadiusM, 10.f, 200.f, "%.0f m");
+    ArcMenuHoverTooltip("Only draw debug shapes/rays within this many metres of the camera.");
+    ImGui::SliderInt("Max Raycast Lines", &UpgradeOptions::collisionDebugMaxRays, 1, 256);
+    ArcMenuHoverTooltip("Cap on how many ray lines are drawn per frame. Lower = less clutter.");
+    ImGui::SliderInt("Debug Triangle Cap", &UpgradeOptions::collisionDebugSceneTriCap, 500, 30000);
+    ArcMenuHoverTooltip("Cap on how many scene triangles the wireframe overlay draws per frame.");
+
+    ImGui::Separator();
+    const bool visReady = EmbreeVis::g_visibility_meshes_ready.load(std::memory_order_acquire);
+    const int visMeshCount = EmbreeVis::g_last_mesh_actors.load(std::memory_order_relaxed);
+    const int visTriCount = EmbreeVis::g_last_triangles.load(std::memory_order_relaxed);
+    ArcMenuLayout::HoverableTextF("Scene status: %s  |  Meshes: %d  |  Triangles: %d",
+        visReady ? "Ready" : "Waiting / Building", visMeshCount, visTriCount);
+    ArcMenuHoverTooltip("Whether the wall scene finished building, and how many meshes/triangles it holds.");
+    if (ImGui::Button("Rebuild World Mesh Now")) {
+        EmbreeVis::RequestRebuildWorldMeshes();
+    }
+    ArcMenuHoverTooltip("Clear and rebuild the Embree world BVH on the next visibility tick.");
 }
 
 void DrawArcHelpGuideTab()
@@ -2199,17 +1821,14 @@ void DrawArcHelpGuideTab()
     ImGui::TextWrapped("Aimbot tab:");
     WrappedBulletText(
         "Overlay crosshair — screen-center paint-only reticle; style, color, size, gap, and spin RPM.");
-    WrappedBulletText("Enable aimbot (MAKCU or Net mouse) + Robot aim (bots even without Show robots).");
-    WrappedBulletText("Robot aim: cached heart point; separate ARC hold key and optional nearest cached component-point selection. No injected shake.");
-    WrappedBulletText("FOV, max distance, deadzone, aim hotkey (hold).");
-    WrappedBulletText(
-        "One shared motion preset and calibration for players and ARC. Hardware motion stops on target loss; legacy humanizer/grace motion is disabled. Optional random bone remains, off by default for new profiles.");
-    WrappedBulletText("Triggerbot sub-tab: auto-fire on target, deadzone, fire delay, hold/toggle modes.");
+    WrappedBulletText("Aimbot: hold the aim key to move the crosshair inside the selection circle; stop zone, speed, response and X/Y calibration are live.");
+    WrappedBulletText("ESP visibility colours can be toggled from the Aimbot tab.");
+    WrappedBulletText("Crosshair sub-tab: screen-center reticle style, colour, size, gap, and animation.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Settings tab:");
     WrappedBulletText("General sub-tab: DMA controller status; re-init controller / KmBox; overlay monitor; MAKCU (COM) or Net (IP/UUID) device settings.");
-    WrappedBulletText("Debug sub-tab: offset validation, near loot HUD, KmBox/config/gamepad status, engine cache/Aimbot runtime/Camera readouts.");
+    WrappedBulletText("Debug sub-tab: offset validation, near-loot HUD, KmBox/config/gamepad status, engine cache and camera readouts.");
 
     ImGui::Spacing();
     ImGui::TextWrapped("Other:");
@@ -2457,6 +2076,20 @@ void DrawArcSidebar(bool& menuOpen, bool& requestExit)
 
     if (ui.regularFont)
         ImGui::PopFont();
+
+    // Version stamp, very bottom of the sidebar, bottom-right and small.
+    ImGui::SetWindowFontScale(0.7f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.64f, 0.9f));
+    {
+        const char* ver = "v0.001";
+        const float tw = ImGui::CalcTextSize(ver).x;
+        const float avail = ImGui::GetContentRegionAvail().x;
+        if (avail > tw)
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - tw);
+        ImGui::TextUnformatted(ver);
+    }
+    ImGui::PopStyleColor();
+    ImGui::SetWindowFontScale(1.0f);
 
     {
         const ImVec2 wPos = ImGui::GetWindowPos();

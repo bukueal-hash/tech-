@@ -6,7 +6,7 @@
 /** Internal cache token when struct bot admitted but fname decrypt failed. */
 inline constexpr const char* kBotStructAdmissionToken = "Constructable";
 
-/** Constructable @0x1210 vs generic @0x1220 — shared by RobotList and aimbot. */
+/** Constructable @0x1210 vs generic @0x1220 — used by RobotList admission. */
 uint8_t ReadBotBrokenFlag(uintptr_t actor);
 
 /** Increment when RenderRobotEspFromFrame fails ResolveBotDrawLabel (debug overlay). */

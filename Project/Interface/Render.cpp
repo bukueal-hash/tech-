@@ -5,6 +5,7 @@
 #include <cfloat>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <shared_mutex>
@@ -18,7 +19,6 @@
 #include "Utils/UpgradeOptions.hpp"
 #include "Utils/Visuals/ThreatWarnings.hpp"
 #include "Utils/Visuals/SystemHud.hpp"
-#include "Overlay/AimbotDebugPanel.hpp"
 #include "../Input/KeyBind.h"
 #include "../Core/Engine.h"
 #include "../Core/AgentLog.h"
@@ -30,6 +30,8 @@
 #include "Utils/AutoConfig.h"
 #include "Utils/Visuals/visuals.hpp"
 #include "../Core/Offsets.h"
+#include "../Core/NameCrypto.hpp"
+#include "../Functions/AimMonitor.h"
 
 bool showmenu = false;
 bool requestExit = false;
@@ -68,6 +70,29 @@ static double s_allGreenAt = -1.0;
 // Record that a counter just went green (first time only, in green order).
 // Also writes a green_time event to the debug log so timings can be compared
 // across runs (same JSON envelope as red_row below).
+// Last world RVA that validated (defined in Functions/Utils.cpp).
+uint64_t LastValidatedWorldRva();
+
+// Called once when every debug counter is green: saves the offsets that produced
+// it to Data\validated_offsets.txt next to the exe, so the set is on record for
+// this game build. The world RVA is also loaded first on the next launch.
+static void SaveValidatedOffsetsSnapshot()
+{
+    wchar_t exePath[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH))
+        return;
+    const std::filesystem::path out =
+        std::filesystem::path(exePath).parent_path() / L"Data" / L"validated_offsets.txt";
+    std::ofstream f(out, std::ios::trunc);
+    if (!f)
+        return;
+    f << std::hex << std::uppercase
+      << "world_rva=0x" << LastValidatedWorldRva() << "\n"
+      << "gnames_rva=0x" << Offsets::GNamePoolRva << "\n"
+      << "keytable_rva=0x" << Offsets::FNameKeyTableRva << "\n"
+      << "keystream_rva=0x" << namecrypto::kRvaKeystream << "\n";
+}
+
 static void RecordGreen(const char* name, double appSec) {
     // Avoid duplicates: only add if the last entry isn't this same counter.
     if (!s_greenLog.empty() && s_greenLog.back().name == name)
@@ -102,7 +127,6 @@ static void HandleRaidHotkeys()
         { 'C', &var::show_crosshair },
         { 'M', &var::radar_map_mode },
         { 'G', &var::enable_world },
-        { 'T', &var::enable_triggerbot },
         { 'H', &var::show_raid_hud },
     };
     static bool wasDown[IM_ARRAYSIZE(kToggles)] = {};
@@ -192,14 +216,41 @@ void Render(HWND hwnd)
         if (UpgradeOptions::combatActive)
             ImGui::GetForegroundDrawList()->AddText(ImVec2(12.f, 12.f), IM_COL32(255, 190, 80, 255), "COMBAT MODE");
     }
-    // ESP/FOV/crosshair hide while the menu is open (menu readability). T4.4's
-    // practice reference is drawn here too, and returns immediately when the mode
-    // is off -- one call site, so the mode cannot leak into an unrelated path.
-    engine.RenderPracticeReference();
+    // Aim monitor runs outside the gate below: a blocked aim tick must still
+    // show up on disk (Build/aim_monitor.log).
+    engine.AimMonitorTick(raidActive, showmenu);
+    // Live on-screen aim monitor (Debug tab toggle): shown during a raid with
+    // the menu closed, right next to where the aim actually runs.
+    if (raidActive && !showmenu && UpgradeOptions::aimMonitorPanel) {
+        AimMonitor::Live live{};
+        AimMonitor::Snapshot(live);
+        if (ImDrawList* dl = ImGui::GetForegroundDrawList()) {
+            char l1[192];
+            char l2[224];
+            std::snprintf(l1, sizeof(l1),
+                "[aim] key=%s moves=%d/%d err=%s",
+                live.keyheld ? "HELD" : "idle",
+                live.moveOk, live.moveCount,
+                live.errPx < 0.0 ? "none" : (std::to_string(static_cast<int>(live.errPx + 0.5)) + "px").c_str());
+            std::snprintf(l2, sizeof(l2), "%s", live.status);
+            const ImVec2 p(12.f, 34.f);
+            const ImVec2 t1 = ImGui::CalcTextSize(l1);
+            const ImVec2 t2 = ImGui::CalcTextSize(l2);
+            const float w = (std::max)(t1.x, t2.x);
+            dl->AddRectFilled(ImVec2(p.x - 6.f, p.y - 4.f),
+                ImVec2(p.x + w + 6.f, p.y + t1.y + t2.y + 8.f),
+                IM_COL32(0, 0, 0, 170), 4.f);
+            const ImU32 keyCol = live.keyheld ? IM_COL32(120, 255, 120, 255)
+                                              : IM_COL32(255, 255, 255, 220);
+            dl->AddText(p, keyCol, l1);
+            dl->AddText(ImVec2(p.x, p.y + t1.y + 4.f), IM_COL32(170, 200, 255, 235), l2);
+        }
+    }
+    // ESP and crosshair hide while the menu is open (menu readability).
     if (raidActive && !showmenu) {
-        engine.RenderFovCircle();
         engine.RenderOverlayCrosshair();
         engine.RenderEsp();
+        engine.RunAimAssist();
     }
 
     if (raidActive) {
@@ -231,9 +282,6 @@ void Render(HWND hwnd)
     if (var::show_debug_overlay && !showmenu)
         DrawDebugOffsetValidation(engine);
     
-    // Aimbot debug monitor panel (renders when visible)
-    if (OverlayUI::AimbotDebugPanel::IsVisible())
-        OverlayUI::AimbotDebugPanel::Render();
 
     if (requestExit) {
         AutoConfig_SaveNow();
@@ -271,7 +319,7 @@ static void DrawDebugOffsetValidation(Engine& eng)
     static auto s_lastHeavy = std::chrono::steady_clock::time_point{};
     const auto nowHeavy = std::chrono::steady_clock::now();
     if (s_lastHeavy.time_since_epoch().count() == 0
-        || nowHeavy - s_lastHeavy >= std::chrono::milliseconds(500)) {
+        || nowHeavy - s_lastHeavy >= std::chrono::milliseconds(250)) {
         const auto t0 = std::chrono::steady_clock::now();
         int64_t msState = 0, msFrame = 0, msPlayer = 0, msWorld = 0, msRobot = 0, msCam = 0;
         int gotState = 0, gotFrame = 0, gotPlayer = 0, gotWorld = 0, gotRobot = 0, gotCam = 0;
@@ -810,6 +858,7 @@ static void DrawDebugOffsetValidation(Engine& eng)
             if (all) {
                 s_allGreenAt = appSec;
                 RecordGreen("ALL_GREEN", appSec);
+                SaveValidatedOffsetsSnapshot();
             }
         }
         char appLine[64];
@@ -874,9 +923,6 @@ static void DrawDebugOffsetValidation(Engine& eng)
         drawRow(xPos, row++, "SkeletalMesh", ok, "0x%llX", (unsigned long long)Offsets::USkeletalMeshComponent);
         drawRow(xPos, row++, "MeshAsset", ok, "0x%llX", (unsigned long long)Offsets::SkeletalMeshAsset);
         drawRow(xPos, row++, "BoundsScale", ok, "0x%llX", (unsigned long long)Offsets::BoundsScale);
-        drawRow(xPos, row++, "LastRender", ok, "0x%llX", (unsigned long long)Offsets::LastRenderTime);
-        drawRow(xPos, row++, "LastRenderScr", ok, "0x%llX", (unsigned long long)Offsets::LastRenderTimeOnScreen);
-        drawRow(xPos, row++, "IsRendered", ok, "0x%llX", (unsigned long long)Offsets::IsRenderedTime);
         drawRow(xPos, row++, "ActorID", ok, "0x%llX", (unsigned long long)Offsets::ActorID);
         drawRow(xPos, row++, "LootInteract", ok, "0x%llX", (unsigned long long)Offsets::LootInteractionComponent);
         drawRow(xPos, row++, "LootSearched", ok, "0x%llX", (unsigned long long)Offsets::LootInteraction_Searched);
@@ -886,15 +932,6 @@ static void DrawDebugOffsetValidation(Engine& eng)
         drawRow(xPos, row++, "IsBreaked", ok, "0x%llX", (unsigned long long)Offsets::bIsBreaked);
         drawRow(xPos, row++, "Inventory", ok, "0x%llX", (unsigned long long)Offsets::InventoryComponent);
 
-        const Engine::HumanizerDebugState humanizer = eng.GetHumanizerDebug();
-        const char* phase = !humanizer.valid ? "retired"
-            : humanizer.phase == 1 ? "react"
-            : humanizer.phase == 2 ? "settle"
-            : humanizer.phase == 3 ? "held" : "retired";
-        drawRow(xPos, row++, "Humanizer", true,
-            "phase=%s offset=(%.2f,%.2f) limiter=%s",
-            phase, humanizer.injectedX, humanizer.injectedY,
-            humanizer.limiterActive ? "ACTIVE" : "off");
     }
 }
 

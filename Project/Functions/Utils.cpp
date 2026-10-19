@@ -2,6 +2,8 @@
 #include "../Interface/Utils/UpgradeOptions.hpp"
 #include "../Core/AgentLog.h"
 #include "../Core/StringUtils.hpp"
+#include "../Core/ResolvedCache.hpp"
+#include "../Core/ArcDecryptBuild2.hpp"
 #include <cmath>
 #include <immintrin.h>
 #include <cstring>
@@ -9,6 +11,8 @@
 #include <algorithm>
 #include <chrono>
 #include <map>
+#include <atomic>
+#include <mutex>
 #include <sstream>
 #include <unordered_set>
 #include <unordered_map>
@@ -31,6 +35,10 @@
 #include "../Interface/OverlayHost.h"
 
 #include <atomic>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <string>
 #include <thread>
 #include <type_traits>
 
@@ -373,32 +381,19 @@ void Engine::SetProjectionViewport(float width, float height)
 	}
 }
 
-Vector3 Engine::GetProjectionScreenCenter() const
-{
-	const float w = g_projViewportW.load(std::memory_order_relaxed);
-	const float h = g_projViewportH.load(std::memory_order_relaxed);
-	return Vector3{
-		static_cast<double>(w) * 0.5,
-		static_cast<double>(h) * 0.5,
-		0.0};
-}
 
-bool Engine::ProjectWorldLocationToScreen(
-	Vector3 WorldLocation,
+static bool ProjectWorldLocationToScreenImpl(
+	const Vector3& WorldLocation,
 	Vector3& screen,
-	const CameraCache& CameraInfo
-)
+	const Engine::CameraCache& CameraInfo,
+	bool clipToViewport)
 {
 	const double overlayW = static_cast<double>(
 		g_projViewportW.load(std::memory_order_relaxed));
 	const double overlayH = static_cast<double>(
 		g_projViewportH.load(std::memory_order_relaxed));
-	// T4.5: the FOV axis is a setting, not an assumption. Vertical (the default)
-	// is the reading this projection has always used, so nothing moves unless the
-	// user asks for the horizontal reading that the aim cone already uses.
-	const EngineProjection::FovAxis axis = UpgradeOptions::fovAxisHorizontal
-		? EngineProjection::FovAxis::Horizontal
-		: EngineProjection::FovAxis::Vertical;
+	// Vertical FOV is the reading this projection has always used.
+	const EngineProjection::FovAxis axis = EngineProjection::FovAxis::Vertical;
 	return EngineProjection::ProjectWorldLocationToScreen(
 		WorldLocation,
 		screen,
@@ -407,7 +402,26 @@ bool Engine::ProjectWorldLocationToScreen(
 		CameraInfo.FOV,
 		overlayW,
 		overlayH,
-		axis);
+		axis,
+		clipToViewport);
+}
+
+bool Engine::ProjectWorldLocationToScreen(
+	Vector3 WorldLocation,
+	Vector3& screen,
+	const CameraCache& CameraInfo
+)
+{
+	return ProjectWorldLocationToScreenImpl(WorldLocation, screen, CameraInfo, true);
+}
+
+bool Engine::ProjectWorldLocationToScreenUnclipped(
+	Vector3 WorldLocation,
+	Vector3& screen,
+	const CameraCache& CameraInfo
+)
+{
+	return ProjectWorldLocationToScreenImpl(WorldLocation, screen, CameraInfo, false);
 }
 
 bool Engine::ProjectWorldLocationToScreen(
@@ -1795,7 +1809,7 @@ uintptr_t Engine::GetCameraManagerFromActors(uintptr_t worldOverride,
 bool Engine::getAllowType(const std::string& actorName, int category) const
 {
     // Radar-only mode must admit bots too (scanner already gates on show_radar).
-    const bool wantBots = var::showRobots || var::robotAimEnabled || var::show_radar;
+    const bool wantBots = var::showRobots || var::show_radar;
 
     if (robotsList.find(actorName) != robotsList.end())
         return wantBots;
@@ -1911,51 +1925,255 @@ std::string Engine::GetWeaponName(const std::string& internal_name) {
 
     const std::string stripped = StripWeaponAssetName(internal_name);
 
-    static const std::unordered_map<std::string, std::string> processMap = {     
-        { "Pneumatic_01",                     "Kettle" },
-        { "AssaultRifle_LowTier_01",           "Rattler" },
-        { "Burst_01",                          "Arpeggio" },
-        { "Heavy_01",                          "Bettina" },
-        { "AssaultRifle_Bullpup_01_C",         "Tempest" },
-        { "SMG_LowTier_01",                    "Stitcher" },
-        { "SMG_02",                            "Bobcat" },
-        { "PumpAction_01",                     "Il Toro" },
-        { "Shotgun_SemiAuto_01",               "Vulcano" },
-        { "Sniper_BoltAction_01",              "Osprey" },
-        { "Sniper_Energy_01",                  "Jupiter" },
-        { "Pistol_Silenced_01",                "Hairpin" },
-        { "Pistol_01",                         "Burletta" },
-        { "SingleAction_01",                   "Anvil" },
-        { "Pistol_HighPower_01",               "Venator" },
-        {"Pistol_SemiAuto_02",                  "Venator"},
-        { "LMG_Standard_01",                   "Torrente" },
-        { "BreachAction_01",                   "Ferro" },
-        { "LeverAction_01",                    "Renegade" },
-        { "AssaultRifle_Bullpup_01",           "Arpeggio" },
-        { "Launcher_AntiArc_Medium_01_C",      "Hullcracker" },
-        { "Launcher_AntiArc_Medium_01",        "Hullcracker" },
-        { "Launcher_AntiArc_SingleShot_01",    "Rascal" },
-        { "LMG_Medium_01",                     "Torrente" },
-        { "Special_BeamRifle_01",              "Equalizer" },
-        { "Beam_01",                           "Equalizer"},
-        { "SniperRifle_BoltAction_Medium_01",  "Osprey" },
+    static const std::unordered_map<std::string, std::string> processMap = {
+                { "AssaultRifle_Bullpup_01",            "Tempest"       },
+                { "AssaultRifle_Bullpup_01_C",          "Tempest"       },
+                { "AssaultRifle_Burst_01",              "Arpeggio"      },
+                { "Burst_01",                           "Arpeggio"      },
+                { "AssaultRifle_LowTier_01",            "Rattler"       },
+                { "AssaultRifle_Pneumatic_01",          "Kettle"        },
+                { "Pneumatic_01",                       "Kettle"        },
+                { "AssaultRifle_Heavy_01",              "Bettina"       },
+                { "Heavy_01",                           "Bettina"       },
 
-        { "BasicMeleeWeapon",                  "Melee" },
-        { "HealingHoT_Small",                  "Bandage" },
-        { "HealingHoT_Improvised",             "Herbal Bandage" },
-        { "HealingHoT_Sterilized",             "Sterilized Bandage" },
-        { "AdrenalineShot",                    "Adrenaline Shot" },
-        { "Consumable_ShieldOverTimePack",     "Shield Recharger" },
-        { "Armor_Patcher",                     "Surge Shield Recharger" },
-        { "ShieldOverTimePack",                "Shield Recharger" },
-        { "Defibrillator",                     "Defibrillator" },
-        { "JumpMine_Impulse",                  "Impulse Mine" },
-        { "SmokeGrenade",                      "Smoke Grenade" },
-        { "ScatterMissileGrenade",             "Wolfpack Grenade" },
-        { "StunGrenade",                       "Showstopper Grenade" },
-        { "FragGrenade",                       "Frag Grenade" },
-        { "GasGrenade",                        "Gas Grenade" },
-        { "LightGrenade",                      "Light Stick" },
+                { "BattleRifle_BreachAction_01",        "Ferro"         },
+                { "BreachAction_01",                    "Ferro"         },
+                { "BattleRifle_EnergyBurst_01",         "Jupiter"       },
+                { "Sniper_Energy_01",                   "Jupiter"       },
+                { "Special_Railgun_01",                 "Jupiter"       },
+                { "BattleRifle_LeverAction_01",         "Renegade"      },
+                { "LeverAction_01",                     "Renegade"      },
+
+                { "LMG_Medium_01",                      "Torrente"      },
+                { "LMG_Standard_01",                    "Torrente"      },
+
+                { "SMG_01",                             "Bobcat"        },
+                { "SMG_02",                             "Bobcat"        },
+                { "SMG_LowTier_01",                     "Stitcher"      },
+                { "SMG_Medium_01",                      "Canto"         },
+
+                { "Shotgun_Energy_Adjustable_01",       "Dolabra"       },
+                { "Shotgun_PumpAction_01",              "Il Toro"       },
+                { "PumpAction_01",                      "Il Toro"       },
+                { "Shotgun_SemiAuto_01",                "Vulcano"       },
+
+                { "SniperRifle_BoltAction_Medium_01",   "Osprey"        },
+                { "Sniper_BoltAction_01",               "Osprey"        },
+
+                { "Launcher_AntiArc_Medium_01",         "Hullcracker"   },
+                { "Launcher_AntiArc_Medium_01_C",       "Hullcracker"   },
+                { "Special_BeamRifle_01",               "Equalizer"     },
+                { "Beam_01",                            "Equalizer"     },
+
+                { "HandCannon_SingleAction_01",         "Anvil"         },
+                { "SingleAction_01",                    "Anvil"         },
+                { "Pistol_01",                          "Burletta"      },
+                { "Pistol_HighPower_01",                "Venator"       },
+                { "Pistol_SemiAuto_02",                 "Venator"       },
+                { "Pistol_Silenced_01",                 "Hairpin"       },
+
+                { "BasicMeleeWeapon",                   "Pickaxe"       },
+                { "UnarmedItem",                        "Unarmed"       },
+
+                { "BasicStickyGrenade",                 "Snap Blast"    },
+                { "DoTGrenade",                         "Blaze Trap"    },
+                { "HEGrenade",                          "Heavy Fuze"    },
+                { "HomingMissileGrenade",               "Seeker Grenade"},
+                { "ImpactGrenade_Small",                "Fireball"      },
+                { "Throwable_ImpactGrenade_Small",      "Fireball"      },
+                { "JoltMine",                           "Jolt Mine"     },
+                { "JumpMine_Explosive",                 "Explosive Mine"},
+                { "Deployable_JumpMine_Explosive",      "Explosive Mine"},
+                { "JumpMine_Impulse",                   "Pulse Mine"    },
+                { "JumpMine_StaminaDoT",                "Gas Mine"      },
+                { "LaserTrap",                          "Laser Trap"    },
+                { "LaserTrap_DoTGrenade",               "Blaze Trap"    },
+                { "LaserTrap_SmokeGrenade",             "Smoke Trap"    },
+                { "Mortar",                             "Mortar"        },
+                { "ScatterMissileGrenade",              "Wolfpack Grenade"},
+                { "SmokeGrenade",                       "Smoke Grenade" },
+                { "StaminaDoTGrenade",                  "Stamina Gas"   },
+                { "StickyRemoteGrenade",                "Trigger Nade"  },
+                { "StunGrenade",                        "Showstopper"   },
+                { "TaggingGrenade",                     "Tagging Grenade"},
+                { "Throwable_TaggingGrenade",           "Tagging Grenade"},
+                { "ThrowableDecoy",                     "Decoy"         },
+                { "Throwable_ShrapnelGrenade",          "Shrapnel"      },
+                { "Throwable_Trailblazer",              "Trailblazer"   },
+                { "TimedMine_Explosive",                "Deadline"      },
+
+                { "AdrenalineShot",                     "Adrenaline Shot"},
+                { "AdrenalinShot",                      "Adrenaline"    },
+                { "HealingHoT_Improvised",              "Herbal Bandage"},
+                { "HealingHoT_Small",                   "Bandage"       },
+                { "HealingHoT_Medium",                  "Sterilized Bandage"},
+                { "HealthSpray",                        "Vita Spray"    },
+                { "HealthPack_01",                      "Health Pack"   },
+                { "Consumable_ShieldOverTimePack",      "Shield Recharge"},
+                { "ShieldOverTimePack",                 "Shield Recharger"},
+                { "Defibrillator",                      "Defib"         },
+
+                { "ARCFriendifierV2",                   "Photo Cloak"   },
+                { "Armorpack",                          "Surge Shield"  },
+                { "DeployableBarricade",                "Barricade"     },
+                { "DoorBlocker",                        "Door Blocker"  },
+                { "Snaphook",                           "Snap Hook"     },
+                { "Zipline",                            "Zipline"       },
+
+                { "Salvage_ExplosiveMixture",           "Explosives"    },
+                { "Salvage_Fabric",                     "Fabric"        },
+                { "Salvage_Hornetflamethrower_Part",    "Flamethrower Part"},
+                { "Salvage_Mat_ARC_Core",               "ARC Core"      },
+                { "Salvage_Mat_Hornet_Part",            "Hornet Part"   },
+                { "Salvage_SynthesizedFuel",            "Fuel"          },
+
+                { "Salvage_Trinket_DogCollar",          "Dog Collar"    },
+                { "Salvage_PortableTV",                 "Portable TV"   },
+                { "Salvage_Projector",                  "Projector"     },
+                { "Salvage_Wires",                      "Wires"         },
+                { "Salvage_DuctTape",                   "Duct Tape"     },
+                { "Salvage_SheetMetal",                 "Sheet Metal"   },
+                { "Salvage_Magnet",                     "Magnet"        },
+                { "Salvage_MagneticAccelerator",        "Magnet Accelerator"},
+                { "Salvage_FootballShoes",              "Football Shoes"},
+                { "Salvage_FrequencyModulationBox",     "Freq. Mod. Box"},
+                { "Salvage_DamagedHeatSink",            "Heat Sink"     },
+                { "Salvage_GeigerCounter",              "Geiger Counter"},
+                { "Salvage_MusicAlbum",                 "Music Album"   },
+                { "Salvage_TurboPump",                  "Turbo Pump"    },
+                { "Salvage_RocketThruster",             "Rocket Thruster"},
+                { "Salvage_FrozenTrailTech",            "Frozen Trail Tech"},
+                { "Salvage_FrozenTrailMechanical",      "Frozen Trail Mech."},
+                { "Salvage_RemoteControl",              "Remote Control"},
+                { "Salvage_SteelSpring",                "Steel Spring"  },
+                { "Salvage_Pottery",                    "Pottery"       },
+                { "Salvage_PowerCable",                 "Power Cable"   },
+                { "Salvage_Trinket_DeflatedFootball",   "Deflated Football"},
+                { "Salvage_FineWristwatch",             "Fine Wristwatch"},
+                { "Salvage_Battery",                    "Battery"       },
+                { "Salvage_VintageSteeringWheel",       "Steering Wheel"},
+                { "Salvage_OldBook",                    "Old Book"      },
+                { "Salvage_Headphones",                 "Headphones"    },
+                { "Salvage_PowerBank",                  "Power Bank"    },
+                { "Salvage_TrainModel",                 "Train Model"   },
+                { "Salvage_Radio",                      "Radio"         },
+                { "Salvage_AdvancedElectricalComponents","Adv. Electrical Components"},
+                { "Salvage_Canister",                   "Canister"      },
+                { "Salvage_RubberPad",                  "Rubber Pad"    },
+                { "Salvage_Humidifier",                 "Humidifier"    },
+                { "Salvage_DeskLamp",                   "Desk Lamp"     },
+                { "Salvage_BureauDeskLamp",             "Bureau Lamp"   },
+                { "Salvage_ArchiveDeskLamp",            "Archive Lamp"  },
+                { "Salvage_Oil",                        "Oil"           },
+                { "Salvage_FlowController",             "Flow Controller"},
+                { "Salvage_ExodusBook",                 "Exodus Book"   },
+                { "Salvage_Trinket_AirFreshener",       "Air Freshener" },
+                { "Salvage_RustedTools",                "Rusted Tools"  },
+                { "Salvage_Coolant",                    "Coolant"       },
+
+                { "HeavyAmmo",                          "Heavy Ammo"    },
+                { "MediumAmmo",                         "Medium Ammo"   },
+                { "LightAmmo",                          "Light Ammo"    },
+                { "ShotgunAmmo",                        "Shotgun Ammo"  },
+                { "LauncherAmmo",                       "Launcher Ammo" },
+
+                { "Augment_Looting_FreeLoadout",        "Free Loadout"  },
+                { "OutpostFurnitureRecipe",             "Furniture Recipe"},
+
+                { "ExtractionPoint_Metro",              "METRO STATION [EXIT]"   },
+                { "ExtractionPoint_Hatch",              "HATCH [KEY REQUIRED]"   },
+
+                { "MedicalBag",                         "MEDICAL BAG"   },
+                { "Backpack",                           "BACKPACK"      },
+                { "Suitcase",                           "SUITCASE"      },
+                { "Res_Suitcase",                       "SUITCASE"      },
+                { "Dumpster",                           "DUMPSTER"      },
+                { "SalvageContainer",                   "LOOT"          },
+                { "SocketContainer",                    "LOOTABLE OBJ"  },
+
+                { "AmmoBox",                            "Ammo Box"      },
+                { "WeaponCase",                         "Weapon Case"   },
+                { "GrenadeContainer",                   "GRENADE BOX"   },
+                { "WeaponsRack",                        "WEAPONS RACK"  },
+
+                { "Car_01",                             "CAR"           },
+                { "Car_02",                             "CAR"           },
+                { "Bus_Lid",                            "BUS"           },
+                { "TruckUtility",                       "UTILITY TRUCK" },
+                { "TrailerCompressor",                  "TRAILER COMPRESSOR"},
+                { "Rover_01",                           "ROVER"         },
+                { "StreetSweeper",                      "STREET SWEEPER"},
+                { "TruckScanner",                       "TRUCK SCANNER" },
+
+                { "Lockers",                            "LOCKERS"       },
+                { "LockerMedical",                      "MEDICAL LOCKER"},
+                { "Drawers",                            "DRAWERS"       },
+                { "Drawer",                             "DRAWER"        },
+                { "Res_Drawer",                         "DRAWER"        },
+                { "Cabinet",                            "CABINET"       },
+                { "TrolleyTools",                       "TOOL TROLLEY"  },
+                { "Wrh_TrolleyTools",                   "TOOL TROLLEY"  },
+                { "BinTrash",                           "TRASH"         },
+                { "Trashcan",                           "TRASH CAN"     },
+                { "Desk_01",                            "DESK"          },
+                { "Gvt_Desk",                           "OFFICE DESK"   },
+                { "Refrigerator",                       "FRIDGE"        },
+                { "Freezer",                            "FREEZER"       },
+                { "Fridge_L",                           "LARGE FRIDGE"  },
+                { "Generator",                          "GENERATOR"     },
+                { "Server",                             "SERVER"        },
+                { "Server_01",                          "SERVER RACK"   },
+                { "Gvt_Server",                         "SERVER RACK"   },
+                { "BirdNest",                           "BIRD NEST"     },
+                { "SolarPanelHatch",                    "SOLAR PANEL"   },
+                { "Workbench",                          "WORKBENCH"     },
+                { "FuseBox",                            "FUSE BOX"      },
+                { "ElectricalCabinet",                  "ELEC. CABINET" },
+                { "FruitBasket",                        "FRUIT BASKET"  },
+                { "CartShelf",                          "SHELF CART"    },
+                { "CenterBench",                        "CENTER BENCH"  },
+
+                { "BenchKitchen",                       "KITCHEN BENCH" },
+                { "Res_BenchKitchen",                   "KITCHEN BENCH" },
+                { "CupboardKitchen",                    "KITCHEN CUPBOARD"},
+                { "CupboardCafe",                       "CAFE CUPBOARD" },
+                { "CashRegister",                       "CASH REGISTER" },
+
+                { "Res_Closet",                         "CLOSET"        },
+                { "TvUnit",                             "TV STAND"      },
+
+                { "Crate_S",                            "SMALL CRATE"   },
+                { "Crate_M",                            "MEDIUM CRATE"  },
+                { "Crate_L",                            "LARGE CRATE"   },
+                { "Sct_Crate",                          "SECURITY CRATE"},
+                { "MuseumCrate",                        "MUSEUM CRATE"  },
+                { "Wrh_Container_M",                    "MEDIUM CONTAINER"},
+                { "Wrh_Container_L",                    "LARGE CONTAINER"},
+                { "Cmr_Lid",                            "CONTAINER LID" },
+
+                { "WallAdd",                            "WALL PANEL"    },
+                { "WallAdd_L_01_A_LargePanel",          "WALL PANEL (LARGE)"},
+                { "WallAdd_S_01_A_PanelSmall",          "WALL PANEL (SMALL)"},
+                { "Wrh_WallAdd_M",                      "WALL PANEL (MED)"},
+                { "Wrh_WallAdd_L",                      "WALL PANEL (LARGE)"},
+                { "Gvt_Machine_M_04",                   "LARGE MACHINE PANEL"},
+
+                { "Computer",                           "COMPUTER"      },
+                { "Gvt_Computer",                       "COMPUTER STATION"},
+                { "InformationTerminal",                "INFO TERMINAL" },
+                { "Console_03",                         "CONTROL CONSOLE"},
+                { "Coms_Console",                       "COMS CONSOLE"  },
+                { "VAU_SeedConsole",                    "SEED CONSOLE"  },
+
+                { "Machine_M_02",                       "INDUSTRIAL MACHINE"},
+                { "Android_01",                         "ANDROID CHASSIS"},
+                { "Rocketparts",                        "ROCKET PARTS"  },
+
+                { "Apricot",                            "APRICOT (PLANT)"},
+                { "Agave",                              "AGAVE (PLANT)" },
+                { "Lemon",                              "LEMON (BUSH)"  },
+                { "Moss",                               "MOSS (HARVEST)"},
+                { "GreatMullein",                       "MULLEIN (PLANT)"},
     };
 
     if (auto it = processMap.find(internal_name); it != processMap.end()) {
@@ -2727,7 +2945,31 @@ int Engine::ReadCrateContents(uintptr_t actor, CrateContents::Stack* out, int ca
 
 std::string Engine::GetActorFNameString(uint64_t actor_base)
 {
-    return steam_decrypt::GetActorFNameString(actor_base);
+    std::string name = steam_decrypt::GetActorFNameString(actor_base);
+    if (!name.empty())
+        return name;
+
+    // Fallback: decode the ArcFName pool directly (ArcDecryptBuild2.hpp).
+    // Accepted only as a plain identifier, so a wrong offset yields "" rather
+    // than garbage text.
+    static ArcFName::State arcState;
+    static std::atomic<bool> arcReady{false};
+    static std::mutex arcInitMutex;
+    if (!arcReady.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(arcInitMutex);
+        if (!arcReady.load(std::memory_order_relaxed)
+            && ArcFName::Initialize(arcState, Memory::getBaseAddress(), &steam_decrypt::MemRead))
+            arcReady.store(true, std::memory_order_release);
+    }
+    if (!arcReady.load(std::memory_order_acquire))
+        return {};
+
+    name = ArcFName::GetObjectName(arcState, actor_base);
+    for (const char c : name) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
+            return {};
+    }
+    return name;
 }
 
 int32_t Engine::GetActorFNameId(uint64_t actor_base)
@@ -3718,10 +3960,79 @@ ActivityFeed::Feed Engine::GetActivityFeed() const
 // it. help/sdk.txt: PL @ 0x120, LevelCollections[i]+0x20, Levels[].
 // ═════════════════════════════════════════════════════════════════════════════
 
+// Last world-slot RVA that validated, saved to Data\world_rva.txt next to the exe.
+// The next launch tries it before the compiled-in candidates.
+static std::atomic<uint64_t> s_worldRvaSaved{ 0 };
+
+static uint64_t LoadWorldRvaCache()
+{
+    const std::string text = ResolvedCache::Get("world_rva");
+    if (text.empty())
+        return 0;
+    try {
+        const uint64_t rva = std::stoull(text, nullptr, 0);
+        return (rva >= 0x1000 && rva < 0x40000000ULL) ? rva : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+uint64_t LastValidatedWorldRva()
+{
+    return s_worldRvaSaved.load(std::memory_order_acquire);
+}
+
+// GameInstance rung that last proved the GI, pinned in Data\resolved.ini
+// ("gi_rung"). The next launch tries that rung before the ladder, so a GI that
+// was already found does not walk every rung again.
+static std::atomic<int> s_giRungSaved{ 0 };
+
+PlayerChain::Rung LoadPinnedGiRung()
+{
+    static const PlayerChain::Rung s_pinned = [] {
+        const std::string text = ResolvedCache::Get("gi_rung");
+        if (text.empty())
+            return PlayerChain::Rung::None;
+        try {
+            const auto r = static_cast<PlayerChain::Rung>(std::stoi(text, nullptr, 0));
+            if (!PlayerChain::IsPinnableGiRung(r))
+                return PlayerChain::Rung::None;
+            s_giRungSaved.store(static_cast<int>(r), std::memory_order_release);
+            return r;
+        } catch (...) {
+            return PlayerChain::Rung::None;
+        }
+    }();
+    return s_pinned;
+}
+
+void RememberPinnedGiRung(PlayerChain::Rung rung)
+{
+    if (!PlayerChain::IsPinnableGiRung(rung))
+        return;
+    const int value = static_cast<int>(rung);
+    if (s_giRungSaved.load(std::memory_order_acquire) == value)
+        return;
+    s_giRungSaved.store(value, std::memory_order_release);
+    ResolvedCache::Put("gi_rung", std::to_string(value));
+}
+
+static void RememberWorldRva(std::ptrdiff_t rva)
+{
+    const uint64_t value = static_cast<uint64_t>(rva);
+    if (s_worldRvaSaved.load(std::memory_order_acquire) == value)
+        return;
+    s_worldRvaSaved.store(value, std::memory_order_release);
+    char hex[32];
+    std::snprintf(hex, sizeof(hex), "0x%llX", static_cast<unsigned long long>(value));
+    ResolvedCache::Put("world_rva", hex);
+}
+
 uintptr_t Engine::ReadWorldSlot(uint64_t base)
 {
     if (!base)
         return 0;
+    static const uint64_t s_cachedRva = LoadWorldRvaCache();
     // Bypass the VMM page cache - a stale GWorld slot blocks raid re-entry until
     // the exe is restarted.
     auto rawSlot = [base](std::ptrdiff_t rva) -> uintptr_t {
@@ -3739,16 +4050,27 @@ uintptr_t Engine::ReadWorldSlot(uint64_t base)
         const uintptr_t inner = WorldSlotInner(slot);
         return inner != 0 && ResolvePersistentLevel(inner) != 0;
     };
-    // Primary GWorld global for the current build.
-    const uintptr_t primary = rawSlot(Offsets::UWorld);
-    if (slotLeadsToWorld(primary))
-        return primary;
-    // Fallback: the adjacent build's GWorld global, probed only when the primary
-    // slot leads to no live UWorld. The literal primary value is preserved for
-    // the overlay when neither resolves.
-    const uintptr_t alt = rawSlot(Offsets::UWorld_Alt);
-    if (slotLeadsToWorld(alt))
-        return alt;
+    // Candidate order: the RVA that validated last run, then the compiled-in
+    // primary GWorld global, then the adjacent build's global. Each candidate is
+    // accepted only when its slot leads to a live UWorld.
+    const std::ptrdiff_t candidates[] = {
+        static_cast<std::ptrdiff_t>(s_cachedRva),
+        Offsets::UWorld,
+        Offsets::UWorld_Alt,
+    };
+    uintptr_t primary = 0;
+    for (std::ptrdiff_t rva : candidates) {
+        if (!rva)
+            continue;
+        const uintptr_t slot = rawSlot(rva);
+        if (rva == Offsets::UWorld && !primary)
+            primary = slot;
+        if (slotLeadsToWorld(slot)) {
+            RememberWorldRva(rva);
+            return slot;
+        }
+    }
+    // Neither resolves: keep the literal primary value for the overlay.
     return primary;
 }
 
@@ -4194,6 +4516,10 @@ void Engine::ResolvePlayerChain(uint64_t base, const PlayerChain::Seed& seed,
     LadderHost host{ *this, base };
     PlayerChain::State st;
     PlayerChain::Resolve(st, host, seed);
+    // Pin the GI rung that just proved the GameInstance (no-op unless it is a
+    // pinnable rung that differs from what is already saved).
+    if (st.Ok(PlayerChain::Hop::GameInstance))
+        RememberPinnedGiRung(st.RungOf(PlayerChain::Hop::GameInstance));
 
     outActors = host.actors;
     outActorCount = host.actorCount;

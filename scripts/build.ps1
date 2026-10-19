@@ -682,17 +682,27 @@ if (-not $RunOnly) {
         '(?i)(chatgpt[ _-]?image|copy of|untitled)',
         '/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.'
     )
-    if (Get-Command git -ErrorAction SilentlyContinue) {
-        $tracked = @(& git ls-files 2>$null)
-        $junk = @()
-        foreach ($f in $tracked) {
-            foreach ($pat in $junkPatterns) {
-                if ($f -match $pat) { $junk += $f; break }
+    # Skip the check outside a git repo (ErrorActionPreference is Stop, so git's
+    # stderr there would otherwise abort the script). The hygiene check is advisory.
+    try {
+        $inRepo = $false
+        if (Get-Command git -ErrorAction SilentlyContinue) {
+            $inRepo = ((& git rev-parse --is-inside-work-tree 2>$null) -eq 'true')
+        }
+        if ($inRepo) {
+            $tracked = @(& git ls-files 2>$null)
+            $junk = @()
+            foreach ($f in $tracked) {
+                foreach ($pat in $junkPatterns) {
+                    if ($f -match $pat) { $junk += $f; break }
+                }
+            }
+            if ($junk.Count -gt 0) {
+                Write-Warning ("Tracked junk files (not build outputs):`n  - " + ($junk -join "`n  - "))
             }
         }
-        if ($junk.Count -gt 0) {
-            Write-Warning ("Tracked junk files (not build outputs):`n  - " + ($junk -join "`n  - "))
-        }
+    } catch {
+        Write-Host "[i] Skipped tracked-file hygiene check: $($_.Exception.Message)"
     }
 
 }

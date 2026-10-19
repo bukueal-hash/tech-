@@ -66,10 +66,14 @@ bool MyMakcu::Initialize() {
     return g_device.connect(g_portNormalized);
 }
 
-void MyMakcu::Move(int x, int y) {
+bool MyMakcu::Move(int x, int y) {
     if (!g_device.isConnected())
-        return;
-    g_device.mouseMove(ClampMoveDelta(x), ClampMoveDelta(y));
+        return false;
+    return g_device.mouseMove(ClampMoveDelta(x), ClampMoveDelta(y));
+}
+
+bool MyMakcu::IsConnected() {
+    return g_device.isConnected();
 }
 
 void MyMakcu::LeftClick() {

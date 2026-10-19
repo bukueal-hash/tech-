@@ -12,6 +12,7 @@
 #include "../Core/BotTypes.h"
 #include "../Core/IntervalTimer.h"
 #include "../Core/ReadBudget.hpp"
+#include "../Core/EmbreeVisCheck.hpp"
 #include "../Core/WorldItemCategory.h"
 #include "RobotList.h"
 #include "WorldScanCommon.h"
@@ -568,9 +569,12 @@ static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point>
 
 // P6b: 8-slice rotating admission ring. Full prune + retain still run every
 // pass; only the expensive admission DMA probes are banded. Positions stay
-// hot via PositionRefreshPass @16ms. 8 slices (was 4) halves reads/pass so
-// the shared DMA link lets the 8ms camera thread keep cadence.
-static constexpr size_t kAdmitSlices = 8;
+// hot via PositionRefreshPass @16ms. 4 slices (was 8): the full admission sweep
+// is what decides how late a newly-seen bot appears, and 8 slices put a full ring
+// cycle at ~8.6s. 4 slices finishes the sweep in about half the time so late bots
+// surface sooner. Cost: roughly double the reads per pass, so the shared DMA link
+// has less headroom for the camera thread - revert to 8 if the camera/ESP stutters.
+static constexpr size_t kAdmitSlices = 4;
 // Streaming window: a transient-failing spawn (no root/mesh/name yet) keeps
 // being retried every pass for this long before it is released. The old
 // 8-try budget (~8 passes ≈ 8-16s) settled slow-streaming spawns, hid them
@@ -1299,9 +1303,12 @@ bool ComponentHasLiveBotWorldPos(uintptr_t component)
 // debug-c190fb bot_grace: at threshold 5 a LIVE Wasp was evicted 128x in one
 // raid (Leaper 36x, Turret 28x) and every single evict was followed by a full
 // VerifyBotActor re-admit — the visual probe false-negatives under DMA load,
-// not because bots died. Double the grace before evicting.
+// not because bots died. Double the grace before evicting. Raised again 10 -> 20
+// for the faster 4-slice sweep: more evaluations per second meant more misses
+// reaching the threshold, and flicker_score showed evictReadmit climbing
+// (8..84) - evict/re-admit churn, not deaths.
 static std::unordered_map<uintptr_t, uint8_t> s_botVisualMisses;
-static constexpr uint8_t kBotVisualMissEvict = 10;
+static constexpr uint8_t kBotVisualMissEvict = 20;
 
 // debug-c190fb G3: bots evicted after 5 visual misses were re-admitted on the
 // very next scan (still in the actor array), producing evict/re-admit churn
@@ -1673,6 +1680,27 @@ std::string ResolveBotDrawLabel(
     return {};
 }
 
+// Stage trace for the robot pass (gated on debug_ghost_bots). Shows whether
+// RobotList is entered, whether the world context was gathered, and whether
+// admission starts: a silent pass otherwise looks identical to a no-bots world.
+static void TraceRobotPass(int stage, size_t actors)
+{
+    if (!var::debug_ghost_bots)
+        return;
+    static const char* const kNames[3] = { "enter", "ctx_ok", "admit_start" };
+    static uint64_t s_lastMs[3] = { 0, 0, 0 };
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (s_lastMs[stage] != 0 && nowMs - s_lastMs[stage] < 1000)
+        return;
+    s_lastMs[stage] = nowMs;
+    std::ostringstream f;
+    f << "{\"message\":\"robot_pass\",\"data\":{\"stage\":\"" << kNames[stage]
+      << "\",\"actors\":" << actors << "},\"ts\":" << nowMs << "}\n";
+    EntityDiagnostics::LogRaw(f.str());
+}
+
 void Engine::RobotList()
 {
     // Pre-size so runtime bot-type discovery inserts never rehash while the
@@ -1683,18 +1711,19 @@ void Engine::RobotList()
         robotsList.reserve(256);
     }
 
-    const bool wantRobots =
-        var::showRobots || var::robotAimEnabled || var::show_radar;
+    const bool wantRobots = var::showRobots || var::show_radar;
     if (!wantRobots) {
         std::unique_lock<std::shared_mutex> lock(m_robotCacheMutex);
         robotCache.clear();
         return;
     }
 
+    TraceRobotPass(0, 0);
     WorldScanContext ctx;
     if (!GatherWorldScanContext(ctx))
         return;
 
+    TraceRobotPass(1, ctx.currentActors.size());
     const uintptr_t sGWorld = ctx.gWorld;
     const uintptr_t sAcknowledgedPawn = ctx.acknowledgedPawn;
     if (!sGWorld || !ctx.persistentLevel)
@@ -1731,17 +1760,7 @@ void Engine::RobotList()
     // LOS mesh rebuild is owned by Update � calling it every RobotList tick
 
     const float visualMaxM = var::bot_esp_distance > 0.f ? var::bot_esp_distance : var::kMaxDistanceSliderM;
-    // One profile: the pool is collected out to whichever is further — what the
-    // ESP draws, or what aim is allowed to shoot at (Core/FeaturePolicy.hpp,
-    // aimbot_distance). It used to follow the separate ARC distance, so an aim
-    // range of 257m over a 180m pool left every bot between them locked out of
-    // the cache and therefore out of aim.
-    const FeaturePolicy::AimFeatures botPoolFeatures{
-        var::enable_aimbot, var::robotAimEnabled, var::enable_triggerbot };
-    const float maxDistM =
-        FeaturePolicy::ShouldCollectRobotTargets(botPoolFeatures)
-        ? (std::max)(visualMaxM, var::aimbot_distance)
-        : visualMaxM;
+    const float maxDistM = visualMaxM;
     const float maxDistSq = maxDistM * maxDistM * 10000.0f;
     // Distance anchor: localPos (pawn-root preferred, camera fallback) instead
     // of g_Location directly. A transiently reset/unreadable camera made every
@@ -1763,6 +1782,21 @@ void Engine::RobotList()
     for (auto it = localCache.begin(); it != localCache.end(); )
     {
         if (!currentActorSet.contains(it->first)) {
+            // Dead-bot fix #1 (grey corpse on vanish): a bot that leaves the
+            // actor array while it was DRAWING is almost always a kill. With
+            // dead-bot ESP on, keep it as a grey corpse for the bounded hold
+            // instead of a silent erase — the corpse path (DeadDisposition)
+            // greys it, then expires it after kCorpseHoldMs. The death stamp
+            // also makes the broken flag sticky below, so freed memory reading
+            // "alive" cannot resurrect the box as a live bot.
+            if (var::show_dead_bots && it->second.Drawing) {
+                it->second.IsBreaked = true;
+                it->second.broken = true;
+                s_botDeadSince.try_emplace(
+                    it->first, std::chrono::steady_clock::now());
+                ++it;
+                continue;
+            }
             ClearBotVisualMiss(it->first);
             s_botVisualEvicted.erase(it->first);
             it = localCache.erase(it);
@@ -1791,6 +1825,7 @@ void Engine::RobotList()
     // ends). Admission's stage budgets total 190ms; this cap mainly truncates
     // the retain tail. Retain runs nearest-first, so the bots actually on
     // screen keep their Drawing flags first.
+    TraceRobotPass(2, currentActors.size());
     WorldScan::ScanBudget turnBudget(std::chrono::milliseconds(300));
 
     const bool doAdmission = true;
@@ -2040,6 +2075,135 @@ void Engine::RobotList()
             }
         }
         dbgAdmitPrioNew = static_cast<int>(prioRows.size());
+
+        // ── Proximity-first window ───────────────────────────────────────────
+        // The pending lane and the band both select by AGE and RING POSITION, so
+        // a bot that just streamed in beside the player (running into a new
+        // area) waits for a lane slot or a full ring rotation regardless of how
+        // close it is. This reads a small rotating window of unadmitted actors,
+        // orders it nearest-first, and lets those rows lead the pass — so the
+        // closest new-area bot is screened first instead of last. Bounded: 96
+        // rows, two 48-row scatters.
+        std::vector<uintptr_t> proxActors;
+        if (distRefOk && admitIndex.size() > 4) {
+            constexpr size_t kProxWindow = 96;
+            constexpr size_t kProxKeep = 32;
+            constexpr size_t kProxChunk = 48;
+            // Own budget: the proximity window must not spend the probe budget
+            // the band and the lane need to finish their own sweep.
+            WorldScan::ScanBudget proxBudget(std::chrono::milliseconds(25));
+            static size_t s_proxCursor = 0;
+            const size_t n = admitIndex.size();
+            std::vector<uintptr_t> win;
+            win.reserve(kProxWindow);
+            for (size_t i = 0; i < n && win.size() < kProxWindow; ++i) {
+                const uintptr_t actor = admitIndex[(s_proxCursor + i) % n];
+                if (!actor || localCache.contains(actor))
+                    continue;
+                if (HasFreshQuickFnameNeg(actor) || HasFreshBotVerifyNeg(actor))
+                    continue;
+                win.push_back(actor);
+            }
+            s_proxCursor = (s_proxCursor + kProxWindow) % n;
+            if (!win.empty()) {
+                std::vector<uintptr_t> roots(win.size(), 0);
+                // Identity reads travel with the proximity scatter: without them
+                // the nearest rows would just be nearby scenery, and props would
+                // spend the pass that a close bot needs.
+                std::vector<uint32_t> typeIds(win.size(), 0);
+                std::vector<uint64_t> itemDas(win.size(), 0);
+                std::vector<uint64_t> hovers(win.size(), 0);
+                for (size_t b = 0; b < win.size(); b += kProxChunk) {
+                    if (proxBudget.expired())
+                        break;
+                    const size_t e = (std::min)(b + kProxChunk, win.size());
+                    ScatterSession rs;
+                    if (!rs.isValid())
+                        break;
+                    bool ok = true;
+                    for (size_t i = b; i < e; ++i) {
+                        ok = rs.prepare(win[i] + Offsets::RootComponent, roots[i]) && ok;
+                        ok = rs.prepare(win[i] + typeOff, typeIds[i]) && ok;
+                        ok = rs.prepare(win[i] + static_cast<uint64_t>(Offsets::ItemDataAsset),
+                                 itemDas[i]) && ok;
+                        ok = rs.prepare(win[i] + Offsets::UIHoverData, hovers[i]) && ok;
+                    }
+                    if (!(ok && rs.execute()))
+                        for (size_t i = b; i < e; ++i)
+                            roots[i] = 0;
+                    std::this_thread::yield();
+                }
+                std::vector<Engine::FVector3d> locs(win.size());
+                std::vector<char> locOk(win.size(), 0);
+                for (size_t b = 0; b < win.size(); b += kProxChunk) {
+                    if (proxBudget.expired())
+                        break;
+                    const size_t e = (std::min)(b + kProxChunk, win.size());
+                    ScatterSession ls;
+                    if (!ls.isValid())
+                        break;
+                    bool ok = true;
+                    for (size_t i = b; i < e; ++i) {
+                        if (!roots[i])
+                            continue;
+                        ok = ls.prepare(roots[i] + Offsets::WorldLocation, locs[i]) && ok;
+                    }
+                    if ((ok && ls.execute()))
+                        for (size_t i = b; i < e; ++i)
+                            if (roots[i])
+                                locOk[i] = 1;
+                    std::this_thread::yield();
+                }
+                std::vector<std::pair<double, uintptr_t>> ranked;
+                ranked.reserve(win.size());
+                for (size_t i = 0; i < win.size(); ++i) {
+                    if (!roots[i] || !locOk[i])
+                        continue;
+                    // Definite non-bots never take a proximity slot: players,
+                    // chests, ground loot, and anything carrying world-item
+                    // structure (item data asset / UI hover).
+                    const uint32_t masked = ArcActorType::MaskActorTypeId(typeIds[i]);
+                    if (ArcActorType::IsPlayerClassId(masked)
+                        || ArcActorType::IsChestClassId(masked)
+                        || ArcActorType::IsGroundLootClassId(masked))
+                        continue;
+                    if (itemDas[i] != 0 || hovers[i] != 0)
+                        continue;
+                    const Vector3 p = Engine::ToVector3(locs[i]);
+                    if (!IsPlausibleWorldPos(p))
+                        continue;
+                    const double dx = p.x - localPos.x;
+                    const double dy = p.y - localPos.y;
+                    const double dz = p.z - localPos.z;
+                    ranked.emplace_back(dx * dx + dy * dy + dz * dz, win[i]);
+                }
+                std::sort(ranked.begin(), ranked.end(),
+                    [](const std::pair<double, uintptr_t>& a,
+                       const std::pair<double, uintptr_t>& b) {
+                        return a.first < b.first;
+                    });
+                const size_t keep = (std::min)(kProxKeep, ranked.size());
+                proxActors.reserve(keep);
+                for (size_t i = 0; i < keep; ++i)
+                    proxActors.push_back(ranked[i].second);
+            }
+        }
+        // Lead the pass with the nearest new-area actors. Rows the lane already
+        // took stay where the lane put them; prox actors join laneSet so the
+        // band below cannot double-probe them.
+        if (!proxActors.empty()) {
+            std::vector<AdmitProbeRow> proxRows;
+            proxRows.reserve(proxActors.size());
+            for (const uintptr_t a : proxActors) {
+                if (laneSet.count(a) != 0)
+                    continue;
+                AdmitProbeRow row{};
+                row.actor = a;
+                proxRows.push_back(row);
+                laneSet.insert(a);
+            }
+            prioRows.insert(prioRows.begin(), proxRows.begin(), proxRows.end());
+        }
 
         // B4 (RIVENTIDES resume-band): stable deterministic row order
         // (admitIndex order) so the cross-pass resume frontier points at the
@@ -3069,6 +3233,12 @@ void Engine::RobotList()
         // Broken flag read BEFORE the Drawing reset: a garbage/DMA-flapped read
         // must not blank the box for one frame then re-draw it (flicker).
         uint8_t broken = ReadBotBrokenFlag(key);
+        // Dead-bot fix #2 (sticky death): once a corpse is stamped, it stays
+        // dead until the corpse path expires it. A despawned actor's freed
+        // memory can read "alive" on the next pass and would otherwise flip the
+        // grey corpse back to a live-coloured box.
+        if (s_botDeadSince.find(key) != s_botDeadSince.end())
+            broken = 1;
         actor.broken = broken != 0; // published for DMA-free consumers (aim/paint)
         actor.brokenSampleMs = SteadyMsFrom(nowRetain);
         // Secondary SDK-backed death evidence. Probe at the HealthMs tolerance
@@ -3194,8 +3364,7 @@ void Engine::RobotList()
         // Part positions are needed by the pips feature and by the flying-bot
         // projection fallback. Do not rebuild the component/bone cache while
         // both consumers are off.
-        const bool wantBotParts = var::show_bot_parts || var::showRobots
-            || var::robotAimEnabled;
+        const bool wantBotParts = var::show_bot_parts || var::showRobots;
         bool needPartCache = wantBotParts && actor.BotPartCount <= 0;
         if (wantBotParts && !needPartCache) {
             const auto meshIt = s_lastBotPartMesh.find(key);
@@ -3469,8 +3638,15 @@ void Engine::RobotList()
         // velocity here as well: RobotList runs at a different cadence and the
         // two writers produced sawtooth velocity estimates and choppy lead.
 
-        // Bots always draw (fail-open).
-        actor.isVisible = true;
+        // Visible = clear line of sight from the camera to the bot's body (about 90 cm up).
+        const bool botRaysOn = UpgradeOptions::visCheckPerBone
+            && EmbreeVis::g_visibility_meshes_ready.load(std::memory_order_acquire);
+        const bool rawBotVisible = !botRaysOn || EmbreeVis::CheckVisibility(
+            EmbreeVis::Vec3{ cam.Location.x, cam.Location.y, cam.Location.z },
+            EmbreeVis::Vec3{ actor.WorldPos.x, actor.WorldPos.y, actor.WorldPos.z + 90.0 },
+            key, true);
+        actor.isVisible = EmbreeVis::ApplyVisHold(
+            actor.visShown, actor.visPendingSinceMs, rawBotVisible, key);
 
         Vector3 delta = actor.WorldPos - localPos;
         const float distanceSq = static_cast<float>(

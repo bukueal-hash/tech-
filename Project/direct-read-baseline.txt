@@ -15,39 +15,12 @@ Project/Core/Engine.h	16
 Project/Core/SteamDecrypt.hpp	8
 Project/Core/WorldItemCategory.cpp	25
 Project/Dumper/Driver.h	3
-Project/Functions/Aimbot.cpp	9
 Project/Functions/BoneList.cpp	26
-# CollisionRead 6 = the AggGeom reader behind UpgradeOptions::collisionProbe: a
-# one-shot, off-by-default probe of UStaticMesh/BodySetup/FKAggregateGeom plus
-# StaticMesh::ExtendedBounds, which is collision geometry the ESP frame does not
-# carry and nothing else reads. The sixth site is the coarse occluder box: for a
-# placed static mesh whose collision is complex-only and therefore does not decode,
-# the probe records the asset's bounds box, oriented with the mesh and with the
-# positive/negative bounds extensions folded back out, so a level's walls are
-# representable to the visibility scene at all. It reads the bounds block (the
-# extensions immediately followed by ExtendedBounds) in one shot, overlapping the
-# offset the decode cross-check reads, but it is a separate site because it runs
-# once per placement rather than up to kMaxBoundsChecks times. When the visibility
-# stage lands, the per-asset cache it fills becomes the shared source and these
-# sites belong in the frame rather than here.
-# CollisionRead 8 = 6 + the two per-actor stand-in reads added with the
-# actor-keyed geometry index. A player or a bot is a character: its root component
-# is a CapsuleComponent and its mesh has no FKAggregateGeom, so the asset path
-# never saw those 613 roots in a live probe and their shape outlines could not
-# draw at all. Both new sites run once per actor INSIDE the existing walk, only
-# while the probe is enabled, and neither is on the ESP or aim path: one 8-byte
-# read of CapsuleComponent's half-height+radius (SDK 0x6b0/0x6b4, adjacent floats)
-# and one of PrimitiveComponent::LocalBounds (SDK 0x710) as the fallback for any
-# other primitive root. What they fill feeds the debug draw, not the BVH scene -
-# a character's own capsule in the scene would occlude the character itself.
-# CollisionRead 9 = 8 + one per-brush read of BrushComponent::BrushBodySetup (SDK
-# 0x698). Brush roots (the walls and floors) are not StaticMeshComponents, so the
-# static-mesh path never reached them and the visibility scene held no level
-# geometry. Same shape as the stand-in reads above: one 8-byte pointer per brush
-# root inside the existing walk, only while the probe is enabled, and it feeds the
-# collision scene, not the ESP or aim path.
-Project/Functions/CollisionRead.cpp	9
 Project/Functions/ContainerList.cpp	6
+# EntityList 82 = 78 + four read sites added on 2026-10-17 by a parallel agent's
+# change to this file; the reason for those four was not recorded with the edit,
+# so this bump is provisional and should be revisited by whoever made it (route
+# through the shared frame if they are avoidable). Above 78 the original note:
 # EntityList 78 = 76 + the two UEmbarkSquad reads that make hide_allies work when
 # this pawn's own TeamID byte is unreadable or reads 0/255. TeamID equality alone
 # fails closed — every teammate then looks like an enemy, with no error — so the
@@ -56,7 +29,7 @@ Project/Functions/ContainerList.cpp	6
 # byte comparison did not already settle the question. Both are one pull each,
 # against the 76 sites below that walk actors; the same PS_Squad field is already
 # read here for enemy squad tags.
-Project/Functions/EntityList.cpp	78
+Project/Functions/EntityList.cpp	82
 Project/Functions/Esp.cpp	6
 Project/Functions/ItemList.cpp	11
 # RobotList 33 = 32 + 1 temporary enemy-container probe (2s diagnostic that scans
@@ -68,3 +41,15 @@ Project/Functions/Update.cpp	19
 Project/Functions/Utils.cpp	206
 Project/Functions/World.cpp	5
 Project/Functions/WorldScanCommon.cpp	29
+
+# RenderVisCheck 4 = UWorld::TimeSeconds (double) + the component vtable check
+# + the on-screen/render stamp reads (nocache). The render-time visibility check
+# behind the ESP visible/not-visible colour pickers; reads bypass the VMM cache
+# (a cached clock freezes) and fail closed on a bad pointer/world/stamp.
+Project/Core/RenderVisCheck.hpp	4
+
+# EmbreeVisCheck 35 = Embree 4 BVH world-mesh collection (one-shot per level) +
+# FKAggregateGeom (sphere/box/sphyl/convex) asset cache + dynamic obstruction
+# cache (500ms background worker). Never runs on the ESP paint path.
+Project/Core/EmbreeVisCheck.hpp	35
+

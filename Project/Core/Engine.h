@@ -74,11 +74,7 @@ namespace EngineProjection {
 
 // Which screen axis CameraCache::FOV describes (T4.5). The projection has always
 // derived its scale from half the overlay HEIGHT -- it has always read the FOV as
-// vertical -- while the aim cone (Visuals::AimbotFovRadiusPx) has always derived
-// its radius from half the WIDTH, i.e. as horizontal. Both readings agree only on
-// a square overlay, so the axis is now a setting rather than an accident:
-// Vertical leaves every screen position exactly as it was, Horizontal makes the
-// projection agree with the cone.
+// vertical, while horizontal can be selected explicitly for widescreen layouts.
 enum class FovAxis : uint8_t {
     Vertical = 0,    // today's behaviour: scale from half the height
     Horizontal = 1   // the FOV spans the width; the vertical half-tangent follows
@@ -123,7 +119,11 @@ inline bool ProjectWorldLocationToScreen(
     double overlayH,
     // Defaulted: every existing caller keeps today's vertical reading, so this
     // parameter cannot change a screen position unless a caller asks it to.
-    FovAxis axis = FovAxis::Vertical)
+    FovAxis axis = FovAxis::Vertical,
+    // Box projection passes false: a bot a few cm from the camera projects to a
+    // huge off-screen X while still in front of the lens. Its box can still
+    // overlap the screen, and IsEspBoxOnScreen culls the box itself.
+    bool clipToViewport = true)
 {
     if (worldLocation.x == 0.0 &&
         worldLocation.y == 0.0 &&
@@ -165,8 +165,9 @@ inline bool ProjectWorldLocationToScreen(
 
     if (!std::isfinite(screen.x) || !std::isfinite(screen.y))
         return false;
-    if (screen.x < -overlayW * 0.5 || screen.x > overlayW * 1.5 ||
-        screen.y < -overlayH * 0.5 || screen.y > overlayH * 1.5)
+    if (clipToViewport
+        && (screen.x < -overlayW * 0.5 || screen.x > overlayW * 1.5 ||
+            screen.y < -overlayH * 0.5 || screen.y > overlayH * 1.5))
         return false;
 
     return true;
@@ -176,17 +177,6 @@ inline bool ProjectWorldLocationToScreen(
 class Engine {
 public:
     struct WorldCacheEntry;
-
-    struct HumanizerDebugState {
-        int phase = 0;              // 0 off, 1 reacting, 2 settling, 3 held
-        float injectedX = 0.f;      // last injected screen-space offset, px
-        float injectedY = 0.f;
-        bool limiterActive = false; // raw offset exceeded the safety cap
-        uint64_t stampMs = 0;       // last aim tick that published this state
-        bool valid = false;
-    };
-    void PublishHumanizerDebug(const HumanizerDebugState& state);
-    HumanizerDebugState GetHumanizerDebug() const;
 
     // FStowedWeaponInfo — 0x40 bytes per stowed weapon slot in InventoryComponent
     // (CL-1315578). Pack(1) without pad put WeaponQuality at +0x30 — wrong.
@@ -311,8 +301,6 @@ public:
     int ReadCrateContents(uintptr_t actor, CrateContents::Stack* out, int cap);
 
 private:
-    mutable std::mutex m_humanizerDebugMutex;
-    HumanizerDebugState m_humanizerDebug{};
 
     std::atomic<bool> entityStarted{ false };
 
@@ -321,10 +309,10 @@ private:
     std::unique_ptr<SyncedThread> m_entityThread;
     std::unique_ptr<SyncedThread> m_worldEspThread;
     std::unique_ptr<SyncedThread> m_robotEspThread;
-    std::unique_ptr<SyncedThread> m_aimThread;
     std::unique_ptr<SyncedThread> m_positionThread;
     std::unique_ptr<SyncedThread> m_cameraThread;
     std::unique_ptr<SyncedThread> m_frameBuilderThread;
+    std::unique_ptr<SyncedThread> m_visThread;
 
 public:
     // Thread synchronization (paint debug overlay uses try_lock on these)
@@ -338,7 +326,7 @@ public:
 private:
     std::atomic<bool> m_raidRaw{ false };
     std::atomic<bool> m_espRaidActive{ false };
-    /** Scanners may run; ESP/aim only draw after caches prove healthy. */
+    /** Scanners may run; ESP draws only after caches prove healthy. */
     std::atomic<bool> m_espDrawReady{ false };
     /** Set by RequestForceRescan() (R hotkey); consumed in TickRaidGate. */
     std::atomic<bool> m_forceRescanRequested{ false };
@@ -354,10 +342,11 @@ private:
     /** Party settle then raid settle before arming scanners.
      *  Was 5s+5s — log proof (raid-gate TheDam_02_P): raw/ok_enter already true
      *  at party_wait, so ESP sat idle ~10s after the map was ready. */
-    static constexpr std::chrono::milliseconds kPartyEnterDelayMs{ 500 };
-    /** Was a 10s user spec (map found -> wait before ESP scanning). Cut to 3s
-     *  on user request to speed up the time to first green diagnostics. */
-    static constexpr std::chrono::milliseconds kRaidEnterDelayMs{ 3000 };
+    static constexpr std::chrono::milliseconds kPartyEnterDelayMs{ 250 };
+    /** Was 3s (10s before that) — user asked for bots to appear sooner. The
+     *  scanners re-arm from the map-ready signal, so 1s is enough to skip the
+     *  load-time garbage the settle exists for without the old idle gap. */
+    static constexpr std::chrono::milliseconds kRaidEnterDelayMs{ 1000 };
     /** Live-verified (debug-c190fb.log TheDam burst): VMM read stalls of ~8.5s
      *  where GWorld resolvers return 0 for every attempt. With a 5s grace the
      *  gate dropped, ClearEspCaches() wiped everything, and re-arm+rescan made
@@ -449,10 +438,17 @@ public:
     void StopWorkerThreads();
 
     void RenderEsp();
-    void RenderFovCircle();
+    /**
+     * Phase 1 aim assist (see aim_plan.html). Reads the published ESP frame,
+     * picks the actor nearest the crosshair inside the selection radius and
+     * sends one relative move through the KmBox. Read-only: no game memory is
+     * written. Must be called from the paint thread, menu closed.
+     */
+    void RunAimAssist();
+    // Writes Build/aim_monitor.log with the live aim path state (2 Hz).
+    void AimMonitorTick(bool raidActive, bool menuOpen);
     // T4.4: draws the named practice/calibration reference objects and returns
     // immediately when the mode is off, so normal ESP output is untouched.
-    void RenderPracticeReference();
     void RenderOverlayCrosshair();
     void RenderRadar(bool interactive = false);
     void RenderSearch();
@@ -484,8 +480,6 @@ public:
         CameraCache& outCamera,
         CameraProbeSnapshot* outProbe = nullptr) const;
     bool InitConsts();
-    void AimAssistence();
-    void ReleaseAimOutputs();
 
     // ── The player chain (Core/PlayerChain.hpp) ───────────────────────────────
     // One ladder, one state, per-hop diagnostics. ResolvePlayerChain walks the
@@ -565,7 +559,6 @@ public:
 
     void UpdateCamera();
     void SetProjectionViewport(float width, float height);
-    Vector3 GetProjectionScreenCenter() const;
     bool RefreshCameraFromViewTarget();
     /** Lean render-path POV: three nocache reads from stored PCM. No rediscovery. */
     bool TryBuildCameraFromPcmPov(uintptr_t pcm, CameraCache& outCamera) const;
@@ -600,6 +593,9 @@ public:
     void DbgStoreCameraProbe(const CameraProbeSnapshot& probe);
     bool ProjectWorldLocationToScreen(Vector3 world_location, Vector3& screen);
     bool ProjectWorldLocationToScreen(Vector3 world_location, Vector3& screen, const CameraCache& camera);
+    // Same projection without the viewport bounds test. Only for box endpoints,
+    // where the caller culls the finished box against the screen.
+    bool ProjectWorldLocationToScreenUnclipped(Vector3 world_location, Vector3& screen, const CameraCache& camera);
 
     uintptr_t GetActorSkeletalMesh(uintptr_t actor) const;
     /** Mesh that owns the encrypted bone block (Embark preferred). */
@@ -730,6 +726,13 @@ public: // PlayerCache
         std::string ActorName;
 
         bool isVisible = false;
+        // Steady-clock ms when isVisible was sampled; 0 = never sampled. The
+        // aim gate refuses visibility data older than its own limit.
+        uint64_t visibleStampMs = 0;
+        // Visibility hold state (EmbreeVis::ApplyVisHold): isVisible only flips
+        // after the raw result stays changed for 2 s.
+        bool visShown = false;
+        uint64_t visPendingSinceMs = 0;
         bool Drawing = false;
         float Distance = 0.f;
         bool isAlly = false;
@@ -1045,18 +1048,12 @@ public:
         // positionSampleMs, this is never advanced by the slow scanner fallback.
         // It is the proof that a scanner-disabled entry still has a live actor.
         uint64_t livePositionSampleMs = 0;
-        // Retain worker's ~2Hz bIsDestroyed probe, published here so latency-
-        // critical consumers (aim tick, paint) never DMA per candidate per tick.
+        // Retain worker's ~2Hz bIsDestroyed probe so paint never DMA-reads it.
         bool broken = false;
-        // Stamps for the fields above, so a consumer can ask how old the value
-        // it is about to use actually is (FeaturePolicy::FieldAgeMs) instead of
-        // assuming it came from the newest frame. 0 = never sampled.
+        // Stamps for the fields above. 0 = never sampled.
         uint64_t brokenSampleMs = 0;
         uint64_t healthSampleMs = 0;
         uint64_t partHpSampleMs = 0;
-        Vector3 boundsCorners[8]{};
-        uint64_t boundsSampleMs = 0;
-        bool boundsValid = false;
         // Last RobotList pass that saw this actor in the current actor array.
         // Prevents an old cache entry from being promoted by a stale plausible
         // root after the actor has left the current world list.
@@ -1089,6 +1086,8 @@ public:
 
         bool Drawing = false;
         bool isVisible = false;
+        bool visShown = false;
+        uint64_t visPendingSinceMs = 0;
         bool IsBreaked = false;
         // Admission proved this is a bot even if its display name has not
         // decrypted yet. Keeps real bots drawable without admitting props.
@@ -1191,15 +1190,6 @@ public:
         // velocity lead from here so skeletons/boxes do not swim behind
         // during the collect→present gap.
         uint64_t collectStampMs = 0;
-        // Steady ms when the player and robot copies below were taken (the frame
-        // completes later, so collectStampMs - playersCopyStampMs is the rest of
-        // the collect). A consumer holding a copy needs these to ask how old a
-        // sample was WHEN IT WAS CAPTURED, instead of charging the copy the whole
-        // collect→read latency: the sampler stamps the cache, the collect copies
-        // it, the frame is published, and only then does the reader run.
-        // See FeaturePolicy::SnapshotSampleAgeMs.
-        uint64_t playersCopyStampMs = 0;
-        uint64_t robotsCopyStampMs = 0;
         bool valid = false;
     };
 
@@ -1281,13 +1271,11 @@ public:
     }
 
     // Published as an immutable snapshot. Consumers copy the shared_ptr (no
-    // deep copy); the 250Hz aim thread was previously memcpy'ing the whole
-    // frame twice per tick (~100MB/s churn) plus one copy per paint.
+    // deep copy), then paint from the latest accepted frame.
     std::shared_ptr<const EspRenderFrame> m_espFrameShared;
-    // Paint/aim retain the last accepted immutable snapshot without blocking
+    // Paint retains the last accepted immutable snapshot without blocking
     // on the frame mutex. These atomics are reset with the world snapshot.
     std::atomic<std::shared_ptr<const EspRenderFrame>> m_espPaintFrame{nullptr};
-    std::atomic<std::shared_ptr<const EspRenderFrame>> m_espAimFrame{nullptr};
     EspFrameDiagnostics m_espFrameDiagnostics;
     mutable std::shared_mutex m_espFrameMutex;
     std::atomic<uint64_t> m_espFrameSeq{ 0 };
@@ -1757,73 +1745,6 @@ public:
             Memory::read<uint8_t>(weaponActor + Offsets::WeaponQuality));
     }
 public:
-    struct AimTarget {
-        uint64_t entityKey = 0;
-        Vector3 aimPos;       // Screen position
-        Vector3 worldPos;     // World position (NOVO)
-        float distToCenter = FLT_MAX;
-        float score = -FLT_MAX;
-        float distanceM = 0.f;
-        float health = 100.f;
-        float healthMax = 100.f;
-        // ── Lead provenance ────────────────────────────────────────────────
-        // The monitor used to print Position/Velocity/Predicted/Prediction
-        // Error as 0.000/[0,0,0] because nothing ever published them: the aim
-        // tick had no way to say what the solver started from or extrapolated
-        // with. Carrying the inputs on the target keeps the measurement honest
-        // (a real lead, not a recomputed guess at display time).
-        Vector3 worldPosNoLead{};   // the sample the solver extrapolated FROM
-        Vector3 velocityUsed{};     // the velocity it extrapolated WITH
-        bool leadApplied = false;
-        bool isRobot = false;
-        int32_t partID = -1;
-        int32_t resistGroup = 0;
-        uint8_t aimPosSrc = 0;
-        // Age of the geometry the aim point was derived from (a bone sample for a
-        // player, the resolved bot entry for a robot), in milliseconds.
-        float aimWorldAgeMs = 0.f;
-        // T4.2/T4.3 -- provenance travels WITH the point, so no consumer has to
-        // guess. `aimDataValidated` is what the strict gate tests: the point is
-        // this tick's own sample, not blended between samples. `aimConfidence`
-        // (FeaturePolicy::AimPointConfidence) is what gets DISPLAYED: a plotted
-        // bone position is confirmed, an inferred bot point or a blended one is
-        // estimated. A bot point is validated but estimated -- two different
-        // questions, so two fields.
-        bool aimDataValidated = false;
-        uint8_t aimConfidence = 0;
-    };
-
-    Vector3 PredictPosition(
-        const Vector3& targetPos,
-        const Vector3& targetVelocity,
-        const Vector3& myPos,
-        float bulletSpeed,
-        int iterations);
-
-    Vector3 GetActorVelocity(uintptr_t actor);
-
-    bool GetRobotAimPoint2D(
-        const WorldCacheEntry& robot,
-        float fovRadius,
-        Vector3& outScreenPos,
-        Vector3& outWorldPos,
-        int32_t& outPartID,
-        int32_t& outResistGroup);
-
-    void AimAssistRobot(
-        float bulletSpeed,
-        const Vector3& screenCenter,
-        float fovRadius,
-        float currentTime,
-        std::vector<AimTarget>& targets);
-
-    void AimAssistPlayer(
-        const Vector3& screenCenter,
-        float fovRadius,
-        float bulletSpeed,
-        float currentTime,
-        std::vector<AimTarget>& targets);
-
 public:
     std::unordered_set<std::string> robotsList = kRobotsList;
 public:

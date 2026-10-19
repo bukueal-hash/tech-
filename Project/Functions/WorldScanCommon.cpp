@@ -31,7 +31,7 @@ struct TArrayU64 {
 };
 
 constexpr int32_t kMaxActorsPerLevel = 16384;
-constexpr int32_t kMaxActorsTotal = 16384;
+constexpr int32_t kMaxActorsTotal = 32768;
 
 struct CachedActorPtr {
     uintptr_t addr = 0;
@@ -152,7 +152,7 @@ bool ReadLevelActors(uintptr_t level, uintptr_t& outData, int32_t& outCount)
     {
         const uintptr_t data = Memory::read<uintptr_t>(level + Offsets::AActors);
         const int32_t count = Memory::read<int32_t>(level + Offsets::ActorsCount);
-        if (Engine::IsPlausibleObjPtr(data) && count > 0 && count <= 12000) {
+        if (Engine::IsPlausibleObjPtr(data) && count > 0 && count <= kMaxActorsPerLevel) {
             outData = data;
             outCount = count;
             return true;

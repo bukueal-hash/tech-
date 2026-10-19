@@ -110,47 +110,6 @@ void Engine::FinalizeWorldCacheMap(
 
         auto cat = static_cast<WorldItemCategory>(entry.worldCategory);
 
-        entry.boundsValid = false;
-        if (UpgradeOptions::worldBounds && IsValidPointer(root)) {
-            // Supported subset: root StaticMeshComponent with validated asset
-            // bounds. No guessed dimensions or render-thread memory reads.
-            // GetActorClassFName deliberately rejects component classes for
-            // actor admission, so resolve this component's UClass directly.
-            const uintptr_t rootClassPtr = steam_decrypt::GetActorClassPtr(root);
-            const std::string rootClass = IsValidPointer(rootClassPtr)
-                ? GetActorFNameString(rootClassPtr) : std::string{};
-            if (rootClass.find("StaticMeshComponent") != std::string::npos) {
-                // Ledger: bounds derivation (mesh asset -> ExtendedBounds) is the
-                // static-mesh bounds purpose, not a position read.
-                ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Bounds);
-                const uintptr_t asset = Memory::read_nocache<uintptr_t>(root + Offsets::StaticMesh);
-                if (IsValidPointer(asset)) {
-                    struct AssetBounds { Vector3 origin, extent; double radius; };
-                    const AssetBounds b = Memory::read_nocache<AssetBounds>(asset + Offsets::StaticMesh_ExtendedBounds);
-                    const FTransform t = ReadComponentToWorld(root);
-                    const auto sane = [](const Vector3& v, double limit) {
-                        return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z)
-                            && std::abs(v.x)<limit && std::abs(v.y)<limit && std::abs(v.z)<limit;
-                    };
-                    const double q = t.Rotation.x*t.Rotation.x+t.Rotation.y*t.Rotation.y
-                        +t.Rotation.z*t.Rotation.z+t.Rotation.w*t.Rotation.w;
-                    if (sane(b.origin,100000) && sane(b.extent,100000) && b.extent.x>0 && b.extent.y>0 && b.extent.z>0
-                        && sane(t.Scale3D,100) && std::abs(t.Scale3D.x)>0.001 && std::abs(t.Scale3D.y)>0.001 && std::abs(t.Scale3D.z)>0.001
-                        && sane(t.Translation,1e8) && std::isfinite(q) && q>0.98 && q<1.02) {
-                        entry.boundsValid = true;
-                        for (int i=0;i<8;++i) {
-                            const Vector3 local((b.origin.x+((i&1)?b.extent.x:-b.extent.x))*t.Scale3D.x,
-                                (b.origin.y+((i&2)?b.extent.y:-b.extent.y))*t.Scale3D.y,
-                                (b.origin.z+((i&4)?b.extent.z:-b.extent.z))*t.Scale3D.z);
-                            entry.boundsCorners[i] = t.Rotation.RotateVector(local)+t.Translation;
-                            if (!sane(entry.boundsCorners[i],1e8)) entry.boundsValid = false;
-                        }
-                        entry.boundsSampleMs = SteadyEspNowMs();
-                    }
-                }
-            }
-        }
-
         if (WorldCategoryIsContainerProp(cat)
             && cat != WorldItemCategory::DroppedPickup
             && cat != WorldItemCategory::Harvestable

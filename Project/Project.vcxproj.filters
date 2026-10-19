@@ -48,15 +48,6 @@
     <ClCompile Include="Functions\WorldScanCommon.cpp">
       <Filter>Functions</Filter>
     </ClCompile>
-    <ClCompile Include="Functions\CollisionRead.cpp">
-      <Filter>Functions</Filter>
-    </ClCompile>
-    <ClCompile Include="Functions\CollisionBvh.cpp">
-      <Filter>Functions</Filter>
-    </ClCompile>
-    <ClCompile Include="Functions\CollisionDebug.cpp">
-      <Filter>Functions</Filter>
-    </ClCompile>
     <ClCompile Include="Functions\RobotList.cpp">
       <Filter>Functions</Filter>
     </ClCompile>
@@ -67,9 +58,6 @@
       <Filter>Functions</Filter>
     </ClCompile>
     <ClCompile Include="Functions\World.cpp">
-      <Filter>Functions</Filter>
-    </ClCompile>
-    <ClCompile Include="Functions\AimbotMonitor.cpp">
       <Filter>Functions</Filter>
     </ClCompile>
     <ClCompile Include="Hardware\KmBox.cpp">
@@ -103,9 +91,6 @@
       <Filter>Interface</Filter>
     </ClCompile>
     <ClCompile Include="Interface\Overlay\MenuAssets.cpp">
-      <Filter>Interface</Filter>
-    </ClCompile>
-    <ClCompile Include="Interface\Overlay\AimbotDebugPanel.cpp">
       <Filter>Interface</Filter>
     </ClCompile>
     <ClCompile Include="Interface\Overlay\MenuLayout.cpp">
@@ -159,29 +144,8 @@
     <ClInclude Include="Core\RunReport.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="Core\AimCalibration.hpp">
-      <Filter>Core</Filter>
-    </ClInclude>
-    <ClInclude Include="Core\PracticeMode.hpp">
-      <Filter>Core</Filter>
-    </ClInclude>
     <ClInclude Include="Core\EntityDiagnostics.hpp">
       <Filter>Core</Filter>
-    </ClInclude>
-    <ClInclude Include="Core\CollisionGeom.hpp">
-      <Filter>Core</Filter>
-    </ClInclude>
-    <ClInclude Include="Core\CollisionTess.hpp">
-      <Filter>Core</Filter>
-    </ClInclude>
-    <ClInclude Include="Functions\CollisionRead.h">
-      <Filter>Functions</Filter>
-    </ClInclude>
-    <ClInclude Include="Functions\CollisionBvh.h">
-      <Filter>Functions</Filter>
-    </ClInclude>
-    <ClInclude Include="Functions\CollisionDebug.h">
-      <Filter>Functions</Filter>
     </ClInclude>
     <ClInclude Include="Core\Engine.h">
       <Filter>Core</Filter>

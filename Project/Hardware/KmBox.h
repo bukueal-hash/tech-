@@ -28,22 +28,23 @@ public:
     uint64_t lastReadyAttemptMs = 0;
     void InitializeFirst();
     void Initialize();
-    /** (Re)open MAKCU/Net if aim needs hardware mouse. Tries MAKCU serial first, then Net. */
+    /** (Re)open the selected MAKCU/Net device. Tries MAKCU serial first, then Net. */
     bool EnsureReady();
     void renderKmboxSettings();
 
-    /** Hot-path move (Net: fire-and-forget UDP). Use from AimAssistence hardware aim path. */
+    /** Low-level relative move command; retained for future device integrations. */
     void Move(int x, int y);
     /** Aim hot path — no minDelay sleep between chunks. */
-    void MoveAim(int x, int y);
+    /** Returns true if the device reported the move as sent. */
+    bool MoveAim(int x, int y);
     /** Blocking move with device ACK (init / UI test). */
     void MoveBlocking(int x, int y);
     void LeftClick();
-    /** Fire click with configurable hold duration in ms. For triggerbot semi-auto mode. */
+    /** Send a device-level click with a configurable hold duration in ms. */
     void Click(int holdMs);
-    /** Press left mouse and keep held. For triggerbot auto-hold mode. */
+    /** Press left mouse and keep it held until released. */
     void HoldStart();
-    /** Release left mouse. For triggerbot auto-hold mode. */
+    /** Release the left mouse button. */
     void HoldEnd();
     void moveTest();
     void fireTest();

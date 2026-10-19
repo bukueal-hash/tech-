@@ -1,0 +1,4 @@
+world_rva=0x10D59B18
+gnames_rva=0x10EAA140
+keytable_rva=0x10D4B30C
+keystream_rva=0x10A1425C

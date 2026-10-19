@@ -12,6 +12,7 @@
 #include "../Core/BoneRoster.hpp"
 #include "../Core/AgentLog.h"
 #include "../Core/EntityDiagnostics.hpp"
+#include "../Core/EmbreeVisCheck.hpp"
 #include <chrono>
 #include <cstdint>
 #include <ctime>
@@ -1153,6 +1154,7 @@ void Engine::GetBones(PlayerCacheEntry& actor)
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
     actor.boneData.valid.reset();
+    actor.boneData.visible.reset();
     actor.boneData.isVisible = false;
     actor.boneArray = 0;
     actor.boneMesh = 0;
@@ -1304,13 +1306,28 @@ void Engine::GetBones(PlayerCacheEntry& actor)
     // crawling players and wrecks their pose, so the transform is now
     // unconditional.)
     const D3DMATRIX ctwMatrix = componentToWorld.ToMatrixWithScale();
+    // Ray origin for the per-bone occlusion check (camera position).
+    CameraCache cam{};
+    {
+        std::shared_lock<std::shared_mutex> lk(m_cameraMutex);
+        cam = g_Camera;
+    }
+    const bool boneRaysOn = UpgradeOptions::visCheckPerBone
+        && EmbreeVis::g_visibility_meshes_ready.load(std::memory_order_acquire);
     for (const auto& [gameIndex, uniBone] : boneMap) {
         if (gameIndex < 0 || gameIndex >= nSlots) continue;
         const D3DMATRIX w = engine.MatrixMultiplication(csMats[gameIndex], ctwMatrix);
         const Vector3 wp(w._41, w._42, w._43);
         if (!IsNearZero(wp) && IsPlausibleWorldPos(wp)) {
-            actor.boneData.bonesWorldDouble[static_cast<size_t>(uniBone)] = wp;
-            actor.boneData.valid.set(static_cast<size_t>(uniBone));
+            const size_t bi = static_cast<size_t>(uniBone);
+            actor.boneData.bonesWorldDouble[bi] = wp;
+            actor.boneData.valid.set(bi);
+            // Off (or meshes not ready) = every bone counts as visible.
+            if (!boneRaysOn || EmbreeVis::CheckVisibility(
+                    EmbreeVis::Vec3{ cam.Location.x, cam.Location.y, cam.Location.z },
+                    EmbreeVis::Vec3{ wp.x, wp.y, wp.z },
+                    actor.APawn, false, static_cast<int>(uniBone)))
+                actor.boneData.visible.set(bi);
         }
     }
 
@@ -1318,7 +1335,13 @@ void Engine::GetBones(PlayerCacheEntry& actor)
         (actor.boneData.valid.test(static_cast<size_t>(UniBone::Pelvis)) ||
          actor.boneData.valid.test(static_cast<size_t>(UniBone::Chest))))
     {
-        actor.boneData.isVisible = true;
+        // Visible only if at least one bone has a clear line of sight.
+        const bool anyBoneVisible = actor.boneData.visible.any();
+        actor.boneData.isVisible = anyBoneVisible;
+        actor.isVisible = EmbreeVis::ApplyVisHold(
+            actor.visShown, actor.visPendingSinceMs, anyBoneVisible, actor.APawn);
+        if (actor.isVisible)
+            actor.visibleStampMs = actor.boneData.readStampMs;
     }
 
 

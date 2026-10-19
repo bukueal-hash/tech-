@@ -31,7 +31,10 @@ namespace game
         // CL-1426848 (game build 25879518, FName pipeline v20261008), all three
         // straight from sdk/sdk.txt: the dumper header states "GWorld RVA:
         // 0x1096ba98 (double-deref)", and FName:: pins the pool and keystream.
-        constexpr u32 GWORLD = 0x1096BA98;   // GWorld global, [RVA] -> intermediary -> [+0] UWorld
+        // Live-verified GWorld RVA (tools/idmap.py LIVE_OVERRIDES, tools/analyze_game_dump.py).
+        // The 10-13 dump value 0x1096BA98 reads as 0 in the live overlay, which forced the
+        // chain through its probing rungs on every launch.
+        constexpr u32 GWORLD = 0x10971338;   // GWorld global, [RVA] -> intermediary -> [+0] UWorld
         constexpr u32 GNAMES = 0x10EAA140;   // FName::RVA_GNAMEPOOL
         constexpr u32 KEYTABLE = 0x10D4B30C; // FName::RVA_FNAME_KEY_TABLE - 64 x u16 keystream words
         constexpr u32 UStruct_SuperStruct = 0xB0;

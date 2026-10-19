@@ -2969,11 +2969,13 @@ bool WorldCategoryVisibleOnRadar(const WorldLootFilterView& loot)
 bool WorldCategoryEnabled(int category)
 {
     const auto cat = static_cast<WorldItemCategory>(category);
-    if (var::show_radar && var::show_radar_special
-        && WorldCategoryHasSpConfig(cat)
-        && WorldCategoryUsesSpContainerRange(cat)) {
-        return true;
-    }
+    // Quest items are their own thing: the Quest tab toggle is the only filter,
+    // independent of the loot master and of every other row. The radar SP/special
+    // bypass used to live here and forced SP-checked rows visible even when their
+    // Loot-tab checkbox was off; the radar has its own WorldCategoryVisibleOnRadar
+    // path, so this shared (ESP/paint/collect) gate must not reintroduce it.
+    if (cat == WorldItemCategory::QuestItem)
+        return var::show_world_quest;
     // showLoot is the master draw switch; category toggles filter while it is on.
     if (!var::showLoot)
         return false;
@@ -3041,10 +3043,6 @@ bool WorldCategoryEnabled(int category)
         return var::show_world_open_container;
     case WorldItemCategory::Hatch:
         return var::showHatches;
-    case WorldItemCategory::QuestItem:
-        // Quest objective items draw whenever loot/items ESP is on — they are
-        // ground pickups (DA_Item_Salvage_Quest_*), never player/bot ESP.
-        return var::droppedItems || var::show_world_items;
     default:
         return false;
     }

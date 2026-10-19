@@ -6,8 +6,12 @@
 #include "../Core/AgentLog.h"
 #include "../Core/BotAdmitQueue.hpp"
 #include "../Core/EntityDiagnostics.hpp"
+#include "../Core/EmbreeVisCheck.hpp"
 #include "../Core/PlayerEspMissLog.hpp"
+#include "../Core/ResolvedCache.hpp"
 #include "EspDraw.h"
+#include <atomic>
+#include <cstdio>
 #include "WorldScanCommon.h"
 
 #include <algorithm>
@@ -125,6 +129,10 @@ constexpr std::ptrdiff_t kReplicatedRootTransform = Offsets::ReplicatedRootTrans
 // APawn::PlayerState is 0x3E0 in the SDK. Do not use the controller's
 // PlayerState slot (0x3D0) here; that pointer belongs to AController.
 constexpr std::ptrdiff_t kPawnPlayerState = Offsets::APlayerState;
+
+// Auto-learned link slots (Data\resolved.ini), defined lower in this file.
+std::ptrdiff_t PinnedPsPawnSlot();
+std::ptrdiff_t PawnStateOff();
 constexpr std::ptrdiff_t kPsPawnPrivate = Offsets::PlayerState_PawnPrivate;
 constexpr std::ptrdiff_t kPsPawnPrivateAlt = Offsets::PlayerState_PawnPrivate;
 constexpr std::ptrdiff_t kPioneerCharacter = Offsets::PioneerPlayerState_PioneerCharacter;
@@ -133,19 +141,24 @@ constexpr std::ptrdiff_t kPioneerCurrentPawn = Offsets::PioneerPlayerState_Curre
 bool PsBacklinksToPawn(uintptr_t ps, uintptr_t pawn)
 {
     ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Link);
+    // nocache: this runs on the REMOTE path. Through the VMM data cache the
+    // back-link reads 0 while the probe (nocache) reads the live pawn at the
+    // same slot in the same instant, so every remote PS was refused as
+    // admit_pawn_missing and no remote player could be admitted.
+    const std::ptrdiff_t pinned = PinnedPsPawnSlot();
+    if (pinned > 0 && Memory::read_nocache<uintptr_t>(ps + pinned) == pawn)
+        return true;
     const std::ptrdiff_t offs[] = {
         kPioneerCurrentPawn,
         kPioneerCharacter,
         kPsPawnPrivate,
         kPsPawnPrivateAlt,
+        0x438,   // local-chain ground truth on the live build
     };
     for (const std::ptrdiff_t off : offs) {
-        // nocache: this runs on the REMOTE path. Through the VMM data cache the
-        // back-link reads 0 while the probe (nocache) reads the live pawn at the
-        // same slot in the same instant, so every remote PS was refused as
-        // admit_pawn_missing and no remote player could be admitted.
-        const uintptr_t linked = Memory::read_nocache<uintptr_t>(ps + off);
-        if (linked == pawn)
+        if (off == pinned)
+            continue;
+        if (Memory::read_nocache<uintptr_t>(ps + off) == pawn)
             return true;
     }
     return false;
@@ -158,7 +171,7 @@ bool TryResolvePawnPlayerState(uintptr_t pawn, uintptr_t& outPs)
         return false;
     // Step 3: nocache on forward PS read — stale VMM page cache was suspected.
     const uintptr_t ps =
-        Memory::read_nocache<uintptr_t>(pawn + kPawnPlayerState);
+        Memory::read_nocache<uintptr_t>(pawn + PawnStateOff());
     if (!ps || !Memory::IsValidPtrFast2(ps))
         return false;
     if (!PsBacklinksToPawn(ps, pawn))
@@ -186,9 +199,9 @@ bool TryResolvePlayerStateAny(uintptr_t pawn, uintptr_t& outPs, bool& outViaActo
         return true;
     if (!IsActorTypePlayerPawn(pawn))
         return false;
-    // Offsets::APlayerState (0x3A0) on Controller; on Pawn use kPawnPlayerState.
+    // Offsets::APlayerState (0x3A0) on Controller; on Pawn the learned slot.
     const uintptr_t ps =
-        Memory::read_nocache<uintptr_t>(pawn + kPawnPlayerState);
+        Memory::read_nocache<uintptr_t>(pawn + PawnStateOff());
     if (!ps || !Memory::IsValidPtrFast2(ps))
         return false;
     outPs = ps;
@@ -224,11 +237,106 @@ bool PlayerStateIsPioneerClass(uintptr_t ps)
     return cls.find("pioneerplayerstate") != std::string::npos;
 }
 
+// PlayerState -> pawn slot, learned from the data instead of a dump. Every
+// remote PlayerState holds its pawn at one fixed offset, so the offset whose
+// value is a live player pawn for most sampled PlayerStates is the one. Pinned
+// in Data\resolved.ini ("ps_pawn_slot") and tried first on later passes.
+std::atomic<std::ptrdiff_t> s_psPawnSlotPinned{ -1 };
+
+std::ptrdiff_t PinnedPsPawnSlot()
+{
+    std::ptrdiff_t v = s_psPawnSlotPinned.load(std::memory_order_acquire);
+    if (v != -1)
+        return v;
+    v = 0;
+    const std::string text = ResolvedCache::Get("ps_pawn_slot");
+    if (!text.empty()) {
+        try {
+            v = static_cast<std::ptrdiff_t>(std::stoll(text, nullptr, 0));
+        } catch (...) {
+            v = 0;
+        }
+    }
+    s_psPawnSlotPinned.store(v, std::memory_order_release);
+    return v;
+}
+
+// pawn -> PlayerState slot (the forward hop remotes need). Same provenance as
+// the reverse slot: learned from the local chain and pinned.
+std::atomic<std::ptrdiff_t> s_pawnPsOffPinned{ -1 };
+
+std::ptrdiff_t PinnedPawnPsOff()
+{
+    std::ptrdiff_t v = s_pawnPsOffPinned.load(std::memory_order_acquire);
+    if (v != -1)
+        return v;
+    v = 0;
+    const std::string text = ResolvedCache::Get("pawn_ps_off");
+    if (!text.empty()) {
+        try {
+            v = static_cast<std::ptrdiff_t>(std::stoll(text, nullptr, 0));
+        } catch (...) {
+            v = 0;
+        }
+    }
+    s_pawnPsOffPinned.store(v, std::memory_order_release);
+    return v;
+}
+
+/** The pawn->PlayerState slot in force: learned when pinned, else the SDK value. */
+std::ptrdiff_t PawnStateOff()
+{
+    const std::ptrdiff_t p = PinnedPawnPsOff();
+    return p > 0 ? p : kPawnPlayerState;
+}
+
+// Learn both link slots from the LOCAL chain, which is ground truth: the local
+// pawn and its PlayerState are both known and already trusted (the local player
+// panel reads them). One scan of the pawn finds the slot holding that exact
+// PlayerState, and one scan of the PlayerState finds the slot holding that exact
+// pawn. This replaces guessing: the compiled PioneerPlayerState offsets do not
+// hold on the live build (PlayerState+0x438 carries the pawn, not +0x560).
+void LearnLocalPairOffsets(uintptr_t pawn, uintptr_t ps)
+{
+    ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Link);
+    if (!pawn || !ps || !Memory::IsValidPtrFast2(pawn) || !Memory::IsValidPtrFast2(ps))
+        return;
+    if (PinnedPawnPsOff() <= 0) {
+        for (std::ptrdiff_t off = 0x300; off <= 0x600; off += 8) {
+            if (Memory::read_nocache<uintptr_t>(pawn + off) != ps)
+                continue;
+            s_pawnPsOffPinned.store(off, std::memory_order_release);
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(off));
+            ResolvedCache::Put("pawn_ps_off", buf);
+            break;
+        }
+    }
+    if (PinnedPsPawnSlot() <= 0) {
+        for (std::ptrdiff_t off = 0x200; off <= 0x800; off += 8) {
+            if (Memory::read_nocache<uintptr_t>(ps + off) != pawn)
+                continue;
+            s_psPawnSlotPinned.store(off, std::memory_order_release);
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(off));
+            ResolvedCache::Put("ps_pawn_slot", buf);
+            break;
+        }
+    }
+}
+
 uintptr_t ResolvePawnFromPlayerState(uintptr_t ps)
 {
     ReadBudget::PurposeScope purpose(ReadBudget::Purpose::Link);
     if (!ps || !Memory::IsValidPtrFast2(ps))
         return 0;
+    // Learned slot first (one read); the named offsets below are the fallback.
+    const std::ptrdiff_t learned = PinnedPsPawnSlot();
+    if (learned > 0) {
+        const uintptr_t pawn = Memory::read_nocache<uintptr_t>(ps + learned);
+        if (pawn && Memory::IsValidPtrFast2(pawn))
+            return pawn;
+    }
     const std::ptrdiff_t offs[] = {
         kPioneerCurrentPawn,
         kPioneerCharacter,
@@ -646,6 +754,11 @@ void Engine::EntityList()
         if (now - s_last >= std::chrono::seconds(2)) { s_last = now; return true; }
         return false;
     }();
+    // Learn the pawn<->PlayerState slots from the local chain (ground truth)
+    // while either one is unpinned. Cheap: one slot scan per direction.
+    if (PinnedPawnPsOff() <= 0 || PinnedPsPawnSlot() <= 0) {
+        LearnLocalPairOffsets(sAcknowledgedPawn, localPlayerState);
+    }
     for (const uintptr_t ps : gsPlayerStates) {
         if (ps == localPlayerState)
             continue;
@@ -693,7 +806,7 @@ void Engine::EntityList()
         if (currentActorSet.contains(backPawn)) {
             ++dbgGsPawnHit;
             const uintptr_t fwdPs =
-                Memory::read_nocache<uintptr_t>(backPawn + kPawnPlayerState);
+                Memory::read_nocache<uintptr_t>(backPawn + PawnStateOff());
             if (fwdPs == ps)
                 ++dbgFwdMatch;
             else
@@ -1148,7 +1261,7 @@ void Engine::EntityList()
         bool prepOk = true;
         for (size_t i = base; i < chunkEnd; ++i) {
             PlayerProbeRow& r = probeRows[i];
-            prepOk = scatter.prepare(r.actor + kPawnPlayerState, r.ps) && prepOk;
+            prepOk = scatter.prepare(r.actor + PawnStateOff(), r.ps) && prepOk;
             prepOk = scatter.prepare(r.actor + typeOff, r.typeId) && prepOk;
             prepOk = scatter.prepare(r.actor + Offsets::RootComponent, r.root) && prepOk;
         }
@@ -1796,7 +1909,6 @@ void Engine::EntityList()
             continue;
         }
         WorldScan::MissCounterClear(s_playerDistMisses, key);
-        WorldScan::MissCounterClear(s_playerDistMisses, key);
 
         const double liveHealth = get_health(key);
         const double liveMaxHealth = get_maxhealth(key);
@@ -1882,14 +1994,14 @@ void Engine::EntityList()
 
 
         // Read weapon system from InventoryComponent only when a presentation
-        // feature consumes it. Aimbot target scoring can use weapon quality.
+        // feature consumes it.
         std::string invWeapon, invStowed0, invStowed1, invArmorName;
         int invWq = -1, invSq0 = -1, invSq1 = -1, invClip = 0;
         int invArmorTier = -1;
         float invArmorPlates = 0.f, invArmorPerPlate = 0.f;
         bool inventoryResolved = false;
         const bool wantInventory = var::show_weapon || var::show_armor_line
-            || var::show_player_kit || var::enable_aimbot;
+            || var::show_player_kit;
         if (wantInventory) {
             ReadPlayerInventory(key, invWeapon, invWq, invClip, invStowed0, invSq0, invStowed1, invSq1,
                 invArmorPlates, invArmorPerPlate, invArmorTier, invArmorName,
@@ -1977,7 +2089,13 @@ void Engine::EntityList()
             actor.ScreenBottom = footScr;
         }
 
-        actor.isVisible = true;
+        actor.isVisible = EmbreeVis::PeekVisHold(
+            actor.APawn, actor.visShown, actor.visPendingSinceMs, true);
+        if (actor.isVisible) {
+            actor.visibleStampMs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+        }
 
         // Audit #3: Drawing must not hinge on health. get_health() returns NaN on
         // a failed read and NaN >= 1.0f is false, so one bad health read erased a

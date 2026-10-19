@@ -109,12 +109,7 @@ void Engine::PositionRefreshPass()
     };
 
     // Players + bots only. Containers/items are stationary — WorldPos set at admit.
-    const FeaturePolicy::AimFeatures aimFeatures{
-        var::enable_aimbot,
-        var::robotAimEnabled,
-        var::enable_triggerbot};
-    if (FeaturePolicy::ShouldRefreshPlayerPositions(
-            var::enableesp || UpgradeOptions::warnings, var::show_radar, aimFeatures)) {
+    if (var::enableesp || UpgradeOptions::warnings || var::show_radar) {
         std::shared_lock<std::shared_mutex> lock(m_playerCacheMutex);
         for (const auto& [key, entry] : playerCache) {
             // Uninitialized first-admission entries must be refreshed even when
@@ -125,12 +120,12 @@ void Engine::PositionRefreshPass()
             // ShouldDrawPlayerEsp still applies the distance gate, so queueing
             // unconditionally cannot draw a player who is out of range.
             (void)entry;
-            queueEntry(PosRefreshKey::CacheKind::Player, key, entry.rootComponent);
+            queueEntry(PosRefreshKey::CacheKind::Player, key, entry.rootComponent,
+                entry.actorMesh);
         }
     }
 
-    if (FeaturePolicy::ShouldRefreshRobotPositions(
-            var::showRobots, aimFeatures, var::show_radar)) {
+    if (var::showRobots || var::show_radar) {
         std::shared_lock<std::shared_mutex> lock(m_robotCacheMutex);
         for (const auto& [key, entry] : robotCache) {
             // Refresh every cached bot with a root, not only ones already
@@ -198,6 +193,11 @@ void Engine::PositionRefreshPass()
     const uint64_t nowMs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
+
+    // One clock read for the whole pass. The visible/not-visible colour is then
+    // refreshed every 16ms tick instead of only inside the ~200-1000ms scans,
+    // which is what made the box colour trail behind cover. The per-bone
+    // raycast (Core/EmbreeVisCheck.hpp) supplies that colour.
 
     auto applyVelocity = [&](
         Vector3& worldPos,

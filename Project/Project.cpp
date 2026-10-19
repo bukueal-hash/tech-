@@ -25,8 +25,6 @@
 #include "Interface/OverlayHost.h"
 #include "Interface/Utils/AutoConfig.h"
 #include "Interface/Utils/UpgradeOptions.hpp"
-#include "Functions/CollisionRead.h"
-#include "Functions/CollisionDebug.h"
 #include "Functions/WorldScanCommon.h"
 #include "Interface/Render.h"
 #include "Core/AgentLog.h"
@@ -333,34 +331,9 @@ int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
         Render(hwnd);
         AutoConfig_Tick();
-        // Armed diagnostics run themselves once the world cache has actors; see
-        // CollisionRead.h. No-op unless UpgradeOptions::collisionProbe is on.
-        CollisionRead::TickAutoArm();
-        // One-shot visibility self-tests that need no target (the collision-debug
-        // ray verdict split, which otherwise only runs when a camera resolves).
-        CollisionDebug::EnsureSelfTestsRan();
         // Same idea for the admission lane's first-probe ordering: it is the one
         // check in this build that the tests project cannot run for you.
         WorldScan::EnsureFirstProbeSelfTestRan();
-        // And the same for the aim profile. "Players and ARC share one collected
-        // target set" is the invariant this build just changed; the tests project
-        // pins it but cannot run here, so the shipping exe checks it once and
-        // records the verdict with the other self-tests.
-        {
-            static bool s_aimProfileChecked = false;
-            if (!s_aimProfileChecked)
-            {
-                s_aimProfileChecked = true;
-                const FeaturePolicy::AimProfileSelfTest aim = FeaturePolicy::RunAimProfileSelfTest();
-                std::ostringstream f;
-                f << "{\"location\":\"FeaturePolicy.hpp\",\"message\":\"aim_profile_selftest\","
-                  << "\"timestamp\":" << EntityDiagnostics::NowMs()
-                  << ",\"passed\":" << (aim.passed ? "true" : "false")
-                  << ",\"cases\":" << aim.cases << ",\"failed\":" << aim.failed
-                  << ",\"detail\":\"" << EntityDiagnostics::Sanitize(aim.detail, 200) << "\"}\n";
-                EntityDiagnostics::LogRaw(f.str());
-            }
-        }
         // Same treatment for the two invariants this build changed and that the
         // tests project cannot run: the read ledger's per-field split (what
         // scan_turn reports) and the legacy auto_config.ini round trip.

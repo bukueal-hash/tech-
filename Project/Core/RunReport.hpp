@@ -2,8 +2,7 @@
 
 // Phase 1 — run report (advantage 1: "one anonymous object per frame").
 //
-// Purpose: every later claim in the adoption plan (a refusal, an input gate, a
-// calibration change) is checked against ONE machine-readable per-frame object
+// Purpose: every frame/ESP result is checked against ONE machine-readable object
 // instead of a screenshot of the debug HUD. The HUD stays the human view; this
 // is the checkable one, and the two are fed from the same counters.
 //
@@ -47,7 +46,6 @@
 #include <thread>
 
 #include "EspFramePolicy.hpp"
-#include "FeaturePolicy.hpp"
 #include "PlayerEspMissLog.hpp"
 
 namespace RunReport {
@@ -142,26 +140,6 @@ struct FrameSample {
     uint64_t dmaScatterExecutes = 0;
     uint64_t dmaScatterLastBatch = 0;
 
-    // T4.1 -- the calibration actually in force, read from the same settings the
-    // aim path reads at the moment this sample was built. X and Y separately,
-    // because one shared number is exactly what this phase removed, and both
-    // classes because player and ARC motion are calibrated independently.
-    float calPlayerX = 0.f;
-    float calPlayerY = 0.f;
-    float calPlayerCurve = 0.f;
-    float calPlayerCap = 0.f;
-    bool calPlayerCapDeferred = true;
-    float calArcX = 0.f;
-    float calArcY = 0.f;
-    float calArcCurve = 0.f;
-    float calArcCap = 0.f;
-    bool calArcCapDeferred = true;
-    // Calibration LINES the loader refused this session (out-of-range values). A
-    // refused line keeps the last good value, so this counts messages rather than
-    // behaviour changes -- it is here so "refused, not clamped" is visible in the
-    // artifact and not only in a startup message.
-    uint32_t calibrationRefused = 0;
-    char calibrationRefusedKey[40] = {};
 };
 
 // ── Publication (worker thread) ───────────────────────────────────────────
@@ -391,27 +369,6 @@ inline std::string FormatReportJson(const FrameSample* s, const WriterStats& sta
             << ",\"executes\":" << s->dmaScatterExecutes
             << ",\"lastBatch\":" << s->dmaScatterLastBatch << "}";
 
-        // T4.1: the per-axis calibration in force (advantage 5). Two axes per
-        // class, so "per-axis" is checkable in the artifact instead of taken on
-        // trust, and capDeferred records that the pre-T4.1 distance-scaled burst
-        // cap is the one doing the limiting. It lives INSIDE the sample branch
-        // because every value here comes from the sample: with no frame yet the
-        // section is absent like the rest of the frame block, never a
-        // dereference of a sample that does not exist.
-        out << ",\"calibration\":{"
-            << "\"player\":{\"x\":" << s->calPlayerX
-            << ",\"y\":" << s->calPlayerY
-            << ",\"curve\":" << s->calPlayerCurve
-            << ",\"cap\":" << s->calPlayerCap
-            << ",\"capDeferred\":" << (s->calPlayerCapDeferred ? "true" : "false") << "},"
-            << "\"arc\":{\"x\":" << s->calArcX
-            << ",\"y\":" << s->calArcY
-            << ",\"curve\":" << s->calArcCurve
-            << ",\"cap\":" << s->calArcCap
-            << ",\"capDeferred\":" << (s->calArcCapDeferred ? "true" : "false") << "},"
-            << "\"refusedLines\":" << s->calibrationRefused
-            << ",\"lastRefusedKey\":\""
-            << Escape(std::string(s->calibrationRefusedKey)) << "\"}";
     }
 
     out << ",\"input\":{\"submitted\":"
@@ -429,181 +386,6 @@ inline std::string FormatReportJson(const FrameSample* s, const WriterStats& sta
         << ",\"pendingRelease\":"
         << (PressOutstanding().load(std::memory_order_relaxed) ? "true" : "false")
         << "}";
-
-    // Why the assist path refused on the last aim tick (Phase 2). Named, so a
-    // held key that does nothing cannot be mistaken for a broken feature.
-    out << ",\"assist\":{\"refusal\":\""
-        << FeaturePolicy::AimRefusalName(FeaturePolicy::CurrentRefusal())
-        << "\",\"refused\":"
-        << (FeaturePolicy::AimRefusalBlocked(FeaturePolicy::CurrentRefusal())
-            ? "true" : "false")
-        << "}";
-
-    // T4.3: the aim point the last tick aimed at, WITH its provenance. `confidence`
-    // is what the panel shows and `validated` is what the strict gate tested, so a
-    // reader of this file can tell a plotted bone from an inferred bot point and
-    // from an interpolated one without inferring anything.
-    {
-        const FeaturePolicy::AimPointDebug point = FeaturePolicy::CurrentAimPointDebug();
-        out << ",\"aimPoint\":{\"confidence\":\""
-            << FeaturePolicy::AimPointConfidenceName(
-                static_cast<FeaturePolicy::AimPointConfidence>(point.confidence))
-            << "\",\"validated\":" << (point.validated ? "true" : "false")
-            << ",\"ageMs\":" << JsonFloat(point.ageMs)
-            << ",\"errorPx\":[" << JsonFloat(point.errorPxX) << "," << JsonFloat(point.errorPxY) << "]"
-            << ",\"counts\":[" << JsonFloat(point.cmdX) << "," << JsonFloat(point.cmdY) << "]"
-            << ",\"strict\":" << (point.strict ? "true" : "false")
-            << ",\"isRobot\":" << (point.isRobot ? "true" : "false")
-            << ",\"targetKey\":" << static_cast<unsigned long long>(point.targetKey)
-            << ",\"stampMs\":" << static_cast<unsigned long long>(point.stampMs)
-            << "}";
-    }
-
-    // Is the aim path running at all, and if not, why not? Published before the
-    // results above are read, because "paused because the menu is open" and "ran
-    // and examined nothing" are the same zeroes and only one is a problem.
-    {
-        const FeaturePolicy::AimPassSnapshot pass = FeaturePolicy::CurrentAimPass();
-        const uint64_t nowSteady = SteadyNowMs();
-        const uint64_t passAgeMs =
-            (pass.lastTickMs != 0 && nowSteady >= pass.lastTickMs)
-                ? nowSteady - pass.lastTickMs : 0;
-        out << ",\"aimPass\":{\"state\":\""
-            << FeaturePolicy::AimPassStateName(pass.state)
-            << "\",\"stage\":\"" << FeaturePolicy::AimPassStageName(pass.stage)
-            << "\",\"ticks\":" << static_cast<unsigned long long>(pass.ticks)
-            << ",\"ageMs\":" << static_cast<unsigned long long>(passAgeMs)
-            << ",\"lastSkipMs\":" << static_cast<unsigned long long>(pass.lastSkipMs)
-            << "}";
-    }
-
-    // T4.6 (advantage 7): the candidate accounting for the last aim tick -- what the
-    // collectors examined, what survived, and the reasons the rest were dropped,
-    // keyed by the T4.2 reason enum. The named summary line is included verbatim so
-    // the report and the debug panel cannot describe the same tick differently.
-    {
-        uint64_t stampMs = 0;
-        const FeaturePolicy::TargetGateCounts counts =
-            FeaturePolicy::CurrentTargetGateCounts(&stampMs);
-        out << ",\"candidates\":{\"considered\":" << counts.considered
-            << ",\"admitted\":" << counts.admitted
-            << ",\"rejected\":" << counts.Rejected()
-            << ",\"summary\":\"" << Escape(FeaturePolicy::TargetGateSummaryLine(counts)) << "\""
-            << ",\"stampMs\":" << static_cast<unsigned long long>(stampMs)
-            << ",\"reasons\":{";
-        bool first = true;
-        for (size_t i = 1; i < FeaturePolicy::kTargetRejectionCount; ++i) {
-            const auto reason = static_cast<FeaturePolicy::TargetRejection>(i);
-            const uint32_t n = counts.byReason[i];
-            if (n == 0)
-                continue;   // absent reasons stay absent: no zero-noise to read past
-            if (!first)
-                out << ",";
-            first = false;
-            out << "\"" << FeaturePolicy::TargetRejectionName(reason) << "\":" << n;
-        }
-        out << "}";   // reasons
-        out << "}";   // candidates
-    }
-
-    // Phase 4 evidence: WHAT the gate was looking at. The candidate block above
-    // says how many candidates shared a reason; this says where the reason came
-    // from -- the sample age behind a motion refusal, and the strict gate's own
-    // decision on every candidate that reached it, with the inputs it decided on.
-    {
-        const FeaturePolicy::AimGateTrace trace = FeaturePolicy::CurrentAimGateTrace();
-        out << ",\"admission\":{\"stampMs\":"
-            << static_cast<unsigned long long>(trace.stampMs)
-            << ",\"motion\":{\"stale\":" << trace.motionStale
-            << ",\"aged\":" << trace.motionStaleAged
-            << ",\"minAgeMs\":"
-            << (trace.motionStaleAged
-                ? static_cast<long long>(trace.motionStaleMinAgeMs) : -1LL)
-            << ",\"maxAgeMs\":"
-            << (trace.motionStaleAged
-                ? static_cast<long long>(trace.motionStaleMaxAgeMs) : -1LL)
-            << ",\"noRoot\":" << trace.motionStaleNoRoot
-            << ",\"neverSampled\":" << trace.motionStaleNeverSampled
-            << ",\"noStamp\":" << trace.motionStaleNoStamp
-            // The latency the pool's samples were NOT charged with (see
-            // FeaturePolicy::SnapshotSampleAgeMs): 0 for a live-cache pool.
-            << ",\"snapshotLatencyMs\":"
-            << static_cast<unsigned long long>(trace.snapshotLatencyMs)
-            << ",\"summary\":\"" << Escape(FeaturePolicy::MotionStaleSummary(trace)) << "\"}"
-            << ",\"strict\":{\"inForce\":" << (trace.strictInForce ? "true" : "false")
-            << ",\"evaluated\":" << trace.strictEvaluated
-            << ",\"admitted\":" << trace.strictAdmitted
-            << ",\"refused\":" << trace.strictRefused
-            << ",\"summary\":\"" << Escape(FeaturePolicy::StrictDecisionSummary(trace)) << "\""
-            << ",\"reasons\":{";
-        bool firstStrict = true;
-        for (size_t i = 1; i < FeaturePolicy::kTargetRejectionCount; ++i) {
-            const uint16_t n = trace.strictByReason[i];
-            if (n == 0)
-                continue;   // absent reasons stay absent: no zero-noise to read past
-            if (!firstStrict)
-                out << ",";
-            firstStrict = false;
-            out << "\"" << FeaturePolicy::TargetRejectionName(
-                static_cast<FeaturePolicy::TargetRejection>(i)) << "\":" << n;
-        }
-        out << "}}";
-        // The candidates themselves, in the order the gate examined them.
-        out << ",\"candidates\":[";
-        for (size_t i = 0; i < trace.recorded; ++i) {
-            const FeaturePolicy::AimTraceCandidate& c = trace.candidates[i];
-            if (i)
-                out << ",";
-            out << "{\"key\":" << static_cast<unsigned long long>(c.key)
-                << ",\"class\":\"" << (c.isRobot ? "robot" : "player") << "\""
-                << ",\"outcome\":\"" << FeaturePolicy::TargetRejectionName(
-                    static_cast<FeaturePolicy::TargetRejection>(c.outcome)) << "\""
-                // The motion facts describe a motion refusal only; on any other
-                // outcome they are absent (null), never a default "false" that
-                // would read as "this actor had no root".
-                << ",\"motionAgeMs\":";
-            if (FeaturePolicy::TraceCandidateHasMotionFacts(c)) {
-                out << (c.motionAgeMs == UINT64_MAX
-                    ? -1LL : static_cast<long long>(c.motionAgeMs));
-            } else {
-                out << "null";
-            }
-            out << ",\"hasRoot\":";
-            out << (FeaturePolicy::TraceCandidateHasMotionFacts(c)
-                ? (c.hasRoot ? "true" : "false") : "null");
-            out << ",\"everSampled\":";
-            out << (FeaturePolicy::TraceCandidateHasMotionFacts(c)
-                ? (c.everSampled ? "true" : "false") : "null")
-                << ""
-                << ",\"strictEvaluated\":" << (c.strictEvaluated ? "true" : "false")
-                << ",\"strictInForce\":" << (c.strictInForce ? "true" : "false")
-                << ",\"validated\":" << (c.validated ? "true" : "false")
-                << ",\"aimDataAgeMs\":" << JsonFloat(c.aimDataAgeMs)
-                << ",\"maxAimDataAgeMs\":"
-                << static_cast<unsigned long long>(c.maxAimDataAgeMs)
-
-                << ",\"distPx\":" << JsonFloat(c.distToCenterPx) << "}";
-        }
-        out << "]}";
-    }
-
-    // How the assist is paced, measured rather than described. "It feels slow" is
-    // produced by a hold-off, by a weak pull, or by a pass that is not running,
-    // and the counters separate them.
-    {
-        const FeaturePolicy::AimTimingTrace t = FeaturePolicy::CurrentAimTimingTrace();
-        const uint64_t timingNow = SteadyNowMs();
-        const uint64_t sinceSubmit =
-            (t.lastSubmitMs != 0 && timingNow >= t.lastSubmitMs)
-                ? timingNow - t.lastSubmitMs : 0;
-        out << ",\"aimTiming\":{\"tickMs\":" << JsonFloat(t.tickMs)
-            << ",\"submits\":" << static_cast<unsigned long long>(t.submits)
-            << ",\"humanizerSkips\":" << static_cast<unsigned long long>(t.humanizerSkips)
-            << ",\"msSinceSubmit\":" << static_cast<unsigned long long>(sinceSubmit)
-            << ",\"distPx\":" << JsonFloat(t.lastDistPx)
-            << ",\"closeFrac\":" << JsonFloat(t.lastCloseFrac)
-            << ",\"gain\":" << JsonFloat(t.lastGain) << "}";
-    }
 
     out << ",\"writer\":{\"writesAttempted\":" << stats.writesAttempted
         << ",\"writesFailed\":" << stats.writesFailed

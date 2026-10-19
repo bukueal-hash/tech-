@@ -131,7 +131,6 @@ struct Snapshot {
     bool show_radar{};
     bool show_debug_overlay{};
     bool debug_skeleton_lag{};
-    bool debug_aim_shake{};
     bool debug_hatch_detect{};
     bool debug_ghost_bots{};
     bool debug_world_trace{};
@@ -170,6 +169,7 @@ struct Snapshot {
     bool bot_box{};
     bool bot_names{};
     bool bot_snaplines{};
+    bool esp_entity_debug{};
     bool bot_show_distance{};
     bool bot_heart{};
     bool show_dead_bots{};
@@ -179,19 +179,35 @@ struct Snapshot {
     float bot_color_invisible[4]{};
 
     bool enable_aimbot{};
-    bool robotAimEnabled{};
     int aim_hold_key{};
+    // Phase 1-4 aim settings.
+    bool aim_autofire{};
+    int aim_radius{};
+    float aim_stop_zone{};
+    int aim_speed{};
+    int aim_response{};
+    float aim_calib_x{};
+    float aim_calib_y{};
+    int aim_priority{};
+    int aim_bone{};
+    int aim_point_percent{};
+    int aim_max_distance{};
+    bool aim_sticky{};
+    bool aim_require_enemy{};
+    bool aim_require_visible{};
+    bool aim_require_bones{};
+    int aim_frame_fresh_ms{};
+    int aim_autofire_radius{};
+    int aim_autofire_interval{};
+    int aim_click_hold{};
+    bool aim_telemetry{};
+    bool aim_deadzone{};
+    bool aim_jitter{};
+    bool aim_close_range{};
+    float aim_close_distance{};
+    float aim_recoil_comp{};
+    bool aim_show_circle{};
     int debug_overlay_key{};
-    int aim_bone_mode{};
-    bool humanizer{};
-    float humanizer_intensity{};
-    float humanizer_react_ms{};
-    float humanizer_overshoot{};
-    bool predict{};
-    bool randombone{};
-    float aimbot_fov{};
-    int aimbot_priority{};
-    bool show_fov{};
     bool show_crosshair{};
     bool camPovUsePending{};
     std::string upgrade_options;
@@ -203,27 +219,6 @@ struct Snapshot {
     float crosshair_thickness{};
     float crosshair_gap{};
     float crosshair_spin_rpm{};
-    float aimbot_distance{};
-    float smoothness{};
-    int aim_algorithm{};
-    float aim_deadzone_px{};
-    float aim_sensitivity{};
-    float aim_hardware_speed{};
-    bool sticky_target_lock{};
-    float aim_sticky_fov_bias_px{};
-    int aim_loss_of_sight_grace_ms{};
-    bool aim_loss_of_sight_grace_enabled{};
-
-    float aim_bullet_speed_cm_s{};
-
-    /* Triggerbot */
-    bool enable_triggerbot{};
-    int trigger_hold_mode{};
-    int trigger_hold_key{};
-    float trigger_deadzone_px{};
-    int trigger_fire_delay_ms{};
-    bool trigger_auto_hold{};
-
     bool enable_world{};
     bool droppedItems{};
     bool raiderStock{};
@@ -285,6 +280,8 @@ struct Snapshot {
     float color_world_open_container[4]{};
 
     bool showLoot{};
+    bool show_world_quest{};
+    bool quest_pulse{};
     bool show_near_loot_hud{};
     float loot_distance{};
     float container_distance_sp{};
@@ -395,7 +392,6 @@ Snapshot CaptureSnapshot()
     s.show_radar = var::show_radar;
     s.show_debug_overlay = var::show_debug_overlay;
     s.debug_skeleton_lag = var::debug_skeleton_lag;
-    s.debug_aim_shake = var::debug_aim_shake;
     s.debug_hatch_detect = var::debug_hatch_detect;
     s.debug_ghost_bots = var::debug_ghost_bots;
     s.debug_world_trace = var::debug_world_trace;
@@ -430,6 +426,7 @@ Snapshot CaptureSnapshot()
     s.bot_box = var::bot_box;
     s.bot_names = var::bot_names;
     s.bot_snaplines = var::bot_snaplines;
+    s.esp_entity_debug = var::esp_entity_debug;
     s.bot_show_distance = var::bot_show_distance;
     s.bot_heart = var::bot_heart;
     s.show_dead_bots = var::show_dead_bots;
@@ -439,19 +436,34 @@ Snapshot CaptureSnapshot()
     std::memcpy(s.color_dead_bots, var::color_dead_bots, sizeof(s.color_dead_bots));
 
     s.enable_aimbot = var::enable_aimbot;
-    s.robotAimEnabled = var::robotAimEnabled;
     s.aim_hold_key = var::aim_hold_key;
+    s.aim_autofire = var::aim_autofire;
+    s.aim_radius = var::aim_radius;
+    s.aim_stop_zone = var::aim_stop_zone;
+    s.aim_speed = var::aim_speed;
+    s.aim_response = var::aim_response;
+    s.aim_calib_x = var::aim_calib_x;
+    s.aim_calib_y = var::aim_calib_y;
+    s.aim_priority = var::aim_priority;
+    s.aim_bone = var::aim_bone;
+    s.aim_point_percent = var::aim_point_percent;
+    s.aim_max_distance = var::aim_max_distance;
+    s.aim_sticky = var::aim_sticky;
+    s.aim_require_enemy = var::aim_require_enemy;
+    s.aim_require_visible = var::aim_require_visible;
+    s.aim_require_bones = var::aim_require_bones;
+    s.aim_frame_fresh_ms = var::aim_frame_fresh_ms;
+    s.aim_autofire_radius = var::aim_autofire_radius;
+    s.aim_autofire_interval = var::aim_autofire_interval;
+    s.aim_click_hold = var::aim_click_hold;
+    s.aim_telemetry = var::aim_telemetry;
+    s.aim_deadzone = var::aim_deadzone;
+    s.aim_jitter = var::aim_jitter;
+    s.aim_close_range = var::aim_close_range;
+    s.aim_close_distance = var::aim_close_distance;
+    s.aim_recoil_comp = var::aim_recoil_comp;
+    s.aim_show_circle = var::aim_show_circle;
     s.debug_overlay_key = var::debug_overlay_key;
-    s.aim_bone_mode = static_cast<int>(var::aim_bone_mode);
-    s.predict = var::predict;
-    s.humanizer = var::humanizer;
-    s.humanizer_intensity = var::humanizer_intensity;
-    s.humanizer_react_ms = var::humanizer_react_ms;
-    s.humanizer_overshoot = var::humanizer_overshoot;
-    s.randombone = var::randombone;
-    s.aimbot_fov = var::aimbot_fov;
-    s.aimbot_priority = static_cast<int>(var::aimbot_priority);
-    s.show_fov = var::show_fov;
     s.show_crosshair = var::show_crosshair;
     s.camPovUsePending = var::camPovUsePending;
     s.upgrade_options = UpgradeOptions::Capture();
@@ -463,25 +475,6 @@ Snapshot CaptureSnapshot()
     s.crosshair_thickness = var::crosshair_thickness;
     s.crosshair_gap = var::crosshair_gap;
     s.crosshair_spin_rpm = var::crosshair_spin_rpm;
-    s.aimbot_distance = var::aimbot_distance;
-    s.smoothness = var::smoothness;
-    s.aim_algorithm = static_cast<int>(var::aim_algorithm);
-    s.aim_deadzone_px = var::aim_deadzone_px;
-    s.aim_sensitivity = var::aim_sensitivity;
-    s.aim_hardware_speed = var::aim_hardware_speed;
-    s.sticky_target_lock = var::sticky_target_lock;
-    s.aim_sticky_fov_bias_px = var::aim_sticky_fov_bias_px;
-    s.aim_loss_of_sight_grace_ms = var::aim_loss_of_sight_grace_ms;
-    s.aim_loss_of_sight_grace_enabled = var::aim_loss_of_sight_grace_enabled;
-    s.aim_bullet_speed_cm_s = var::aim_bullet_speed_cm_s;
-
-    s.enable_triggerbot = var::enable_triggerbot;
-    s.trigger_hold_mode = var::trigger_hold_mode;
-    s.trigger_hold_key = var::trigger_hold_key;
-    s.trigger_deadzone_px = var::trigger_deadzone_px;
-    s.trigger_fire_delay_ms = var::trigger_fire_delay_ms;
-    s.trigger_auto_hold = var::trigger_auto_hold;
-
     s.enable_world = var::enable_world;
     s.droppedItems = var::droppedItems;
     s.raiderStock = var::raiderStock;
@@ -543,6 +536,8 @@ Snapshot CaptureSnapshot()
     std::memcpy(s.color_world_open_container, var::color_world_open_container, sizeof(s.color_world_open_container));
 
     s.showLoot = var::showLoot;
+    s.show_world_quest = var::show_world_quest;
+    s.quest_pulse = var::quest_pulse;
     s.show_near_loot_hud = var::show_near_loot_hud;
     s.loot_distance = var::loot_distance;
     s.container_distance_sp = var::container_distance_sp;
@@ -612,7 +607,6 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.show_radar == b.show_radar &&
         a.show_debug_overlay == b.show_debug_overlay &&
         a.debug_skeleton_lag == b.debug_skeleton_lag &&
-        a.debug_aim_shake == b.debug_aim_shake &&
         a.debug_hatch_detect == b.debug_hatch_detect &&
         a.debug_ghost_bots == b.debug_ghost_bots &&
         a.debug_world_trace == b.debug_world_trace &&
@@ -647,6 +641,7 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.bot_box == b.bot_box &&
         a.bot_names == b.bot_names &&
         a.bot_snaplines == b.bot_snaplines &&
+        a.esp_entity_debug == b.esp_entity_debug &&
         a.bot_show_distance == b.bot_show_distance &&
         a.bot_heart == b.bot_heart &&
         a.show_dead_bots == b.show_dead_bots &&
@@ -655,19 +650,34 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         ColorsEqual(a.bot_color_invisible, b.bot_color_invisible) &&
         ColorsEqual(a.color_dead_bots, b.color_dead_bots) &&
         a.enable_aimbot == b.enable_aimbot &&
-        a.robotAimEnabled == b.robotAimEnabled &&
         a.aim_hold_key == b.aim_hold_key &&
+        a.aim_autofire == b.aim_autofire &&
+        a.aim_radius == b.aim_radius &&
+        a.aim_stop_zone == b.aim_stop_zone &&
+        a.aim_speed == b.aim_speed &&
+        a.aim_response == b.aim_response &&
+        a.aim_calib_x == b.aim_calib_x &&
+        a.aim_calib_y == b.aim_calib_y &&
+        a.aim_priority == b.aim_priority &&
+        a.aim_bone == b.aim_bone &&
+        a.aim_point_percent == b.aim_point_percent &&
+        a.aim_max_distance == b.aim_max_distance &&
+        a.aim_sticky == b.aim_sticky &&
+        a.aim_require_enemy == b.aim_require_enemy &&
+        a.aim_require_visible == b.aim_require_visible &&
+        a.aim_require_bones == b.aim_require_bones &&
+        a.aim_frame_fresh_ms == b.aim_frame_fresh_ms &&
+        a.aim_autofire_radius == b.aim_autofire_radius &&
+        a.aim_autofire_interval == b.aim_autofire_interval &&
+        a.aim_click_hold == b.aim_click_hold &&
+        a.aim_telemetry == b.aim_telemetry &&
+        a.aim_deadzone == b.aim_deadzone &&
+        a.aim_jitter == b.aim_jitter &&
+        a.aim_close_range == b.aim_close_range &&
+        a.aim_close_distance == b.aim_close_distance &&
+        a.aim_recoil_comp == b.aim_recoil_comp &&
+        a.aim_show_circle == b.aim_show_circle &&
         a.debug_overlay_key == b.debug_overlay_key &&
-        a.aim_bone_mode == b.aim_bone_mode &&
-        a.predict == b.predict &&
-        a.humanizer == b.humanizer &&
-        a.humanizer_intensity == b.humanizer_intensity &&
-        a.humanizer_react_ms == b.humanizer_react_ms &&
-        a.humanizer_overshoot == b.humanizer_overshoot &&
-        a.randombone == b.randombone &&
-        a.aimbot_fov == b.aimbot_fov &&
-        a.aimbot_priority == b.aimbot_priority &&
-        a.show_fov == b.show_fov &&
         a.show_crosshair == b.show_crosshair &&
         a.camPovUsePending == b.camPovUsePending &&
         a.upgrade_options == b.upgrade_options &&
@@ -679,23 +689,6 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         a.crosshair_thickness == b.crosshair_thickness &&
         a.crosshair_gap == b.crosshair_gap &&
         a.crosshair_spin_rpm == b.crosshair_spin_rpm &&
-        a.aimbot_distance == b.aimbot_distance &&
-        a.smoothness == b.smoothness &&
-        a.aim_algorithm == b.aim_algorithm &&
-        a.aim_deadzone_px == b.aim_deadzone_px &&
-        a.aim_sensitivity == b.aim_sensitivity &&
-        a.aim_hardware_speed == b.aim_hardware_speed &&
-        a.sticky_target_lock == b.sticky_target_lock &&
-        a.aim_sticky_fov_bias_px == b.aim_sticky_fov_bias_px &&
-        a.aim_loss_of_sight_grace_ms == b.aim_loss_of_sight_grace_ms &&
-        a.aim_loss_of_sight_grace_enabled == b.aim_loss_of_sight_grace_enabled &&
-        a.aim_bullet_speed_cm_s == b.aim_bullet_speed_cm_s &&
-        a.enable_triggerbot == b.enable_triggerbot &&
-        a.trigger_hold_mode == b.trigger_hold_mode &&
-        a.trigger_hold_key == b.trigger_hold_key &&
-        a.trigger_deadzone_px == b.trigger_deadzone_px &&
-        a.trigger_fire_delay_ms == b.trigger_fire_delay_ms &&
-        a.trigger_auto_hold == b.trigger_auto_hold &&
         a.enable_world == b.enable_world &&
         a.droppedItems == b.droppedItems &&
         a.raiderStock == b.raiderStock &&
@@ -756,6 +749,8 @@ bool SnapshotsEqual(const Snapshot& a, const Snapshot& b)
         ColorsEqual(a.color_world_deaddrop, b.color_world_deaddrop) &&
         ColorsEqual(a.color_world_open_container, b.color_world_open_container) &&
         a.showLoot == b.showLoot &&
+        a.show_world_quest == b.show_world_quest &&
+        a.quest_pulse == b.quest_pulse &&
         a.show_near_loot_hud == b.show_near_loot_hud &&
         a.loot_distance == b.loot_distance &&
         a.container_distance_sp == b.container_distance_sp &&
@@ -801,6 +796,14 @@ bool ParseBool(const std::string& val, bool defaultVal)
 bool ApplyLootConfigKey(const std::string& key, const std::string& val)
 {
     if (key == "showLoot") { var::showLoot = ParseBool(val, var::showLoot); return true; }
+    if (key == "show_world_quest") {
+        var::show_world_quest = ParseBool(val, var::show_world_quest);
+        return true;
+    }
+    if (key == "quest_pulse") {
+        var::quest_pulse = ParseBool(val, var::quest_pulse);
+        return true;
+    }
     if (key == "show_near_loot_hud") {
         var::show_near_loot_hud = ParseBool(val, var::show_near_loot_hud);
         return true;
@@ -842,59 +845,8 @@ bool ApplyLootConfigKey(const std::string& key, const std::string& val)
 
 static bool ApplyAimbotConfigKey(const std::string& key, const std::string& val)
 {
-    if (key == "aim_sticky_fov_bias_px") {
-        var::aim_sticky_fov_bias_px = static_cast<float>(std::atof(val.c_str()));
-        var::aim_sticky_fov_bias_px = std::clamp(var::aim_sticky_fov_bias_px, 0.f, 120.f);
-        return true;
-    }
-    if (key == "aim_loss_of_sight_grace_ms") {
-        var::aim_loss_of_sight_grace_ms = std::clamp(std::atoi(val.c_str()), 0, 2000);
-        return true;
-    }
-    if (key == "aim_loss_of_sight_grace_enabled") {
-        var::aim_loss_of_sight_grace_enabled = ParseBool(val, var::aim_loss_of_sight_grace_enabled);
-        return true;
-    }
-    if (key == "aim_bullet_speed_cm_s") {
-        var::aim_bullet_speed_cm_s = static_cast<float>(std::atof(val.c_str()));
-        var::aim_bullet_speed_cm_s = std::clamp(var::aim_bullet_speed_cm_s, 10000.f, 200000.f);
-        return true;
-    }
-    /* Triggerbot */
-    if (key == "enable_triggerbot") {
-        var::enable_triggerbot = ParseBool(val, var::enable_triggerbot);
-        return true;
-    }
-    if (key == "trigger_hold_mode") {
-        var::trigger_hold_mode = std::clamp(static_cast<int>(std::atoi(val.c_str())), 0, 2);
-        return true;
-    }
-    if (key == "trigger_hold_key") {
-        var::trigger_hold_key = static_cast<int>(std::atoi(val.c_str()));
-        return true;
-    }
-    if (key == "trigger_deadzone_px") {
-        var::trigger_deadzone_px = std::clamp(static_cast<float>(std::atof(val.c_str())), 1.f, 50.f);
-        return true;
-    }
-    if (key == "trigger_fire_delay_ms") {
-        var::trigger_fire_delay_ms = std::clamp(static_cast<int>(std::atoi(val.c_str())), 0, 500);
-        return true;
-    }
-    if (key == "trigger_auto_hold") {
-        var::trigger_auto_hold = ParseBool(val, var::trigger_auto_hold);
-        return true;
-    }
-    if (key == "aim_deadzone_px") {
-        var::aim_deadzone_px = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.f, 50.f);
-        return true;
-    }
-    if (key == "aim_sensitivity") {
-        var::aim_sensitivity = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.25f, 4.f);
-        return true;
-    }
-    if (key == "aim_hardware_speed") {
-        var::aim_hardware_speed = std::clamp(static_cast<float>(std::atof(val.c_str())), 1.f, 20.f);
+    if (key == "enable_aimbot") {
+        var::enable_aimbot = ParseBool(val, var::enable_aimbot);
         return true;
     }
     return false;
@@ -1008,7 +960,6 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     if (key == "enableesp") var::enableesp = ParseBool(val, var::enableesp);
     else if (key == "box") var::box = ParseBool(val, var::box);
     else if (key == "show_head_dot") var::show_head_dot = ParseBool(val, var::show_head_dot);
-    else if (key == "practice_mode") var::practice_mode = ParseBool(val, var::practice_mode);
     else if (key == "radar_ghost_suppress_poi") var::radar_ghost_suppress_poi = ParseBool(val, var::radar_ghost_suppress_poi);
     else if (key == "show_search_window") var::show_search_window = ParseBool(val, var::show_search_window);
     else if (key == "head_dot_radius_px") {
@@ -1044,7 +995,6 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     else if (key == "show_radar") var::show_radar = ParseBool(val, var::show_radar);
     else if (key == "show_debug_overlay") var::show_debug_overlay = ParseBool(val, var::show_debug_overlay);
     else if (key == "debug_skeleton_lag") var::debug_skeleton_lag = ParseBool(val, var::debug_skeleton_lag);
-    else if (key == "debug_aim_shake") var::debug_aim_shake = ParseBool(val, var::debug_aim_shake);
     else if (key == "debug_hatch_detect") var::debug_hatch_detect = ParseBool(val, var::debug_hatch_detect);
     else if (key == "debug_ghost_bots") var::debug_ghost_bots = ParseBool(val, var::debug_ghost_bots);
     else if (key == "debug_world_trace") var::debug_world_trace = ParseBool(val, var::debug_world_trace);
@@ -1083,6 +1033,7 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     else if (key == "bot_box") var::bot_box = ParseBool(val, var::bot_box);
     else if (key == "bot_names") var::bot_names = ParseBool(val, var::bot_names);
     else if (key == "bot_snaplines") var::bot_snaplines = ParseBool(val, var::bot_snaplines);
+    else if (key == "esp_entity_debug") var::esp_entity_debug = ParseBool(val, var::esp_entity_debug);
     else if (key == "bot_show_distance") var::bot_show_distance = ParseBool(val, var::bot_show_distance);
     else if (key == "bot_heart") var::bot_heart = ParseBool(val, var::bot_heart);
     else if (key == "show_dead_bots") var::show_dead_bots = ParseBool(val, var::show_dead_bots);
@@ -1092,26 +1043,56 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     }
     else if (key == "bot_color_visible") ParseColor4(val, var::bot_color_visible);
     else if (key == "bot_color_invisible") ParseColor4(val, var::bot_color_invisible);
-    else if (key == "enable_aimbot") var::enable_aimbot = ParseBool(val, var::enable_aimbot);
-    else if (key == "robotAimEnabled") var::robotAimEnabled = ParseBool(val, var::robotAimEnabled);
     else if (key == "aim_hold_key") var::aim_hold_key = std::atoi(val.c_str());
+    else if (key == "aim_autofire") var::aim_autofire = ParseBool(val, var::aim_autofire);
+    else if (key == "aim_radius") var::aim_radius = std::clamp(std::atoi(val.c_str()), 10, 120);
+    else if (key == "aim_stop_zone") {
+        var::aim_stop_zone = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.5f, 6.f);
+    }
+    else if (key == "aim_speed") var::aim_speed = std::clamp(std::atoi(val.c_str()), 10, 300);
+    else if (key == "aim_response") var::aim_response = std::clamp(std::atoi(val.c_str()), 1, 100);
+    else if (key == "aim_calib_x") {
+        var::aim_calib_x = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.1f, 20.f);
+    }
+    else if (key == "aim_calib_y") {
+        var::aim_calib_y = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.1f, 20.f);
+    }
+    else if (key == "aim_priority") var::aim_priority = std::clamp(std::atoi(val.c_str()), 0, 2);
+    else if (key == "aim_bone") var::aim_bone = std::clamp(std::atoi(val.c_str()), 0, 19);
+    else if (key == "aim_point_percent") {
+        var::aim_point_percent = std::clamp(std::atoi(val.c_str()), 2, 45);
+    }
+    else if (key == "aim_max_distance") {
+        var::aim_max_distance = std::clamp(std::atoi(val.c_str()), 5, 500);
+    }
+    else if (key == "aim_sticky") var::aim_sticky = ParseBool(val, var::aim_sticky);
+    else if (key == "aim_require_enemy") var::aim_require_enemy = ParseBool(val, var::aim_require_enemy);
+    else if (key == "aim_require_visible") var::aim_require_visible = ParseBool(val, var::aim_require_visible);
+    else if (key == "aim_require_bones") var::aim_require_bones = ParseBool(val, var::aim_require_bones);
+    else if (key == "aim_frame_fresh_ms") {
+        var::aim_frame_fresh_ms = std::clamp(std::atoi(val.c_str()), 80, 1000);
+    }
+    else if (key == "aim_autofire_radius") {
+        var::aim_autofire_radius = std::clamp(std::atoi(val.c_str()), 3, 12);
+    }
+    else if (key == "aim_autofire_interval") {
+        var::aim_autofire_interval = std::clamp(std::atoi(val.c_str()), 80, 1000);
+    }
+    else if (key == "aim_click_hold") {
+        var::aim_click_hold = std::clamp(std::atoi(val.c_str()), 10, 100);
+    }
+    else if (key == "aim_telemetry") var::aim_telemetry = ParseBool(val, var::aim_telemetry);
+    else if (key == "aim_deadzone") var::aim_deadzone = ParseBool(val, var::aim_deadzone);
+    else if (key == "aim_jitter") var::aim_jitter = ParseBool(val, var::aim_jitter);
+    else if (key == "aim_close_range") var::aim_close_range = ParseBool(val, var::aim_close_range);
+    else if (key == "aim_close_distance") {
+        var::aim_close_distance = std::clamp(static_cast<float>(std::atof(val.c_str())), 2.f, 10.f);
+    }
+    else if (key == "aim_recoil_comp") {
+        var::aim_recoil_comp = std::clamp(static_cast<float>(std::atof(val.c_str())), 1.f, 2.f);
+    }
+    else if (key == "aim_show_circle") var::aim_show_circle = ParseBool(val, var::aim_show_circle);
     else if (key == "debug_overlay_key") var::debug_overlay_key = std::atoi(val.c_str());
-    else if (key == "aim_bone_mode") {
-        const int m = std::clamp(std::atoi(val.c_str()), 0, 5);
-        var::aim_bone_mode = static_cast<AimBoneMode>(m);
-    }
-    else if (key == "predict") var::predict = ParseBool(val, var::predict);
-    else if (key == "humanizer") var::humanizer = ParseBool(val, var::humanizer);
-    else if (key == "humanizer_intensity") var::humanizer_intensity = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.f, 3.f);
-    else if (key == "humanizer_react_ms") var::humanizer_react_ms = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.f, 800.f);
-    else if (key == "humanizer_overshoot") var::humanizer_overshoot = std::clamp(static_cast<float>(std::atof(val.c_str())), 0.f, 0.6f);
-    else if (key == "randombone") var::randombone = ParseBool(val, var::randombone);
-    else if (key == "aimbot_fov") var::aimbot_fov = static_cast<float>(std::atof(val.c_str()));
-    else if (key == "aimbot_priority") {
-        const int prio = std::clamp(std::atoi(val.c_str()), 0, 4);
-        var::aimbot_priority = static_cast<AimbotPriority>(prio);
-    }
-    else if (key == "show_fov") var::show_fov = ParseBool(val, var::show_fov);
     else if (key == "camPovUsePending") var::camPovUsePending = ParseBool(val, var::camPovUsePending);
     else if (key == "show_crosshair") var::show_crosshair = ParseBool(val, var::show_crosshair);
     else if (key == "crosshair_style") {
@@ -1122,18 +1103,6 @@ void ApplyKeyValue(const std::string& key, const std::string& val)
     else if (key == "crosshair_thickness") var::crosshair_thickness = static_cast<float>(std::atof(val.c_str()));
     else if (key == "crosshair_gap") var::crosshair_gap = static_cast<float>(std::atof(val.c_str()));
     else if (key == "crosshair_spin_rpm") var::crosshair_spin_rpm = static_cast<float>(std::atof(val.c_str()));
-    else if (key == "aimbot_distance") {
-        var::aimbot_distance = static_cast<float>(std::atof(val.c_str()));
-        var::aimbot_distance = std::clamp(var::aimbot_distance, 0.f, var::kMaxDistanceSliderM);
-    }
-    else if (key == "smoothness") {
-        var::smoothness = std::clamp(static_cast<float>(std::atof(val.c_str())), 1.f, 20.f);
-    }
-    else if (key == "aim_algorithm") {
-        const int algo = std::atoi(val.c_str());
-        var::aim_algorithm = (algo == 0) ? AimAlgorithm::Linear : AimAlgorithm::Accelerated;
-    }
-    else if (key == "sticky_target_lock") var::sticky_target_lock = ParseBool(val, var::sticky_target_lock);
     else if (key == "showmenu") showmenu = ParseBool(val, showmenu);
     else if (key == "kmbox_type") {
         if (val == "BPro")
@@ -1301,7 +1270,6 @@ void SerializeIni(std::ostream& file)
     file << "enableesp=" << (var::enableesp ? 1 : 0) << '\n';
     file << "box=" << (var::box ? 1 : 0) << '\n';
     file << "show_head_dot=" << var::show_head_dot << '\n';
-    file << "practice_mode=" << (var::practice_mode ? 1 : 0) << '\n';
     file << "radar_ghost_suppress_poi=" << (var::radar_ghost_suppress_poi ? 1 : 0) << '\n';
     file << "show_search_window=" << (var::show_search_window ? 1 : 0) << '\n';
     file << "head_dot_radius_px=" << var::head_dot_radius_px << '\n';
@@ -1329,7 +1297,6 @@ void SerializeIni(std::ostream& file)
     file << "show_radar=" << (var::show_radar ? 1 : 0) << '\n';
     file << "show_debug_overlay=" << (var::show_debug_overlay ? 1 : 0) << '\n';
     file << "debug_skeleton_lag=" << (var::debug_skeleton_lag ? 1 : 0) << '\n';
-    file << "debug_aim_shake=" << (var::debug_aim_shake ? 1 : 0) << '\n';
     file << "debug_hatch_detect=" << (var::debug_hatch_detect ? 1 : 0) << '\n';
     file << "debug_ghost_bots=" << (var::debug_ghost_bots ? 1 : 0) << '\n';
     file << "debug_world_trace=" << (var::debug_world_trace ? 1 : 0) << '\n';
@@ -1364,6 +1331,7 @@ void SerializeIni(std::ostream& file)
     file << "bot_box=" << (var::bot_box ? 1 : 0) << '\n';
     file << "bot_names=" << (var::bot_names ? 1 : 0) << '\n';
     file << "bot_snaplines=" << (var::bot_snaplines ? 1 : 0) << '\n';
+    file << "esp_entity_debug=" << (var::esp_entity_debug ? 1 : 0) << '\n';
     file << "bot_show_distance=" << (var::bot_show_distance ? 1 : 0) << '\n';
     file << "bot_heart=" << (var::bot_heart ? 1 : 0) << '\n';
     file << "show_dead_bots=" << (var::show_dead_bots ? 1 : 0) << '\n';
@@ -1373,19 +1341,34 @@ void SerializeIni(std::ostream& file)
     WriteColor4(file, "bot_color_invisible", var::bot_color_invisible);
 
     file << "enable_aimbot=" << (var::enable_aimbot ? 1 : 0) << '\n';
-    file << "robotAimEnabled=" << (var::robotAimEnabled ? 1 : 0) << '\n';
+    file << "aim_autofire=" << (var::aim_autofire ? 1 : 0) << '\n';
     file << "aim_hold_key=" << var::aim_hold_key << '\n';
+    file << "aim_radius=" << var::aim_radius << '\n';
+    file << "aim_stop_zone=" << var::aim_stop_zone << '\n';
+    file << "aim_speed=" << var::aim_speed << '\n';
+    file << "aim_response=" << var::aim_response << '\n';
+    file << "aim_calib_x=" << var::aim_calib_x << '\n';
+    file << "aim_calib_y=" << var::aim_calib_y << '\n';
+    file << "aim_priority=" << var::aim_priority << '\n';
+    file << "aim_bone=" << var::aim_bone << '\n';
+    file << "aim_point_percent=" << var::aim_point_percent << '\n';
+    file << "aim_max_distance=" << var::aim_max_distance << '\n';
+    file << "aim_sticky=" << (var::aim_sticky ? 1 : 0) << '\n';
+    file << "aim_require_enemy=" << (var::aim_require_enemy ? 1 : 0) << '\n';
+    file << "aim_require_visible=" << (var::aim_require_visible ? 1 : 0) << '\n';
+    file << "aim_require_bones=" << (var::aim_require_bones ? 1 : 0) << '\n';
+    file << "aim_frame_fresh_ms=" << var::aim_frame_fresh_ms << '\n';
+    file << "aim_autofire_radius=" << var::aim_autofire_radius << '\n';
+    file << "aim_autofire_interval=" << var::aim_autofire_interval << '\n';
+    file << "aim_click_hold=" << var::aim_click_hold << '\n';
+    file << "aim_telemetry=" << (var::aim_telemetry ? 1 : 0) << '\n';
+    file << "aim_deadzone=" << (var::aim_deadzone ? 1 : 0) << '\n';
+    file << "aim_jitter=" << (var::aim_jitter ? 1 : 0) << '\n';
+    file << "aim_close_range=" << (var::aim_close_range ? 1 : 0) << '\n';
+    file << "aim_close_distance=" << var::aim_close_distance << '\n';
+    file << "aim_recoil_comp=" << var::aim_recoil_comp << '\n';
+    file << "aim_show_circle=" << (var::aim_show_circle ? 1 : 0) << '\n';
     file << "debug_overlay_key=" << var::debug_overlay_key << '\n';
-    file << "aim_bone_mode=" << static_cast<int>(var::aim_bone_mode) << '\n';
-    file << "predict=" << (var::predict ? 1 : 0) << '\n';
-    file << "humanizer=" << (var::humanizer ? 1 : 0) << '\n';
-    file << "humanizer_intensity=" << var::humanizer_intensity << '\n';
-    file << "humanizer_react_ms=" << var::humanizer_react_ms << '\n';
-    file << "humanizer_overshoot=" << var::humanizer_overshoot << '\n';
-    file << "randombone=" << (var::randombone ? 1 : 0) << '\n';
-    file << "aimbot_fov=" << var::aimbot_fov << '\n';
-    file << "aimbot_priority=" << static_cast<int>(var::aimbot_priority) << '\n';
-    file << "show_fov=" << (var::show_fov ? 1 : 0) << '\n';
     file << "camPovUsePending=" << (var::camPovUsePending ? 1 : 0) << '\n';
     file << "show_crosshair=" << (var::show_crosshair ? 1 : 0) << '\n';
     UpgradeOptions::Save(file);
@@ -1397,23 +1380,6 @@ void SerializeIni(std::ostream& file)
     file << "crosshair_thickness=" << var::crosshair_thickness << '\n';
     file << "crosshair_gap=" << var::crosshair_gap << '\n';
     file << "crosshair_spin_rpm=" << var::crosshair_spin_rpm << '\n';
-    file << "aimbot_distance=" << var::aimbot_distance << '\n';
-    file << "smoothness=" << var::smoothness << '\n';
-    file << "aim_algorithm=" << static_cast<int>(var::aim_algorithm) << '\n';
-    file << "aim_deadzone_px=" << var::aim_deadzone_px << '\n';
-    file << "aim_sensitivity=" << var::aim_sensitivity << '\n';
-    file << "aim_hardware_speed=" << var::aim_hardware_speed << '\n';
-    file << "sticky_target_lock=" << (var::sticky_target_lock ? 1 : 0) << '\n';
-    file << "aim_sticky_fov_bias_px=" << var::aim_sticky_fov_bias_px << '\n';
-    file << "aim_loss_of_sight_grace_ms=" << var::aim_loss_of_sight_grace_ms << '\n';
-    file << "aim_loss_of_sight_grace_enabled=" << (var::aim_loss_of_sight_grace_enabled ? 1 : 0) << '\n';
-    file << "aim_bullet_speed_cm_s=" << var::aim_bullet_speed_cm_s << '\n';
-    file << "enable_triggerbot=" << (var::enable_triggerbot ? 1 : 0) << '\n';
-    file << "trigger_hold_mode=" << var::trigger_hold_mode << '\n';
-    file << "trigger_hold_key=" << var::trigger_hold_key << '\n';
-    file << "trigger_deadzone_px=" << var::trigger_deadzone_px << '\n';
-    file << "trigger_fire_delay_ms=" << var::trigger_fire_delay_ms << '\n';
-    file << "trigger_auto_hold=" << (var::trigger_auto_hold ? 1 : 0) << '\n';
     file << "enable_world=" << (var::enable_world ? 1 : 0) << '\n';
     file << "droppedItems=" << (var::droppedItems ? 1 : 0) << '\n';
     file << "raiderStock=" << (var::raiderStock ? 1 : 0) << '\n';
@@ -1476,6 +1442,8 @@ void SerializeIni(std::ostream& file)
     WriteColor4(file, "color_world_deaddrop", var::color_world_deaddrop);
 
     file << "showLoot=" << (var::showLoot ? 1 : 0) << '\n';
+    file << "show_world_quest=" << (var::show_world_quest ? 1 : 0) << '\n';
+    file << "quest_pulse=" << (var::quest_pulse ? 1 : 0) << '\n';
     file << "show_near_loot_hud=" << (var::show_near_loot_hud ? 1 : 0) << '\n';
     file << "loot_distance=" << var::loot_distance << '\n';
     file << "container_distance_sp=" << var::container_distance_sp << '\n';

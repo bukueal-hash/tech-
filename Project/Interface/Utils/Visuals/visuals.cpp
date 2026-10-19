@@ -39,25 +39,6 @@ Visuals::EspDrawScale MakeScale(float espScale)
 
 namespace Visuals {
 
-float AimbotFovRadiusPx(float aimbotFovDegrees, float gameFovDegrees, float screenW)
-{
-    if (aimbotFovDegrees <= 0.f || screenW < 1.f)
-        return 0.f;
-
-    float gameFov = gameFovDegrees;
-    if (gameFov <= 1.f || gameFov > 179.f)
-        gameFov = 90.f;
-
-    const float aimHalfRad = static_cast<float>((aimbotFovDegrees * 0.5f) * 3.14159265f / 180.0f);
-    const float gameHalfRad = static_cast<float>((gameFov * 0.5f) * 3.14159265f / 180.0f);
-    const float tanGame = tanf(gameHalfRad);
-    if (tanGame < 0.0001f)
-        return 4.f;
-
-    float radius = (screenW * 0.5f) * tanf(aimHalfRad) / tanGame;
-    return radius < 4.f ? 4.f : radius;
-}
-
 } // namespace Visuals
 
 float Visuals::EspDistanceScale(float distanceMeters)
@@ -186,28 +167,6 @@ void Visuals::DrawScaledText(const char* text, float centerX, float y, const Esp
     dl->AddText(font, scale.textPx, ImVec2(pos.x, pos.y - outline), outlineColor, text);
     dl->AddText(font, scale.textPx, ImVec2(pos.x, pos.y + outline), outlineColor, text);
     dl->AddText(font, scale.textPx, pos, color, text);
-}
-
-void Visuals::FovCircle(float aimbotFovDegrees, float gameFovDegrees, ImU32 color)
-{
-    if (aimbotFovDegrees <= 0.f)
-        return;
-
-    const float screenW = ImGui::GetIO().DisplaySize.x;
-    const float screenH = ImGui::GetIO().DisplaySize.y;
-    if (screenW < 1.f || screenH < 1.f)
-        return;
-
-    const float radius = AimbotFovRadiusPx(aimbotFovDegrees, gameFovDegrees, screenW);
-    if (radius < 4.f)
-        return;
-
-    ImGui::GetForegroundDrawList()->AddCircle(
-        ImVec2(screenW * 0.5f, screenH * 0.5f),
-        radius,
-        color,
-        64,
-        2.0f);
 }
 
 namespace {

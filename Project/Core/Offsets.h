@@ -12,8 +12,6 @@
 // [live] ComponentToWorld - live CL-1426848 FTransform block = 0x320; translation at +0x20 => 0x340 (measured on the pawn root)
 // [live] GObjectsRva - sdk/SDK1.txt GUObjectArray live reference: encrypted global = 0x10E423D0
 // [live] Health - ArcOffsets::HealthComponent::CURRENT_HEALTH = 0x6D0 (the 0x700 dump field is an FName shadow)
-// [live] LastRenderTime - user-provided 2026-09-23: PrimitiveComponent::LastRenderTime = 0x480 (plain float; drop's 0x4C0 reads zero now)
-// [live] LastRenderTimeOnScreen - user-provided 2026-09-23: LastRenderTimeOnScreen = 0x484 (plain float; was 0x4C4)
 // MaxHealth - HealthComponent.MaxHealth = 0x378 (reflected double in sdk/sdk.txt; replaces the 0x348 live pin)
 // [live] PCOwner - pre-regeneration owner slot 0xD0; SDK reflects 0x428 which broke PCM discovery
 
@@ -109,6 +107,14 @@ namespace Offsets {
     // -- Controller / PlayerController -------------------------------
 
     constexpr std::ptrdiff_t StaticMeshComponent_StaticMesh         = 0x6E8;                                       // Engine.StaticMeshComponent.StaticMesh = 0x6E8 - StaticMesh* asset reference  [lit/probed]
+    // UInstancedStaticMeshComponent (base of HISM/Foliage/Grass/HLOD): the per-
+    // instance transforms. PerInstanceSMData is a TArray<InstancedStaticMeshInstanceData>
+    // (data @+0x00, count @+0x08), one 128-byte double 4x4 matrix each (translation in
+    // row 3). Offsets from the calibrated SDK dump (sdk/sdk.txt); StaticMesh is the
+    // inherited 0x6E8 above.  [dump]
+    constexpr std::ptrdiff_t InstancedStaticMeshComponent_PerInstanceSMData = 0x7B0;
+    constexpr std::ptrdiff_t InstancedStaticMeshComponent_InstanceStride    = 0x80;
+    constexpr std::ptrdiff_t InstancedStaticMeshComponent_InstanceTranslation = 0x60;  // row 3 of the 4x4 (3 doubles)
     constexpr std::ptrdiff_t SceneComponent_RelativeLocation        = 0x280;                                       // Engine.SceneComponent.RelativeLocation = 0x280 - FVector local position  [lit/probed]
     constexpr std::ptrdiff_t SceneComponent_RelativeRotation        = 0x298;                                       // Engine.SceneComponent.RelativeRotation = 0x298 - FRotator local rotation  [lit/probed]
     constexpr std::ptrdiff_t SceneComponent_RelativeScale3D         = 0x2B0;                                       // Engine.SceneComponent.RelativeScale3D = 0x2B0 - FVector local scale  [lit/probed]
@@ -241,7 +247,6 @@ namespace Offsets {
     constexpr std::ptrdiff_t ClassDefaultObject                     = 0x70;                                        // 0x70 - no dump source - int32 read on actor keys  [lit/probed]
     constexpr std::ptrdiff_t ClassDefaultObjectAlt                  = 0x78;                                        // 0x78 - no dump source  [lit/probed]
     constexpr std::ptrdiff_t ActorTypeId                            = 0xB0;                                        // 0xB0 - no dump source  [lit/probed]
-    constexpr std::ptrdiff_t IsRenderedTime                         = 0x1F0;                                       // 0x1F0 - no dump source  [lit/probed]
     constexpr std::ptrdiff_t ActorID                                = 0x18;                                        // 0x18 - no dump source  [lit/probed]
     constexpr std::ptrdiff_t ActorOwner                             = 0x1D0;                                       // Engine.Actor.Owner = 0x1D0
     constexpr std::ptrdiff_t ActorInstigator                        = 0x220;                                       // Engine.Actor.Instigator = 0x220
@@ -288,9 +293,6 @@ namespace Offsets {
 
     // -- Primitive / skinned mesh ------------------------------------
     constexpr std::ptrdiff_t BoundsScale                            = 0x478;                                       // Engine.PrimitiveComponent.BoundsScale = 0x478
-    constexpr std::ptrdiff_t LastRenderTime                         = 0x480;                                       // 0x480 - user-provided 2026-09-23: PrimitiveComponent::LastRenderTime = 0x480 (plain float)  [live]
-    constexpr std::ptrdiff_t LastRenderTimeOnScreen                 = 0x484;                                       // 0x484 - user-provided 2026-09-23: LastRenderTimeOnScreen = 0x484 (plain float)  [live]
-    constexpr std::ptrdiff_t LastSubmitTime                         = LastRenderTime;                              // LastRenderTime - alias (== LastRenderTime)  [lit/probed]
     constexpr std::ptrdiff_t VisibilityBasedAnimTickOption          = 0xA1C;                                       // Engine.SkinnedMeshComponent.VisibilityBasedAnimTickOption = 0xA1C
     constexpr std::ptrdiff_t bRecentlyRendered                      = 0xA20;                                       // Engine.SkinnedMeshComponent.bRecentlyRendered = 0xA20 - byte holding bRecentlyRendered
     constexpr uint8_t        bRecentlyRenderedMask                  = 0x40;                                        // 0x40  [lit/probed]
@@ -567,7 +569,6 @@ namespace Offsets {
     constexpr std::ptrdiff_t Pawn_RemoteViewPitch16                 = 0x3D2;                                       // Engine.Pawn.RemoteViewPitch16 = 0x3D2
     constexpr std::ptrdiff_t Pawn_RemoteViewPitch                   = 0x3D4;                                       // Engine.Pawn.RemoteViewPitch = 0x3D4
     constexpr std::ptrdiff_t PlayerCameraManager_PCOwner            = PCOwner;                                     // PCOwner - alias  [lit/probed]
-    constexpr std::ptrdiff_t CharacterMovement_LastSubmitTime       = LastSubmitTime;                              // LastSubmitTime - alias  [lit/probed]
     constexpr std::ptrdiff_t Character_Mesh                         = USkeletalMeshComponent;                      // USkeletalMeshComponent - alias  [lit/probed]
     constexpr std::ptrdiff_t SquadmateInfo0                         = 0xD08;                                       // Angelscript.PioneerPlayerCharacter.SquadmateInfo0 = 0xD08
     constexpr std::ptrdiff_t SquadmateInfo1                         = 0xD30;                                       // Angelscript.PioneerPlayerCharacter.SquadmateInfo1 = 0xD30

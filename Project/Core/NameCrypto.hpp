@@ -61,7 +61,7 @@ constexpr uint64_t kSlotClmulK1     = 0x8E9484400ADF26C1ULL;
 constexpr uint64_t kSlotClmulK2     = 0x1ADA36649C975181ULL;
 
 // -- FName pool ------------------------------------------------------------
-constexpr uint64_t kRvaGnamePool        = 0x10B779F0ULL; // 2026-10-09 encrypted FName pool
+constexpr uint64_t kRvaGnamePool        = 0x10EAA140ULL; // FName::RVA_GNAMEPOOL, CL-1426848 (matches game::offsets::GNAMES in SDK.hpp)
 constexpr uint64_t kRvaKeystream        = 0x10A1425CULL; // 2026-10-09 ARC_RVA_CHARKEY (table data at +0x30)
 constexpr int      kKeystreamBaseIdx    = 0xC;
 constexpr int      kKeystreamCount      = 0x100;
@@ -184,7 +184,7 @@ constexpr uint32_t kGiShuffleMaskRva    = 0xB09C350u;
 constexpr uint32_t kGiXorKeyRva         = 0xB06C380u;
 constexpr uint32_t kGiXorKeyRva2        = 0xB06C390u;
 constexpr uint32_t kWorldOffset         = 0x2F0;
-constexpr uint64_t kUWorldBaseRva       = 0x10839A98ULL;
+constexpr uint64_t kUWorldBaseRva       = 0x10971338ULL; // GWorld global, CL-1426848 (matches game::offsets::GWORLD)
 constexpr uint32_t kObjectXorKeyRva     = 0xD91F885u;
 constexpr uint32_t kSimdMaskRva         = 0xAD2FC50u;
 constexpr uint64_t kXmmXorVal           = 0xA738DD8241D227C2ULL;

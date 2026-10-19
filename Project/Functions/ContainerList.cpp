@@ -1601,6 +1601,17 @@ void Engine::ContainerList()
                         && (row.searched1 & 0x1) != 0)
                     || (row.liSimple && Memory::IsValidPtrFast2(row.liSimple)
                         && (row.searched2 & 0x1) != 0));
+            // Record the probed state ON the entry. Before this, the probe only
+            // decided erase-vs-keep: a looted crate left in the cache by
+            // grey_looted mode kept cachedOpened unknown, so the ESP drew it
+            // exactly like a fresh crate — no grey, no "(Looted)" tag.
+            if (row.retainIdx < retainIters.size()) {
+                auto& probed = retainIters[row.retainIdx]->second;
+                probed.cachedOpened = opened ? 1 : 0;
+                probed.openedProbeMs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+            }
             if (!opened)
                 continue;
             // #region agent log

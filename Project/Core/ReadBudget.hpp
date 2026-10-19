@@ -4,8 +4,8 @@
 // Why this exists: the overlay has a dozen subsystems that each read game
 // memory on their own schedule, and nothing recorded who asked for what. The
 // old readout summed a single stopwatch around one frame, so it printed
-// 0.000 ms while the scan thread, the retain worker, the aim tick and the
-// position refresh all competed for the same DMA ring. "Who is fighting whom"
+// 0.000 ms while the scan thread, the retain worker and the position refresh
+// all competed for the same DMA ring. "Who is fighting whom"
 // was unanswerable.
 //
 // This ledger answers it with two axes:

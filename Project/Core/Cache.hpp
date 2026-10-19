@@ -55,6 +55,7 @@ struct BoneData {
     std::array<Vector3, (size_t)UniBone::Count> bonesDouble;
     std::array<Vector3, (size_t)UniBone::Count> bonesWorldDouble;
     std::bitset<(size_t)UniBone::Count> valid;
+    std::bitset<(size_t)UniBone::Count> visible;
     bool isVisible = false;
     // Steady-clock ms when this bone sample was taken — skeleton-lag probe
     // measures draw-time age against it.

@@ -21,9 +21,8 @@ void DrawArcSettingsTab();
     void DrawArcDumperTab();
 void DrawArcHelpTab();
 void DrawArcDebugContent();
-void DrawArcTriggerbotContent();
 void DrawArcLootContent();
-void DrawArcCollisionContent();
+void DrawArcQuestContent();
 }
 
 void ArcMenuAddVerticalSpacing(float spacing);

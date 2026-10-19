@@ -160,8 +160,10 @@ inline bool WorldToScreenBox(
 {
     Vector3 headScr{};
     Vector3 feetScr{};
-    const bool headOk = eng.ProjectWorldLocationToScreen(headWorld, headScr, cam);
-    const bool feetOk = eng.ProjectWorldLocationToScreen(feetWorld, feetScr, cam);
+    // Unclipped: a bot close to the lens can have one endpoint far outside the
+    // viewport while the box still overlaps it. The box is culled below.
+    const bool headOk = eng.ProjectWorldLocationToScreenUnclipped(headWorld, headScr, cam);
+    const bool feetOk = eng.ProjectWorldLocationToScreenUnclipped(feetWorld, feetScr, cam);
 
     if (!headOk || !feetOk) {
         // Close flying bots (Firefly/Wasp overhead, sky-drop Snitch): one end
@@ -174,7 +176,7 @@ inline bool WorldToScreenBox(
             (headWorld.y + feetWorld.y) * 0.5,
             (headWorld.z + feetWorld.z) * 0.5};
         Vector3 centerScr{};
-        if (!eng.ProjectWorldLocationToScreen(centerWorld, centerScr, cam))
+        if (!eng.ProjectWorldLocationToScreenUnclipped(centerWorld, centerScr, cam))
             return false;
 
         const double dx = centerWorld.x - cam.Location.x;

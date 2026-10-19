@@ -30,6 +30,7 @@ namespace var {
     bool bot_box = true;
     bool bot_names = true;
     bool bot_snaplines = false;
+    bool esp_entity_debug = false;
     bool bot_show_distance = true;
     bool bot_heart = true;
     float bot_esp_distance = 500.f;
@@ -38,18 +39,33 @@ namespace var {
 
     /* Aimbot */
     bool enable_aimbot = false;
-    bool robotAimEnabled = false;
     int aim_hold_key = 0x10; // VK_SHIFT
-    AimBoneMode aim_bone_mode = AimBoneMode::ClosestBone;
-    bool predict = true;
-    bool humanizer = false;
-    float humanizer_intensity = 1.0f;   // overall jitter scale (0=off-ish, 2=max)
-    float humanizer_react_ms = 220.f;   // base reaction delay (ms)
-    float humanizer_overshoot = 0.18f;  // settling overshoot as fraction of error
-    bool randombone = false;
-    float aimbot_fov = 50.f;
-    AimbotPriority aimbot_priority = AimbotPriority::Fov;
-    bool show_fov = true;
+    int aim_radius = 60;
+    float aim_stop_zone = 1.5f;
+    int aim_speed = 120;
+    int aim_response = 50;
+    float aim_calib_x = 1.f;
+    float aim_calib_y = 1.f;
+    int aim_priority = 2; // balanced
+    int aim_bone = 0;     // closest to crosshair
+    int aim_point_percent = 18;
+    int aim_max_distance = 120;
+    bool aim_sticky = true;
+    bool aim_require_enemy = false;
+    bool aim_require_visible = false;
+    bool aim_require_bones = false;
+    int aim_frame_fresh_ms = 250;
+    bool aim_autofire = false;
+    int aim_autofire_radius = 6;
+    int aim_autofire_interval = 120;
+    int aim_click_hold = 25;
+    bool aim_telemetry = true;
+    bool aim_deadzone = true;
+    bool aim_jitter = true;
+    bool aim_close_range = true;
+    float aim_close_distance = 5.f;
+    float aim_recoil_comp = 1.2f;
+    bool aim_show_circle = true;
     bool show_crosshair = true;
     int crosshair_style = 0;
     float crosshair_color[4] = { 0.f, 1.f, 0.f, 1.f };
@@ -57,26 +73,7 @@ namespace var {
     float crosshair_thickness = 1.5f;
     float crosshair_gap = 3.f;
     float crosshair_spin_rpm = 20.f;
-    float aimbot_distance = 500.f;
-    float aim_deadzone_px = 0.f;
-    float smoothness = 2.f;
-    AimAlgorithm aim_algorithm = AimAlgorithm::Linear;
-    float aim_sensitivity = 1.0f;
-    float aim_hardware_speed = 15.f;
-    bool sticky_target_lock = true;
-    float aim_sticky_fov_bias_px = 35.f;
-    int aim_loss_of_sight_grace_ms = 250;
     int debug_overlay_key = 0x77; // VK_F8 default; 0 = unbound
-    bool aim_loss_of_sight_grace_enabled = true;
-    float aim_bullet_speed_cm_s = 80000.f;
-
-    /* Triggerbot */
-    bool enable_triggerbot = false;
-    int trigger_hold_mode = 0; // Hold
-    int trigger_hold_key = 0x10; // VK_SHIFT
-    float trigger_deadzone_px = 3.f;
-    int trigger_fire_delay_ms = 30;
-    bool trigger_auto_hold = false;
 
     /* World */
     bool enable_world = true;
@@ -145,6 +142,10 @@ namespace var {
 
     /* Loot */
     bool showLoot = true;
+// Quest item ESP: master on/off and the breathing pulse. Both default on, which
+// is the previous always-on behaviour.
+bool show_world_quest = true;
+bool quest_pulse = true;
     bool show_near_loot_hud = false;
     float loot_distance = 500.f;
     float container_distance_sp = 500.f;
@@ -186,7 +187,6 @@ namespace var {
     /* Debug */
     bool show_debug_overlay = false;
     bool debug_skeleton_lag = false;
-    bool debug_aim_shake = false;
     bool debug_hatch_detect = false;
     bool debug_ghost_bots = false;
     bool debug_world_trace = false;

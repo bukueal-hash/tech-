@@ -121,7 +121,4 @@ float HealthShieldBarsAboveHead(
     ImDrawList* drawList = nullptr);
 void Box(const Vector3& headScreenPos, const Vector3& feetScreenPos, bool visible, ImU32 color, int boxType, const EspDrawScale& scale);
 void DrawCorneredBox(float X, float Y, float W, float H, const ImU32& color, float thickness);
-void FovCircle(float aimbotFovDegrees, float gameFovDegrees,
-    ImU32 color = IM_COL32(255, 255, 255, 220));
-float AimbotFovRadiusPx(float aimbotFovDegrees, float gameFovDegrees, float screenW);
 }

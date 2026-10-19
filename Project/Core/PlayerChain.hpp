@@ -168,7 +168,27 @@ struct State {
 
 // What the host carries over from the previous tick. Every cached value is
 // re-proved by the rung that reuses it, so a stale entry cannot be published.
+// GameInstance rungs that may be pinned to disk (Data\gi_rung.txt). Cached and
+// the LP/controller-derived rungs are per-tick state, not a fixed address path.
+inline bool IsPinnableGiRung(Rung r)
+{
+    switch (r) {
+    case Rung::OwningSlot:
+    case Rung::OwningBackRef:
+    case Rung::TlsDecrypt:
+    case Rung::SimdDecrypt:
+    case Rung::LegacySlot:
+    case Rung::Scan:
+    case Rung::ObjectScan:
+        return true;
+    default:
+        return false;
+    }
+}
+
 struct Seed {
+    // The GI rung that won last run, tried first this run. None = no pin.
+    Rung giPinned = Rung::None;
     uint64_t base = 0;
     uintptr_t world = 0;
     uintptr_t pc = 0;
@@ -331,7 +351,36 @@ void Resolve(State& st, Host& host, const Seed& seed)
     // the LP outer hop, then the per-thread TLS block, then the retired CLs'
     // schemes, then a scan of UWorld.
     uintptr_t gi = 0;
-    {
+    // Pinned rung from the last run that proved the GI: try exactly that
+    // primitive first. Each primitive still applies its own proof, and a miss
+    // falls through to the full ladder below, so a stale pin only costs time.
+    if (seed.giPinned != Rung::None && IsPinnableGiRung(seed.giPinned)) {
+        detail::Attempt(st, Hop::GameInstance);
+        uintptr_t v = 0;
+        Rung which = seed.giPinned;
+        switch (seed.giPinned) {
+        case Rung::OwningSlot:
+        case Rung::OwningBackRef: {
+            bool backRef = false;
+            v = host.GiOwningSlot(world, backRef);
+            which = backRef ? Rung::OwningBackRef : Rung::OwningSlot;
+            break;
+        }
+        case Rung::TlsDecrypt: v = host.GiFromTls(); break;
+        case Rung::SimdDecrypt: v = host.GiFromDecrypt(world); break;
+        case Rung::LegacySlot: v = host.GiFromLegacySlot(world); break;
+        case Rung::Scan: v = host.GiFromScan(world); break;
+        case Rung::ObjectScan: v = host.GiFromObjectScan(); break;
+        default: break;
+        }
+        if (v) {
+            detail::Accept(st, Hop::GameInstance, v, which, which != Rung::OwningSlot);
+            gi = v;
+        } else {
+            ++st.Get(Hop::GameInstance).rejected;
+        }
+    }
+    if (!gi) {
         detail::Attempt(st, Hop::GameInstance);
         bool backRef = false;
         const uintptr_t v = host.GiOwningSlot(world, backRef);

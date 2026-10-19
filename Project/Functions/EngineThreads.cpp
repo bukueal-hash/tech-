@@ -6,10 +6,10 @@
 #include "../Core/EntityDiagnostics.hpp"
 #include "../Core/ScanGatePolicy.hpp"
 #include "../Core/ReadBudget.hpp"
+#include "../Core/EmbreeVisCheck.hpp"
 #include "../../DMA/Memory.h"
 #include "../Interface/Utils/Variables/index.h"
 #include "WorldScanCommon.h"
-#include "CollisionRead.h"
 
 #include <algorithm>
 #include <chrono>
@@ -181,7 +181,6 @@ struct CadenceStats {
 
 static CadenceStats g_camCadence;
 static CadenceStats g_posCadence;
-static CadenceStats g_aimCadence;
 // #endregion
 
 // Scan gate: serialize the heavy scanner passes (Update, EntityList,
@@ -737,7 +736,7 @@ void RunGatedScan(const char* scanner, int cadenceMs, bool deferrable, Fn&& fn)
 // gate's fairness policy so the two cannot drift apart.
 constexpr int kUpdateCadenceMs = 16;
 constexpr int kEntityCadenceMs = 220;
-constexpr int kRobotCadenceMs = 200;
+constexpr int kRobotCadenceMs = 120;
 constexpr int kContainerCadenceMs = 250;
 constexpr int kItemCadenceMs = 250;
 
@@ -860,7 +859,6 @@ void Engine::StartWorkerThreads()
     // Initialize callback-owned telemetry before any constructor launches a worker.
     g_camCadence.init("camera", 8);
     g_posCadence.init("position", 16);
-    g_aimCadence.init("aim", 4);
 
     // DMA throttle: slower periods cut PCIe/FPGA "packet loss" under load.
     // Frame velocity extrapolate still bridges gaps; aim 8 ms is plenty for kmbox.
@@ -960,21 +958,61 @@ void Engine::StartWorkerThreads()
             std::chrono::steady_clock::now() - t0).count();
         LogPerfSpike("FrameBuilder", totalMs);
     }, 12);
-    m_aimThread = std::make_unique<SyncedThread>([this] {
-        if (!IsEspRaidActive() || showmenu) {
-            // Publish WHY the pass is not running before returning. Without this,
-            // "paused because the menu is open" and "ran and examined no
-            // candidate" are the same zeroes on screen, and a deliberately
-            // suspended pass is indistinguishable from a dead worker.
-            FeaturePolicy::NoteAimPassSkipped(!IsEspRaidActive(), RunReport::SteadyNowMs());
-            ReleaseAimOutputs();
-            return;
+    m_visThread = std::make_unique<SyncedThread>([this] {
+        // Build stages: 0 = near-player scene (fast first ready), 1 = full map, 2 = done.
+        static uint64_t s_lastWorldGen = 0;
+        static int s_buildStage = 0;
+        static auto s_nextBuildAt = std::chrono::steady_clock::time_point{};
+        const uint64_t curGen = m_worldGeneration.load(std::memory_order_acquire);
+        if (curGen != s_lastWorldGen) {
+            s_lastWorldGen = curGen;
+            s_buildStage = 0;
+            s_nextBuildAt = {};
+            EmbreeVis::ResetVisibilityWorld();
         }
-        g_aimCadence.tick();
-        FeaturePolicy::NoteAimPassTick(RunReport::SteadyNowMs());
-        AimAssistence();
-    }, 4);
-    m_aimThread->set_priority(THREAD_PRIORITY_HIGHEST);
+        if (!IsEspRaidActive() || !UpgradeOptions::visCheckPerBone)
+            return;
+        ReadBudget::SetCurrentRequester("Visibility");
+        uintptr_t gw = 0;
+        {
+            std::shared_lock<std::shared_mutex> lk(m_stateMutex);
+            gw = GWorld;
+        }
+        if (!gw)
+            return;
+        CameraCache cam{};
+        {
+            std::shared_lock<std::shared_mutex> lk(m_cameraMutex);
+            cam = g_Camera;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const bool ready = EmbreeVis::g_visibility_meshes_ready.load(std::memory_order_acquire);
+        if (s_buildStage == 2 && !ready) s_buildStage = 0; /* a rebuild request clears ready: start over */
+        if (s_buildStage != 2 && (!ready || s_buildStage == 1) && now >= s_nextBuildAt) {
+            const uint32_t myGen = EmbreeVis::g_vis_generation.load(std::memory_order_acquire);
+            const bool nearPass = (s_buildStage == 0);
+            // Near pass: only actors within 150 m (Unreal units are cm).
+            const float range = nearPass ? 15000.0f : 0.0f;
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool ok = EmbreeVis::CollectVisibilityMeshesFromWorld(gw, cam.Location, range, myGen);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (ok) {
+                std::printf("[VISIBILITY] %s build took %lld ms\n", nearPass ? "near" : "full", (long long)ms);
+                EmbreeVis::g_visibility_meshes_ready.store(true, std::memory_order_release);
+                s_buildStage = nearPass ? 1 : 2;
+            } else if (nearPass) {
+                // No meshes within range: fall back to the full map right away.
+                s_buildStage = 1;
+            } else {
+                // Full map not usable yet (still loading). Wait instead of rescanning every tick.
+                s_nextBuildAt = now + std::chrono::milliseconds(1500);
+            }
+        }
+        if (UpgradeOptions::visibilityObstructionSpheres || UpgradeOptions::visDebugObstructions) {
+            EmbreeVis::CacheObstructions(gw);
+        }
+    }, 50);
 }
 
 void Engine::StopWorkerThreads()
@@ -984,11 +1022,11 @@ void Engine::StopWorkerThreads()
 
     // Stop the scheduler that can submit background jobs before joining the
     // other workers. This prevents a world/ESP pass from racing shutdown.
+    m_visThread.reset();
     m_worldThread.reset();
     m_entityThread.reset();
     m_robotEspThread.reset();
     m_worldEspThread.reset();
-    m_aimThread.reset();
     m_frameBuilderThread.reset();
     m_cameraThread.reset();
     m_positionThread.reset();
@@ -996,11 +1034,8 @@ void Engine::StopWorkerThreads()
     // All tracker writers are joined; aggregation cannot race tick().
     g_camCadence.dump();
     g_posCadence.dump();
-    g_aimCadence.dump();
-    ReleaseAimOutputs();
 
     // All engine workers are now stopped, so no new background job can be
     // submitted. Join diagnostic/rebuild jobs before destroying dependencies.
     WorldScan::StopBackgroundJobs();
-    CollisionRead::StopJobs();
 }

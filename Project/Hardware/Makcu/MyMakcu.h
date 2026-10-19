@@ -8,7 +8,9 @@ struct MyMakcu {
     static std::string AutoDetectComPort();
     static void SetComPort(const std::string& port);
     static bool Initialize();
-    static void Move(int x, int y);
+    /** Returns true if the move command was actually sent to the device. */
+    static bool Move(int x, int y);
+    static bool IsConnected();
     static void LeftClick();
     static void MouseDown();
     static void MouseUp();

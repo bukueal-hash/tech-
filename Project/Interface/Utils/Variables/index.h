@@ -1,28 +1,6 @@
 #pragma once
 #include <cstdint>
 
-enum class AimbotPriority : int {
-    Fov = 0,
-    Distance = 1,
-    Threat = 2,
-    LowHealth = 3,
-    FovDistance = 4,
-};
-
-enum class AimBoneMode : int {
-    Head = 0,
-    Chest = 1,
-    Pelvis = 2,
-    Arms = 3,
-    Legs = 4,
-    ClosestBone = 5,
-};
-
-enum class AimAlgorithm : int {
-    Linear = 0,
-    Accelerated = 1,
-};
-
 namespace var {
     /** Max range (m) for all distance sliders — matches practical game replication limit. */
     inline constexpr float kMaxDistanceSliderM = 500.f;
@@ -31,10 +9,6 @@ namespace var {
     extern bool enableesp;
     extern bool box;
     inline bool show_head_dot = false;
-    // T4.4: practice / calibration reference mode. Draws the named reference
-    // objects in Core/PracticeMode.hpp and nothing else; normal ESP output does not
-    // depend on it. Off by default.
-    inline bool practice_mode = false;
     inline float head_dot_radius_px = 3.f;
     inline float head_dot_color[4] = { 1.f, 1.f, 1.f, 1.f };
     extern int player_box_style; // 0 Full, 1 Corners, 2 Dashed, 3 Rounded
@@ -67,6 +41,7 @@ namespace var {
     extern bool bot_box;
     extern bool bot_names;
     extern bool bot_snaplines;
+    extern bool esp_entity_debug;
     extern bool bot_show_distance;
     extern bool bot_heart;
     extern bool show_dead_bots;
@@ -76,23 +51,61 @@ namespace var {
     extern float bot_color_invisible[4];
 
     /* Aimbot */
+    // Phase 1 aim assist: the tick reads these and sends relative moves to the
+    // KmBox. Ranges match the menu sliders; the tick clamps them again.
     extern bool enable_aimbot;
-    extern bool robotAimEnabled;
     extern int aim_hold_key;
+    /** Selection circle around screen centre, in pixels. */
+    extern int aim_radius;
+    /** Inside this screen distance (px) no move is sent at all. */
+    extern float aim_stop_zone;
+    /** Cap on relative units per second. */
+    extern int aim_speed;
+    /** How much of the error is corrected per tick (1 = slowest). */
+    extern int aim_response;
+    /** Pixels the view moves per mouse unit, per axis. */
+    extern float aim_calib_x;
+    extern float aim_calib_y;
+    /** Target choice: 0 = screen, 1 = distance, 2 = balanced. */
+    extern int aim_priority;
+    /** Aim point: 0 = closest to crosshair, 1+ = fixed bone (menu order). */
+    extern int aim_bone;
+    /** Estimated head point, percent down from the box top (2-45). */
+    extern int aim_point_percent;
+    /** Ignore actors further away than this (metres). */
+    extern int aim_max_distance;
+    /** Keep the current actor while it stays near the crosshair. */
+    extern bool aim_sticky;
+    /** Trust gates (phase 3): reject actors we cannot confirm. */
+    extern bool aim_require_enemy;
+    extern bool aim_require_visible;
+    extern bool aim_require_bones;
+    /** Oldest data the tick will act on, in ms (80-1000). */
+    extern int aim_frame_fresh_ms;
+    /** Phase 4: guarded autofire. Off by default and not persisted. */
+    extern bool aim_autofire;
+    extern int aim_autofire_radius;
+    extern int aim_autofire_interval;
+    /** Device click hold time in ms. */
+    extern int aim_click_hold;
+    /** Draw the 1 Hz aim status line. */
+    extern bool aim_telemetry;
+    /** Stop zone on/off. Off = keep correcting at tiny error (may buzz). */
+    extern bool aim_deadzone;
+    /** Per-tick jitter on response (+-5%) and radius (+-1 px). */
+    extern bool aim_jitter;
+    /** Under the close distance: double correction, faster autofire. */
+    extern bool aim_close_range;
+    /** Distance (m) under which the close-range boost applies. */
+    extern float aim_close_distance;
+    /** Y move multiplier while firing (1.0 = off, 1.2 = mild climb fight). */
+    extern float aim_recoil_comp;
+    /** Draw the selection circle (menu preview + in raid). */
+    extern bool aim_show_circle;
     // Offset debug overlay (green timers) toggle key (VK code; 0 = unbound).
     // Pickable via Settings -> Debug -> "Debug overlay hotkey"; edge-detected
     // in HandleRaidHotkeys.
     extern int debug_overlay_key;
-    extern AimBoneMode aim_bone_mode;
-    extern bool predict;
-    extern bool humanizer;
-    extern float humanizer_intensity;
-    extern float humanizer_react_ms;
-    extern float humanizer_overshoot;
-    extern bool randombone;
-    extern float aimbot_fov;
-    extern AimbotPriority aimbot_priority;
-    extern bool show_fov;
     extern bool show_crosshair;
     extern int crosshair_style;
     extern float crosshair_color[4];
@@ -118,34 +131,6 @@ namespace var {
     inline float crosshair_pulse_amount = 2.f;
     inline float crosshair_outline_color[4] = { 0.f, 0.f, 0.f, 0.8f };
     inline float crosshair_accent_color[4] = { 0.35f, 0.85f, 1.f, 0.9f };
-    extern float aimbot_distance;
-    extern float aim_deadzone_px;
-    /** Aim smoothing. 1 = instant snap. Higher = smoother. Range [1, 20]. */
-    extern float smoothness;
-    /** Streck-style aim curve: Linear or Accelerated (default). */
-    extern AimAlgorithm aim_algorithm;
-    /** Extra divisor on hardware aim step. Lower = faster pull. */
-    extern float aim_sensitivity;
-    /** Fraction-of-distance gain per aim tick. Higher = faster (1–20). */
-    extern float aim_hardware_speed;
-    /** Prefer the previously locked target within an enlarged FOV to reduce churn. */
-    extern bool sticky_target_lock;
-    /** Extra pixels of FOV granted to the locked target so a marginal rival can't steal lock. */
-    extern float aim_sticky_fov_bias_px;
-    /** Milliseconds we keep the lock after losing visibility (0 = drop immediately). */
-    extern int aim_loss_of_sight_grace_ms;
-    extern bool aim_loss_of_sight_grace_enabled;
-    /** Bullet speed for lead prediction (cm/s). */
-    extern float aim_bullet_speed_cm_s;
-
-    /* Triggerbot */
-    extern bool enable_triggerbot;
-    extern int trigger_hold_mode; // 0=Hold, 1=Toggle, 2=Always
-    extern int trigger_hold_key;
-    extern float trigger_deadzone_px;
-    extern int trigger_fire_delay_ms;
-    extern bool trigger_auto_hold;
-
     /* World */
     extern bool enable_world;
     extern bool droppedItems;
@@ -210,6 +195,11 @@ namespace var {
 
     /* Loot */
     extern bool showLoot;
+// Quest items draw as a gold star and were previously unconditional (no UI). The
+// Quest tab exposes them: a master toggle and a pulse toggle for the breathing
+// highlight. Default on for both, so nothing changes until turned off.
+extern bool show_world_quest;
+extern bool quest_pulse;
     /** On-screen list of nearby ground pickups; F7 marks nearest as picked. */
     extern bool show_near_loot_hud;
     extern float loot_distance;
@@ -270,7 +260,6 @@ namespace var {
     /* Debug */
     extern bool show_debug_overlay;
     extern bool debug_skeleton_lag;
-    extern bool debug_aim_shake;
     extern bool debug_hatch_detect;
     /** Log each bot rejection/ghost decision to entity_diagnostics.ndjson. */
     extern bool debug_ghost_bots;
@@ -326,7 +315,7 @@ inline bool AnyWorldEspEnabled()
     // independent world-blip path.
     return var::enable_world && var::showLoot && (
         var::droppedItems || var::raiderStock || var::showArc ||
-        var::showDeadPlayers || var::showLoot ||
+        var::showDeadPlayers ||
         var::show_world_items || var::show_world_ammo || var::show_world_arc_loot ||
         var::show_world_backpack || var::show_world_crate || var::show_world_furniture ||
         var::show_world_grenade || var::show_world_harvestable || var::show_world_industrial ||

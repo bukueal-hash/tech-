@@ -121,14 +121,14 @@
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(SolutionDir)Project;$(ProjectDir)lib\include;$(ProjectDir)ThirdParty;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)Project;$(ProjectDir)lib\include;$(ProjectDir)ThirdParty;$(SolutionDir)ThirdParty\embree\include;C:\embree-4.4.1.x64.windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <DebugInformationFormat>None</DebugInformationFormat>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>false</GenerateDebugInformation>
-      <AdditionalDependencies>d3d11.lib;vmm.lib;leechcore.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(ArcDmaBinDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>d3d11.lib;vmm.lib;leechcore.lib;winmm.lib;embree4.lib;embree_sse42.lib;embree_avx.lib;embree_avx2.lib;lexers.lib;math.lib;simd.lib;sys.lib;tasking.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ArcDmaBinDir);$(SolutionDir)ThirdParty\embree-build\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <PostBuildEvent>
       <Command>xcopy /Y /D "$(ArcDmaBinDir)\*.dll" "$(OutDir)" 2&gt;nul&#x0D;&#x0A;if exist "$(ArcDmaBinDir)\info.db" xcopy /Y /D "$(ArcDmaBinDir)\info.db" "$(OutDir)"&#x0D;&#x0A;robocopy "$(ProjectDir)Data" "$(OutDir)Data" /E /XF pois.json&#x0D;&#x0A;if errorlevel 8 exit /b 1&#x0D;&#x0A;if not exist "$(OutDir)Data\pois.json" copy /Y "$(ProjectDir)Data\pois.json" "$(OutDir)Data\pois.json"&#x0D;&#x0A;exit /b 0</Command>
@@ -144,16 +144,12 @@
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>false</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(SolutionDir)Project;$(ProjectDir)lib\include;$(ProjectDir)ThirdParty;$(SolutionDir)ThirdParty\embree\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)Project;$(ProjectDir)lib\include;$(ProjectDir)ThirdParty;$(SolutionDir)ThirdParty\embree\include;C:\embree-4.4.1.x64.windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <DebugInformationFormat>None</DebugInformationFormat>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>false</GenerateDebugInformation>
-      <!-- Embree 4.4, built static (EMBREE_STATIC_LIB=ON, ISPC/tutorials off,
-           internal tasking) so no new DLL ships next to ArcRaiders.exe. The
-           embree*_<isa>.lib device libraries are part of this build: the BVH
-           entry points are per-ISA, and the API lib alone cannot select one. -->
       <AdditionalDependencies>d3d11.lib;vmm.lib;leechcore.lib;winmm.lib;embree4.lib;embree_sse42.lib;embree_avx.lib;embree_avx2.lib;lexers.lib;math.lib;simd.lib;sys.lib;tasking.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(ArcDmaBinDir);$(SolutionDir)ThirdParty\embree-build\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
@@ -175,15 +171,10 @@
     <ClCompile Include="Functions\PositionRefreshPass.cpp" />
     <ClCompile Include="Interface\Render\RenderQueue.cpp" />
     <ClCompile Include="Functions\WorldScanCommon.cpp" />
-    <ClCompile Include="Functions\CollisionRead.cpp" />
-    <ClCompile Include="Functions\CollisionBvh.cpp" />
-    <ClCompile Include="Functions\CollisionDebug.cpp" />
     <ClCompile Include="Functions\RobotList.cpp" />
     <ClCompile Include="Functions\World.cpp" />
     <ClCompile Include="Functions\BoneList.cpp" />
     <ClCompile Include="Functions\Esp.cpp" />
-    <ClCompile Include="Functions\Aimbot.cpp" />
-    <ClCompile Include="Functions\AimbotMonitor.cpp" />
     <ClCompile Include="Core\SessionLog.cpp" />
     <ClCompile Include="Core\CrashHandler.cpp" />
     <ClCompile Include="Core\AssetNames.cpp" />
@@ -204,7 +195,6 @@
     <ClCompile Include="Input\KeyBind.cpp" />
     <!-- Interface -->
     <ClCompile Include="Interface\Overlay\MenuAssets.cpp" />
-    <ClCompile Include="Interface\Overlay\AimbotDebugPanel.cpp" />
     <ClCompile Include="Interface\Overlay\ImGuiKeybind.cpp" />
     <ClCompile Include="Interface\Overlay\MenuLayout.cpp" />
     <ClCompile Include="Interface\Overlay\MenuSidebar.cpp" />
@@ -260,14 +250,8 @@
     <ClInclude Include="Interface\Utils\ColorProfile.h" />
     <ClInclude Include="Core\EspFramePolicy.hpp" />
     <ClInclude Include="Core\FeaturePolicy.hpp" />
-    <ClInclude Include="Core\AimCalibration.hpp" />
-    <ClInclude Include="Core\PracticeMode.hpp" />
     <ClInclude Include="Core\EntityDiagnostics.hpp" />
-    <ClInclude Include="Core\CollisionGeom.hpp" />
-    <ClInclude Include="Core\CollisionTess.hpp" />
-    <ClInclude Include="Functions\CollisionRead.h" />
-    <ClInclude Include="Functions\CollisionBvh.h" />
-    <ClInclude Include="Functions\CollisionDebug.h" />
+    <ClInclude Include="Core\EmbreeVisCheck.hpp" />
     <ClInclude Include="Core\PlayerEspMissLog.hpp" />
     <ClInclude Include="Core\RunReport.hpp" />
     <ClInclude Include="Core\BotEspPosition.hpp" />
@@ -306,7 +290,6 @@
     <!-- Core (added for solution-explorer completeness) -->
     <ClInclude Include="Core\ActorType.h" />
     <ClInclude Include="Core\AgentLog.h" />
-    <ClInclude Include="Core\AimMath.hpp" />
     <ClInclude Include="Core\BoneMath.hpp" />
     <ClInclude Include="Core\BotTypes.h" />
     <ClInclude Include="Core\CrashHandler.h" />
@@ -323,12 +306,10 @@
     <ClInclude Include="Core\StringUtils.hpp" />
     <ClInclude Include="Core\WorldItemCategory.h" />
     <!-- Functions -->
-    <ClInclude Include="Functions\AimbotMonitor.hpp" />
     <ClInclude Include="Functions\EspDraw.h" />
     <ClInclude Include="Functions\RobotList.h" />
     <ClInclude Include="Functions\WorldScanCommon.h" />
     <!-- Interface -->
-    <ClInclude Include="Interface\Overlay\AimbotDebugPanel.hpp" />
     <ClInclude Include="Interface\Overlay\MenuLayout.h" />
     <ClInclude Include="Interface\Render\RenderQueue.h" />
     <ClInclude Include="Interface\Utils\Threads\ScanBudget.h" />

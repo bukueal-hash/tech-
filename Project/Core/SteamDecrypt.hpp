@@ -12,6 +12,7 @@
 #include "Cache.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -104,6 +105,13 @@ constexpr int      kRotLegacy  = 19;
 // the current build actually applies to APlayerState.PlayerNamePrivate.
 constexpr uint32_t kKeyRef = 0xA1900265u;
 constexpr int      kRotRef = 15;
+// 0x6ACCA5BB reference drop (Core/ArcDecryptBuild2.hpp, namespace ArcPlayerName):
+// the player-name scramble for the user-supplied build - key 0x50480069, rol 14,
+// same state advance and printable substitution as the other keys. It was ported
+// but never wired into the decode chain, so this build's names fell through to
+// the raw bytes ("eB_+}A") or an empty string ("Raider").
+constexpr uint32_t kKeyBuild2 = 0x50480069u;
+constexpr int      kRotBuild2 = 14;
 
 inline uint32_t RotateLeft32(uint32_t value, int count) {
 	return (value << count) | (value >> (32 - count));
@@ -201,6 +209,14 @@ inline void DecryptPlayerNameSdk(std::vector<uint16_t>& buffer, int maxLength)
 	}
 	if (i < static_cast<int>(buffer.size()))
 		buffer[static_cast<size_t>(i)] = 0;
+}
+
+// 0x6ACCA5BB reference drop key (Core/ArcDecryptBuild2.hpp ArcPlayerName): the
+// state advance is identical to the other keys (rol 14) but the add constant is
+// 0x50480069, which none of the CL variants carry.
+inline void DecryptPlayerNameBuild2(std::vector<uint16_t>& buffer, int maxLength)
+{
+	DecryptWithKey(buffer, maxLength, kKeyBuild2, kRotBuild2);
 }
 
 // ── CL-1341255 SIMD name decrypt ────────────────────────────────────────────
@@ -1546,6 +1562,8 @@ inline uint64_t ResolveNamePointerAlt(uint64_t moduleBase, int32_t CompIndex) {
 }
 
 inline uint64_t ResolveNamePointer(uint64_t moduleBase, int32_t CompIndex) {
+	if (const uint64_t Entry = ResolveNamePointerAlt(moduleBase, CompIndex))
+		return Entry;
 	if (const uint64_t Entry = ResolveNamePointerRef(moduleBase, CompIndex))
 		return Entry;
 	if (const uint64_t Entry = ResolveNamePointerPlain(moduleBase, CompIndex))
@@ -1809,6 +1827,8 @@ inline std::string ResolveNameTextAlt(uint64_t moduleBase, int32_t CompIndex) {
 // then the v20260818 keystream. Every candidate must pass the entry-text gate,
 // so a candidate produced by the wrong layout is rejected rather than published.
 inline std::string DecodeString(uint64_t NameEntryPtr) {
+	if (const std::string Alt = DecodeStringAlt(NameEntryPtr); LooksLikeNameEntry(Alt))
+		return Alt;
 	if (const std::string Ref = DecodeStringRef(NameEntryPtr); LooksLikeNameEntry(Ref))
 		return Ref;
 	if (const std::string Plain = DecodeStringPlain(NameEntryPtr); LooksLikeNameEntry(Plain))
@@ -2125,6 +2145,13 @@ inline void DecryptPlayerNameSdk(std::vector<uint16_t>& NameBuffer, int MaxLengt
 	PlayerName::DecryptPlayerNameSdk(NameBuffer, MaxLength);
 }
 
+// 0x6ACCA5BB reference build key (Core/ArcDecryptBuild2.hpp ArcPlayerName),
+// 0x50480069 / rol 14 - the user-supplied drop's APlayerState name scramble.
+inline void DecryptPlayerNameBuild2(std::vector<uint16_t>& NameBuffer, int MaxLength)
+{
+	PlayerName::DecryptPlayerNameBuild2(NameBuffer, MaxLength);
+}
+
 inline void DecryptName(std::vector<uint16_t>& nameBuffer, int maxLength)
 {
 	DecryptPlayerName(nameBuffer, maxLength);
@@ -2171,6 +2198,18 @@ inline bool IsPlausibleArcPlayerName(const std::string& name)
 		if (c == 0)
 			break;
 		if (c < 0x20 || c == 0x7F)
+			return false;
+	}
+
+	// Only gamer-tag characters: letters, digits, '_', '-', '.', ' '. A name
+	// carrying '+', '}', '$', '^', '(' ... is ciphertext that slipped past the
+	// old gate (e.g. "eB_+}A", "B{eZhcA(Cav$:3P") and was shown verbatim.
+	for (unsigned char c : name) {
+		if (c == 0)
+			break;
+		const bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' || c == ' ';
+		if (!allowed)
 			return false;
 	}
 
@@ -2245,6 +2284,50 @@ inline bool IsValidNameHeapPtr(uint64_t ptr)
 	return ptr > 0x10000 && ptr < 0x00007FFFFFFFFFFF && ValidPtr(ptr);
 }
 
+// PlayerNamePrivate (APlayerState + 0x458) decrypt, ported from the 0x6ACCA5BB dump.
+// Each UTF-16 unit is XORed with a low-5-bit keystream from a 32-bit FNV-style state,
+// then the printable classes are rotated (a character-class cipher).
+inline uint8_t RotatePlayerNameChar(uint8_t value, uint8_t low, uint8_t high, uint8_t shift)
+{
+	if (value < low || value > high)
+		return value;
+	const uint8_t range = static_cast<uint8_t>(high - low + 1);
+	return static_cast<uint8_t>(low + ((value - low + shift) % range));
+}
+
+// Operates on UTF-16 units the caller already read from the FString buffer, so it adds no DMA read site.
+inline std::string DecryptPlayerNameUnits(const uint16_t* units, int32_t count)
+{
+	if (!units || count <= 1 || count > 64)
+		return {};
+
+	constexpr uint32_t kPrime = 0x01000193u;
+	constexpr uint32_t kAdd = 0x50480069u;
+
+	uint32_t state = 0;
+	std::string result;
+	result.reserve(static_cast<size_t>(count));
+
+	for (int32_t i = 0; i < count; ++i) {
+		const uint16_t encrypted = units[i];
+		if (!encrypted)
+			break;
+
+		state = kPrime * (state + std::rotl(kPrime * state + kAdd, 14));
+
+		uint8_t decoded = static_cast<uint8_t>((encrypted ^ (state & 0x1Fu)) & 0xFFu);
+		decoded = RotatePlayerNameChar(decoded, 33, 126, 47);
+		decoded = RotatePlayerNameChar(decoded, 48, 57, 5);
+		decoded = RotatePlayerNameChar(decoded, 97, 122, 13);
+		decoded = RotatePlayerNameChar(decoded, 65, 90, 13);
+		decoded = RotatePlayerNameChar(decoded, 33, 126, 47);
+
+		result.push_back(static_cast<char>(decoded));
+	}
+
+	return result;
+}
+
 inline std::string ReadPlayerNameFromFString(uintptr_t fstringAddr)
 {
 	if (!fstringAddr || !ValidPtr(fstringAddr))
@@ -2280,6 +2363,13 @@ inline std::string ReadPlayerNameFromFString(uintptr_t fstringAddr)
 		if (!readOk)
 			continue;
 
+		// PlayerNamePrivate decrypt first, before the key-guessing paths below.
+		if (rawLen == count) {
+			if (const std::string decoded = DecryptPlayerNameUnits(chars.data(), rawLen);
+				IsPlausibleArcPlayerName(decoded))
+				return decoded;
+		}
+
 		if (rawLen >= 2) {
 			// LIVE-VERIFIED (debug-c190fb.log): names ARE scrambled on
 			// CL-1341255 — "2!}lvfc" @ PS+0x448 decodes to "Execoper" with the
@@ -2301,6 +2391,18 @@ inline std::string ReadPlayerNameFromFString(uintptr_t fstringAddr)
 					if (IsPlausibleArcPlayerName(result))
 						return result;
 				}
+			}
+
+			// User-supplied reference build key (0x50480069 / rol 14) next. The
+			// CL variants decode this build's names to punctuation ("eB_+}A"),
+			// which the tightened gate below now rejects, so the reference key
+			// earns the first real attempt.
+			{
+				std::vector<uint16_t> ks = original;
+				DecryptPlayerNameBuild2(ks, rawLen);
+				result = WideCharsToPlayerName(ks, rawLen);
+				if (IsPlausibleArcPlayerName(result))
+					return result;
 			}
 
 			// Scramble proven on the game's verification FString first (SDK drop

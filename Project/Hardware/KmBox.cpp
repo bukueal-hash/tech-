@@ -349,7 +349,7 @@ void KmboxController::renderKmboxSettings() {
 
     ImGui::SliderInt("Move delay (ms)", &kmboxConfig.minDelay, 0, 50);
     ArcMenuHoverTooltip(
-        "Sleep after Move/MoveBlocking/LeftClick. MoveAim (aim hot path) ignores this.");
+        "Sleep after manual Move/MoveBlocking/LeftClick test commands.");
     if (ImGui::IsItemDeactivatedAfterEdit())
         AutoConfig_MarkDirty();
 
@@ -357,7 +357,7 @@ void KmboxController::renderKmboxSettings() {
 
     if (ImGui::Button("Initialize"))
         Initialize();
-    ArcMenuHoverTooltip("Open the device and set initialized status. Required for hardware aim.");
+    ArcMenuHoverTooltip("Open the device and set initialized status for manual tests and future integrations.");
 
     ImGui::SameLine();
     if (ImGui::Button("Move test"))
@@ -367,7 +367,7 @@ void KmboxController::renderKmboxSettings() {
     ImGui::SameLine();
     if (ImGui::Button("Test fire"))
         fireTest();
-    ArcMenuHoverTooltip("Manual hardware left-click test. This is not used by aimbot.");
+    ArcMenuHoverTooltip("Manual hardware left-click test. The clean shell sends no aim or trigger input.");
 
     if (kmboxConfig.initialized)
         ArcMenuLayout::HoverableTextColoredF(ImVec4(0, 1, 0, 1.f), "Status: connected");
@@ -447,16 +447,19 @@ void KmboxController::Move(int x, int y) {
         Sleep(static_cast<DWORD>(kmboxConfig.minDelay));
 }
 
-void KmboxController::MoveAim(int x, int y) {
+bool KmboxController::MoveAim(int x, int y) {
     if (!kmboxConfig.initialized)
-        return;
+        return false;
     // Run report: counted where the command reaches the device, not where it is
     // decided, so the number is submissions rather than intent.
     RunReport::NoteInputMoveSubmitted();
     if (kmboxConfig.type == "MAKCU")
-        MyMakcu::Move(x, y);
-    else if (kmboxConfig.type == "Net")
+        return MyMakcu::Move(x, y);
+    if (kmboxConfig.type == "Net") {
         kmNet_mouse_move_fire_and_forget(static_cast<short>(x), static_cast<short>(y));
+        return true;
+    }
+    return false;
 }
 
 void KmboxController::MoveBlocking(int x, int y) {

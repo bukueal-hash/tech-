@@ -325,7 +325,9 @@ void Engine::Update() {
 	// one ordered walk that names the rung it used. This tick only seeds that walk
 	// from the previous one, then publishes what the ladder decided.
 	const auto nowRetain = std::chrono::steady_clock::now();
+	PlayerChain::Rung LoadPinnedGiRung();   // Functions/Utils.cpp
 	PlayerChain::Seed seed;
+	seed.giPinned = LoadPinnedGiRung();   // Data\gi_rung.txt, tried first
 	seed.base = base;
 	seed.world = s_lastWorld;
 	seed.worldStillValid = s_lastWorld != 0
@@ -345,6 +347,35 @@ void Engine::Update() {
 	ResolvePlayerChain(base, seed, tActors, actorCount);
 	const auto updT1 = std::chrono::steady_clock::now();
 	const PlayerChain::State chain = GetChainState();
+
+	// Chain readout (debug log): the on-screen overlay refreshes at 250ms and
+	// is skip-on-contention, and this tree stubs the hop instrumentation — so a
+	// session's GI/LP resolution history was invisible in every log. One
+	// throttled line per second names the winning rung and pointer per hop, so
+	// "no GI / no LP" is diagnosable offline (which rung ran, how many tried,
+	// how many rejected).
+	{
+		static uint64_t s_lastChainLogMs = 0;
+		const uint64_t nowChainMs = static_cast<uint64_t>(
+			std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count());
+		if (nowChainMs - s_lastChainLogMs >= 1000) {
+			s_lastChainLogMs = nowChainMs;
+			std::ostringstream l;
+			l << "{\"location\":\"Update.cpp:chain\",\"message\":\"player_chain\","
+			  << "\"data\":{\"world\":\"0x" << std::hex
+			  << chain.Ptr(PlayerChain::Hop::World)
+			  << "\",\"gi\":\"0x" << chain.Ptr(PlayerChain::Hop::GameInstance)
+			  << "\",\"pc\":\"0x" << chain.Ptr(PlayerChain::Hop::Controller)
+			  << "\",\"lp\":\"0x" << chain.Ptr(PlayerChain::Hop::LocalPlayer)
+			  << "\",\"pawn\":\"0x" << chain.Ptr(PlayerChain::Hop::Pawn)
+			  << "\",\"ps\":\"0x" << chain.Ptr(PlayerChain::Hop::State)
+			  << "\",\"pcm\":\"0x" << chain.Ptr(PlayerChain::Hop::CameraManager)
+			  << std::dec << "\",\"trace\":\"" << PlayerChain::Trace(chain)
+			  << "\"},\"ts\":" << nowChainMs << "}\n";
+			EntityDiagnostics::LogRaw(l.str());
+		}
+	}
 
 	const uintptr_t tGWorld = chain.Ptr(PlayerChain::Hop::World);
 	if (!tGWorld) {
@@ -887,7 +918,6 @@ void Engine::ClearEspCaches()
 		std::unique_lock<std::shared_mutex> lock(m_espFrameMutex);
 		m_espFrameShared.reset();
 		m_espPaintFrame.store(nullptr);
-		m_espAimFrame.store(nullptr);
 	}
 	ResetEspFrameDiagnostics();
 	entityStarted.store(false, std::memory_order_release);
